@@ -1,5 +1,5 @@
 import i18n, { loadLocaleMessages } from '@/i18n'
-import { ref, watch } from 'vue'
+import { effectScope, nextTick, ref, watch } from 'vue'
 import { describe, expect, it, vi } from 'vitest'
 
 import { useChatSlashCommands, type UseChatSlashCommandsOptions } from './useChatSlashCommands'
@@ -8,7 +8,7 @@ import { useLocalPathDraft } from './useLocalPathDraft'
 import type { SkillCatalog } from '@/modules/skillCatalog'
 import type { SelectedSkillRef } from '@/types/selectedSkills'
 import type { RpcCallOptions } from '@/lib/rpc'
-import type { SessionMaintenance } from '@/modules/sessionMaintenance'
+import type { SessionCompactionResult, SessionMaintenance } from '@/modules/sessionMaintenance'
 import { usageReportingDouble } from '@/testing/usage.test-helper'
 import {
   commandCatalogFromTestRpc,
@@ -21,6 +21,95 @@ function deferred() {
   })
   return { promise, resolve }
 }
+
+const initCatalogCommand = {
+  name: '/init', aliases: [], category: 'turn', busy_policy: 'next_turn', presentation: 'turn',
+  execution: { kind: 'local', action: 'project.init' },
+}
+
+describe('project initialization command intent', () => {
+  it('requires catalog support and resolves only an explicitly typed init command', async () => {
+    const { api } = harness(false, [initCatalogCommand])
+    await expect(api.classifySlashCommand('/init keep existing sections')).resolves.toBe('registered')
+    expect(api.resolveTurnCommand('/init keep existing sections')).toEqual({ name: 'project.init', args: 'keep existing sections' })
+    expect(api.resolveTurnCommand('//init')).toBeNull()
+    expect(api.resolveTurnCommand('Please explain /init')).toBeNull()
+    expect(api.resolveTurnCommand('> /init')).toBeNull()
+  })
+
+  it('keeps init unavailable on an older Gateway instead of sending ordinary text', async () => {
+    const { api, inputText, notify } = harness(false)
+    inputText.value = '/init'
+    await expect(api.classifySlashCommand('/init')).resolves.toBe('unavailable')
+    await expect(api.executeSlashCommand('/init')).resolves.toBe(true)
+    expect(notify).toHaveBeenCalledWith(i18n.global.t('chat.slashCommands.initUnavailable'))
+    expect(inputText.value).toBe('/init')
+  })
+
+  it('does not treat an init action without ordinary-turn scheduling evidence as supported', async () => {
+    const { api } = harness(false, [{ ...initCatalogCommand, category: undefined }])
+    await expect(api.supportsTurnCommand({ name: 'project.init', args: '' })).resolves.toBe(false)
+  })
+
+  it('invalidates command support when the Gateway scope changes', async () => {
+    const scope = ref('profile-a')
+    const { api, rpc } = harness(false, [initCatalogCommand], Promise.resolve(), undefined, { catalogScope: () => scope.value })
+    await api.loadSlashCommands()
+    expect(api.resolveTurnCommand('/init')).not.toBeNull()
+    scope.value = 'profile-b'
+    await nextTick()
+    expect(api.resolveTurnCommand('/init')).toBeNull()
+    rpc.call.mockResolvedValue({ commands: [] })
+    await expect(api.supportsTurnCommand({ name: 'project.init', args: '' })).resolves.toBe(false)
+  })
+
+  it('reloads an invalidated catalog when the palette reopens and shares the pending request', async () => {
+    const scope = ref('epoch-1')
+    const { api, rpc, inputText } = harness(true, [initCatalogCommand, { name: '/compact', aliases: [] }],
+      Promise.resolve(), undefined, { catalogScope: () => scope.value })
+    await api.loadSlashCommands()
+    inputText.value = '/'
+    api.handleSlashInput()
+    expect(api.filteredSlashCmds.value.map(command => command.cmd)).toEqual(['/init', '/compact', '/plan'])
+    scope.value = 'epoch-2'
+    const ready = deferred()
+    rpc.call.mockImplementationOnce(async () => { await ready.promise; return { commands: [initCatalogCommand] } })
+    api.handleSlashInput()
+    expect(rpc.call).toHaveBeenCalledTimes(2)
+    const supported = api.supportsTurnCommand({ name: 'project.init', args: '' })
+    inputText.value = '/in'
+    api.handleSlashInput()
+    expect(rpc.call).toHaveBeenCalledTimes(2)
+    ready.resolve()
+    await expect(supported).resolves.toBe(true)
+    expect(inputText.value).toBe('/in')
+    expect(api.filteredSlashCmds.value.map(command => command.cmd)).toEqual(['/init'])
+  })
+
+  it('discards a late catalog from the previous scope', async () => {
+    const scope = ref('epoch-1')
+    const ready = deferred()
+    const { api, rpc } = harness(false, [initCatalogCommand], ready.promise, undefined, { catalogScope: () => scope.value })
+    const previous = api.loadSlashCommands()
+    scope.value = 'epoch-2'
+    rpc.call.mockResolvedValue({ commands: [] })
+    await api.loadSlashCommands()
+    ready.resolve()
+    await previous
+    expect(api.resolveTurnCommand('/init')).toBeNull()
+    await expect(api.supportsTurnCommand({ name: 'project.init', args: '' })).resolves.toBe(false)
+  })
+
+  it('retries a failed catalog when the palette is opened again', async () => {
+    const { api, rpc, inputText } = harness(false, [initCatalogCommand])
+    rpc.call.mockRejectedValueOnce(new Error('temporarily unavailable'))
+    await api.loadSlashCommands()
+    inputText.value = '/'
+    api.handleSlashInput()
+    await vi.waitFor(() => expect(api.filteredSlashCmds.value.some(command => command.cmd === '/init')).toBe(true))
+    expect(rpc.call).toHaveBeenCalledTimes(2)
+  })
+})
 
 function harness(
   planModeAvailable: boolean,
@@ -80,9 +169,7 @@ function harness(
     autoResizeTextarea: vi.fn(),
     newSession: vi.fn(),
     resetCurrentSession: vi.fn(),
-    setCompactInFlight: vi.fn(),
-    showCompactStatus: vi.fn(),
-    showCompactionToast: vi.fn(),
+    beginManualCompactionRequest: vi.fn(() => ({ resolve: vi.fn(), reject: vi.fn(() => null), retire: vi.fn(() => null) })),
     notify,
     activatePlanMode,
     planModeAvailable: () => planModeAvailable,
@@ -135,9 +222,7 @@ describe('useChatSlashCommands compaction lifecycle', () => {
       })
       const { api, sessionMaintenance } = harness(false, [], Promise.resolve(), undefined, {
         sessionKey,
-        setCompactInFlight: compaction.setCompactInFlight,
-        showCompactStatus: compaction.showCompactStatus,
-        showCompactionToast: compaction.showCompactionToast,
+        beginManualCompactionRequest: compaction.beginManualCompactionRequest,
       })
       api.selectSlashCmd({ name: '/compact', cmd: '/compact', label: 'Compact', desc: '', aliases: [] })
 
@@ -168,12 +253,110 @@ describe('useChatSlashCommands compaction lifecycle', () => {
       compaction.cleanup()
     }
   })
+
+  function commandDeferred() {
+    let resolve!: (result: SessionCompactionResult) => void
+    let reject!: (error: unknown) => void
+    const promise = new Promise<SessionCompactionResult>((accept, refuse) => { resolve = accept; reject = refuse })
+    return { promise, resolve, reject }
+  }
+
+  function integratedHarness() {
+    const scope = effectScope()
+    const sessionKey = ref('agent:main:webchat:A')
+    const catalogScope = ref('gateway-1')
+    const recover = vi.fn(() => true)
+    const compaction = scope.run(() => useChatCompaction({ sessionKey, popAllPendingIntoComposer: recover, schedulePendingDrainAfterTerminal: vi.fn() }))!
+    const h = scope.run(() => harness(false, [], Promise.resolve(), undefined, {
+      sessionKey, catalogScope: () => catalogScope.value,
+      beginManualCompactionRequest: compaction.beginManualCompactionRequest,
+    }))!
+    const start = () => h.api.selectSlashCmd({ name: '/compact', cmd: '/compact', label: 'Compact', desc: '', aliases: [] })
+    const progress = (id: string) => compaction.showCompactionToast({
+      key: sessionKey.value, source: 'manual', compaction_id: id, status: 'observed', sequence: 1,
+    })
+    const result = (id: string): SessionCompactionResult => ({
+      key: sessionKey.value, compactionId: id, status: 'started', compacted: false, applied: false, durability: 'none', userVisible: true,
+    })
+    return { ...h, scope, sessionKey, catalogScope, compaction, recover, start, progress, result }
+  }
+
+  it.each(['resolve', 'reject'] as const)('ignores an old %s after leaving and returning to the same session', async outcome => {
+    const h = integratedHarness()
+    const old = commandDeferred()
+    const current = commandDeferred()
+    vi.mocked(h.sessionMaintenance.compact).mockReturnValueOnce(old.promise).mockReturnValueOnce(current.promise)
+    try {
+      h.start()
+      h.progress('cmp-old')
+      h.sessionKey.value = 'agent:main:webchat:B'
+      h.compaction.setCompactInFlight(false)
+      h.compaction.hideCompactStatus()
+      h.sessionKey.value = 'agent:main:webchat:A'
+      h.start()
+      h.progress('cmp-current')
+      if (outcome === 'resolve') old.resolve(h.result('cmp-old'))
+      else old.reject(new Error('old connection closed'))
+      await Promise.resolve()
+      expect(h.compaction.compactStatus.value).toMatchObject({ compactionId: 'cmp-current', isBusy: true })
+      expect(h.compaction.isCompactInFlightForCurrentSession()).toBe(true)
+      expect(h.notify).not.toHaveBeenCalled()
+      current.resolve(h.result('cmp-current'))
+      await Promise.resolve()
+    } finally { h.scope.stop(); h.compaction.cleanup() }
+  })
+
+  it('retires an unacknowledged request when the Gateway scope changes, even if no snapshot arrives', async () => {
+    const h = integratedHarness()
+    const request = commandDeferred()
+    vi.mocked(h.sessionMaintenance.compact).mockReturnValueOnce(request.promise)
+    try {
+      h.start()
+      h.catalogScope.value = 'gateway-2'
+      expect(h.compaction.isCompactInFlightForCurrentSession()).toBe(false)
+      expect(h.compaction.compactStatus.value).toMatchObject({ reason: 'request_unconfirmed', status: 'failed' })
+      expect(h.recover).toHaveBeenCalledOnce()
+      expect(h.notify).toHaveBeenCalledWith(i18n.global.t('chat.compact.requestUnconfirmed'))
+      request.resolve(h.result('cmp-old-generation'))
+      await Promise.resolve()
+      expect(h.compaction.compactStatus.value.compactionId).toBe('')
+    } finally { h.scope.stop(); h.compaction.cleanup() }
+  })
+
+  it('retires the optimistic request on disposal without reviving it from a late rejection', async () => {
+    const h = integratedHarness()
+    const request = commandDeferred()
+    vi.mocked(h.sessionMaintenance.compact).mockReturnValueOnce(request.promise)
+    h.start()
+    h.scope.stop()
+    expect(h.compaction.isCompactInFlightForCurrentSession()).toBe(false)
+    request.reject(new Error('old view connection closed'))
+    await Promise.resolve()
+    expect(h.notify).not.toHaveBeenCalled()
+    h.compaction.cleanup()
+  })
+
+  it('reports command uncertainty while preserving its already accepted operation', async () => {
+    const h = integratedHarness()
+    const request = commandDeferred()
+    vi.mocked(h.sessionMaintenance.compact).mockReturnValueOnce(request.promise)
+    try {
+      h.start()
+      h.progress('cmp-running')
+      request.reject(new Error('lost command acknowledgement'))
+      await Promise.resolve()
+      expect(h.compaction.compactStatus.value).toMatchObject({ compactionId: 'cmp-running', isBusy: true })
+      expect(h.notify).toHaveBeenCalledWith(i18n.global.t('chat.compact.requestUnconfirmed'))
+      expect(h.recover).not.toHaveBeenCalled()
+    } finally { h.scope.stop(); h.compaction.cleanup() }
+  })
 })
 
 describe('local side chat command palette', () => {
   it('has one primary entry searchable by its alias before the remote catalog loads', async () => {
     const run = vi.fn(async () => true)
-    const { api, inputText, rpc } = harness(false, [], Promise.resolve(), undefined, { sideChat: { run } })
+    const ready = deferred()
+    const { api, inputText, rpc } = harness(false, [], ready.promise, undefined, { sideChat: { run } })
     for (const query of ['/si', '/btw']) {
       inputText.value = query
       api.handleSlashInput()
@@ -183,7 +366,8 @@ describe('local side chat command palette', () => {
     await expect(api.classifySlashCommand('/btw question')).resolves.toBe('registered')
     await expect(api.executeSlashCommand('/btw question')).resolves.toBe(true)
     expect(run).toHaveBeenCalledWith('/btw question')
-    expect(rpc.call).not.toHaveBeenCalled()
+    expect(rpc.call).toHaveBeenCalledOnce()
+    ready.resolve()
   })
 
   it('completes only the leading token and preserves all prose after the caret', () => {
@@ -577,7 +761,7 @@ describe('useChatSlashCommands goal', () => {
     await api.executeSlashCommand(inputText.value)
 
     expect(goalClear).toHaveBeenCalledTimes(1)
-    expect(notify).toHaveBeenCalledWith(expect.stringContaining('cleared'))
+    expect(notify).not.toHaveBeenCalled()
   })
 
   it('pauses and resumes via /goal pause and /goal resume', async () => {
@@ -585,11 +769,12 @@ describe('useChatSlashCommands goal', () => {
     inputText.value = '/goal pause'
     await api.executeSlashCommand(inputText.value)
     expect(goalPause).toHaveBeenCalledTimes(1)
+    expect(notify).not.toHaveBeenCalled()
 
     inputText.value = '/goal resume'
     await api.executeSlashCommand(inputText.value)
     expect(goalResume).toHaveBeenCalledTimes(1)
-    expect(notify).toHaveBeenCalledWith(expect.stringContaining('resumed'))
+    expect(notify).not.toHaveBeenCalled()
   })
 
   it('edits the current Goal through the authoritative Goal composable', async () => {

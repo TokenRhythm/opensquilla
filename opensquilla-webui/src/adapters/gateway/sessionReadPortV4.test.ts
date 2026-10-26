@@ -2,8 +2,9 @@ import { RpcClient, RpcTimeoutError } from '@/lib/rpc'
 import { createConversationEventHub } from '@/modules/conversationEventHub'
 import { createConversationEventTransport } from './conversationEventTransport'
 import { TransportFlowV4 } from './transportFlowV4'
-import type { TransportEventHandler, TransportLaneRetireReceipt } from './transportTypes'
-import { createSessionReadLifecycle, type SessionReadPortLease } from '@/modules/sessionReadLifecycle'
+import type { TransportEventHandler, TransportLaneOwner, TransportLaneRetireReceipt } from './transportTypes'
+import { createSessionReadLifecycle, type SessionReadPortLease, type SessionReadLease } from '@/modules/sessionReadLifecycle'
+import { useChatSessionBootstrap } from '@/composables/chat/useChatSessionBootstrap'
 import { createConversationRuntime } from '@/modules/conversationRuntime'
 import { createConversationSubscriptionLifecycle } from '@/modules/conversationSubscriptionLifecycle'
 import { afterEach, describe, expect, it, vi } from 'vitest'
@@ -463,7 +464,7 @@ describe('read-v2 consumption covered by an installed snapshot', () => {
       // The caller applies the returned snapshot before confirming its install.
       await live.confirmInstalled!()
       expect(h.waitForConsumption.mock.calls).toEqual([
-        ['alpha', { streamGeneration: 'stream-1', fromSeq: 10, toSeq: 10 }],
+        ['alpha', { streamGeneration: 'stream-1', fromSeq: 10, toSeq: 10, replayAccepted: true }],
       ])
       expect(h.calls.filter(call => call.method === READ_INSTALL_V2).slice(-1)[0]?.params)
         .toMatchObject({ consumed_through_seq: 10, ack_through_seq: 10 })
@@ -579,6 +580,62 @@ describe('read-v2 admission and retirement ownership', () => {
     } finally { await lease.close() }
   })
 
+  it.each([true, false])('projects a busy v2 history read with eager history %s into a retryable domain error', async eager => {
+    const h = v2AdmissionHarness()
+    const error = Object.assign(new Error('Session storage is temporarily busy. Retry this operation.'), {
+      code: 'STORAGE_BUSY', retryable: true, retryAfterMs: 100,
+      details: { operation: 'history.view', stage: 'permit', resource: 'session_history_read' },
+    })
+    h.results.set(HISTORY_V2, error)
+    const request = openRequest(undefined, eager)
+    const lease = createV4SessionReadPort(h.rpc).open(request)
+    try {
+      await lease.live
+      await expect(lease.readHistory(historyRequest(request.signal))).rejects.toMatchObject({
+        name: 'SessionReadFailure', kind: 'busy', retryable: true, retryAfterMs: 100, cause: error,
+      })
+      expect(h.calls.filter(call => call.method === READ_OPEN_V2)).toHaveLength(1)
+    } finally { await lease.close() }
+  })
+
+  it('keeps automatic live reconciliation retrying after repeated busy v2 history reads', async () => {
+    const h = v2AdmissionHarness()
+    const success = h.results.get(HISTORY_V2)
+    h.results.set(HISTORY_V2, Object.assign(new Error('Session storage is temporarily busy. Retry this operation.'), {
+      code: 'STORAGE_BUSY', retryable: true,
+    }))
+    const request = openRequest(undefined, false)
+    const lease = createV4SessionReadPort(h.rpc).open(request)
+    await lease.live
+    vi.useFakeTimers()
+    let attempts = 0
+    const readThenInstall = vi.fn(async () => {
+      if (++attempts === 3) h.results.set(HISTORY_V2, success)
+      await lease.readHistory(historyRequest(request.signal))
+      return { authoritative: true, live: false, backgroundOnly: false }
+    })
+    const moduleLease = lease as unknown as SessionReadLease
+    const open = vi.fn(() => moduleLease)
+    const api = useChatSessionBootstrap({
+      sessionKey: ref('alpha'), connectionState: ref('connected'),
+      sessionReadLifecycle: { open, current: () => moduleLease },
+      loadHistory: async () => ({ ok: true }),
+      subscribeSession: readThenInstall, reconcileSession: readThenInstall,
+      cancelHistory() {}, cancelSubscription() {},
+    })
+    try {
+      await api.startSessionBootstrap({ includeHistory: false }).live
+      expect(api.livePhase.value).toBe('degraded')
+      await vi.advanceTimersByTimeAsync(500)
+      expect(readThenInstall).toHaveBeenCalledTimes(2)
+      await vi.advanceTimersByTimeAsync(1_000)
+      expect(readThenInstall).toHaveBeenCalledTimes(3)
+      expect(api.livePhase.value).toBe('ready')
+      expect(open).toHaveBeenCalledOnce()
+      expect(h.calls.filter(call => call.method === READ_OPEN_V2)).toHaveLength(1)
+    } finally { api.cancelSessionBootstrap(); await lease.close(); vi.useRealTimers() }
+  })
+
   it.each(['closed', 'replaced', 'generation'])('does not promote a late rebase error from a %s owner', async change => {
     const h = v2AdmissionHarness()
     const port = createV4SessionReadPort(h.rpc)
@@ -590,15 +647,17 @@ describe('read-v2 admission and retirement ownership', () => {
     const recovery = expect(lease.reconcile()).rejects.toMatchObject({ kind: 'aborted' })
     await vi.waitFor(() => expect(h.calls.filter(call => call.method === READ_INSTALL_V2)).toHaveLength(2))
     let replacement: SessionReadPortLease | undefined
-    if (change === 'closed') await lease.close()
+    let closing: Promise<void> | undefined
+    if (change === 'closed') closing = lease.close()
     else if (change === 'generation') h.setGeneration(h.rpc.generation + 1)
     else {
       h.results.set(READ_INSTALL_V2, install)
       replacement = port.open(openRequest(undefined, false))
-      await replacement.live
     }
     delayed.reject(Object.assign(new Error('Old base expired'), { code: 'REBASE_REQUIRED' }))
     await recovery
+    await closing
+    await replacement?.live
     const closeCount = h.calls.filter(call => call.method === READ_CLOSE_V2).length
     await lease.close()
     expect(h.calls.filter(call => call.method === READ_CLOSE_V2)).toHaveLength(closeCount)
@@ -716,6 +775,39 @@ describe('read-v2 admission and retirement ownership', () => {
     },
   )
 
+  it.each([READ_INSTALL_V2, READ_STATE_V2])('rebases an active view after a lost %s result is reconciled', async method => {
+    vi.useFakeTimers()
+    const h = v2AdmissionHarness()
+    const original = h.results.get(method)
+    const delayed = deferred<unknown>()
+    const port = createV4SessionReadPort(h.rpc)
+    if (method === READ_INSTALL_V2) h.results.set(method, delayed.promise)
+    const lease = port.open(openRequest(undefined, false))
+    const metadata = lease.metadata.catch(error => error)
+    const admitted = lease.criticalRequestsQueued.catch(error => error)
+    let pending = lease.live
+    if (method === READ_STATE_V2) {
+      await lease.live
+      h.results.set(method, delayed.promise)
+      pending = lease.reconcile()
+    }
+    const failed = expect(pending).rejects.toMatchObject({ kind: 'timeout' })
+    await vi.advanceTimersByTimeAsync(7_000)
+    await failed
+    if (method === READ_INSTALL_V2) {
+      expect(await metadata).toMatchObject({ kind: 'timeout' })
+      expect(await admitted).toBeUndefined()
+    }
+    h.results.set(method, original)
+    await flushAsyncWork()
+    // The old local handle cannot silently retry a lease retired by the probe.
+    await expect(lease.reconcile()).rejects.toMatchObject({ kind: 'rebase-required', retryable: true })
+    await lease.close()
+    const replacement = port.open(openRequest(undefined, false))
+    await expect(replacement.live).resolves.toMatchObject({ sessionKey: 'alpha' })
+    await replacement.close()
+  })
+
   it('queues old A unsubscribe before a delayed read-close response can reach replacement A', async () => {
     vi.useFakeTimers()
     const h = v2AdmissionHarness()
@@ -735,6 +827,11 @@ describe('read-v2 admission and retirement ownership', () => {
     })
     const oldClose = old.close()
     const beta = port.open({ ...openRequest(), sessionKey: 'beta' })
+    await flushAsyncWork()
+    expect(h.calls.filter(call => call.method === READ_OPEN_V2)).toHaveLength(1)
+    setTimeout(() => delayed.resolve(h.results.get(READ_CLOSE_V2)), 200)
+    await vi.advanceTimersByTimeAsync(200)
+    await oldClose
     await beta.live
     await beta.close()
     const replacement = port.open(openRequest())
@@ -744,11 +841,7 @@ describe('read-v2 admission and retirement ownership', () => {
       const replacementSubscribe = h.calls.map(call => call.method).lastIndexOf(SESSIONS_MESSAGES_SUBSCRIBE_METHOD)
       expect(unsubscribe).toBeGreaterThan(-1)
       expect(unsubscribe).toBeLessThan(replacementSubscribe)
-      const countBeforeReply = h.calls.filter(call => call.method === SESSIONS_MESSAGES_UNSUBSCRIBE_METHOD).length
-      setTimeout(() => delayed.resolve(h.results.get(READ_CLOSE_V2)), 200)
-      await vi.advanceTimersByTimeAsync(200)
-      await oldClose
-      expect(h.calls.filter(call => call.method === SESSIONS_MESSAGES_UNSUBSCRIBE_METHOD)).toHaveLength(countBeforeReply)
+      expect(h.calls.filter(call => call.method === SESSIONS_MESSAGES_UNSUBSCRIBE_METHOD)).toHaveLength(2)
       await expect(replacement.reconcile()).resolves.toMatchObject({ sessionKey: 'alpha' })
     } finally {
       await replacement.close()
@@ -789,9 +882,12 @@ describe('read-v2 admission and retirement ownership', () => {
     const metadata = expect(lease.metadata).rejects.toMatchObject({ kind: 'aborted' })
     for (let index = 0; index < 12; index++) await flushAsyncWork()
     expect(h.calls.some(call => call.method === READ_INSTALL_V2)).toBe(true)
-    await lease.close()
-    expect(h.calls.filter(call => call.method === READ_CLOSE_V2)).toHaveLength(1)
+    const closing = lease.close()
+    await flushAsyncWork()
+    expect(h.calls.filter(call => call.method === READ_CLOSE_V2)).toHaveLength(0)
     delayed.resolve(installed)
+    await closing
+    expect(h.calls.filter(call => call.method === READ_CLOSE_V2)).toHaveLength(1)
     await Promise.all([live, metadata])
     await expect(lease.reconcile()).rejects.toMatchObject({ name: 'AbortError' })
     expect(h.calls.some(call => call.method === READ_STATE_V2)).toBe(false)
@@ -815,14 +911,17 @@ describe('read-v2 admission and retirement ownership', () => {
     else await old.close()
     h.results.set(READ_OPEN_V2, opened)
     const replacement = reason === 'replacement' ? port.open(openRequest()) : null
-    if (replacement) await replacement.live
+    await flushAsyncWork()
+    expect(h.calls.filter(call => call.method === READ_OPEN_V2)).toHaveLength(1)
     delayed.resolve(opened)
     await rejected
-    expect(h.calls.filter(call => call.method === READ_CLOSE_V2)).toHaveLength(replacement ? 0 : 1)
+    await replacement?.live
+    await flushAsyncWork()
+    expect(h.calls.filter(call => call.method === READ_CLOSE_V2)).toHaveLength(1)
     if (replacement) {
       await expect(replacement.reconcile()).resolves.toMatchObject({ sessionKey: 'alpha' })
       await replacement.close()
-      expect(h.calls.filter(call => call.method === READ_CLOSE_V2)).toHaveLength(1)
+      expect(h.calls.filter(call => call.method === READ_CLOSE_V2)).toHaveLength(2)
     }
     await old.close()
   })
@@ -1982,6 +2081,106 @@ describe('v4 SessionReadPort Adapter', () => {
       retire_token: 'retire-token',
       final_published_id: 7,
     })
+  })
+
+  it('claims at physical subscribe and drains before sending unsubscribe, keeping the old fence owner', async () => {
+    const h = makeHarness()
+    const sequence: string[] = []
+    const firstOwner: TransportLaneOwner = {
+      beginRetirement: vi.fn(() => { sequence.push('begin') }),
+      completeRetirement: vi.fn(async () => {}),
+      failRetirement: vi.fn(),
+    }
+    const nextOwner: TransportLaneOwner = {
+      beginRetirement: vi.fn(), completeRetirement: vi.fn(async () => {}), failRetirement: vi.fn(),
+    }
+    const claimLaneOwner = vi.fn().mockReturnValueOnce(firstOwner).mockReturnValue(nextOwner)
+    const original = h.requestMock.getMockImplementation()!
+    h.requestMock.mockImplementation((method, params, options) => {
+      if (method === SESSIONS_MESSAGES_UNSUBSCRIBE_METHOD) sequence.push('unsubscribe')
+      return original(method, params, options)
+    })
+    const port = createV4SessionReadPort({ ...h.rpc, claimLaneOwner })
+    const prior = port.open(openRequest())
+    await prior.live
+    expect(claimLaneOwner).toHaveBeenCalledExactlyOnceWith('alpha', 7)
+    const oldReply = deferred<unknown>()
+    h.results.set(SESSIONS_MESSAGES_UNSUBSCRIBE_METHOD, oldReply.promise)
+    await prior.close()
+    expect(sequence).toEqual(['begin', 'unsubscribe'])
+    expect(firstOwner.completeRetirement).not.toHaveBeenCalled()
+    const successor = port.open(openRequest())
+    await successor.live
+    const receipt = { connection_epoch: 'connection', subscription_epoch: 'old-alpha',
+      retire_token: 'old-token', final_published_id: 3 }
+    oldReply.resolve({ lane_retire: receipt })
+    await flushAsyncWork()
+    expect(firstOwner.completeRetirement).toHaveBeenCalledExactlyOnceWith(receipt)
+    expect(nextOwner.beginRetirement).not.toHaveBeenCalled()
+    expect(nextOwner.completeRetirement).not.toHaveBeenCalled()
+    h.results.set(SESSIONS_MESSAGES_UNSUBSCRIBE_METHOD, null)
+    await successor.close()
+  })
+
+  it('never begins retirement from a superseded local read owner', async () => {
+    const h = makeHarness()
+    const firstOwner = { beginRetirement: vi.fn(), completeRetirement: vi.fn(async () => {}), failRetirement: vi.fn() }
+    const nextOwner = { beginRetirement: vi.fn(), completeRetirement: vi.fn(async () => {}), failRetirement: vi.fn() }
+    const claimLaneOwner = vi.fn().mockReturnValueOnce(firstOwner).mockReturnValue(nextOwner)
+    const port = createV4SessionReadPort({ ...h.rpc, claimLaneOwner })
+    const prior = port.open(openRequest())
+    await prior.live
+    const successor = port.open(openRequest())
+    await successor.live
+    await prior.close()
+    expect(firstOwner.beginRetirement).not.toHaveBeenCalled()
+    expect(nextOwner.beginRetirement).not.toHaveBeenCalled()
+    expect(h.calls.filter(call => call.method === SESSIONS_MESSAGES_UNSUBSCRIBE_METHOD)).toHaveLength(0)
+    await successor.close()
+    expect(nextOwner.beginRetirement).toHaveBeenCalledTimes(1)
+  })
+
+  it('cancels the local drain when a delayed unsubscribe fails after send admission', async () => {
+    const h = makeHarness()
+    const laneOwner = { beginRetirement: vi.fn(), completeRetirement: vi.fn(async () => {}), failRetirement: vi.fn() }
+    const port = createV4SessionReadPort({ ...h.rpc, claimLaneOwner: () => laneOwner })
+    const lease = port.open(openRequest())
+    await lease.live
+    const reply = deferred<unknown>()
+    h.results.set(SESSIONS_MESSAGES_UNSUBSCRIBE_METHOD, reply.promise)
+    await lease.close()
+    expect(laneOwner.beginRetirement).toHaveBeenCalledTimes(1)
+    expect(laneOwner.failRetirement).not.toHaveBeenCalled()
+    reply.reject(new Error('Unsubscribe failed'))
+    await flushAsyncWork()
+    expect(laneOwner.failRetirement).toHaveBeenCalledTimes(1)
+    expect(laneOwner.completeRetirement).not.toHaveBeenCalled()
+  })
+
+  it('retains one owner for same-generation admission retries and replaces it after reconnect', async () => {
+    const h = makeHarness()
+    const firstOwner = { beginRetirement: vi.fn(), completeRetirement: vi.fn(async () => {}), failRetirement: vi.fn() }
+    const nextOwner = { beginRetirement: vi.fn(), completeRetirement: vi.fn(async () => {}), failRetirement: vi.fn() }
+    const claimLaneOwner = vi.fn().mockReturnValueOnce(firstOwner).mockReturnValue(nextOwner)
+    const port = createV4SessionReadPort({ ...h.rpc, get generation() { return h.rpc.generation }, claimLaneOwner })
+    h.results.set(SESSIONS_MESSAGES_SUBSCRIBE_METHOD, new Error('Subscribe reply lost'))
+    const prior = port.open(openRequest())
+    await Promise.all([
+      expect(prior.live).rejects.toThrow('Subscribe reply lost'),
+      expect(prior.metadata).rejects.toThrow('Subscribe reply lost'),
+    ])
+    h.results.set(SESSIONS_MESSAGES_SUBSCRIBE_METHOD, subscribeResult())
+    await prior.reconcile()
+    expect(claimLaneOwner).toHaveBeenCalledExactlyOnceWith('alpha', 7)
+    h.setGeneration(8)
+    await expect(prior.reconcile()).rejects.toMatchObject({ kind: 'aborted' })
+    const successor = port.open(openRequest())
+    await successor.live
+    expect(claimLaneOwner.mock.calls).toEqual([['alpha', 7], ['alpha', 8]])
+    await prior.close()
+    expect(firstOwner.beginRetirement).not.toHaveBeenCalled()
+    await successor.close()
+    expect(nextOwner.beginRetirement).toHaveBeenCalledTimes(1)
   })
 
   it('keeps a late malformed unsubscribe reply local after its successor has subscribed', async () => {

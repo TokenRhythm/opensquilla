@@ -14,6 +14,7 @@ import os
 import shutil
 import signal
 import sqlite3
+import struct
 import subprocess
 import sys
 import textwrap
@@ -1070,6 +1071,7 @@ def test_posix_unverifiable_live_pid_cannot_prove_signal_cleanup(
     captured = process_tree._CapturedPosixProcess(4242, 501, "original-start", 1)
     signals: list[tuple[int, int]] = []
     monkeypatch.setattr(process_tree, "_posix_process_info", lambda _pid: None)
+    monkeypatch.setattr(process_tree, "_darwin_process_info", lambda *_args, **_kwargs: None)
 
     def kill(pid: int, sig: int) -> None:
         signals.append((pid, sig))
@@ -1158,6 +1160,7 @@ def test_darwin_capture_requires_proof_for_missing_second_identity(
     monkeypatch.setattr(
         process_tree, "_posix_process_info", lambda pid: None if pid == 102 else root,
     )
+    monkeypatch.setattr(process_tree, "_darwin_process_info", lambda *_args, **_kwargs: None)
     probes: list[tuple[int, int]] = []
 
     def probe(pid: int, sig: int) -> None:
@@ -1176,17 +1179,286 @@ def test_darwin_capture_requires_proof_for_missing_second_identity(
     assert probes == [(102, 0)]
 
 
+@pytest.mark.parametrize("include_zombies", [False, True])
+@pytest.mark.parametrize("invalid", [None, "short", "pid", "unique-id"])
+def test_darwin_process_info_reads_one_combined_kernel_identity(
+    include_zombies, invalid,
+) -> None:
+    calls = []
+
+    def pidinfo(pid, flavor, arg, buffer, size):
+        calls.append((pid, flavor, arg, size))
+        # Darwin's proc_bsdinfo (136 bytes) + proc_uniqidentifierinfo (56).
+        raw = bytearray(192)
+        struct.pack_into("=III", raw, 12, 999 if invalid == "pid" else 101, 100, 501)
+        struct.pack_into("=I", raw, 100, 100)
+        struct.pack_into("=QQ", raw, 120, 23, 42)
+        struct.pack_into("=QQ", raw, 152, 0 if invalid == "unique-id" else 1001, 1000)
+        ctypes.memmove(buffer, bytes(raw), len(raw))
+        return 191 if invalid == "short" else len(raw)
+
+    info = process_tree._darwin_process_info(
+        101, SimpleNamespace(proc_pidinfo=pidinfo), include_zombies=include_zombies,
+    )
+
+    assert calls == [(101, 18, 1, 192)]
+    if invalid is not None:
+        assert info is None
+    else:
+        assert info == process_tree._PosixProcessInfo(
+            101, 100, 100, 501, "darwin-libproc-start:23:42", 1001, 1000,
+        )
+
+
+@pytest.mark.parametrize("status", [1, 4, 5], ids=["exiting", "stopped", "zombie"])
+def test_darwin_zombie_proof_does_not_mistake_stopped_process_for_exit(monkeypatch, status):
+    def pidinfo(_pid, _flavor, _arg, buffer, _size):
+        assert _arg == 1
+        raw = bytearray(192)
+        struct.pack_into("=I", raw, 0, 4 if status == 1 else 0)  # PROC_FLAG_INEXIT
+        struct.pack_into("=I", raw, 4, status)
+        struct.pack_into("=I", raw, 12, 101)
+        struct.pack_into("=Q", raw, 152, 1001)
+        ctypes.memmove(buffer, bytes(raw), len(raw))
+        return len(raw)
+
+    monkeypatch.setattr(process_tree.sys, "platform", "darwin")
+    monkeypatch.setattr(
+        process_tree, "_darwin_libproc", lambda: SimpleNamespace(proc_pidinfo=pidinfo),
+    )
+    probes = []
+    monkeypatch.setattr(process_tree.os, "kill", lambda pid, sig: probes.append((pid, sig)))
+
+    assert (process_tree._darwin_process_info(101) is None) is (status == 5)
+    assert process_tree._posix_pid_definitively_gone(101) is (status == 5)
+    assert probes == ([] if status == 5 else [(101, 0)])
+
+
+@pytest.mark.skipif(sys.platform != "darwin", reason="native Darwin zombie identity")
+def test_darwin_exited_target_identity_is_available_before_reaping() -> None:
+    target = subprocess.Popen([sys.executable, "-c", "pass"])
+    try:
+        deadline = time.monotonic() + 5
+        # Observe exit without poll()/wait(): the sole parent's unreaped zombie
+        # is exactly what an immediately exiting PTY target leaves behind.
+        while process_tree._darwin_process_info(target.pid) is not None:
+            assert time.monotonic() < deadline
+            time.sleep(0.01)
+        info = process_tree._darwin_process_info(target.pid, include_zombies=True)
+        assert info is not None
+        assert info.pid == target.pid
+        assert info.ppid == os.getpid()
+        assert info.uid == os.geteuid()
+        assert info.unique_id
+        assert info.is_zombie
+        captured = (process_tree._CapturedPosixProcess(
+            info.pid, info.uid, info.start_identity, 1,
+        ),)
+        # kill(pid, 0) succeeds for zombies. All cleanup consumers must accept
+        # kernel exit evidence without declaring the missing live info unsafe.
+        assert process_tree._posix_pid_definitively_gone(target.pid)
+        assert process_tree._signal_captured_posix_processes(captured, signal.SIGTERM)
+        assert not process_tree._captured_posix_processes_alive(captured)
+        assert process_tree._merge_live_posix_captures(captured, ()) == ((), True)
+        assert target.wait(timeout=5) == 0
+        assert process_tree._darwin_process_info(target.pid, include_zombies=True) is None
+    finally:
+        if target.poll() is None:
+            target.kill()
+        target.wait(timeout=5)
+
+
+def test_darwin_lineage_captures_orphans_and_retains_exited_ancestors(monkeypatch) -> None:
+    uid = 501
+    anchor = process_tree._PosixProcessInfo(100, 1, 100, uid, "anchor", 1000, 1)
+    orphan = process_tree._PosixProcessInfo(102, 1, 102, uid, "orphan", 1002, 1001)
+    grandchild = process_tree._PosixProcessInfo(103, 1, 103, uid, "grandchild", 1003, 1002)
+    sentinel = process_tree._PosixProcessInfo(104, 1, 104, uid, "sentinel", 1004, 999)
+    snapshot = {info.pid: info for info in (anchor, orphan, grandchild, sentinel)}
+    # The target (unique ID 1001) has already exited and been reaped.
+    lineage = {1001: 1}
+    monkeypatch.setattr(process_tree.sys, "platform", "darwin")
+    monkeypatch.setattr(process_tree.os, "geteuid", lambda: uid, raising=False)
+    monkeypatch.setattr(process_tree, "_posix_process_snapshot", lambda: snapshot)
+    monkeypatch.setattr(process_tree, "_posix_process_info", snapshot.get)
+    signals = []
+    monkeypatch.setattr(process_tree.os, "kill", lambda pid, sig: signals.append((pid, sig)))
+
+    first = process_tree._capture_posix_group_descendants(
+        100, 100, include_anchor_children=True, darwin_lineage=lineage,
+    )
+    assert first.complete
+    assert {item.pid for item in first.processes} == {102, 103}
+    assert lineage == {1001: 1, 1002: 2, 1003: 3}
+    assert process_tree._signal_captured_posix_processes(first.processes, signal.SIGTERM)
+    assert {pid for pid, _sig in signals} == {102, 103}
+
+    del snapshot[102]
+    # A previously captured child can exec after reparenting: its *own* unique
+    # ID survives even though the kernel now reports launchd as its parent.
+    snapshot[103] = process_tree._PosixProcessInfo(
+        103, 1, 103, uid, "grandchild", 1003, 1,
+    )
+    snapshot[105] = process_tree._PosixProcessInfo(
+        105, 1, 105, uid, "late-child", 1005, 1002,
+    )
+    second = process_tree._capture_posix_group_descendants(
+        100, 100, include_anchor_children=True, darwin_lineage=lineage,
+    )
+    assert second.complete
+    assert {item.pid for item in second.processes} == {103, 105}
+    assert lineage[1005] == 3
+
+
+@pytest.mark.parametrize("change", ["uid", "pid-reuse", "unverifiable", "limit"])
+def test_darwin_lineage_never_signals_unverified_candidates(monkeypatch, change) -> None:
+    uid = 501
+    anchor = process_tree._PosixProcessInfo(100, 1, 100, uid, "anchor", 1000, 1)
+    orphan = process_tree._PosixProcessInfo(
+        102, 1, 102, 502 if change == "uid" else uid, "orphan", 1002, 1001,
+    )
+    snapshot = {100: anchor, 102: orphan}
+    lineage = {1001: 1}
+    current = (
+        process_tree._PosixProcessInfo(102, 1, 102, uid, "orphan", 9999, 1)
+        if change == "pid-reuse" else None if change == "unverifiable" else orphan
+    )
+    monkeypatch.setattr(process_tree.sys, "platform", "darwin")
+    monkeypatch.setattr(process_tree.os, "geteuid", lambda: uid, raising=False)
+    monkeypatch.setattr(process_tree, "_posix_process_snapshot", lambda: snapshot)
+    monkeypatch.setattr(process_tree, "_posix_process_info", lambda _pid: current)
+    monkeypatch.setattr(process_tree, "_posix_pid_definitively_gone", lambda _pid: False)
+    if change == "limit":
+        monkeypatch.setattr(process_tree, "_POSIX_DESCENDANT_CAPTURE_LIMIT", 1)
+    monkeypatch.setattr(
+        process_tree.os, "kill", lambda *_args: pytest.fail("must not signal this process"),
+    )
+
+    capture = process_tree._capture_posix_group_descendants(
+        100, 100, include_anchor_children=True, darwin_lineage=lineage,
+    )
+
+    assert capture.processes == ()
+    assert capture.complete is (change == "pid-reuse")
+    assert len(lineage) <= process_tree._POSIX_DESCENDANT_CAPTURE_LIMIT
+    assert process_tree._signal_captured_posix_processes(capture.processes, signal.SIGTERM)
+
+
+def test_darwin_retained_lineage_limit_reports_incomplete_but_cleans_known_child(
+    monkeypatch,
+) -> None:
+    anchor = process_tree._PosixProcessInfo(100, 1, 100, 501, "anchor", 1000, 1)
+    orphan = process_tree._PosixProcessInfo(105, 1, 105, 501, "orphan", 1005, 1001)
+    snapshot = {100: anchor, 105: orphan}
+    # Old, exited identities still count towards the lifetime bound.
+    lineage = {1001: 1, 1002: 2, 1003: 2}
+    monkeypatch.setattr(process_tree.sys, "platform", "darwin")
+    monkeypatch.setattr(process_tree.os, "geteuid", lambda: 501, raising=False)
+    monkeypatch.setattr(process_tree, "_posix_process_snapshot", lambda: snapshot)
+    monkeypatch.setattr(process_tree, "_posix_process_info", snapshot.get)
+    monkeypatch.setattr(process_tree, "_POSIX_DESCENDANT_CAPTURE_LIMIT", 3)
+
+    capture = process_tree._capture_posix_group_descendants(
+        100, 100, include_anchor_children=True, darwin_lineage=lineage,
+    )
+
+    assert not capture.complete
+    assert [item.pid for item in capture.processes] == [105]
+    assert lineage == {1001: 1, 1002: 2, 1003: 2}
+
+
+@pytest.mark.skipif(os.name != "posix", reason="POSIX anchor uses file descriptors")
+@pytest.mark.parametrize(
+    "initial_snapshot",
+    [
+        "ready", "no-target", "unavailable", "empty-list", "missing-anchor",
+        "identity-missing", "wrong-uid", "wrong-group",
+    ],
+)
+def test_darwin_pipe_anchor_verifies_group_before_acknowledging_arm(
+    monkeypatch, initial_snapshot,
+) -> None:
+    anchor = process_tree._PosixProcessInfo(100, 1, 100, 501, "anchor", 1000, 1)
+    # The gated pipe helper and anchor are siblings, not parent/child.
+    target = process_tree._PosixProcessInfo(101, 1, 100, 501, "target", 1001, 1)
+    events = []
+    def snapshot():
+        assert process_tree._POSIX_ANCHOR_ARMED in events, "no startup whole-machine scan"
+        events.append("snapshot")
+        return {100: anchor}
+
+    def initial_identity(pid):
+        assert pid == 101
+        events.append("root-identity")
+        if initial_snapshot == "identity-missing":
+            return None
+        if initial_snapshot == "wrong-uid":
+            return process_tree._PosixProcessInfo(101, 1, 100, 502, "other", 1001, 1)
+        if initial_snapshot == "wrong-group":
+            return process_tree._PosixProcessInfo(101, 1, 999, 501, "other", 1001, 1)
+        return target
+
+    monkeypatch.setattr(process_tree.sys, "platform", "darwin")
+    monkeypatch.setattr(process_tree.os, "getpid", lambda: 100)
+    monkeypatch.setattr(process_tree.os, "getpgrp", lambda: 100)
+    monkeypatch.setattr(process_tree.os, "geteuid", lambda: 501)
+    monkeypatch.setattr(process_tree.signal, "signal", lambda *_args: None)
+    monkeypatch.setattr(process_tree, "_posix_process_snapshot", snapshot)
+    monkeypatch.setattr(process_tree, "_darwin_process_info", initial_identity)
+    monkeypatch.setattr(
+        process_tree, "_darwin_group_members",
+        lambda _pgid: (
+            None if initial_snapshot == "unavailable"
+            else () if initial_snapshot == "empty-list"
+            else (101,) if initial_snapshot == "missing-anchor"
+            else (100,) if initial_snapshot == "no-target" else (100, 101)
+        ),
+    )
+    monkeypatch.setattr(process_tree, "_posix_group_members", lambda _pgid: (100,))
+    read_fd, write_fd = os.pipe()
+
+    class Output(io.BytesIO):
+        def write(self, data):
+            events.append(data)
+            if data == process_tree._POSIX_ANCHOR_EMPTY:
+                os.write(write_fd, process_tree._POSIX_ANCHOR_RELEASE)
+            return super().write(data)
+
+    output = Output()
+    try:
+        os.write(write_fd, process_tree._POSIX_ANCHOR_ARM)
+        with os.fdopen(read_fd, "rb", buffering=0) as input_pipe:
+            result = process_tree._run_posix_group_anchor(
+                "-", input_pipe=input_pipe, output_pipe=output,
+            )
+        if initial_snapshot in {"ready", "no-target"}:
+            assert result == 0
+            if initial_snapshot == "ready":
+                assert events.index("root-identity") < events.index(
+                    process_tree._POSIX_ANCHOR_ARMED,
+                )
+            else:
+                assert "root-identity" not in events
+            assert output.getvalue() == b"YBE"
+        else:
+            assert result == 125
+            assert output.getvalue() == b"Y", "an unowned target must stay behind its gate"
+    finally:
+        os.close(write_fd)
+
+
 @pytest.mark.skipif(os.name != "posix", reason="POSIX anchor uses file descriptors")
 @pytest.mark.parametrize("target_visible", [True, False])
+@pytest.mark.parametrize("root_identity", ["known", "missing", "wrong-parent"])
 def test_darwin_pre_eof_requires_identity_bound_direct_target(
-    monkeypatch: pytest.MonkeyPatch, target_visible: bool,
+    monkeypatch: pytest.MonkeyPatch, target_visible: bool, root_identity: str,
 ) -> None:
     uid = 501
-    anchor = process_tree._PosixProcessInfo(100, 1, 100, uid, "anchor")
+    anchor = process_tree._PosixProcessInfo(100, 1, 100, uid, "anchor", 1000, 1)
     # The target is still the anchor's child, but has moved to its own group.
-    target = process_tree._PosixProcessInfo(101, 100, 101, uid, "target")
-    group_root = process_tree._PosixProcessInfo(102, 1, 100, uid, "orphaned-root")
-    escaped = process_tree._PosixProcessInfo(103, 102, 103, uid, "escaped-child")
+    target = process_tree._PosixProcessInfo(101, 100, 101, uid, "target", 1001, 1000)
+    group_root = process_tree._PosixProcessInfo(102, 1, 100, uid, "orphaned-root", 1002, 1)
+    escaped = process_tree._PosixProcessInfo(103, 102, 103, uid, "escaped-child", 1003, 1002)
     snapshot = {
         100: anchor, 102: group_root, 103: escaped,
         **({101: target} if target_visible else {}),
@@ -1194,11 +1466,28 @@ def test_darwin_pre_eof_requires_identity_bound_direct_target(
     capture_flags: list[bool] = []
     captured_ids: list[tuple[int, ...]] = []
     original_capture = process_tree._capture_posix_group_descendants
+    initial_identity_read = False
+    reset_signals = []
 
-    def capture(pgid: int, anchor_pid: int, *, include_anchor_children: bool = False):
+    def read_initial_identity(pid, *, include_zombies=False):
+        nonlocal initial_identity_read
+        assert pid == 101 and include_zombies
+        assert (signal.SIGCHLD, signal.SIG_DFL) in reset_signals
+        initial_identity_read = True
+        if root_identity == "missing":
+            return None
+        if root_identity == "wrong-parent":
+            return process_tree._PosixProcessInfo(101, 999, 101, uid, "target", 1001, 9999)
+        return target
+
+    def capture(
+        pgid: int, anchor_pid: int, *, include_anchor_children: bool = False,
+        darwin_lineage=None,
+    ):
         capture_flags.append(include_anchor_children)
         result = original_capture(
             pgid, anchor_pid, include_anchor_children=include_anchor_children,
+            darwin_lineage=darwin_lineage,
         )
         captured_ids.append(tuple(process.pid for process in result.processes))
         return result
@@ -1208,16 +1497,18 @@ def test_darwin_pre_eof_requires_identity_bound_direct_target(
         returncode = None
 
         def poll(self) -> int | None:
+            assert initial_identity_read, "never reap before capturing the target's identity"
             return 0 if b"V" in output_pipe.getvalue() or b"F" in output_pipe.getvalue() else None
 
     monkeypatch.setattr(process_tree.sys, "platform", "darwin")
     monkeypatch.setattr(process_tree.os, "getpid", lambda: 100)
     monkeypatch.setattr(process_tree.os, "getpgrp", lambda: 100)
     monkeypatch.setattr(process_tree.os, "geteuid", lambda: uid)
-    monkeypatch.setattr(process_tree.signal, "signal", lambda *_args: None)
+    monkeypatch.setattr(process_tree.signal, "signal", lambda *args: reset_signals.append(args))
     monkeypatch.setattr(process_tree.subprocess, "Popen", lambda *_args, **_kwargs: Target())
     monkeypatch.setattr(process_tree, "_posix_process_snapshot", lambda: snapshot)
     monkeypatch.setattr(process_tree, "_posix_process_info", snapshot.get)
+    monkeypatch.setattr(process_tree, "_darwin_process_info", read_initial_identity)
     monkeypatch.setattr(process_tree, "_posix_group_members", lambda _pgid: (100,))
     monkeypatch.setattr(process_tree, "_captured_posix_processes_alive", lambda _items: False)
     monkeypatch.setattr(process_tree, "_capture_posix_group_descendants", capture)
@@ -1252,10 +1543,11 @@ def test_darwin_pre_eof_requires_identity_bound_direct_target(
             result = process_tree._run_posix_group_anchor(
                 "-", input_pipe=input_pipe, output_pipe=output_pipe, target_argv=["target"],
             )
-        assert result == (0 if target_visible else 125)
-        assert capture_flags == [True]
+        complete = target_visible and root_identity == "known"
+        assert result == (0 if complete else 125)
+        assert capture_flags and all(capture_flags)
         assert set(captured_ids[0]) == ({101, 102, 103} if target_visible else {102, 103})
-        assert output_pipe.getvalue() == (b"YBVE" if target_visible else b"YBFU")
+        assert output_pipe.getvalue() == (b"YBVE" if complete else b"YBFU")
     finally:
         os.close(write_fd)
 
@@ -1940,6 +2232,67 @@ async def test_owner_registration_failure_never_releases_target(
     assert "row-deleted" not in case.events
     stopped = "job-closed" if case.platform == "windows" else "anchor-stopped"
     assert stopped in case.events
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("controlled_async_launch", ["posix"], indirect=True)
+async def test_darwin_pipe_arm_failure_reclaims_gated_helper_and_owner(
+    controlled_async_launch, monkeypatch,
+) -> None:
+    case = controlled_async_launch
+    original_create_anchor = process_tree._create_posix_anchor
+    failure = process_tree.ProcessTreeOwnershipError("anchor exited before ARMED")
+
+    async def fail_arm():
+        raise failure
+
+    async def create_anchor(*args, **kwargs):
+        anchor = await original_create_anchor(*args, **kwargs)
+        monkeypatch.setattr(anchor, "arm", fail_arm)
+        return anchor
+
+    monkeypatch.setattr(process_tree, "_create_posix_anchor", create_anchor)
+    with pytest.raises(process_tree.ProcessTreeOwnershipError, match="failed closed") as exc:
+        await case.launch()
+
+    assert exc.value.__cause__ is failure
+    assert "released" not in case.events
+    assert case.events.index("gate-closed") < case.events.index("process-stopped")
+    assert case.events.index("process-stopped") < case.events.index("anchor-stopped")
+    assert case.events.index("anchor-stopped") < case.events.index("row-deleted")
+    assert case.events.count("row-deleted") == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.skipif(sys.platform != "darwin", reason="Darwin gated pipe launch")
+async def test_darwin_empty_anchor_cannot_release_an_exited_pipe_helper(
+    monkeypatch, tmp_path,
+) -> None:
+    original_arm = process_tree._PosixGroupAnchor.arm
+    anchors = []
+
+    async def arm_after_helper_exit(anchor):
+        anchors.append(anchor)
+        assert anchor._owner is not None
+        helper = anchor._owner.process
+        helper.kill()
+        await asyncio.wait_for(helper.wait(), timeout=5)
+        await original_arm(anchor)
+
+    monkeypatch.setattr(process_tree._PosixGroupAnchor, "arm", arm_after_helper_exit)
+    marker = tmp_path / "must-not-run"
+    with pytest.raises(process_tree.ProcessTreeOwnershipError, match="failed closed") as exc:
+        await process_tree.create_owned_subprocess_exec(
+            sys.executable, "-c", f"from pathlib import Path; Path({str(marker)!r}).touch()",
+        )
+
+    assert isinstance(exc.value.__cause__, BrokenPipeError)
+    assert not marker.exists()
+    assert len(anchors) == 1
+    assert anchors[0].process.returncode is not None
+    monitor = anchors[0]._monitor_task
+    assert monitor is not None
+    await asyncio.wait_for(asyncio.shield(monitor), timeout=5)
 
 
 @pytest.mark.asyncio
@@ -4688,3 +5041,103 @@ async def test_persisted_task_residual_check_rejects_unreadable_registry(tmp_pat
         await process_tree.has_persisted_processes_for_task(
             tmp_path, "synthetic-session", "synthetic-task",
         )
+
+
+@pytest.mark.asyncio
+@pytest.mark.skipif(sys.platform != "darwin", reason="Darwin orphaned process ownership")
+@pytest.mark.parametrize("delayed_termination", [False, True], ids=["immediate", "delayed"])
+async def test_darwin_pipe_retains_detached_child_after_parent_exit(
+    delayed_termination, tmp_path,
+) -> None:
+    def process_identity(pid):
+        info = process_tree._darwin_process_info(pid)
+        return info.start_identity if info is not None else None
+
+    child_ready = tmp_path / "child.json"
+    child = tmp_path / "child.py"
+    child.write_text(
+        "import json, os, pathlib, signal, time\n"
+        "from opensquilla.process_tree import _darwin_process_info\n"
+        "signal.signal(signal.SIGTERM, signal.SIG_IGN)\n"
+        f"ready = pathlib.Path({str(child_ready)!r})\n"
+        "pending = ready.with_suffix('.pending')\n"
+        "pending.write_text(json.dumps({\n"
+        "    'pid': os.getpid(), 'identity': _darwin_process_info(os.getpid()).start_identity,\n"
+        "}))\n"
+        "pending.replace(ready)\n"
+        "time.sleep(60)\n",
+        encoding="utf-8",
+    )
+    parent = tmp_path / "parent.py"
+    parent.write_text(
+        "import pathlib, subprocess, sys, time\n"
+        f"subprocess.Popen([sys.executable, {str(child)!r}], start_new_session=True,\n"
+        "    stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)\n"
+        "deadline = time.monotonic() + 10\n"
+        f"while not pathlib.Path({str(child_ready)!r}).exists():\n"
+        "    if time.monotonic() >= deadline:\n"
+        "        raise RuntimeError('child readiness timed out')\n"
+        "    time.sleep(0.001)\n",
+        encoding="utf-8",
+    )
+    sentinel = subprocess.Popen(
+        [sys.executable, "-c", "import time; time.sleep(60)"],
+        start_new_session=True,
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    sentinel_identity = process_identity(sentinel.pid)
+    owner = None
+    try:
+        assert sentinel_identity is not None
+        process = await process_tree.create_owned_subprocess_exec(
+            sys.executable, str(parent),
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+            cwd=str(tmp_path),
+            env=dict(os.environ),
+        )
+        owner = process_tree.capture_process_tree_owner(process, isolated=True)
+        assert owner.durable
+        owner.start_completion_monitor()
+        stdout, stderr = await asyncio.wait_for(process.communicate(), timeout=10)
+        assert process.returncode == 0, (stdout, stderr)
+        child_record = json.loads(child_ready.read_text())
+        assert child_record["identity"]
+        assert process_identity(child_record["pid"]) == child_record["identity"]
+        if delayed_termination:
+            # Allow consecutive empty-group observations and completion
+            # monitoring to run. A detached descendant must retain ownership.
+            for _ in range(30):
+                await asyncio.sleep(0.01)
+            assert owner.is_active(), (
+                "pipe owner reported completion while its detached child remained alive"
+            )
+        assert await owner.terminate(graceful_timeout=0.1, kill_timeout=2)
+        assert not owner.is_active()
+        assert process_identity(sentinel.pid) == sentinel_identity
+        assert process_identity(child_record["pid"]) != child_record["identity"], (
+            "pipe cleanup reported success while its detached child remained alive"
+        )
+    finally:
+        # Retain proof of birth even if successful cleanup finishes before this
+        # controller runs. Never send signals to an unverified or reused PID.
+        if child_ready.exists():
+            record = json.loads(child_ready.read_text())
+            if (
+                record["identity"] is not None
+                and process_identity(record["pid"]) == record["identity"]
+            ):
+                with contextlib.suppress(ProcessLookupError):
+                    os.kill(record["pid"], signal.SIGKILL)
+        if sentinel_identity is not None and process_identity(sentinel.pid) == sentinel_identity:
+            with contextlib.suppress(ProcessLookupError):
+                os.kill(sentinel.pid, signal.SIGKILL)
+        await asyncio.to_thread(sentinel.wait, timeout=5)
+        if owner is not None:
+            await owner.terminate(graceful_timeout=0.1, kill_timeout=2)
+            if owner.posix_anchor is not None and owner.posix_anchor._monitor_task is not None:
+                await asyncio.wait_for(
+                    asyncio.shield(owner.posix_anchor._monitor_task), timeout=5,
+                )

@@ -221,6 +221,26 @@ supports_tools = true
 supports_vision = false
 reasoning_format = "openrouter"
 
+# Refreshed routing deployment; provider-specific offline fallback.
+[openrouter."deepseek/deepseek-v4.1-flash-1017"]
+display_name = "DeepSeek V4.1 Flash 1017"
+context_window = 1048576
+max_output_tokens = 393216
+supports_reasoning = true
+supports_tools = true
+supports_vision = true
+reasoning_format = "openrouter"
+
+# Refreshed routing deployment; provider-specific offline fallback.
+[openrouter."moonshotai/kimi-k3"]
+display_name = "Kimi K3"
+context_window = 1048576
+max_output_tokens = 943718
+supports_reasoning = true
+supports_tools = true
+supports_vision = true
+reasoning_format = "openrouter"
+
 # --- capability ladder migration (transcribed from get_capabilities) ---
 #
 # Rows below carry the per-provider capability ladder that used to live as
@@ -1050,6 +1070,27 @@ cache_read_cost_per_mtok = 0.21505376344086022
 # live ingest has run, a newly served model budgets from the snapshot's
 # cross-provider merge, so still add an exact row here (with the
 # platform's published window) per new model for offline boots.
+# Refreshed routing deployment; provider-specific offline fallback.
+[tokenrhythm."deepseek-v4.1-flash-1017"]
+display_name = "DeepSeek V4.1 Flash 1017"
+context_window = 1000000
+max_output_tokens = 384000
+supports_reasoning = true
+supports_tools = true
+supports_vision = true
+reasoning_format = "none"
+
+# Refreshed routing deployment; provider-specific offline fallback.
+[tokenrhythm."kimi-k3"]
+display_name = "Kimi K3"
+status = "testing"
+context_window = 1048576
+max_output_tokens = 1048576
+supports_reasoning = true
+supports_tools = true
+supports_vision = true
+reasoning_format = "none"
+
 [tokenrhythm."*"]
 supports_reasoning = true
 supports_tools = true

@@ -342,9 +342,27 @@ class WorkspaceFiles:
         return _Workspace(root, binding, profile)
 
     async def resolve(
-        self, session_key: str, paths: list[str], *, native_actions: bool = False
+        self, session_key: str, paths: list[str], *, native_actions: bool = False,
+        reference: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         workspace = await self.workspace(session_key)
+        if reference is not None:
+            from opensquilla.gateway.workspace_references import _validated_reference
+            from opensquilla.tools.source_edit_contract import workspace_reference_id
+
+            key, validated, relative, _revision, _start, _end = _validated_reference({
+                "sessionKey": session_key, "reference": reference,
+            }, require_line_range=False)
+            if paths != [relative]:
+                raise WorkspaceFileUnavailableError()
+            storage = get_session_storage(self.manager)
+            session = await storage.get_session(key) if storage else None
+            if session is None:
+                raise WorkspaceFileUnavailableError()
+            workspace_id = session.workspace_id or workspace_reference_id(workspace.root)
+            scoped_workspace = validated["scope"].get("workspaceId")
+            if scoped_workspace is not None and scoped_workspace != workspace_id:
+                raise WorkspaceFileUnavailableError()
 
         def collect() -> list[dict[str, Any]]:
             files = []
@@ -388,9 +406,21 @@ class WorkspaceFiles:
             return files
 
         files = await asyncio.to_thread(collect)
+        from opensquilla.gateway.annotation_preparation import discover_workspace_annotations
+
+        await discover_workspace_annotations(
+            self.config, self.manager, session_key, workspace, files,
+        )
+        # A scope-validated reference opens the same current file as a path or
+        # tree entry, including files that have not been registered as Documents.
+        # Discovery supplies metadata only; registration remains an explicit
+        # annotation preparation operation and pinned text reads stay separate.
         if await self.workspace(session_key) != workspace:
             raise WorkspaceFileUnavailableError()
-        return {"workspaceBinding": workspace.binding, "files": files}
+        return {
+            "workspaceBinding": workspace.binding, "files": files,
+            **({"referenceScopeValidated": True} if reference is not None else {}),
+        }
 
     async def read(
         self, session_key: str, path: str, binding: str, expected_revision: str = ""
@@ -1047,6 +1077,9 @@ def register_workspace_file_routes(
                 or any(not isinstance(path, str) or len(path) > 4096 for path in paths)
             ):
                 raise ValueError()
+            reference = payload.get("reference")
+            if "reference" in payload and not isinstance(reference, dict):
+                raise ValueError()
         except (ValueError, UnicodeDecodeError):
             return JSONResponse({"code": "INVALID_REQUEST"}, status_code=400, headers=_HEADERS)
         try:
@@ -1054,6 +1087,7 @@ def register_workspace_file_routes(
                 request.headers.get("x-opensquilla-session-key", ""),
                 paths,
                 native_actions=native_owner(request) is not None,
+                reference=reference,
             )
         except (OSError, ValueError, RpcHandlerError, ProjectWorkspaceStateError):
             return unavailable()

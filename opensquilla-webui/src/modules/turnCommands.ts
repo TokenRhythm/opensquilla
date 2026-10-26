@@ -6,6 +6,7 @@ import type { GatewayModelRoutingMode } from '@/types/modelRouting'
 import type { CollaborationMode } from '@/types/plans'
 import type { SandboxRunMode } from '@/types/sandbox'
 import type { ArtifactProductFailure } from '@/utils/artifactProductErrors'
+import type { ProjectInitTurnCommand } from '@/types/turnCommand'
 
 /** Options shared by turn commands without exposing transport details. */
 export interface TurnCommandRequestOptions {
@@ -71,6 +72,7 @@ export interface TurnSendAttachment {
  */
 export interface TurnSendParams {
   message: string
+  turnCommand?: ProjectInitTurnCommand
   localPathReferences?: string[]
   sessionKey: string
   /** Stable idempotency key for one logical send attempt. */

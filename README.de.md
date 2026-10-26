@@ -51,7 +51,9 @@ Provider-Schicht spricht mit TokenRhythm, OpenRouter, OpenAI, Anthropic, Ollama,
 DeepSeek, Gemini, Qwen/DashScope und über 20 weiteren LLM-Providern —
 ohne Änderung an deinem Code oder deinem Konfigurationsschema.
 
-OpenSquilla 0.5.6 ist die aktuelle stabile Version.
+OpenSquilla 0.5.7 ist die aktuelle stabile Version.
+
+Downloads: [OpenSquilla 0.5.7](https://github.com/TokenRhythm/opensquilla/releases/tag/v0.5.7).
 
 Für aufgabenorientierte Produktdokumentation beginnst du am besten mit
 dem [OpenSquilla-Produktleitfaden](README.product.md) oder dem
@@ -77,10 +79,10 @@ Python-Wheel-Installationen verwenden versionsbehaftete Wheel-Dateinamen,
 weil die Installationsprogramme die im Wheel-Dateinamen eingebettete
 Version prüfen.
 
-Für den Desktop-Einsatz von 0.5.6 bevorzugst du die gepackten
+Für den Desktop-Einsatz von 0.5.7 bevorzugst du die gepackten
 Desktop-Installationsprogramme aus dem GitHub-Release:
-`OpenSquilla-0.5.6-mac-arm64.dmg` unter macOS und
-`OpenSquilla-0.5.6-win-x64.exe` unter Windows.
+`OpenSquilla-0.5.7-mac-arm64.dmg` unter macOS und
+`OpenSquilla-0.5.7-win-x64.exe` unter Windows.
 
 | Weg | Zielgruppe | Wann verwenden |
 | --- | --- | --- |
@@ -131,11 +133,11 @@ Installationslinks: [Git](https://git-scm.com/downloads) ·
 
 ### Desktop-Installationsprogramme
 
-Die 0.5.6-Desktop-Installationsprogramme bündeln die Vue-Steuerkonsole
+Die 0.5.7-Desktop-Installationsprogramme bündeln die Vue-Steuerkonsole
 und die Gateway-Runtime in einer Electron-Hülle.
 
-- macOS Apple Silicon: <https://github.com/TokenRhythm/opensquilla/releases/download/v0.5.6/OpenSquilla-0.5.6-mac-arm64.dmg>
-- Windows x64: <https://github.com/TokenRhythm/opensquilla/releases/download/v0.5.6/OpenSquilla-0.5.6-win-x64.exe>
+- macOS Apple Silicon: <https://github.com/TokenRhythm/opensquilla/releases/download/v0.5.7/OpenSquilla-0.5.7-mac-arm64.dmg>
+- Windows x64: <https://github.com/TokenRhythm/opensquilla/releases/download/v0.5.7/OpenSquilla-0.5.7-win-x64.exe>
 
 Für schnellere Downloads in Festlandchina verwende die direkten OSS-Download-Aliasse:
 - macOS Apple Silicon: <https://opensquilla-releases.oss-cn-beijing.aliyuncs.com/releases/latest/OpenSquilla-mac-arm64.dmg>
@@ -185,7 +187,7 @@ $env:Path = "$env:USERPROFILE\.local\bin;" + $env:Path
 **2. OpenSquilla installieren** — derselbe Befehl auf jeder Plattform.
 
 ```sh
-uv tool install --python 3.12 "opensquilla[recommended] @ https://github.com/TokenRhythm/opensquilla/releases/download/v0.5.6/opensquilla-0.5.6-py3-none-any.whl"
+uv tool install --python 3.12 "opensquilla[recommended] @ https://github.com/TokenRhythm/opensquilla/releases/download/v0.5.7/opensquilla-0.5.7-py3-none-any.whl"
 ```
 
 Damit wird das OpenSquilla-Wheel von der Release-URL installiert;
@@ -213,7 +215,7 @@ opensquilla gateway run
 
 Für eine vollständig festgelegte Installation verwende die
 versionsbehaftete Wheel-URL:
-`https://github.com/TokenRhythm/opensquilla/releases/download/v0.5.6/opensquilla-0.5.6-py3-none-any.whl`.
+`https://github.com/TokenRhythm/opensquilla/releases/download/v0.5.7/opensquilla-0.5.7-py3-none-any.whl`.
 
 <a id="install-from-source"></a>
 

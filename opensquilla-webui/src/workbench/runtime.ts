@@ -239,12 +239,20 @@ export class WorkbenchRuntimeManager {
     }
     const item = this.items.get(rect.itemId)
     if (!item || !this.openItemIds.has(item.id)) return
-    const currentInput = this.inputGuard(item)
+    const itemEpoch = this.itemEpochs.get(item.id)
+    const runtimeGeneration = this.runtimeGenerations.get(item.id)
     const hadRuntime = this.runtimes.has(item.id)
     this.enqueue(item.id, async () => {
       // A newly created runtime already receives the latest stored rect.
-      if (!hadRuntime || !currentInput()) return
-      await this.runtimes.get(item.id)?.handleSurfaceRect?.(rect, item)
+      // Geometry belongs to this open item, not its metadata descriptor.
+      // Refreshing metadata while an action awaits must not drop the last
+      // visible rect and strand a retained native page behind a hidden one.
+      const currentItem = this.items.get(item.id)
+      if (!hadRuntime || !currentItem || !this.openItemIds.has(item.id)
+        || this.itemEpochs.get(item.id) !== itemEpoch
+        || this.runtimeGenerations.get(item.id) !== runtimeGeneration
+        || this.surfaceRects.get(item.id) !== rect) return
+      await this.runtimes.get(item.id)?.handleSurfaceRect?.(rect, currentItem)
     }, item)
   }
 
@@ -254,10 +262,12 @@ export class WorkbenchRuntimeManager {
     if (event.type === 'error' || event.type === 'crashed') {
       this.hideNativeSurfaceImmediately(item)
     }
-    const currentInput = this.inputGuard(item)
+    const preservePickerState = event.type === 'annotation-picker-state'
+    const currentInput = this.inputGuard(item, preservePickerState)
     this.enqueue(item.id, async () => {
       if (!currentInput()) return
-      await this.runtimes.get(item.id)?.handleNativeSurfaceEvent?.(event, item)
+      const currentItem = preservePickerState ? this.items.get(item.id)! : item
+      await this.runtimes.get(item.id)?.handleNativeSurfaceEvent?.(event, currentItem)
     }, item)
   }
 
@@ -274,6 +284,14 @@ export class WorkbenchRuntimeManager {
 
   getRenderState(itemId: string): Readonly<Record<string, unknown>> {
     return this.renderStates.get(itemId) ?? {}
+  }
+
+  /** Visibility changes synchronously, even while a provider action holds its queue. */
+  isNativeSurfaceVisible(itemId: string): boolean {
+    return this.items.get(itemId)?.hostKind === 'native-webcontents'
+      && this.openItemIds.has(itemId)
+      && this.resumedItemIds.has(itemId)
+      && this.surfaceRects.get(itemId)?.visible === true
   }
 
   async flush(itemId?: string): Promise<void> {
@@ -357,18 +375,34 @@ export class WorkbenchRuntimeManager {
       && (item.retention === 'keep-alive' || this.resumedItemIds.has(item.id))
   }
 
-  private inputGuard(item: WorkbenchItem): () => boolean {
+  private inputGuard(item: WorkbenchItem, allowMetadataRefresh = false): () => boolean {
     const generation = this.runtimeGenerations.get(item.id)
     const itemEpoch = this.itemEpochs.get(item.id)
     const activationEpoch = this.activationEpochs.get(item.id) ?? 0
     const pendingCreation = generation === undefined
       && (item.retention === 'keep-alive' || this.resumedItemIds.has(item.id))
-    return () => this.isCurrentDescriptor(item)
+    return () => (this.isCurrentDescriptor(item)
+      || allowMetadataRefresh && this.isMetadataRefreshOf(item))
       && this.itemEpochs.get(item.id) === itemEpoch
       && (generation === undefined
         ? pendingCreation && this.runtimeGenerations.has(item.id)
           && (this.activationEpochs.get(item.id) ?? 0) === activationEpoch
         : this.runtimeGenerations.get(item.id) === generation)
+  }
+
+  private isMetadataRefreshOf(item: WorkbenchItem): boolean {
+    const current = this.items.get(item.id)
+    if (!current || !this.openItemIds.has(item.id)
+      || current.kind !== item.kind || current.hostKind !== item.hostKind
+      || current.retention !== item.retention || current.scope.type !== item.scope.type
+      || ('id' in current.scope && (!('id' in item.scope) || current.scope.id !== item.scope.id))) return false
+    // Picker cancellation belongs to the live native instance, so a title or
+    // shallow metadata refresh must not lose it. Resource, revision, preview
+    // request and policy changes still use the original descriptor boundary.
+    const keys = Object.keys(item.payload)
+    return keys.length === Object.keys(current.payload).length
+      && keys.every(key => Object.prototype.hasOwnProperty.call(current.payload, key)
+        && Object.is(toRaw(item.payload[key]), toRaw(current.payload[key])))
   }
 
   private admitRestore(key: string, valid: () => boolean, task: () => Promise<void>): Promise<void> {
@@ -559,8 +593,7 @@ export class WorkbenchRuntimeManager {
     }
     const mayShow = () =>
       isCurrent()
-      && this.resumedItemIds.has(item.id)
-      && this.surfaceRects.get(item.id)?.visible === true
+      && this.isNativeSurfaceVisible(item.id)
     const ignored = (): NativeWorkbenchSurfaceResult => ({
       ok: false,
       message: 'Workbench surface is no longer active',
@@ -634,6 +667,15 @@ export class WorkbenchRuntimeManager {
             closeArtifactAnnotationOverlay: request => (
               isCurrent()
                 ? nativeApi.closeArtifactAnnotationOverlay!(request)
+                : Promise.resolve(ignored())
+            ),
+          }
+        : {}),
+      ...(nativeApi.updateArtifactAnnotationOverlay
+        ? {
+            updateArtifactAnnotationOverlay: request => (
+              mayShow()
+                ? nativeApi.updateArtifactAnnotationOverlay!(request)
                 : Promise.resolve(ignored())
             ),
           }

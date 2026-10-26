@@ -30,6 +30,7 @@ from opensquilla.provider.image_generation_credentials import (
     resolve_image_generation_credential,
 )
 from opensquilla.provider.image_generation_policy import (
+    OPENAI_IMAGE_GENERATION_DEFAULT_MODEL,
     conflicting_image_generation_endpoint_provider,
     is_valid_image_generation_base_url,
     parse_image_generation_model_ref,
@@ -68,6 +69,7 @@ class ImageGenerationRequest:
         default=None,
         repr=False,
     )
+    max_output_tokens: int | None = None
 
 
 @dataclass
@@ -161,7 +163,7 @@ def _detach_exception(exc: Exception) -> Exception:
 
 class OpenAIImageGenerationProvider:
     provider_id = "openai"
-    default_model = "gpt-image-1"
+    default_model = OPENAI_IMAGE_GENERATION_DEFAULT_MODEL
     auth_env_vars: tuple[str, ...] = ("OPENAI_API_KEY",)
 
     def __init__(
@@ -211,6 +213,7 @@ class OpenAIImageGenerationProvider:
             provider=self.provider_id,
             model=request.model,
             base_url=self._base_url,
+            operation_kind="image_generation",
         )
         safe_request_error: Exception | None = None
         cancelled_request_error: asyncio.CancelledError | None = None
@@ -425,12 +428,17 @@ class OpenRouterImageGenerationProvider:
             "stream": False,
             "image_config": self._image_config_for_size(request.size),
         }
+        if request.max_output_tokens is not None:
+            if type(request.max_output_tokens) is not int or request.max_output_tokens <= 0:
+                raise ValueError("max_output_tokens must be a positive integer")
+            payload["max_tokens"] = request.max_output_tokens
         from opensquilla.engine.usage_http import reserve_direct_usage_call
 
         usage = await reserve_direct_usage_call(
             provider=self.provider_id,
             model=request.model,
             base_url=self._base_url,
+            operation_kind="image_generation",
         )
         safe_request_error: Exception | None = None
         cancelled_request_error: asyncio.CancelledError | None = None
@@ -603,6 +611,7 @@ class TokenRhythmImageGenerationProvider:
             provider=self.provider_id,
             model=request.model,
             base_url=base_url,
+            operation_kind="image_generation",
         )
         safe_request_error: Exception | None = None
         cancelled_request_error: asyncio.CancelledError | None = None
@@ -834,6 +843,7 @@ class QwenTokenPlanImageGenerationProvider:
             provider=self.provider_id,
             model=request.model,
             base_url=self._base_url,
+            operation_kind="image_generation",
         )
         try:
             async with httpx.AsyncClient(

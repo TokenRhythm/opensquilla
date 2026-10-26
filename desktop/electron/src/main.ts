@@ -14,6 +14,7 @@ import { basename, dirname, join, resolve } from 'node:path'
 import { performance } from 'node:perf_hooks'
 import { fileURLToPath, pathToFileURL } from 'node:url'
 import { NativeAttachmentSelections } from './native-attachments.js'
+import { installTextContextMenu } from './text-context-menu.js'
 import { chooseLocalFilePaths } from './native-path-picker.js'
 import { saveArtifactFile, saveAttachmentFile, performSourceFileAction, performWorkspaceFileAction, type SaveArtifactRequest, type SaveAttachmentRequest, type SourceFileActionRequest, type WorkspaceFileActionRequest } from './resource-file-actions.js'
 import {
@@ -205,6 +206,7 @@ import {
   parseNativeWorkbenchAnnotationModeRequest,
   parseNativeWorkbenchAnnotationOverlayCloseRequest,
   parseNativeWorkbenchAnnotationOverlayShowRequest,
+  parseNativeWorkbenchAnnotationOverlayUpdateRequest,
 } from './native-workbench-annotation-contract.js'
 import { DesktopBrowserError, DesktopBrowserServer, DESKTOP_BROWSER_URL_ENV, DESKTOP_BROWSER_TOKEN_ENV } from './desktop-browser.js'
 import { installDesktopZoomShortcuts } from './desktop-zoom-shortcuts.js'
@@ -5637,16 +5639,7 @@ function reloadDesktopWindow(ignoreCache: boolean): void {
 }
 
 function installEditingContextMenu(window: BrowserWindow): void {
-  window.webContents.on('context-menu', (_event, params) => {
-    if (!params.isEditable) return
-    Menu.buildFromTemplate([
-      { role: 'cut', enabled: params.editFlags.canCut },
-      { role: 'copy', enabled: params.editFlags.canCopy },
-      { role: 'paste', enabled: params.editFlags.canPaste },
-      { type: 'separator' },
-      { role: 'selectAll', enabled: params.editFlags.canSelectAll },
-    ]).popup({ window })
-  })
+  installTextContextMenu(window.webContents)
 }
 
 // Server-side HTML escape for localized strings interpolated into the
@@ -10245,6 +10238,8 @@ async function createMainWindow(): Promise<BrowserWindow> {
     },
   })
   mainWindow = window
+  // Observe fullscreen before a background task opens the first sidebar page.
+  nativeWorkbenchSurfaces.observeWindow(window)
   desktopStartupLog('window_created')
   installGatewayShutdownRequestInterceptor(window)
   trackDesktopReliabilityWindow(window)
@@ -13713,6 +13708,16 @@ ipcMain.handle('desktop:workbench:annotation:close-overlay', async (event, paylo
   try {
     return await nativeWorkbenchSurfaces.closeArtifactAnnotationOverlay(
       parseNativeWorkbenchAnnotationOverlayCloseRequest(payload),
+    )
+  } catch (error) {
+    return { ok: false, message: error instanceof Error ? error.message : String(error) }
+  }
+})
+ipcMain.handle('desktop:workbench:annotation:update-overlay', (event, payload: unknown) => {
+  if (!trustedControlUiIpc(event)) throw new Error('Untrusted artifact annotation request.')
+  try {
+    return nativeWorkbenchSurfaces.updateArtifactAnnotationOverlay(
+      parseNativeWorkbenchAnnotationOverlayUpdateRequest(payload),
     )
   } catch (error) {
     return { ok: false, message: error instanceof Error ? error.message : String(error) }

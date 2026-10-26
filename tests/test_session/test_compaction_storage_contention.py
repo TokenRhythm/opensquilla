@@ -255,8 +255,16 @@ async def test_wal_metadata_reads_committed_task_while_writer_is_active(tmp_path
 async def test_wal_read_does_not_hold_writer_and_close_drains_cursor(tmp_path, monkeypatch, cancel):
     storage = await SessionStorage.open(str(tmp_path / "sessions.db"))
     entered, release = asyncio.Event(), asyncio.Event()
+    cursor_exited, close_started, reader_closed = (
+        asyncio.Event(), asyncio.Event(), asyncio.Event()
+    )
+    # Native I/O has a finite hang guard; ordering below proves independence
+    # without making disk or runner scheduling a one-second latency contract.
+    io_hang_guard_s = 10.0
     reader = storage._transcript_reader
     original_execute = reader.execute
+    original_reader_close = reader.close
+    original_close = storage.close
 
     class PausedCursor:
         async def __aenter__(self):
@@ -270,28 +278,52 @@ async def test_wal_read_does_not_hold_writer_and_close_drains_cursor(tmp_path, m
             return await self.cursor.fetchone()
 
         async def __aexit__(self, *args):
-            return await self.delegate.__aexit__(*args)
+            try:
+                return await self.delegate.__aexit__(*args)
+            finally:
+                cursor_exited.set()
 
     def execute(sql, params=()):
         if "FROM agent_tasks WHERE task_id" in sql:
             return PausedCursor()
         return original_execute(sql, params)
 
+    async def close_reader():
+        try:
+            assert cursor_exited.is_set(), "reader retired before its cursor drained"
+        finally:
+            await original_reader_close()
+            reader_closed.set()
+
+    async def close_storage():
+        close_started.set()
+        await original_close()
+
     await storage.create_agent_task(AgentTaskRecord(task_id="task", session_key="synthetic"))
     monkeypatch.setattr(reader, "execute", execute)
+    monkeypatch.setattr(reader, "close", close_reader)
+    monkeypatch.setattr(storage, "close", close_storage)
     read = asyncio.create_task(storage.get_agent_task("task"))
     close = None
     try:
-        await asyncio.wait_for(entered.wait(), 1)
+        await asyncio.wait_for(entered.wait(), io_hang_guard_s)
         await asyncio.wait_for(storage.create_agent_task(
             AgentTaskRecord(task_id="other", session_key="synthetic-other"),
-        ), 1)
-        assert await asyncio.wait_for(storage.get_session("absent"), 1) is None
+        ), io_hang_guard_s)
+        assert not read.done()
+        assert not release.is_set()
+        assert await asyncio.wait_for(
+            storage.get_session("absent"), io_hang_guard_s,
+        ) is None
+        assert not read.done()
+        assert not release.is_set()
         if cancel:
             read.cancel()
         close = asyncio.create_task(storage.close())
-        await asyncio.sleep(0)
+        await close_started.wait()
         assert not close.done()
+        assert not cursor_exited.is_set()
+        assert not reader_closed.is_set()
     finally:
         release.set()
         result, = await asyncio.gather(read, return_exceptions=True)
@@ -299,6 +331,8 @@ async def test_wal_read_does_not_hold_writer_and_close_drains_cursor(tmp_path, m
             await close
         else:
             await storage.close()
+    assert cursor_exited.is_set()
+    assert reader_closed.is_set()
     if cancel:
         assert isinstance(result, asyncio.CancelledError)
     else:

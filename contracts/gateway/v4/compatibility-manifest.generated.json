@@ -336,7 +336,7 @@
       "lifecycle": "stable",
       "name": "chat.send",
       "schema": "conversation/chat-send.schema.json",
-      "schemaSha256": "0b1b81008b159d15f3de1085c13fa497d2537f5e953761b6e8a83356c4af0c67"
+      "schemaSha256": "523d7a8fb45f468a9d31953e497ac33fe4f3f13bcadb9cd5bcd37b12c3b5c273"
     },
     {
       "lifecycle": "stable",
@@ -1092,19 +1092,19 @@
       "lifecycle": "stable",
       "name": "sessions.pending_inputs.enqueue",
       "schema": "sessions/sessions-pending-inputs-enqueue.schema.json",
-      "schemaSha256": "11bbc18b553dd86c25bfc92b241bc10a25708f85651ebe3fda933b1931562b4a"
+      "schemaSha256": "ba5ec14b3907efaa06f0ee344ab072d734941189d045b5160a8eae48eef8afa8"
     },
     {
       "lifecycle": "stable",
       "name": "sessions.pending_inputs.list",
       "schema": "sessions/sessions-pending-inputs-list.schema.json",
-      "schemaSha256": "a8c665cacbf492885d7c8ea5386e0b88093cfc0d3aba0a5abba79b7cedce848e"
+      "schemaSha256": "ca0474c045ec803f756d169fed3a7b61d81f5fb434ebabd180046f1a8e3965cd"
     },
     {
       "lifecycle": "stable",
       "name": "sessions.pending_inputs.reorder",
       "schema": "sessions/sessions-pending-inputs-reorder.schema.json",
-      "schemaSha256": "4b9f51b55fe1803433a50add258deeb30d1ed5b823dfcaceade4c8aa47889be3"
+      "schemaSha256": "a4ec1789d14cd74c28ef6198a3d4984f6ad22d1fbcda2513b0cca63a4c63ed84"
     },
     {
       "lifecycle": "stable",
@@ -1116,7 +1116,7 @@
       "lifecycle": "stable",
       "name": "sessions.pending_inputs.update",
       "schema": "sessions/sessions-pending-inputs-update.schema.json",
-      "schemaSha256": "37f247bc0398b7cad5943e97e20a194e110d9afa85535dac7bc877682cab9c81"
+      "schemaSha256": "e192721aac53e0c88e0d2ee4759355cb453b93564e30a2976f2c694403f4c03d"
     },
     {
       "lifecycle": "stable",
@@ -1218,7 +1218,7 @@
       "lifecycle": "stable",
       "name": "sessions.send",
       "schema": "conversation/sessions-send.schema.json",
-      "schemaSha256": "ed604b0b29bdcc0d4345476eb5ba2a535913b74b0381c23a37a35cdfcdfe30e4"
+      "schemaSha256": "eebff515085d413785a26f1c19a2f41b50b04a8f00b2014ff8a6c7021bb23e56"
     },
     {
       "lifecycle": "stable",
@@ -1386,19 +1386,25 @@
       "lifecycle": "stable",
       "name": "workbench.resources.get",
       "schema": "workbench/workbench-resources-get.schema.json",
-      "schemaSha256": "bbd8433f083a4d76b15eb2b74f97180a9f306424db7b548d34c855e92b7a88ce"
+      "schemaSha256": "6c550ddc8630eedfd348ad878d8cc114b979d5994f304d9f69b9278a4c129c58"
     },
     {
       "lifecycle": "stable",
       "name": "workbench.resources.list",
       "schema": "workbench/workbench-resources-list.schema.json",
-      "schemaSha256": "27d6dfaf751460502ff731c5704db913dae05778e341541a144e760b441d497f"
+      "schemaSha256": "46fe7ab8b7b3b6917938adf70d579ee978ac2f800e860eaf575c28e766fa7f3c"
     },
     {
       "lifecycle": "stable",
       "name": "workbench.resources.open",
       "schema": "workbench/workbench-resources-open.schema.json",
-      "schemaSha256": "c8a47141861ca3074aa1a008991dac6d8d5ac3df7809ac2bdba65187a82a5423"
+      "schemaSha256": "644b95a959deb117e28848c4fd8c7722e6ab091934a5a8d915ee9c033a889a24"
+    },
+    {
+      "lifecycle": "stable",
+      "name": "workspaces.create",
+      "schema": "workspaces/workspaces-create.schema.json",
+      "schemaSha256": "c830b2e7b547091cbbcfa6487efe1bbf74a1592970afd2cef46d97ea28dab4cd"
     },
     {
       "lifecycle": "stable",
@@ -1410,7 +1416,7 @@
       "lifecycle": "stable",
       "name": "workspaces.list",
       "schema": "workspaces/workspaces-list.schema.json",
-      "schemaSha256": "63d8f75e1962ad870288036cc6ae9bdf83424de8ffa9b015854d9a5bf15e03eb"
+      "schemaSha256": "f0efec721d7273d1aec62d3bf74744f81467664a9b312041439c79b9a008cd48"
     },
     {
       "lifecycle": "stable",
@@ -1446,10 +1452,10 @@
   "protocol": "opensquilla-websocket-json",
   "source": {
     "eventFamilyCount": 10,
-    "generatorSha256": "5663d69c0f0b761bd637bd6615ae8e262006b703d729d25fd3393ba6322f8012",
-    "methodCount": 212,
-    "schemaCount": 222,
-    "schemaTreeSha256": "2188b03815aa7f70c1295109cbbce82849a166688e4097122023fc016175dc6a",
+    "generatorSha256": "829c5afc1ad4481e06e232cd30f7746db621efafcc9c29f6dcb01e7eb3b79cad",
+    "methodCount": 213,
+    "schemaCount": 223,
+    "schemaTreeSha256": "a9cd022ee94536dd4183ac6a6a1b7ed09a563caf53de231ba9046fb4f6f01e88",
     "toolchains": {
       "legacyTypes": {
         "python": {

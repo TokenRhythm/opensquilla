@@ -6,7 +6,7 @@ from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
-from opensquilla.agents.scope import resolve_agent_workspace_dir
+from opensquilla.agents.scope import resolve_agent_source_paths
 from opensquilla.memory.dream import Dream
 from opensquilla.router_tiers import DEFAULT_TEXT_TIER, normalize_text_tier
 
@@ -115,6 +115,7 @@ def build_dream_factory(
     turn_runner: Any | None = None,
     workspace_for_agent: Callable[[str], Path] | None = None,
     need_provider: bool = True,
+    memory_managers: dict[str, Any] | None = None,
 ) -> Callable[[str], Dream]:
     """Return ``build_dream(agent_id)`` wired to gateway/CLI dependencies."""
     dream_cfg = getattr(getattr(config, "memory", None), "dream", None)
@@ -122,13 +123,20 @@ def build_dream_factory(
         raise RuntimeError("memory.dream config is missing")
 
     def build_dream(agent_id: str) -> Dream:
-        workspace = (
-            workspace_for_agent(agent_id)
-            if workspace_for_agent is not None
-            else resolve_agent_workspace_dir(agent_id, config)
-        )
-        workspace.mkdir(parents=True, exist_ok=True)
-        (workspace / "memory").mkdir(parents=True, exist_ok=True)
+        manager = memory_managers.get(agent_id) if memory_managers is not None else None
+        if workspace_for_agent is not None:
+            workspace = workspace_for_agent(agent_id)
+            notes_dir = workspace / "memory"
+        elif (
+            manager is not None
+            and manager.workspace_dir is not None
+            and manager.memory_dir is not None
+        ):
+            workspace = Path(manager.workspace_dir)
+            notes_dir = Path(manager.memory_dir)
+        else:
+            sources = resolve_agent_source_paths(agent_id, config)
+            workspace, notes_dir = sources.memory_root, sources.notes_dir
         provider = _resolve_provider(
             config=config,
             need_provider=need_provider,
@@ -139,6 +147,7 @@ def build_dream_factory(
             session_lock=_session_lock_for(turn_runner, agent_id),
             config=dream_cfg,
             agent_id=agent_id,
+            notes_dir=notes_dir,
         )
 
     return build_dream

@@ -33,6 +33,7 @@ from opensquilla.gateway.generated_artifact_adoption import GeneratedArtifactAdo
 from opensquilla.gateway.rpc import RpcContext, RpcUnavailableError, get_dispatcher
 from opensquilla.gateway.scopes import METHOD_SCOPES, READ_SCOPE, WRITE_SCOPE
 from opensquilla.gateway.transcripts import build_transcript_attachment_envelope
+from opensquilla.sandbox.config import SandboxSettings
 from opensquilla.session.attachment_manifest import legacy_attachment_id
 from opensquilla.session.manager import SessionManager
 from opensquilla.session.models import TranscriptEntry
@@ -254,6 +255,7 @@ async def resource_env(tmp_path: Path):
         state_dir=str(tmp_path / "state"),
         config_path=None,
         workspace_dir=str(tmp_path / "workspace"),
+        sandbox=SandboxSettings(),
     )
     ctx = RpcContext(
         conn_id="workbench-resource-test",
@@ -275,6 +277,70 @@ async def resource_env(tmp_path: Path):
 
 async def _dispatch(env, method: str, params: dict[str, object]):
     return await get_dispatcher().dispatch(f"test:{method}", method, params, env.ctx)
+
+
+@pytest.mark.asyncio
+async def test_resource_source_paths_distinguish_same_names_without_read_side_writes(
+    resource_env,
+) -> None:
+    env = resource_env
+    workspace = Path(env.config.workspace_dir)
+    service = await ArtifactSessionService.from_session_storage(env.storage)
+    documents = []
+    for directory in ("original", "copy"):
+        folder = workspace / directory
+        folder.mkdir(parents=True)
+        payload = f"<h1>{directory}</h1>".encode()
+        (folder / "report.html").write_bytes(payload)
+        ref = env.store.publish_bytes(
+            payload, session_id=env.session.session_id, session_key=SESSION_KEY,
+            name="report.html", mime="text/html", source="source-path-test",
+        )
+        adopted = await resource_rpc.adopt_generated_deliverable_if_editable(
+            service=service, store=env.store, session_key=SESSION_KEY,
+            session_id=env.session.session_id, ref=ref,
+            working_source={
+                "workspace": str(workspace), "source_path": f"{directory}/report.html",
+                "relative_root": directory, "entrypoint": "report.html",
+                "bundle_mode": "none", "bundle_root": "",
+            },
+        )
+        assert adopted is not None
+        documents.append((adopted[0].document_id, ref.id, f"{directory}/report.html"))
+    changes_before = await _sqlite_total_changes(env.storage)
+
+    listed = await _dispatch(env, "workbench.resources.list", {"sessionKey": SESSION_KEY})
+    assert listed.error is None, listed.error
+    assert sorted(item["sourcePath"] for item in listed.payload["resources"]) == [
+        "copy/report.html", "copy/report.html", "original/report.html", "original/report.html",
+    ]
+    for document_id, artifact_id, relative in documents:
+        for ref in (
+            {"type": "document", "documentId": document_id},
+            {"type": "deliverable", "artifactId": artifact_id},
+        ):
+            fetched = await _dispatch(env, "workbench.resources.get", {
+                "sessionKey": SESSION_KEY, "resourceRef": ref,
+            })
+            assert fetched.error is None, fetched.error
+            assert fetched.payload["resource"]["sourcePath"] == relative
+    assert await _sqlite_total_changes(env.storage) == changes_before
+
+    # Changing the current workspace or its read policy must not disclose old
+    # host bindings, even though immutable artifact previews remain available.
+    env.config.sandbox = SandboxSettings(denied_read_globs=["**/copy/**"])
+    denied = await _dispatch(env, "workbench.resources.list", {"sessionKey": SESSION_KEY})
+    assert denied.error is None, denied.error
+    for item in denied.payload["resources"]:
+        if item["relations"]["documentId"] == documents[1][0]:
+            assert "sourcePath" not in item
+    elsewhere = workspace.parent / "elsewhere"
+    elsewhere.mkdir()
+    env.config.workspace_dir = str(elsewhere)
+    moved = await _dispatch(env, "workbench.resources.list", {"sessionKey": SESSION_KEY})
+    assert moved.error is None, moved.error
+    assert all("sourcePath" not in item for item in moved.payload["resources"])
+    assert await _sqlite_total_changes(env.storage) == changes_before
 
 
 @pytest.mark.asyncio

@@ -99,21 +99,33 @@ class RecoveryScheduler:
         self._active_keys: set[tuple[int, str]] = set()
         self._active_connections: dict[str, int] = {}
         self._mutation_tails: dict[tuple[int, str], asyncio.Future[None]] = {}
+        self._read_barrier_tails: dict[tuple[int, str], asyncio.Future[None]] = {}
 
     def mutation_tail(self, runtime: object, key: str) -> asyncio.Future[None] | None:
         return self._mutation_tails.get((id(runtime), key))
 
+    def read_barrier_tail(self, runtime: object, key: str) -> asyncio.Future[None] | None:
+        return self._read_barrier_tails.get((id(runtime), key))
+
     def admit_mutation(
-        self, runtime: object, key: str,
+        self, runtime: object, key: str, *, blocks_reads: bool = True,
     ) -> tuple[asyncio.Future[None] | None, asyncio.Future[None]]:
         scope_key = id(runtime), key
         predecessor = self._mutation_tails.get(scope_key)
         tail: asyncio.Future[None] = asyncio.get_running_loop().create_future()
         self._mutation_tails[scope_key] = tail
+        # Owner-preserving maintenance can await a model while committed WAL
+        # reads remain valid. It still follows the mutation dispatch chain,
+        # but must not replace an earlier reset/append read barrier with its
+        # potentially long-lived completion future.
+        if blocks_reads:
+            self._read_barrier_tails[scope_key] = tail
 
         def clear(_: asyncio.Future[None]) -> None:
             if self._mutation_tails.get(scope_key) is tail:
                 del self._mutation_tails[scope_key]
+            if self._read_barrier_tails.get(scope_key) is tail:
+                del self._read_barrier_tails[scope_key]
 
         tail.add_done_callback(clear)
         return predecessor, tail

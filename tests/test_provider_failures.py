@@ -10,6 +10,7 @@ from opensquilla.provider.failures import (
     ProviderRecoveryAction,
     classify_provider_error,
     decide_recovery_action,
+    structured_provider_error_code,
 )
 from opensquilla.provider.openai import _http_error_body_text
 
@@ -166,3 +167,66 @@ def test_constraint_free_matcher_rows_are_rejected() -> None:
     # A row with no constraints would match every error; the table refuses it.
     with pytest.raises(ValueError, match="at least one constraint"):
         FailureMatcher(ProviderFailureKind.UNKNOWN)
+
+
+def test_tokenrhythm_wrapped_input_length_range_uses_context_recovery() -> None:
+    body = (
+        '{"code":"LITELLM_ERROR","message":"litellm.BadRequestError: OpenAIException - '
+        'data: {\\"error\\":{\\"code\\":\\"invalid_parameter_error\\",\\"param\\":null,'
+        '\\"message\\":\\"Range of input length should be [1, 983616]\\",'
+        '\\"type\\":\\"invalid_request_error\\"}}. Received Model Group=qwen3.8-flash"}'
+    )
+    kind = classify_provider_error(
+        "tokenrhythm", 400, raw_code=structured_provider_error_code(body),
+        message=_http_error_body_text(body),
+    )
+    assert kind is ProviderFailureKind.CONTEXT_OVERFLOW
+    assert decide_recovery_action(kind) is ProviderRecoveryAction.COMPACT_AND_RETRY
+
+
+@pytest.mark.parametrize("raw_code", [
+    "", "400", "invalid_parameter_error", "invalid_request_error",
+])
+def test_input_length_range_requires_explicit_400(raw_code) -> None:
+    assert classify_provider_error(
+        "dashscope", 400, raw_code=raw_code,
+        message="Range of input length should be [1, 32768]",
+    ) is ProviderFailureKind.CONTEXT_OVERFLOW
+
+
+@pytest.mark.parametrize("message", [
+    "invalid_parameter_error: invalid temperature",
+    "Range of max_tokens should be [1, 983616]",
+    "Range of output length should be [1, 983616]",
+    "Range of input length should be [1, 0]",
+    "Range of input length should be [1, -983616]",
+    "Range of input length should be [0, 983616]",
+    "Range of input length should be [1, unknown]",
+    "Input must not be empty",
+    "Input is empty. Range of input length should be [1, 983616]",
+    "Input length is 0. Range of input length should be [1, 983616]",
+])
+def test_unrelated_or_empty_input_parameter_errors_do_not_trigger_compaction(message) -> None:
+    assert classify_provider_error(
+        "tokenrhythm", 400, raw_code="invalid_parameter_error", message=message,
+    ) is ProviderFailureKind.BAD_REQUEST
+
+
+@pytest.mark.parametrize(("status", "raw_code", "kind"), [
+    (400, "authentication_error", ProviderFailureKind.AUTH_INVALID),
+    (400, "invalid_api_key", ProviderFailureKind.AUTH_INVALID),
+    (400, "insufficient_quota", ProviderFailureKind.INSUFFICIENT_CREDITS),
+    (400, "rate_limit_exceeded", ProviderFailureKind.RATE_LIMITED),
+    (401, "", ProviderFailureKind.AUTH_INVALID),
+    (402, "", ProviderFailureKind.INSUFFICIENT_CREDITS),
+    (429, "", ProviderFailureKind.RATE_LIMITED),
+    (400, "cancelled", ProviderFailureKind.BAD_REQUEST),
+    (None, "invalid_parameter_error", ProviderFailureKind.UNKNOWN),
+])
+def test_input_range_does_not_override_explicit_business_or_non_400_signals(
+    status, raw_code, kind,
+) -> None:
+    assert classify_provider_error(
+        "tokenrhythm", status, raw_code=raw_code,
+        message="Range of input length should be [1, 983616]",
+    ) is kind

@@ -44,7 +44,7 @@ def _cached_receipt(*, credential_env: str = "") -> media._VideoJobReceipt:
     )
 
 
-def test_video_fingerprints_change_with_credentials_and_process_salt(
+def test_video_fingerprints_change_with_credentials_and_durable_salt(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     fingerprint = media._video_credential_fingerprint(_KEY)
@@ -52,7 +52,9 @@ def test_video_fingerprints_change_with_credentials_and_process_salt(
     assert fingerprint != media._video_credential_fingerprint("synthetic-replacement-key")
     assert len(bytes.fromhex(fingerprint)) == 32
     assert _KEY not in fingerprint
-    monkeypatch.setattr(media, "_VIDEO_JOB_FINGERPRINT_SALT", b"\x00" * 32)
+    from opensquilla.provider.media_jobs import job_record
+
+    job_record("settings", "credential_salt", {"salt": "00" * 32})
     assert fingerprint != media._video_credential_fingerprint(_KEY)
 
 

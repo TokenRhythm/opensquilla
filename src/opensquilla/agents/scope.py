@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import os
 from collections.abc import Mapping
+from dataclasses import dataclass
 from pathlib import Path
 
 import structlog
@@ -145,11 +147,45 @@ def resolve_agent_memory_source_dir(
     state_dir: str | Path | None = None,
 ) -> Path:
     """Return the Markdown memory source root for an agent."""
-    if source == "workspace":
-        return resolve_agent_workspace_dir(agent_id, config, state_dir=state_dir)
-    if source == "state":
-        return resolve_agent_state_dir(agent_id, config, state_dir=state_dir)
-    raise ValueError("memory source must be 'state' or 'workspace'")
+    return resolve_agent_source_paths(
+        agent_id, config, source=source, state_dir=state_dir,
+    ).memory_root
+
+
+@dataclass(frozen=True)
+class AgentSourcePaths:
+    """Existing independent bootstrap, MEMORY.md, and note sources; no relocation."""
+
+    bootstrap_dir: Path
+    memory_root: Path
+    notes_dir: Path
+
+
+def resolve_agent_source_paths(
+    agent_id: str,
+    config: object | None = None,
+    *,
+    source: str | None = None,
+    state_dir: str | Path | None = None,
+) -> AgentSourcePaths:
+    normalized = normalize_agent_id(agent_id)
+    bootstrap = resolve_agent_workspace_dir(normalized, config)
+    selected = source or getattr(getattr(config, "memory", None), "source", "state")
+    if selected == "workspace":
+        return AgentSourcePaths(bootstrap, bootstrap, bootstrap / "memory")
+    if selected != "state":
+        raise ValueError("memory source must be 'state' or 'workspace'")
+    external_notes = os.environ.get("OPENSQUILLA_MEMORY_DIR") if normalized == "main" else None
+    if external_notes:
+        # Preserve the existing manager's ENV branch: only notes move, and
+        # MEMORY.md uses the default Agent state root rather than config.state_dir.
+        memory_root = resolve_agent_data_dir(normalized)
+        notes = Path(external_notes).expanduser()
+    else:
+        state_base = state_dir or _config_value(config, "state_dir")
+        memory_root = resolve_agent_data_dir(normalized, state_base)
+        notes = resolve_agent_memory_dir(normalized, state_base)
+    return AgentSourcePaths(bootstrap, memory_root, notes)
 
 
 def resolve_agent_data_dir(agent_id: str, base: str | Path | None = None) -> Path:

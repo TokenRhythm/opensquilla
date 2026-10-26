@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+import asyncio
 import base64
 import json
 import os
 import re
+import threading
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -74,17 +76,20 @@ class _FakeServices:
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("explicit_workspace", [False, True])
+@pytest.mark.parametrize("precreated", [False, True])
+@pytest.mark.parametrize("agent_id", ["main", "ops"])
 async def test_cli_new_sessions_keep_the_effective_startup_workspace(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, explicit_workspace: bool
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, explicit_workspace: bool, precreated: bool,
+    agent_id: str,
 ) -> None:
     from opensquilla.gateway.execution_workspaces import build_execution_workspace_factory
 
-    monkeypatch.setattr(
-        "opensquilla.gateway.config.default_opensquilla_home", lambda: tmp_path / "profile"
-    )
+    monkeypatch.setenv("OPENSQUILLA_STATE_DIR", str(tmp_path / "profile"))
     config = GatewayConfig.load(tmp_path / "config.toml", read_only=True)
     selected = tmp_path / "selected" if explicit_workspace else Path(config.workspace_dir)
-    selected.mkdir(parents=True)
+    expected = selected if agent_id == "main" else selected / "agents" / agent_id
+    if precreated or explicit_workspace:
+        expected.mkdir(parents=True)
     storage = await SessionStorage.open(str(tmp_path / "cli-workspace.db"))
     contexts: list[Any] = []
 
@@ -114,19 +119,61 @@ async def test_cli_new_sessions_keep_the_effective_startup_workspace(
     monkeypatch.setattr("opensquilla.gateway.build_services", fake_build_services)
     try:
         for suffix in ("first", "second"):
-            key = f"agent:main:cli-workspace:{suffix}"
+            key = f"agent:{agent_id}:cli-workspace:{suffix}"
             await run_agent_once(
-                message="pwd", session_id=key, config=config,
+                message="pwd", session_id=key, config=config, agent_id=agent_id,
                 workspace=str(selected) if explicit_workspace else None,
             )
             session = await storage.get_session(key)
             assert session.execution_workspace["kind"] == "configured"
-            assert session.execution_workspace["root"] == str(selected.resolve())
+            assert session.execution_workspace["root"] == str(expected.resolve())
     finally:
         await storage.close()
 
-    assert [ctx.workspace_dir for ctx in contexts] == [str(selected.resolve())] * 2
+    assert [ctx.workspace_dir for ctx in contexts] == [str(expected.resolve())] * 2
     assert config.workspace_dir_source == "default"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("agent_id", ["main", "ops"])
+@pytest.mark.parametrize("source", ["argument", "config", "agent"])
+async def test_cli_does_not_initialize_missing_user_workspace(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, agent_id: str, source: str,
+) -> None:
+    from opensquilla.gateway.execution_workspaces import build_execution_workspace_factory
+
+    monkeypatch.setenv("OPENSQUILLA_STATE_DIR", str(tmp_path / "profile"))
+    selected = tmp_path / "existing-project"
+    selected.mkdir()
+    (selected / "AGENTS.md").write_text("Keep this guide.\n", encoding="utf-8")
+    missing = selected / "missing"
+    config = GatewayConfig.load(tmp_path / "config.toml", read_only=True)
+    if source == "config":
+        config = GatewayConfig(workspace_dir=str(missing))
+    elif source == "agent":
+        # Agent-specific overrides apply to non-main agents.
+        agent_id = "ops"
+        config.agents = [AgentEntryConfig(id=agent_id, workspace=str(missing))]
+    storage = await SessionStorage.open(str(tmp_path / "cli-workspace.db"))
+
+    async def fake_build_services(*, config: GatewayConfig, **kwargs: Any) -> _FakeServices:
+        return _FakeServices(config, SessionManager(
+            storage, execution_workspace_factory=build_execution_workspace_factory(
+                config, profile_home=tmp_path,
+            ),
+        ))
+
+    monkeypatch.setattr("opensquilla.gateway.build_services", fake_build_services)
+    try:
+        with pytest.raises(ProjectWorkspaceStateError):
+            await run_agent_once(
+                message="pwd", config=config, agent_id=agent_id,
+                workspace=str(missing) if source == "argument" else None,
+            )
+    finally:
+        await storage.close()
+    assert sorted(path.name for path in selected.iterdir()) == ["AGENTS.md"]
+    assert (selected / "AGENTS.md").read_text(encoding="utf-8") == "Keep this guide.\n"
 
 
 def test_benchmark_transcript_preserves_tool_result_execution_status() -> None:
@@ -1723,10 +1770,10 @@ async def test_agent_launch_counts_cli_even_with_retired_child_marker(
     active: list[dict[str, Any]] = []
     turns: list[dict[str, Any]] = []
 
-    async def record_launch(**kwargs: Any) -> None:
+    def observe_launch(**kwargs: Any) -> None:
         launches.append(kwargs)
 
-    async def record_active(**kwargs: Any) -> None:
+    def observe_active(**kwargs: Any) -> None:
         active.append(kwargs)
 
     class FakeTurnRunner:
@@ -1740,7 +1787,7 @@ async def test_agent_launch_counts_cli_even_with_retired_child_marker(
     async def fake_build_services(*, config: GatewayConfig, **kwargs: Any) -> _FakeServices:
         svc = _FakeServices(config)
         svc.growth_event_sink = SimpleNamespace(
-            record_client_launch=record_launch, record_product_active=record_active,
+            observe_client_launch=observe_launch, observe_product_active=observe_active,
         )
         return svc
 
@@ -1765,6 +1812,95 @@ async def test_agent_launch_counts_cli_even_with_retired_child_marker(
     assert len(turns) == 1
     assert turns[0]["telemetry_surface"] is ClientSurface.CLI
     assert turns[0]["telemetry_execution_mode"] is ExecutionMode.ONE_SHOT
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("blocked_event", ["client_launch", "product_active"])
+async def test_agent_streams_while_growth_storage_is_blocked(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, blocked_event: str,
+) -> None:
+    from opensquilla.telemetry import growth_sink as sink_module
+    from opensquilla.telemetry.consent import (
+        CURRENT_PRODUCT_ANALYTICS_NOTICE_VERSION,
+        resolve_scope_consent,
+    )
+    from opensquilla.telemetry.coordination import scope_consent_coordinator_for
+    from opensquilla.telemetry.recorder import RecordResult, RecordStatus
+
+    entered = threading.Event()
+    release = threading.Event()
+    streamed = asyncio.Event()
+    events = []
+    sinks = []
+    writer_name = f"write_{blocked_event}_state"
+    write_state = getattr(sink_module, writer_name)
+
+    def delayed_write(path, records):
+        entered.set()
+        assert release.wait(5)
+        write_state(path, records)
+
+    class CapturingRuntime:
+        async def record(self, event, **kwargs):
+            events.append(event)
+            return RecordResult(RecordStatus.RECORDED)
+
+        async def recover_contract_rejection_once(self, event, **kwargs):
+            return False
+
+    class FakeTurnRunner:
+        def __init__(self, **kwargs: Any) -> None:
+            pass
+
+        async def run(self, message: str, session_key: str, **kwargs: Any):
+            yield TextDeltaEvent(text="synthetic answer")
+            yield DoneEvent(text="synthetic answer", model="synthetic-model")
+
+    class Services(_FakeServices):
+        async def close(self) -> None:
+            await self.growth_event_sink.close()
+
+    async def fake_build_services(*, config: GatewayConfig, **kwargs: Any):
+        svc = Services(config)
+        scope_consent_coordinator_for(
+            config,
+            state_provider=lambda scope: resolve_scope_consent(scope, config=config, env={}),
+        )
+        svc.growth_event_sink = sink_module.GrowthEventSink(
+            CapturingRuntime(), config=config,
+        )
+        sinks.append(svc.growth_event_sink)
+        return svc
+
+    def event_sink(event):
+        if isinstance(event, TextDeltaEvent):
+            streamed.set()
+
+    config = GatewayConfig(
+        state_dir=str(tmp_path / "profile"), workspace_dir=str(tmp_path / "workspace"),
+    )
+    config.privacy.product_analytics_enabled = True
+    config.privacy.product_analytics_notice_version = CURRENT_PRODUCT_ANALYTICS_NOTICE_VERSION
+    config.privacy.product_analytics_consented_at_utc = "2026-09-02T01:00:00Z"
+    monkeypatch.setattr(sink_module, writer_name, delayed_write)
+    monkeypatch.setattr(sink_module, "get_device_id", lambda: "1" * 64)
+    monkeypatch.setattr("opensquilla.engine.runtime.TurnRunner", FakeTurnRunner)
+    monkeypatch.setattr("opensquilla.gateway.build_services", fake_build_services)
+
+    running = asyncio.create_task(run_agent_once(
+        message="synthetic task", config=config, event_sink=event_sink,
+    ))
+    try:
+        assert await asyncio.to_thread(entered.wait, 2)
+        assert streamed.is_set()
+        assert not running.done()
+    finally:
+        release.set()
+        result = await asyncio.wait_for(running, 2)
+
+    assert result.status == "ok"
+    assert {event.event_name for event in events} == {"client_launch", "product_active"}
+    assert not sinks[0]._tasks
 
 
 @pytest.mark.asyncio

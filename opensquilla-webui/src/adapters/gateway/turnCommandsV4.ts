@@ -1,8 +1,9 @@
 import { copySelectedSkills, isSelectedSkills } from '@/types/selectedSkills'
 import { copyLocalPathReferences } from '@/types/localPathReferences'
 import { SKILLS_CANDIDATES_METHOD } from '@/contracts/generated/v4/skillsCandidates'
-import { normalizePageContext } from '@/types/pageContext'
+import { assertPageContextWithinLimits, normalizePageContext } from '@/types/pageContext'
 import type { TransportCallOptions as RpcCallOptions } from './transportTypes'
+import { copyTurnCommand, isProjectInitTurnCommand } from '@/types/turnCommand'
 import { readTransportFailure } from './transportTypes'
 import {
   CHAT_ABORT_METHOD,
@@ -348,6 +349,7 @@ export function toWireSendParams(request: TurnSendParams): Record<string, unknow
   const sourceRecord = request as TurnSendParams & Record<string, unknown>
   const {
     message,
+    turnCommand,
     sessionKey,
     clientRequestId,
     clientMessageId,
@@ -398,11 +400,21 @@ export function toWireSendParams(request: TurnSendParams): Record<string, unknow
   if (selectedSkills !== undefined && !isSelectedSkills(selectedSkills)) {
     throw new TurnCommandError('rejected', 'Invalid selected skill references.', 'INVALID_REQUEST', false)
   }
-  const context = normalizePageContext(pageContext ?? legacyPageContext)
+  if (turnCommand !== undefined && !isProjectInitTurnCommand(turnCommand)) {
+    throw new TurnCommandError('rejected', 'Invalid turn command.', 'INVALID_REQUEST', false)
+  }
+  const rawPageContext = pageContext ?? legacyPageContext
+  try {
+    if (rawPageContext != null) assertPageContextWithinLimits(rawPageContext)
+  } catch (error) {
+    throw new TurnCommandError('rejected', error instanceof Error ? error.message : 'Invalid page context.', 'INVALID_REQUEST', false)
+  }
+  const context = normalizePageContext(rawPageContext)
 
   return {
     ...extensions,
     message,
+    ...(turnCommand ? { turnCommand: copyTurnCommand(turnCommand) } : {}),
     ...(copyLocalPathReferences(localPathReferences ?? legacyLocalPathReferences, String(displayText ?? legacyDisplayText ?? message)).length
       ? { localPathReferences: copyLocalPathReferences(localPathReferences ?? legacyLocalPathReferences, String(displayText ?? legacyDisplayText ?? message)) } : {}),
     ...(selectedSkills?.length ? { selectedSkills: copySelectedSkills(selectedSkills) } : {}),

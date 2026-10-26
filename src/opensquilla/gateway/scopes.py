@@ -296,7 +296,8 @@ METHOD_SCOPES: dict[str, str] = {
     "sessions.reset": WRITE_SCOPE,
     "sessions.contextCompact": WRITE_SCOPE,
     "sessions.truncate": WRITE_SCOPE,
-    "workspaces.open": WRITE_SCOPE,  # OpenSquilla-only; owner-guarded project lifecycle.
+    "workspaces.create": WRITE_SCOPE,  # OpenSquilla-only; owner-guarded project lifecycle.
+    "workspaces.open": WRITE_SCOPE,
     "workspaces.update": WRITE_SCOPE,
     "workspaces.pin": WRITE_SCOPE,
     "workspaces.remove": WRITE_SCOPE,

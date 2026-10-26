@@ -10,7 +10,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from opensquilla.context_budget import ContextBudgetGovernor
+from opensquilla.context_budget import hard_input_tokens
 from opensquilla.engine.capacity_admission import (
     LargeContextCapacityError,
     assess_model_request_capacity,
@@ -808,11 +808,11 @@ def test_large_context_floor_validates_router_fallback_capacity(monkeypatch) -> 
     ]
 
 
-def test_capacity_admission_reserves_actual_high_thinking_budget(monkeypatch) -> None:
+def test_capacity_admission_reserves_native_anthropic_high_thinking_budget(monkeypatch) -> None:
     catalog = ModelCatalog()
     catalog.set_user_overrides(
         {
-            "openai/reasoning-model": {
+            "anthropic/reasoning-model": {
                 "context_window": 128_000,
                 "max_output_tokens": 10_000,
             }
@@ -821,15 +821,15 @@ def test_capacity_admission_reserves_actual_high_thinking_budget(monkeypatch) ->
     monkeypatch.setattr("opensquilla.provider.model_catalog._shared_catalog", catalog)
 
     assert model_has_request_capacity(
-        provider="openai",
+        provider="anthropic",
         model="reasoning-model",
-        material_tokens=75_000,
+        material_tokens=98_000,
         thinking_budget_tokens=4_096,
     )
     assert not model_has_request_capacity(
-        provider="openai",
+        provider="anthropic",
         model="reasoning-model",
-        material_tokens=75_000,
+        material_tokens=98_000,
         thinking_budget_tokens=20_000,
     )
 
@@ -848,12 +848,7 @@ def test_complete_request_capacity_boundary_and_unknown_model_fail_closed(
     )
     monkeypatch.setattr("opensquilla.provider.model_catalog._shared_catalog", catalog)
     safe_input_tokens, _headroom = effective_proof_token_budget(
-        ContextBudgetGovernor.from_values(
-            context_window_tokens=32_000,
-            max_output_tokens=4_000,
-            thinking_budget_tokens=0,
-            context_overflow_threshold=0.85,
-        ).snapshot().usable_tokens
+        hard_input_tokens(32_000, 1),
     )
 
     assert model_has_request_capacity(
@@ -879,6 +874,23 @@ def test_complete_request_capacity_boundary_and_unknown_model_fail_closed(
     )
 
 
+def test_capacity_prefilter_only_assumes_dynamic_caps_for_the_wired_backend(monkeypatch):
+    catalog = ModelCatalog()
+    catalog.set_user_overrides({
+        f"{provider}/large-output": {"context_window": 128_000, "max_output_tokens": 64_000}
+        for provider in ("openai", "anthropic")
+    })
+    monkeypatch.setattr("opensquilla.provider.model_catalog._shared_catalog", catalog)
+    assert model_has_request_capacity(
+        provider="openai", model="large-output", material_tokens=0,
+        request_input_tokens=80_000, thinking_budget_tokens=0,
+    )
+    assert not model_has_request_capacity(
+        provider="anthropic", model="large-output", material_tokens=0,
+        request_input_tokens=80_000, thinking_budget_tokens=0,
+    )
+
+
 def test_capacity_assessment_distinguishes_unknown_from_recoverable_pressure(monkeypatch) -> None:
     catalog = ModelCatalog()
     catalog.set_user_overrides({
@@ -898,6 +910,50 @@ def test_capacity_assessment_distinguishes_unknown_from_recoverable_pressure(mon
     assert known.safe_input_tokens is not None and known.safe_input_tokens > 10_000
     assert unknown.status == "capacity_unknown"
     assert unknown.safe_input_tokens is None
+
+
+def test_route_capacity_uses_input_room_without_reserving_the_full_output_ceiling(monkeypatch):
+    catalog = ModelCatalog()
+    catalog.set_user_overrides({
+        "openai/long-output": {"context_window": 200_000, "max_output_tokens": 128_000},
+    })
+    monkeypatch.setattr("opensquilla.provider.model_catalog._shared_catalog", catalog)
+
+    assessment = assess_model_request_capacity(
+        provider="openai", model="long-output", material_tokens=0,
+        request_input_tokens=68_305, thinking_budget_tokens=0,
+    )
+    assert assessment.fits
+    assert assessment.safe_input_tokens >= 68_305
+    # The exact deployment window still bounds routing even when its output
+    # allowance can shrink: the existing proof headroom still applies.
+    assert not model_has_request_capacity(
+        provider="openai", model="long-output", material_tokens=0,
+        request_input_tokens=199_000, thinking_budget_tokens=0,
+    )
+
+
+def test_route_capacity_accepts_a_positive_output_budget_below_1024(monkeypatch):
+    catalog = ModelCatalog()
+    catalog.set_user_overrides({
+        "openai/small-answer-room": {
+            "context_window": 200_000, "max_output_tokens": 128_000,
+        },
+    })
+    monkeypatch.setattr("opensquilla.provider.model_catalog._shared_catalog", catalog)
+
+    # 195392 input + 512 output + the existing 4096 proof headroom fits.
+    # Reserving an invented 1024-token minimum would reject this legal route.
+    assessment = assess_model_request_capacity(
+        provider="openai", model="small-answer-room", material_tokens=0,
+        request_input_tokens=195_392, thinking_budget_tokens=0,
+    )
+    assert assessment.fits
+    assert assessment.safe_input_tokens == 195_392
+    assert not model_has_request_capacity(
+        provider="openai", model="small-answer-room", material_tokens=0,
+        request_input_tokens=195_904, thinking_budget_tokens=0,
+    )
 
 
 @pytest.mark.parametrize("changed_field", [None, "model", "base_url", "api_key", "extra_body"])
@@ -1026,13 +1082,13 @@ def test_capacity_admission_honors_global_context_and_output_overrides(
     assert model_has_request_capacity(
         provider="openai",
         model="override-model",
-        material_tokens=50_000,
+        material_tokens=70_000,
         thinking_budget_tokens=0,
     )
     assert not model_has_request_capacity(
         provider="openai",
         model="override-model",
-        material_tokens=50_000,
+        material_tokens=70_000,
         thinking_budget_tokens=0,
         context_window_override_tokens=80_000,
         max_output_override_tokens=10_000,
@@ -1065,14 +1121,14 @@ def test_capacity_admission_honors_endpoint_and_defers_character_cap_to_final_pr
     assert not model_has_request_capacity(
         provider="openai",
         model="endpoint-model",
-        material_tokens=50_000,
+        material_tokens=70_000,
         thinking_budget_tokens=0,
         base_url="https://deployment.example/v1",
     )
     assert model_has_request_capacity(
         provider="openai",
         model="endpoint-model",
-        material_tokens=50_000,
+        material_tokens=70_000,
         thinking_budget_tokens=0,
         provider_request_proof_max_chars=160_000,
     )
@@ -1084,7 +1140,7 @@ def test_capacity_admission_honors_endpoint_and_defers_character_cap_to_final_pr
     assert proof["fits"] is False
 
 
-def test_large_context_fallback_rejects_model_at_high_thinking_budget(
+def test_large_context_fallback_does_not_add_openai_thinking_to_the_output_cap(
     monkeypatch,
 ) -> None:
     catalog = ModelCatalog()
@@ -1112,7 +1168,7 @@ def test_large_context_fallback_rejects_model_at_high_thinking_budget(
             {"tier": "c3", "model": "router-borderline"},
         ],
         "large_context_floor_min_tier": "c3",
-        "large_context_material_tokens": 75_000,
+        "large_context_material_tokens": 98_000,
         "large_context_thinking_budget_tokens": 20_000,
         "routed_model": "routed-at-floor",
     }
@@ -1125,7 +1181,7 @@ def test_large_context_fallback_rejects_model_at_high_thinking_budget(
     )
 
     assert [config.model for config in selector.remaining_chain()] == [
-        "routed-at-floor"
+        "routed-at-floor", "router-borderline",
     ]
 
 
@@ -1154,7 +1210,7 @@ def test_large_context_final_head_honors_global_context_override(monkeypatch) ->
         "routing_applied": True,
         "router_fallback_chain": [{"tier": "c3", "model": "catalog-large"}],
         "large_context_floor_min_tier": "c3",
-        "large_context_material_tokens": 50_000,
+        "large_context_material_tokens": 70_000,
         "large_context_thinking_budget_tokens": 0,
         "large_context_context_window_override_tokens": 80_000,
         "large_context_max_output_override_tokens": 10_000,
@@ -1215,7 +1271,7 @@ def test_configured_fallback_uses_its_exact_endpoint_limits(monkeypatch) -> None
         "routing_applied": True,
         "router_fallback_chain": [],
         "large_context_floor_min_tier": "c3",
-        "large_context_material_tokens": 50_000,
+        "large_context_material_tokens": 70_000,
         "large_context_thinking_budget_tokens": 0,
         "routed_model": "routed-at-floor",
     }
@@ -1359,7 +1415,7 @@ def test_cross_provider_large_context_head_uses_exact_endpoint_limits(
     metadata = {
         "routing_applied": True,
         "large_context_floor_min_tier": "c2",
-        "large_context_material_tokens": 50_000,
+        "large_context_material_tokens": 70_000,
         "large_context_thinking_budget_tokens": 0,
         "routed_model": "routed-large",
     }
@@ -1402,7 +1458,7 @@ def test_large_context_explicit_override_requires_final_head_capacity(
         "routing_applied": True,
         "router_fallback_chain": [],
         "large_context_floor_min_tier": "c2",
-        "large_context_material_tokens": 50_000,
+        "large_context_material_tokens": 70_000,
         "large_context_thinking_budget_tokens": 0,
         "routed_model": "routed-large",
     }
@@ -1437,7 +1493,7 @@ def test_cross_provider_large_context_explicit_restore_revalidates_primary(
     metadata = {
         "routing_applied": True,
         "large_context_floor_min_tier": "c2",
-        "large_context_material_tokens": 50_000,
+        "large_context_material_tokens": 70_000,
         "large_context_thinking_budget_tokens": 0,
         "routed_model": "routed-large",
     }
@@ -1481,7 +1537,7 @@ def test_large_context_blocked_route_rejects_unsafe_primary_rebound(
     metadata = {
         "routing_applied": True,
         "large_context_floor_min_tier": "c2",
-        "large_context_material_tokens": 50_000,
+        "large_context_material_tokens": 70_000,
         "large_context_thinking_budget_tokens": 0,
         "routed_provider": "tokenrhythm",
         "routed_provider_blocked": "missing_credential",
@@ -1544,7 +1600,7 @@ def test_router_fallback_uses_exact_configured_endpoint_capacity(monkeypatch) ->
             }
         ],
         "large_context_floor_min_tier": "c2",
-        "large_context_material_tokens": 50_000,
+        "large_context_material_tokens": 70_000,
         "large_context_thinking_budget_tokens": 0,
         "routed_model": "routed-large",
     }

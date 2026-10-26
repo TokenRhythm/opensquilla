@@ -155,7 +155,6 @@ async function handleWorkspaceFileAction(action: string, file: WorkspaceFile) {
     if (action === 'open') { openWorkspaceFile(file); return }
     if (action === 'copy-path') {
       await copyTextWithFallback(file.path)
-      if (current()) pushToast(t('workspaceReference.copied'), { tone: 'ok' })
       return
     }
     if (action === 'native-open' || action === 'reveal') {
@@ -183,7 +182,6 @@ async function handleWorkspaceFileAction(action: string, file: WorkspaceFile) {
       if (!current()) return
       if (content.includes('\0')) throw new Error('unsupported')
       await copyTextWithFallback(content)
-      if (current()) pushToast(t('workspaceReference.copied'), { tone: 'ok' })
     } else if (action === 'download') {
       if (platform.files.saveArtifact) {
         const data = await blob.arrayBuffer()

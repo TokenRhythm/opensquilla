@@ -142,8 +142,7 @@
         "resources": {
           "type": "array",
           "items": {
-            "type": "object",
-            "additionalProperties": true
+            "$ref": "#/$defs/WorkbenchResourceProjection"
           }
         },
         "totalCount": {
@@ -245,6 +244,21 @@
           "$ref": "#/$defs/Err"
         }
       ]
+    },
+    "WorkbenchResourceProjection": {
+      "type": "object",
+      "additionalProperties": true,
+      "properties": {
+        "sourcePath": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "minLength": 1,
+          "maxLength": 4096,
+          "description": "Authorized workspace-relative path to the existing working source; presentation metadata, never a resource identity or host absolute path."
+        }
+      }
     }
   }
 }

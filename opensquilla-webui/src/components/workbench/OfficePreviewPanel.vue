@@ -9,7 +9,7 @@
         <Icon :name="navigatorExpanded ? 'sidebar-visible' : 'sidebar-hidden'" :size="18" aria-hidden="true" />
       </button>
       <button
-        v-if="annotationEnabled"
+        v-if="annotationEnabled && selectionMode === undefined"
         type="button"
         class="btn office-preview__request"
         :class="{ 'is-active': choosing }"
@@ -67,24 +67,29 @@
         </div>
       </div>
     </div>
-    <p class="office-preview__hint">{{ t(choosing ? 'workbench.office.modeHint' : annotationEnabled ? 'workbench.office.previewHint' : 'workbench.office.readOnlyHint') }}</p>
+    <p v-if="selectionMode === undefined" class="office-preview__hint">{{ t(choosing ? 'workbench.office.modeHint' : annotationEnabled ? 'workbench.office.previewHint' : 'workbench.office.readOnlyHint') }}</p>
   </section>
 </template>
 
 <script setup lang="ts">
-import { computed, onBeforeUnmount, onMounted, ref, shallowRef, useId, watch } from 'vue'
+import { computed, nextTick, onBeforeUnmount, onMounted, ref, shallowRef, useId, watch } from 'vue'
 import { useI18n } from 'vue-i18n'
 import Icon from '@/components/Icon.vue'
 import OfficePageNavigator from './OfficePageNavigator.vue'
 import type { OfficePreviewFormat } from '@/utils/workbench/artifactPreview'
 import type { OfficeSelection } from '@/types/officeSelection'
-import { createOfficePreviewSession, type OfficePreviewSession } from '@/workbench/officePreviewAdapter'
+import { createOfficePreviewSession, type OfficePreviewSession, type OfficeSelectionCommit,
+  type OfficeSelectionAnchor, type OfficeLocateResult } from '@/workbench/officePreviewAdapter'
 import { resourceReadingState, type ResourceReadingState } from './resourceReadingState'
 
-const props = withDefaults(defineProps<{ data: ArrayBuffer; format: OfficePreviewFormat; annotationEnabled?: boolean; suspended?: boolean; readingState?: ResourceReadingState }>(), {
-  annotationEnabled: false, suspended: false,
+const props = withDefaults(defineProps<{ data: ArrayBuffer; format: OfficePreviewFormat; annotationEnabled?: boolean; suspended?: boolean; readingState?: ResourceReadingState;
+  revisionId?: string; selectionMode?: boolean; selectionLocked?: boolean; selectionToLocate?: { selection: OfficeSelection; revisionId?: string; stale?: boolean; requestId: string | number } }>(), {
+  annotationEnabled: false, suspended: false, selectionMode: undefined, selectionLocked: false,
 })
-const emit = defineEmits<{ 'selection-request': [selection: OfficeSelection]; loading: []; ready: []; error: [error: Error]; thumbnail: [blob: Blob]; 'reading-state': [state: ResourceReadingState, data: ArrayBuffer] }>()
+const emit = defineEmits<{ 'selection-request': [selection: OfficeSelection]; 'selection-commit': [value: OfficeSelectionCommit];
+  'anchor-change': [anchor: OfficeSelectionAnchor | null]; 'locate-result': [result: OfficeLocateResult & { requestId: string | number }];
+  'selection-mode-change': [enabled: boolean];
+  loading: []; ready: []; error: [error: Error]; thumbnail: [blob: Blob]; 'reading-state': [state: ResourceReadingState, data: ArrayBuffer] }>()
 const { t } = useI18n()
 const panel = ref<HTMLElement | null>(null)
 const container = ref<HTMLElement | null>(null)
@@ -118,6 +123,9 @@ function saveReading() {
     top: viewport.value?.scrollTop ?? 0, left: viewport.value?.scrollLeft ?? 0, time: 0 }, readingData)
 }
 function exitSelectionMode(event?: Event) {
+  // An open editor owns Escape/cancellation. A toolbar-focused Escape must not
+  // destroy its target while the draft card remains open.
+  if (props.selectionLocked && event?.type === 'keydown') return
   if (choosing.value && event?.type === 'keydown') {
     event.preventDefault()
     event.stopPropagation()
@@ -125,6 +133,7 @@ function exitSelectionMode(event?: Event) {
   choosing.value = false
   selection.value = null
   session.value?.setSelectionMode(false)
+  emit('selection-mode-change', false)
 }
 function toggleSelectionMode() {
   if (!props.annotationEnabled || !session.value || loading.value || failure.value || props.suspended) return
@@ -132,6 +141,7 @@ function toggleSelectionMode() {
   selection.value = null
   choosing.value = true
   session.value.setSelectionMode(true)
+  emit('selection-mode-change', true)
   // Keep Escape scoped to this preview even when the pointer button preserves
   // the document's DOM selection instead of taking focus itself.
   panel.value?.focus({ preventScroll: true })
@@ -139,6 +149,34 @@ function toggleSelectionMode() {
 function requestChange(value: OfficeSelection) {
   if (!choosing.value || !props.annotationEnabled || !session.value || loading.value || failure.value || props.suspended) return
   emit('selection-request', value)
+}
+function commitSelection(value: OfficeSelectionCommit) {
+  if (!choosing.value || !props.annotationEnabled || !session.value || loading.value || failure.value || props.suspended) return
+  emit('selection-commit', value)
+}
+function clearTransientSelection() {
+  selection.value = null
+  if (session.value?.clearTransientSelection) session.value.clearTransientSelection()
+  else session.value?.clearSelection()
+}
+function reselect() {
+  if (!props.annotationEnabled || !session.value || loading.value || props.suspended) return
+  choosing.value = true
+  selection.value = null
+  if (session.value.reselect) session.value.reselect()
+  else { session.value.clearSelection(); session.value.setSelectionMode(true) }
+  panel.value?.focus({ preventScroll: true })
+}
+async function locateRequestedSelection() {
+  const request = props.selectionToLocate, current = session.value, run = generation
+  if (!request || !current || loading.value || props.suspended) return
+  if (!request.stale && props.annotationEnabled) {
+    choosing.value = !props.selectionLocked
+    current.setSelectionMode(!props.selectionLocked, props.selectionLocked)
+  }
+  const result = await current.locateSelection?.(request.selection, request) ?? { status: 'unavailable' as const, anchor: null }
+  if (run !== generation || current !== session.value || request.requestId !== props.selectionToLocate?.requestId) return
+  emit('locate-result', { ...result, requestId: request.requestId })
 }
 function stop() {
   generation += 1
@@ -167,23 +205,25 @@ async function start() {
   try {
     const created = await createOfficePreviewSession({ container: container.value, viewportElement: viewport.value || undefined,
       viewportBottomInset: props.format === 'pptx' ? 112 : 0,
-      data, format: props.format, signal,
+      data, format: props.format, revisionId: props.revisionId, signal,
       onView: state => {
         if (run !== generation) return
         viewMode.value = state.mode; scale.value = state.scale; renderedWidth.value = state.width
       },
       selectionLabels: { text: t('workbench.office.hoverText'), element: t('workbench.office.hoverElement'), range: t('workbench.office.hoverRange') },
       onSelection: value => {
-        if (run !== generation || !choosing.value || !props.annotationEnabled) return
+        if (run !== generation || (!choosing.value && !props.selectionLocked) || !props.annotationEnabled) return
         selection.value = value
       },
       onSelectionCommit: value => {
         if (run !== generation) return
         requestChange(value)
       },
+      onSelectionCommitDetail: value => { if (run === generation) commitSelection(value) },
+      onAnchorChange: anchor => { if (run === generation) emit('anchor-change', anchor) },
       onLocation: (index, count) => {
         if (run !== generation) return
-        if (page.value !== index) selection.value = null
+        if (page.value !== index && !props.selectionLocked) selection.value = null
         page.value = index; total.value = count
       },
       onError: error => {
@@ -210,11 +250,16 @@ async function start() {
       failure.value = true
       emit('error', error instanceof Error ? error : new Error(String(error)))
     }
-  } finally { if (run === generation) { loading.value = false; saveReading() } }
+  } finally { if (run === generation) {
+    loading.value = false
+    if (props.selectionLocked) session.value?.setSelectionMode(false, true)
+    else if (props.selectionMode && !choosing.value) toggleSelectionMode()
+    saveReading(); void locateRequestedSelection()
+  } }
 }
 async function navigate(action: 'previous' | 'next' | 'zoomIn' | 'zoomOut' | 'fitWidth' | 'fitPage' | 'resize') {
   const run = generation
-  if (action === 'previous' || action === 'next') { selection.value = null; session.value?.clearSelection() }
+  if ((action === 'previous' || action === 'next') && !props.selectionLocked) { selection.value = null; session.value?.clearSelection() }
   try {
     await session.value?.[action]()
     if (run === generation && (action === 'previous' || action === 'next')) viewport.value?.scrollTo({ top: 0, left: 0 })
@@ -233,8 +278,7 @@ function changeFit(event: Event) {
 async function goTo(index: number) {
   if (!session.value || index === page.value) return
   const run = generation
-  selection.value = null
-  session.value.clearSelection()
+  if (!props.selectionLocked) { selection.value = null; session.value.clearSelection() }
   try {
     await session.value.goTo(index)
     if (run === generation) viewport.value?.scrollTo({ top: 0, left: 0 })
@@ -246,6 +290,21 @@ async function goTo(index: number) {
   }
 }
 watch(() => [props.data, props.format, props.suspended] as const, () => { void start() })
+watch(() => props.selectionToLocate?.requestId, () => { void locateRequestedSelection() })
+watch(() => [props.selectionMode, props.selectionLocked] as const, async ([value, locked]) => {
+  if (locked && props.annotationEnabled) {
+    choosing.value = false
+    session.value?.setSelectionMode(false, true)
+  } else if (value) {
+    // Unlocking starts a fresh gesture even if selection mode stayed true.
+    choosing.value = false
+    toggleSelectionMode()
+  } else if (value === false) exitSelectionMode()
+  // Hiding the selection guide moves the canvas without necessarily resizing
+  // it. Resolve geometry after Vue has placed the preview at its new position.
+  await nextTick()
+  await session.value?.refreshAnchor?.()
+})
 watch(() => props.annotationEnabled, enabled => { if (!enabled) exitSelectionMode() })
 onMounted(() => {
   void start()
@@ -257,9 +316,11 @@ onMounted(() => {
         if (entry.target === panel.value) { panelWidth.value = rect.width; continue }
         // Selecting content must not resize its text layer when the guide appears.
         const watchHeight = props.format === 'xlsx' || (viewMode.value === 'page' && !choosing.value)
+        const geometryChanged = rect.width !== width || rect.height !== height
         const changed = rect.width !== width || (watchHeight && rect.height !== height)
         width = rect.width; height = rect.height
         if (changed && session.value && !props.suspended) void navigate('resize')
+        else if (geometryChanged && session.value && !props.suspended) void session.value.refreshAnchor?.()
       }
     })
     observer.observe(viewport.value)
@@ -267,6 +328,10 @@ onMounted(() => {
   }
 })
 onBeforeUnmount(() => { saveReading(); observer?.disconnect(); stop() })
+defineExpose({ clearTransientSelection, reselect, setSelectionMode: (enabled: boolean) => {
+  if (enabled && !choosing.value) toggleSelectionMode()
+  else if (!enabled) exitSelectionMode()
+} })
 </script>
 
 <style scoped>

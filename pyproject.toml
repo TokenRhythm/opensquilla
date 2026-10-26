@@ -1,6 +1,6 @@
 [project]
 name = "opensquilla"
-version = "0.5.6"
+version = "0.5.7"
 description = "OpenSquilla — microkernel Python agent runtime with MCP-native tools and multi-channel messaging"
 license = "Apache-2.0"
 license-files = ["LICENSE", "THIRD_PARTY_NOTICES.md"]
@@ -28,7 +28,7 @@ dependencies = [
     "httpx>=0.27",
     "mcp>=2.2.0,<3",
     # Security floors for HTTP and parsing dependencies used by base features.
-    "aiohttp>=3.14.3",
+    "aiohttp>=3.14.4",
     "multidict>=6.9.1",
     "idna>=3.19",
     "urllib3>=2.7.0",
@@ -53,9 +53,9 @@ dependencies = [
     "beautifulsoup4>=4.15.0",
     "soupsieve>=2.9.2",
     "cachetools>=5.3",
-    "certifi>=2026.7.22",
+    "certifi>=2026.10.19",
     "pdfplumber>=0.11.10",
-    "pillow>=12.3.0",
+    "pillow>=13.0.0",
     "croniter>=6.2.4",
     "tomli-w>=1.0",
     "yoyo-migrations>=8.2,<10",
@@ -66,7 +66,7 @@ dependencies = [
     "python-docx>=1.1.0",
     "python-pptx>=1.0.0",
     "openpyxl>=3.1.0",
-    "pypdf>=6.18.1",
+    "pypdf>=6.21.1",
     "reportlab>=4.0.0",
     "lark-oapi>=1.5.5,<1.6",
     "python-telegram-bot>=22.8",

@@ -301,12 +301,34 @@ describe('AssistantActivityTimeline', () => {
 
     const events = root.querySelectorAll<HTMLElement>('[data-testid="compaction-event"]')
     expect(events).toHaveLength(2)
-    expect(events[0]?.textContent).toContain('History temporarily reduced; continuing')
-    expect(events[0]?.textContent).not.toContain('Context organized')
+    expect(events[0]?.textContent).not.toContain('History temporarily reduced; continuing')
+    expect(events[0]?.textContent).toContain('Context organized')
+    expect(events[0]?.querySelector('button')?.getAttribute('aria-label')).toBe('History temporarily reduced; continuing')
     expect(events[0]?.dataset.status).toBe('completed')
     expect(events[0]?.dataset.durability).toBe('request_scoped')
     expect(events[1]?.textContent).toContain('Context organized')
+    for (const event of events) {
+      expect(event.classList.contains('assistant-activity-status__row--failed')).toBe(false)
+      expect(event.querySelector('.assistant-activity-status__dot, .compaction-recovery-marker__ring')).not.toBeNull()
+      expect(event.querySelector('.assistant-activity-status__duration')).toBeNull()
+      expect(event.textContent).not.toContain('session history was not rewritten')
+    }
     expect(root.querySelector('.assistant-activity-status__row--current')).toBeNull()
+  })
+
+  it.each(['working', 'settled'] as const)('does not announce an automatic failed attempt as a terminal chat error while %s', async lifecycle => {
+    const root = await mountTimeline([], [{
+      action: 'context_compaction', label: '', at: 1_000,
+      id: 'cmp-failed-attempt', category: 'maintenance', state: 'failed',
+      source: 'automatic', failureKind: 'rate_limited', httpStatus: 429,
+    }], lifecycle)
+    const event = root.querySelector<HTMLElement>('[data-testid="compaction-event"]')!
+    expect(event.dataset.status).toBe('failed')
+    expect(event.textContent?.trim()).toBe(i18n.global.t('chat.compact.incomplete'))
+    expect(event.classList.contains('assistant-activity-status__row--failed')).toBe(false)
+    expect(event.querySelector('[role="alert"]')).toBeNull()
+    expect(event.querySelector('[role="status"]')).not.toBeNull()
+    expect(event.querySelector('.assistant-activity-status__duration')).toBeNull()
   })
 
   it('inherits caller attributes on its semantic root without Vue fragment warnings', async () => {

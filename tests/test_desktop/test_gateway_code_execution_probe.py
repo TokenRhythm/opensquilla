@@ -16,7 +16,10 @@ _SCRIPTS = _ROOT / "desktop" / "electron" / "scripts"
 _PROBE = _SCRIPTS / "probe-code-execution.py"
 
 
-def test_code_execution_probe_runs_the_real_tool_through_the_gateway_entry(tmp_path: Path) -> None:
+@pytest.mark.parametrize("aliased_profile", [False, True], ids=["canonical", "aliased"])
+def test_code_execution_probe_runs_the_real_tool_through_the_gateway_entry(
+    tmp_path: Path, aliased_profile: bool,
+) -> None:
     environment = {
         key: value for key, value in os.environ.items()
         if key.upper() in {"PATH", "SYSTEMROOT", "WINDIR", "COMSPEC", "PATHEXT"}
@@ -30,7 +33,9 @@ def test_code_execution_probe_runs_the_real_tool_through_the_gateway_entry(tmp_p
         "APPDATA": str(profile / "AppData" / "Roaming"),
         "LOCALAPPDATA": str(profile / "AppData" / "Local"),
         "TMP": str(temporary), "TEMP": str(temporary), "TMPDIR": str(temporary),
-        "OPENSQUILLA_STATE_DIR": str(profile),
+        "OPENSQUILLA_STATE_DIR": str(
+            profile / ".." / profile.name if aliased_profile else profile
+        ),
         "PYTHONPATH": str(_ROOT / "src"),
         "PYTHONDONTWRITEBYTECODE": "1", "PYTHONUTF8": "1", "PYTHONNOUSERSITE": "1",
     })

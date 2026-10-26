@@ -120,6 +120,19 @@ async def fetch_live_catalog_entries(
                 else resp.json()
             )
             parsed = parser(payload if isinstance(payload, Mapping) else {})
+            if (
+                shape == "tokenrhythm"
+                and url == "https://tokenrhythm.studio/api/models"
+                and isinstance(payload, Mapping)
+            ):
+                from opensquilla.provider.media_pricing import register_media_catalog
+
+                register_media_catalog(
+                    "tokenrhythm",
+                    payload.get("data", []),
+                    base_url="https://tokenrhythm.studio/v1",
+                    source_url=url,
+                )
     except asyncio.CancelledError:
         cancelled_request_error = asyncio.CancelledError()
     except httpx.HTTPError as exc:

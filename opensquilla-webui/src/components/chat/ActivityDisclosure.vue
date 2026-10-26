@@ -57,6 +57,16 @@
       {{ phaseAnnouncement || liveStatusLabel }}
     </span>
     <div
+      v-if="showCollapsedCompaction"
+      class="assistant-activity__compaction"
+      :class="{ 'assistant-activity__compaction--running': executing && !stale && !phaseWaiting }"
+      data-testid="collapsed-compaction-status"
+      aria-hidden="true"
+    >
+      <span class="assistant-activity__compaction-ring" />
+      <span>{{ t('chat.compact.compacting') }}</span>
+    </div>
+    <div
       :id="bodyId"
       class="assistant-activity__body"
       :aria-hidden="!open"
@@ -99,6 +109,7 @@ const props = withDefaults(defineProps<{
   phaseLabel?: string
   phaseAnnouncement?: string
   phaseWaiting?: boolean
+  compacting?: boolean
   elapsedLabel?: string
   queued?: boolean
   stale?: boolean
@@ -113,6 +124,7 @@ const props = withDefaults(defineProps<{
   summaryLabel: '',
   detailLabel: '',
   phaseLabel: '',
+  compacting: false,
   elapsedLabel: '',
   queued: false,
   stale: false,
@@ -125,12 +137,15 @@ const props = withDefaults(defineProps<{
 const { t } = useI18n()
 const emit = defineEmits<{ openChange: [open: boolean] }>()
 const bodyId = `assistant-activity-body-${useId()}`
-const initialOpen = () => props.defaultOpen
-const open = ref(readAssistantActivityExpansion(
-  props.stateKey,
-  initialOpen(),
-  props.continuityKey,
-))
+function readOpenState(key: string, continuityKey: string) {
+  if (props.lifecycle === 'working' || props.lifecycle === 'answering') {
+    // A previous owner may have auto-collapsed this turn while settling.
+    // Only a reader's explicit choice should override the live default.
+    return readAssistantActivityManualChoice(key, continuityKey) ?? props.defaultOpen
+  }
+  return readAssistantActivityExpansion(key, props.defaultOpen, continuityKey)
+}
+const open = ref(readOpenState(props.stateKey, props.continuityKey))
 const parentActivityVisible = useActivityDisclosureVisibility()
 provideActivityDisclosureVisibility(open)
 const manuallyToggled = ref(
@@ -152,7 +167,7 @@ watch(open, expanded => emit('openChange', expanded), { immediate: true, flush: 
 
 watch(() => [props.stateKey, props.continuityKey] as const, ([key, continuityKey]) => {
   manuallyToggled.value = readAssistantActivityManualChoice(key, continuityKey) !== undefined
-  open.value = readAssistantActivityExpansion(key, initialOpen(), continuityKey)
+  open.value = readOpenState(key, continuityKey)
 })
 
 watch(
@@ -168,11 +183,16 @@ watch(
 const isLive = computed(() =>
   props.lifecycle === 'working' || props.lifecycle === 'answering',
 )
+// The existing live region owns announcements; this is its visible counterpart
+// while the detailed maintenance row is folded away.
+const showCollapsedCompaction = computed(() =>
+  isLive.value && props.compacting && !props.queued && !open.value,
+)
 
 // A live turn can be queued or waiting for approval. The owner supplies the
 // execution signal; opening details moves motion to the actual current row.
 const headerMotionActive = computed(() =>
-  parentActivityVisible.value && isLive.value && props.executing && !open.value && !props.stale && !props.phaseWaiting,
+  parentActivityVisible.value && isLive.value && props.executing && !open.value && !props.stale && !props.phaseWaiting && !showCollapsedCompaction.value,
 )
 
 const liveStatusLabel = computed(() => props.phaseLabel || t('chat.activityWorking'))
@@ -270,6 +290,42 @@ const resolvedSummaryLabel = computed(() => {
   color: var(--text-muted);
   font-size: inherit;
   font-variant-numeric: tabular-nums;
+}
+
+.assistant-activity__compaction {
+  display: flex;
+  align-items: center;
+  gap: 0.625rem;
+  min-height: 1.75rem;
+  padding: 0.25rem 0.125rem;
+  color: color-mix(in srgb, var(--text) 58%, transparent);
+  font-size: 0.8125rem;
+  line-height: 1.45;
+}
+
+.assistant-activity__compaction-ring {
+  width: 0.5rem;
+  height: 0.5rem;
+  flex: 0 0 auto;
+  margin: 0 0.1875rem;
+  border: 1px solid currentColor;
+  border-radius: var(--radius-full);
+}
+
+.assistant-activity__compaction--running .assistant-activity__compaction-ring {
+  border-color: var(--accent);
+  border-right-color: transparent;
+  animation: collapsedCompactionSpin 0.9s linear infinite;
+}
+
+@keyframes collapsedCompactionSpin {
+  to { transform: rotate(360deg); }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .assistant-activity__compaction--running .assistant-activity__compaction-ring {
+    animation: none;
+  }
 }
 
 /* The shared mask supplies the dimming; do not dim small metadata twice. */

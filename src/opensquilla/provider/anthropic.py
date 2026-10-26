@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 from collections.abc import AsyncIterator
 from copy import deepcopy
+from dataclasses import replace
 from typing import Any
 
 import httpx
@@ -24,6 +25,7 @@ from .failures import (
     structured_provider_error_code,
 )
 from .model_catalog import shared_catalog
+from .recovery_origin import transport_recovery_origin
 from .registry import AuthHeaderStyle
 from .request_proof import (
     ProviderRequestBudgetExceededError,
@@ -38,6 +40,7 @@ from .stream_assembly import (
     ToolStreamAccumulator,
     ToolStreamProtocolError,
 )
+from .stream_usage import interrupted_stream_error
 from .tool_argument_rejection import rejected_tool_arguments_error
 from .trace_recorder import LLMTraceRecorder
 from .types import (
@@ -338,6 +341,17 @@ def _anthropic_iteration_token_counts(usage: dict[str, Any]) -> tuple[int, int]:
         input_tokens += _coerce_int(iteration.get("input_tokens"))
         output_tokens += _coerce_int(iteration.get("output_tokens"))
     return input_tokens, output_tokens
+
+
+def _anthropic_token_count_known(usage: dict[str, Any], field: str) -> bool:
+    iterations = usage.get("iterations")
+    if isinstance(iterations, list):
+        return bool(iterations) and all(
+            isinstance(iteration, dict)
+            and type(iteration.get(field)) is int and iteration[field] >= 0
+            for iteration in iterations
+        )
+    return type(usage.get(field)) is int and usage[field] >= 0
 
 
 class AnthropicProvider:
@@ -645,6 +659,8 @@ class AnthropicProvider:
         cached_tokens = 0
         cache_creation_tokens = 0
         usage_known = False
+        input_tokens_known = False
+        output_tokens_known = False
         reasoning = ReasoningAccumulator()
         native_blocks: dict[int, dict[str, Any]] = {}
         native_open_blocks: set[int] = set()
@@ -668,6 +684,19 @@ class AnthropicProvider:
         # are tolerated diagnostics, never client tool calls; only deltas for
         # indices that were never opened at all remain protocol errors.
         non_tool_block_indices: set[Any] = set()
+
+        def stream_error(*, message: str, code: str, **kwargs: Any) -> ErrorEvent:
+            if not usage_known:
+                return ErrorEvent(message=message, code=code, **kwargs)
+            return replace(interrupted_stream_error(
+                message=message, code=code, recovery_origin="unknown",
+                usage=DoneEvent(
+                    input_tokens=input_tokens, output_tokens=output_tokens,
+                    cached_tokens=cached_tokens, cache_write_tokens=cache_creation_tokens,
+                    model=self._model, provider=self.provider_id,
+                ),
+                input_tokens_known=input_tokens_known, output_tokens_known=output_tokens_known,
+            ), **kwargs)
 
         try:
             async with httpx.AsyncClient(
@@ -702,7 +731,7 @@ class AnthropicProvider:
                             status_code=response.status_code,
                             response_body=safe_body_text,
                         )
-                        yield ErrorEvent(
+                        yield stream_error(
                             message=message,
                             code=str(response.status_code),
                             http_status=safe_http_status(response.status_code),
@@ -744,7 +773,7 @@ class AnthropicProvider:
                                     "frame_chars": len(data_str),
                                 },
                             )
-                            yield ErrorEvent(
+                            yield stream_error(
                                 message=message,
                                 code="invalid_stream_frame",
                             )
@@ -753,7 +782,7 @@ class AnthropicProvider:
                         if not isinstance(event, dict):
                             message = "Anthropic stream contained a non-object data frame"
                             trace.record_error(code="invalid_stream_frame", message=message)
-                            yield ErrorEvent(message=message, code="invalid_stream_frame")
+                            yield stream_error(message=message, code="invalid_stream_frame")
                             return
                         etype = event.get("type", "")
                         # Error frames may echo the active credential.  They
@@ -770,7 +799,7 @@ class AnthropicProvider:
                         }:
                             message = "Anthropic stream mutated content after message_delta"
                             trace.record_error(code="invalid_stream_order", message=message)
-                            yield ErrorEvent(message=message, code="invalid_stream_order")
+                            yield stream_error(message=message, code="invalid_stream_order")
                             return
                         if etype in {
                             "content_block_start",
@@ -780,14 +809,14 @@ class AnthropicProvider:
                         } and not message_started:
                             message = "Anthropic stream emitted content before message_start"
                             trace.record_error(code="invalid_stream_order", message=message)
-                            yield ErrorEvent(message=message, code="invalid_stream_order")
+                            yield stream_error(message=message, code="invalid_stream_order")
                             return
 
                         if etype == "message_start":
                             if message_started:
                                 message = "Anthropic stream repeated message_start"
                                 trace.record_error(code="invalid_stream_order", message=message)
-                                yield ErrorEvent(message=message, code="invalid_stream_order")
+                                yield stream_error(message=message, code="invalid_stream_order")
                                 return
                             message_started = True
                             message_id = event.get("message", {}).get("id")
@@ -798,6 +827,14 @@ class AnthropicProvider:
                                 type(usage.get(key)) is int and usage[key] >= 0
                                 for key in ("input_tokens", "output_tokens")
                             )
+                            input_tokens_known = _anthropic_token_count_known(
+                                usage, "input_tokens",
+                            )
+                            output_tokens_known = _anthropic_token_count_known(
+                                usage, "output_tokens",
+                            )
+                            if output_tokens_known:
+                                output_tokens = _coerce_int(usage["output_tokens"])
                             base_input_tokens = _coerce_int(usage.get("input_tokens"))
                             (
                                 input_tokens,
@@ -1113,6 +1150,16 @@ class AnthropicProvider:
                                 iteration_input_tokens,
                                 iteration_output_tokens,
                             ) = _anthropic_iteration_token_counts(usage)
+                            if "input_tokens" in usage or isinstance(usage.get("iterations"), list):
+                                input_tokens_known = _anthropic_token_count_known(
+                                    usage, "input_tokens",
+                                )
+                            if "output_tokens" in usage or isinstance(
+                                usage.get("iterations"), list,
+                            ):
+                                output_tokens_known = _anthropic_token_count_known(
+                                    usage, "output_tokens",
+                                )
                             if "output_tokens" in usage or isinstance(
                                 usage.get("iterations"), list
                             ):
@@ -1144,7 +1191,7 @@ class AnthropicProvider:
                             if not message_started:
                                 message = "Anthropic stream ended before message_start"
                                 trace.record_error(code="invalid_stream_order", message=message)
-                                yield ErrorEvent(message=message, code="invalid_stream_order")
+                                yield stream_error(message=message, code="invalid_stream_order")
                                 return
                             message_stopped = True
                             break
@@ -1171,13 +1218,23 @@ class AnthropicProvider:
                                 api_key=self._api_key,
                             )
                             trace.record_error(code=error_code, message=error_message)
-                            yield ErrorEvent(message=error_message, code=error_code)
+                            yield stream_error(message=error_message, code=error_code)
                             return
 
                     if not message_stopped:
                         message = "Anthropic stream ended before message_stop"
                         trace.record_error(code="incomplete_stream", message=message)
-                        yield ErrorEvent(message=message, code="incomplete_stream")
+                        yield interrupted_stream_error(
+                            message=message, code="incomplete_stream", recovery_origin="unknown",
+                            usage=DoneEvent(
+                                input_tokens=input_tokens, output_tokens=output_tokens,
+                                cached_tokens=cached_tokens,
+                                cache_write_tokens=cache_creation_tokens,
+                                model=self._model, provider=self.provider_id,
+                            ) if usage_known else None,
+                            input_tokens_known=input_tokens_known,
+                            output_tokens_known=output_tokens_known,
+                        )
                         return
 
                     pending_tool_calls = tools_acc.pending_raw_arguments()
@@ -1238,7 +1295,7 @@ class AnthropicProvider:
                                 ),
                             )
                         else:
-                            yield ErrorEvent(message=message, code="incomplete_tool_call")
+                            yield stream_error(message=message, code="incomplete_tool_call")
                         return
 
                     if native_capture_invalid or native_open_blocks:
@@ -1248,7 +1305,7 @@ class AnthropicProvider:
                         )
                         message = "Anthropic response has invalid or incomplete content blocks"
                         trace.record_error(code=code, message=message)
-                        yield ErrorEvent(message=message, code=code)
+                        yield stream_error(message=message, code=code)
                         return
 
                     # Tool block completion is provisional until the response
@@ -1338,7 +1395,7 @@ class AnthropicProvider:
                 limit=exc.limit,
                 observed=exc.observed,
             )
-            yield ErrorEvent(message=message, code="candidate_artifact_limit_exceeded")
+            yield stream_error(message=message, code="candidate_artifact_limit_exceeded")
         except httpx.TimeoutException as exc:
             code = CONNECTION_FAILED_CODE if is_connection_failure(exc) else "timeout"
             message = redact_upstream_error_text(
@@ -1347,7 +1404,15 @@ class AnthropicProvider:
                 max_len=2000,
             )
             trace.record_error(code=code, message=message)
-            yield ErrorEvent(message=message, code=code)
+            yield interrupted_stream_error(
+                message=message, code=code, recovery_origin=transport_recovery_origin(exc),
+                usage=DoneEvent(
+                    input_tokens=input_tokens, output_tokens=output_tokens,
+                    cached_tokens=cached_tokens, cache_write_tokens=cache_creation_tokens,
+                    model=self._model, provider=self.provider_id,
+                ) if usage_known else None,
+                input_tokens_known=input_tokens_known, output_tokens_known=output_tokens_known,
+            )
         except httpx.RequestError as exc:
             code = CONNECTION_FAILED_CODE if is_connection_failure(exc) else "request_error"
             message = redact_upstream_error_text(
@@ -1356,7 +1421,15 @@ class AnthropicProvider:
                 max_len=2000,
             )
             trace.record_error(code=code, message=message)
-            yield ErrorEvent(message=message, code=code)
+            yield interrupted_stream_error(
+                message=message, code=code, recovery_origin=transport_recovery_origin(exc),
+                usage=DoneEvent(
+                    input_tokens=input_tokens, output_tokens=output_tokens,
+                    cached_tokens=cached_tokens, cache_write_tokens=cache_creation_tokens,
+                    model=self._model, provider=self.provider_id,
+                ) if usage_known else None,
+                input_tokens_known=input_tokens_known, output_tokens_known=output_tokens_known,
+            )
         except Exception as exc:  # noqa: BLE001 - chat() contract: ErrorEvent instead of raising
             message = redact_upstream_error_text(
                 f"Provider response handling failed: {str(exc) or repr(exc)}",
@@ -1373,7 +1446,7 @@ class AnthropicProvider:
                 code="provider_internal",
                 message=message,
             )
-            yield ErrorEvent(
+            yield stream_error(
                 message=message,
                 code="provider_internal",
             )

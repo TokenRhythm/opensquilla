@@ -31,4 +31,16 @@ describe('chat view departure budget', () => {
     for (let index = 0; index < 40; index++) deep = { next: deep }
     expect(createChatViewCaptureBudget(1024).include('messages', deep)).toBe(false)
   })
+
+  it('reports bounded structural rejection separately from bytes without retaining input', () => {
+    const nested = Array.from({ length: 5_001 }, () => ({ a: 1, b: 2, c: 3 }))
+    const budget = createChatViewCaptureBudget(8 * 1024 * 1024)
+    expect(budget.include('messages', nested)).toBe(false)
+    expect(budget.rejectionReason).toBe('nodes')
+    expect(budget.bytes).toBeLessThan(8 * 1024 * 1024)
+    expect(budget.visitedNodes).toBe(20_001)
+    const bytes = createChatViewCaptureBudget(32)
+    expect(bytes.include('messages', 'x'.repeat(100))).toBe(false)
+    expect(bytes.rejectionReason).toBe('bytes')
+  })
 })

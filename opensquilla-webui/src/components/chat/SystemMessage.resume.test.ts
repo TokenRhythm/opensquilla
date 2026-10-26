@@ -3,7 +3,10 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { createApp, h, nextTick, ref, shallowRef } from 'vue'
 import { createMemoryHistory, createRouter } from 'vue-router'
 import i18n, { loadLocaleMessages } from '@/i18n'
-import type { ChatRenderedMessage } from '@/types/chat'
+import type { ChatMessage, ChatRenderedMessage } from '@/types/chat'
+import { useChatRenderedMessages } from '@/composables/chat/useChatRenderedMessages'
+import { projectHistoryMessage } from '@/adapters/gateway/sessionHistoryV4'
+import { projectConversationHistoryMessage } from '@/utils/chat/conversationHistory'
 import { normalizeTurnOutcome } from '@/utils/chat/turnOutcome'
 import SystemMessage from './SystemMessage.vue'
 
@@ -69,6 +72,132 @@ afterEach(() => {
 })
 
 describe('SystemMessage runtime errors', () => {
+  it.each([
+    {
+      // Anthropic message_start reports an observed subtotal, not final output usage.
+      usage: {
+        input_tokens: 100, output_tokens: 1,
+        cost_usd: 0.000315, billed_cost: 0, estimated_cost_component_usd: 0.000315,
+        has_billed_component: false, has_estimated_component: true,
+        cost_source: 'mixed', missing_cost_entries: 1,
+        coverage_status: 'usage_unknown', usage_unknown: true, unknown_usage_events: 0,
+      },
+      expected: ['Estimated $0.000315', 'known subtotal'],
+      absent: ['Actual'], allowZero: false,
+    },
+    {
+      usage: {
+        input_tokens: 30, output_tokens: 4, cost_usd: 0.03, billed_cost: 0.02,
+        cost_source: 'mixed', estimated_cost_component_usd: 0.01,
+        missing_cost_entries: 1, coverage_status: 'usage_unknown',
+        usage_unknown: true, unknown_usage_events: 1,
+      },
+      expected: ['Actual $0.02', 'Estimated $0.01', 'known subtotal'],
+      absent: [], allowZero: false,
+    },
+    {
+      usage: {
+        cost_usd: 0, billed_cost: 0, cost_source: 'unpriced', missing_cost_entries: 2,
+        coverage_status: 'usage_unknown', usage_unknown: true, unknown_usage_events: 2,
+      },
+      expected: ['exact usage total unavailable'],
+      absent: ['Actual', 'Estimated'], allowZero: false,
+    },
+    {
+      usage: {
+        cost_usd: 0.0045, billed_cost: 0, cost_source: 'mixed', missing_cost_entries: 1,
+        usage_unknown: true, coverage_status: 'usage_unknown',
+      },
+      expected: ['Estimated $0.0045', 'known subtotal'],
+      absent: ['Actual'], allowZero: false,
+    },
+    {
+      usage: {
+        cost_usd: 0.02, billed_cost: 0.02, cost_source: 'mixed', missing_cost_entries: 1,
+        usage_unknown: true, coverage_status: 'usage_unknown',
+      },
+      expected: ['Actual $0.02', 'known subtotal'],
+      absent: ['Estimated'], allowZero: false,
+    },
+    {
+      usage: {
+        cost_usd: 0, billed_cost: 0, cost_source: 'mixed', missing_cost_entries: 1,
+        usage_unknown: true, coverage_status: 'usage_unknown',
+        model_usage_breakdown: [{ cost_source: 'mixed', billed_cost: 0, has_billed_component: true }],
+      },
+      expected: ['Actual $0', 'known subtotal'],
+      absent: ['Estimated'], allowZero: true,
+    },
+    {
+      usage: {
+        cost_usd: 0, billed_cost: 0, cost_source: 'mixed', missing_cost_entries: 1,
+        usage_unknown: true, coverage_status: 'usage_unknown',
+      },
+      expected: ['exact usage total unavailable'],
+      absent: ['Actual', 'Estimated'], allowZero: false,
+    },
+    {
+      usage: {
+        cost_usd: 0, billed_cost: 0, cost_source: 'mixed', missing_cost_entries: 1,
+        usage_unknown: true, coverage_status: 'usage_unknown',
+        model_usage_breakdown: [{ cost_source: 'provider_billed', billing_receipt: { status: 'pending' } }],
+      },
+      expected: ['exact usage total unavailable'],
+      absent: ['Actual', 'Estimated'], allowZero: false,
+    },
+    {
+      usage: {
+        cost_usd: 0, billed_cost: 0, cost_source: 'mixed', missing_cost_entries: 1,
+        usage_unknown: true, coverage_status: 'usage_unknown', has_billed_component: true,
+      },
+      expected: ['Actual $0', 'known subtotal'],
+      absent: ['Estimated'], allowZero: true,
+    },
+    {
+      usage: {
+        cost_usd: 0, billed_cost: 0, cost_source: 'mixed', missing_cost_entries: 1,
+        usage_unknown: true, coverage_status: 'usage_unknown',
+        model_usage_breakdown: [{ cost_source: 'unavailable', billing_receipt: {
+          status: 'confirmed', currency: 'CNY', amount_nanos: 100_000_000,
+          usd_equivalent_nanos: null,
+        } }],
+      },
+      expected: ['exact usage total unavailable'],
+      absent: ['Actual', 'Estimated'], allowZero: false,
+    },
+  ])('shows failed-turn accounting from error-only restored history without a false zero total', async ({ usage, expected, absent, allowZero }) => {
+    const historyMessage = projectConversationHistoryMessage(projectHistoryMessage({
+      id: 'failed-message', message_id: 'failed-message', role: 'system',
+      text: 'Error: response incomplete', timestamp: 1,
+      turn_context: { turn_id: 'failed-turn' }, turn_usage: usage,
+    }, 0))
+    expect(historyMessage.role).toBe('error')
+    const api = useChatRenderedMessages({
+      messages: ref<ChatMessage[]>([historyMessage]),
+      sessionKey: ref('agent:main:failed-usage'), routerSlots: ref([]),
+      routerModels: ref({}), routerTierConfigs: ref({}), routerVisualEffectsEnabled: ref(false),
+      routerVisualMode: ref('real_candidates'), renderMarkdown: text => text,
+      stripGeneratedArtifactMarkers: text => text, stripTimePrefix: text => text,
+      isSubagentCompletionMessage: () => false,
+    })
+    const message = api.renderedMessages.value[0]!
+    expect(message.meta?.usageUnknown).toBe(true)
+    const { app, el } = await mountMsg(message)
+    try {
+      const summary = el.querySelector('.msg-error__usage')?.textContent || ''
+      for (const text of expected) expect(summary).toContain(text)
+      for (const text of absent) expect(summary).not.toContain(text)
+      if (!allowZero) expect(summary).not.toMatch(/\$0(?:\s|$)/)
+      expect(el.querySelectorAll('button,a')).toHaveLength(0)
+    } finally { app.unmount() }
+  })
+
+  it('keeps a failed turn with no accounting metadata free of invented costs', async () => {
+    const { app, el } = await mountMsg(errorMessage({ restoredFromHistory: true }))
+    expect(el.querySelector('.msg-error__usage')).toBeNull()
+    app.unmount()
+  })
+
   it('shows only an explicit HTTP fact and clears it on cancellation without a new action', async () => {
     const { app, el, setMessage } = await mountMsg(errorMessage({ turnOutcome: { turnId: 't', status: 'failed', failureKind: 'rate_limited', httpStatus: 429 } }))
     try {

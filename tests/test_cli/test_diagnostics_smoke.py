@@ -1,5 +1,7 @@
 """Packaged runtime capability diagnostics remain available without task runners."""
 
+from pathlib import Path
+
 import pytest
 from typer.testing import CliRunner
 
@@ -59,3 +61,46 @@ def test_smoke_router_fails_when_runtime_unavailable(monkeypatch: pytest.MonkeyP
     assert result.exit_code == 1
     assert '"success": false' in result.stdout
     assert "No module named" in result.stdout
+
+
+def test_smoke_tokenizer_fails_offline_with_missing_encoding_asset(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+):
+    import tiktoken.registry
+
+    monkeypatch.setenv("TIKTOKEN_CACHE_DIR", str(tmp_path))
+    monkeypatch.setattr(tiktoken.registry, "ENCODINGS", {})
+
+    result = runner.invoke(diagnostics_app, ["smoke-tokenizer"])
+
+    assert result.exit_code == 1, result.output
+    assert '"success": false' in result.stdout
+    assert "offline tokenizer cache miss" in result.stdout
+
+
+def test_smoke_tokenizer_does_not_accept_estimator_fallback(monkeypatch: pytest.MonkeyPatch):
+    from types import SimpleNamespace
+
+    import tiktoken
+
+    from opensquilla import token_estimation
+
+    text = "OpenSquilla offline tokenizer verification. 离线编码验证。"
+    monkeypatch.setattr(
+        tiktoken,
+        "get_encoding",
+        lambda _name: SimpleNamespace(
+            name="cl100k_base", encode=lambda *_args, **_kwargs: [1, 2], decode=lambda _: text
+        ),
+    )
+    monkeypatch.setattr(
+        token_estimation,
+        "estimate_tokens_with_source",
+        lambda _text: (2, "utf8_unicode_conservative"),
+    )
+
+    result = runner.invoke(diagnostics_app, ["smoke-tokenizer"])
+
+    assert result.exit_code == 1, result.output
+    assert '"success": false' in result.stdout
+    assert "utf8_unicode_conservative" in result.stdout

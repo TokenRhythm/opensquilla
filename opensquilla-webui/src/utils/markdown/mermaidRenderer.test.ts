@@ -2,11 +2,13 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
 const api = vi.hoisted(() => ({ initialize: vi.fn(), render: vi.fn(), graphviz: vi.fn() }))
+const clipboard = vi.hoisted(() => vi.fn())
+vi.mock('@/utils/browser', () => ({ copyTextWithFallback: clipboard }))
 vi.mock('./diagrams/graphviz', () => ({ renderGraphviz: api.graphviz }))
 vi.mock('mermaid', () => ({ default: api }))
 vi.mock('dompurify', () => ({ default: () => ({ sanitize: (source: string) => source, addHook: vi.fn() }) }))
 vi.mock('@/themes/registry', () => ({ getManifest: (id: string) => ({ capabilities: { colorScheme: id } }) }))
-const labels = { zoomIn: '+', zoomOut: '-', reset: 'Reset', copyCode: 'Copy', copied: 'Copied', copyFailed: 'Failed', exportPng: 'PNG', exportFailed: 'Export failed', loadFailed: 'Load failed', tooLarge: 'Too large', blockedResource: 'Blocked resource', viewSource: 'Source', syntaxErrorAt: (line: number) => `Line ${line}` }
+const labels = { zoomIn: '+', zoomOut: '-', reset: 'Reset', copyCode: 'Copy', copyFailed: 'Failed', exportPng: 'PNG', exportFailed: 'Export failed', loadFailed: 'Load failed', tooLarge: 'Too large', blockedResource: 'Blocked resource', viewSource: 'Source', syntaxErrorAt: (line: number) => `Line ${line}` }
 const svg = '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 100 80"><text>Rendered</text></svg>'
 function fixture(source = 'flowchart TD\n A-->B') {
   const root = document.createElement('div')
@@ -19,10 +21,32 @@ function fixture(source = 'flowchart TD\n A-->B') {
   document.body.appendChild(root)
   return root
 }
-beforeEach(() => { vi.resetModules(); api.initialize.mockReset(); api.render.mockReset().mockResolvedValue({ svg }); api.graphviz.mockReset().mockResolvedValue(svg) })
-afterEach(() => document.body.replaceChildren())
+beforeEach(() => { vi.resetModules(); clipboard.mockReset().mockResolvedValue(undefined); api.initialize.mockReset(); api.render.mockReset().mockResolvedValue({ svg }); api.graphviz.mockReset().mockResolvedValue(svg) })
+afterEach(() => { document.body.replaceChildren(); vi.clearAllTimers(); vi.useRealTimers() })
 
 describe('Mermaid engine ownership', () => {
+  it('keeps failed diagram source copyable with a temporary check and stable action name', async () => {
+    vi.useFakeTimers()
+    const { renderMermaidBlocks } = await import('./mermaidRenderer')
+    const source = 'flowchart TD\n A@{img: "file:///secret"}'
+    const root = fixture(source)
+    await renderMermaidBlocks(root, labels)
+    const button = root.querySelector<HTMLButtonElement>('.mermaid-err-copy')!
+    clipboard.mockRejectedValueOnce(new Error('clipboard denied'))
+    button.click()
+    await Promise.resolve(); await Promise.resolve()
+    expect(button.textContent).toBe('Failed')
+    expect(button.getAttribute('aria-label')).toBe('Failed')
+    button.click()
+    await Promise.resolve()
+    expect(clipboard).toHaveBeenLastCalledWith(source)
+    expect(button.textContent).toBe('✓')
+    expect(button.title).toBe('Copy')
+    expect(button.getAttribute('aria-label')).toBe('Copy')
+    vi.advanceTimersByTime(1500)
+    expect(button.textContent).toBe('Copy')
+    expect(button.getAttribute('aria-label')).toBe('Copy')
+  })
   it('does not interpret ordinary label text as image attributes or CSS requests', async () => {
     const { hasUnsupportedMermaidImageSources } = await import('./mermaidRenderer')
     expect(hasUnsupportedMermaidImageSources('flowchart TD\n A["img: ./cache.png"]')).toBe(false)

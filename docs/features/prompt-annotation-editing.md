@@ -1,4 +1,89 @@
-# HTML preview annotations
+# Preview annotations
+
+HTML, DOCX, PPTX and XLSX use **Annotate changes** in the preview toolbar.
+The card next to the selected element uses the application's theme. Enter records
+the instruction and resumes selection; Shift+Enter inserts a newline. IME
+composition never records a draft. The card arrow also
+**records into the existing chat composer**. Only the chat Send action submits or
+queues the instructions. Recording never calls the send command.
+
+## Entry points and preparation
+
+Chat cards, paths, workspace files, reference cards and deliveries prepare a
+working Document through `workbench.resources.open` with `intent: "annotate"`.
+The request uses either a resource reference or a workspace file with its binding
+and expected revision. Read-only workspace resolution can report `documentTarget`
+and annotation availability; it never creates a document or advances a version.
+
+An immutable delivery opens its associated current Document, or creates an
+editable working copy using the existing import rules. The original delivery
+remains unchanged. If the version differs, the user sees a notice before selecting
+the target. A workspace file is registered in place, without copying it or guessing
+associations from its name. HTML subpages must belong to an authorized bundle.
+
+Preparing annotations validates the actual source. External edits create a new
+baseline only at this explicit preparation step. Normal preview, `edit-current`,
+send and execution do not refresh the baseline. Send and execution reject an
+outdated version or source and preserve the instructions for reselection.
+
+## Drafts and selection
+
+Draft identity is the session and canonical Document, independent of its opening
+entry point. HTML sends annotations for the current page; Office sends annotations
+for the entire file. Other HTML pages retain their drafts. The chat composer is
+the only annotation list; the preview has no duplicate bottom summary or record
+button. Composer annotations support locating, editing and deleting. Opening an
+Office annotation also opens its nearby card, where the target can be reselected.
+Reselection replaces the target
+atomically with a new ID, preserving the instruction and order.
+
+Office adapters report the final selection and update its temporary display
+anchor during scroll, zoom and layout. Locating a draft distinguishes exact,
+location-only, unavailable and stale results. Equal text alone never identifies
+the original target. Display coordinates are not persisted or sent to the Agent.
+The card remains reachable at the preview edge when its target leaves the viewport.
+
+Word supports clicking a paragraph and dragging a precise text range. A paragraph
+uses the renderer's source identity, not a search for the first matching text.
+Opening the card pauses picking while preserving the committed target, highlight
+and geometry tracking. Recording or canceling releases that target.
+
+Office and the version 2 native HTML editor share a placement function. Cards
+prefer the space below the visible target, then flip above or to either side.
+Cross-axis shifting keeps them inside the preview without moving them to an
+unrelated corner. A valid existing side is retained while typing. Scrolling and
+zooming recompute the anchor; a target outside the viewport docks the card at the
+nearest edge. Office cards show the target summary when exact positioning is
+unavailable. Mouse movement alone does not reposition an open editor.
+
+Canceling an existing edit restores its opening text; canceling a new selection
+removes only that draft. Closing or switching files saves text first. A storage
+failure retains the editor for recovery. Old drafts are preserved; unverifiable
+versions require reselection.
+
+The existing persistent chat queue owns queued batches. Queued annotations cannot
+be edited until cancellation succeeds. Generic take-back shortcuts skip annotation
+items; **Cancel sending and restore annotations** restores their full context under
+new draft IDs. Receipt cleanup compares the original target and body so a delayed
+receipt cannot remove a replacement or a newer edit.
+
+A batch contains at most 16 annotations, each text field is at most 16 KiB UTF-8,
+and the normalized page context is at most 64 KiB. Preflight rejects oversized
+batches without truncation or automatic splitting.
+
+## Client compatibility
+
+Office annotation works in Web and Desktop when the feature is enabled. HTML
+element selection requires Desktop. New Desktop advertises
+`overlayEditorVersion: 2` for the compact native editor, dynamic height and explicit
+record action. Legacy `submit` remains a single-record action; older Desktop keeps
+its existing editor. The chat composer provides the batch workflow.
+
+This change adds no database migration or second execution queue. Old Office
+formats, HTML element selection on Web, historical-version branching and batches
+spanning HTML pages remain outside this release.
+
+## HTML context
 
 HTML previews support selecting a region and adding a request to the normal chat
 composer. The request includes a page reference, an optional document reference,
@@ -83,6 +168,25 @@ without its selection context: the updated client asks the user to select the
 page again.
 
 ## Verification
+
+Normal HTML and Office navigation follows an existing, authorized Document
+relation to its current revision. Published cards, inline paths, workspace-tree
+entries and reference cards reuse that Document's tab. Discovery is read-only:
+it neither imports a document nor absorbs an externally edited file. The
+explicit annotation preparation operation remains responsible for establishing
+a new working baseline.
+
+The file menu's "View this delivered version" and each version-history row's
+"View this version" open separately labelled historical tabs. Those previews
+retain the selected bytes, including the HTML bundle, and never follow working
+source changes. Returning to the latest document reuses its existing tab.
+
+The Files list and its header count share one canonical projection, grouped by
+Document lineage or resource identity. A filename or content hash never merges
+independent files. Authorized workspace-relative source paths distinguish
+same-name files in the list and open tabs; host filesystem paths are not exposed.
+Right-side annotation controls continue to record into the left composer; only
+the left Send button dispatches a request.
 
 Offline tests cover normal message acceptance and replay, attachments, shared
 Agent behavior, complete resource versions, restoration, cancellation, target

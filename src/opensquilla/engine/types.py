@@ -78,6 +78,11 @@ class ThinkingStartEvent:
     started_at: int = 0
     content_kind: Literal["summary", "reasoning"] = "reasoning"
     generation_epoch: int = 0
+    model_call_id: str = ""
+    iteration: int = 0
+    # False only when this turn cannot roll back an exposed provider call.
+    # Gateway observers may then stream it without call-reset support.
+    provider_call_resettable: bool = True
 
 
 @dataclass
@@ -95,6 +100,9 @@ class ThinkingEvent:
     # Additive defaults preserve legacy producers and positional construction.
     model_call_id: str = ""
     iteration: int = 0
+    # False only when this turn cannot roll back an exposed provider call.
+    # Gateway observers may then stream it without call-reset support.
+    provider_call_resettable: bool = True
 
 
 @dataclass
@@ -104,6 +112,33 @@ class ThinkingEndEvent:
     block_index: int = 0
     status: Literal["completed", "interrupted", "error"] = "completed"
     ended_at: int = 0
+    generation_epoch: int = 0
+    model_call_id: str = ""
+    iteration: int = 0
+    # False only when this turn cannot roll back an exposed provider call.
+    # Gateway observers may then stream it without call-reset support.
+    provider_call_resettable: bool = True
+
+
+@dataclass
+class ProviderAttemptStartEvent:
+    """Internal checkpoint before a physical response publishes any content."""
+
+    kind: Literal["provider_attempt_start"] = field(default="provider_attempt_start", init=False)
+    model_call_id: str = ""
+    iteration: int = 0
+    generation_epoch: int = 0
+
+
+@dataclass
+class ProviderAttemptCommittedEvent:
+    """Internal boundary after a complete response passes runtime validation."""
+
+    kind: Literal["provider_attempt_committed"] = field(
+        default="provider_attempt_committed", init=False
+    )
+    model_call_id: str = ""
+    iteration: int = 0
     generation_epoch: int = 0
 
 
@@ -122,6 +157,9 @@ class TextDeltaEvent:
     # Additive defaults preserve legacy producers and positional construction.
     model_call_id: str = ""
     iteration: int = 0
+    # False only when this turn cannot roll back an exposed provider call.
+    # Gateway observers may then stream it without call-reset support.
+    provider_call_resettable: bool = True
 
 
 @dataclass
@@ -549,6 +587,8 @@ class CompactionEvent:
     coverage_status: str = "unknown"
     missing_obligations: list[str] | None = None
     critical_carry_forward: list[str] | None = None
+    source_snapshot: Any | None = field(default=None, repr=False, compare=False)
+    persist_result: Any | None = field(default=None, repr=False, compare=False)
 
 
 @dataclass
@@ -574,6 +614,7 @@ class CompactionOutcome:
     # Request-scoped projection only. The canonical turn transcript remains
     # raw and no CompactionEvent may be persisted for this outcome.
     ephemeral_only: bool = False
+    source_snapshot: Any | None = field(default=None, repr=False, compare=False)
     # Runtime-only owner for a multi-stage overflow recovery. Durable and
     # request-scoped projections share its absolute deadline and physical LLM
     # call counter; it must never enter persistence, logs, or event reprs.
@@ -589,6 +630,8 @@ AgentEvent = (
     | ThinkingEvent
     | ThinkingEndEvent
     | TextDeltaEvent
+    | ProviderAttemptStartEvent
+    | ProviderAttemptCommittedEvent
     | RunHeartbeatEvent
     | ToolInputPreviewEvent
     | ProviderActivityEvent
@@ -692,6 +735,8 @@ class AgentConfig:
     # Per-turn volatile request context injected after persisted history
     # and before the current user turn. It is not persisted to history.
     request_context_prompt: str | None = None
+    # Durable checkpoint contribution, kept separate from volatile context.
+    compaction_summary_context: str | None = None
     # Initial facts; physical request boundaries rebind this immutable snapshot.
     execution_identity: ExecutionIdentity | None = None
     # Per-turn user-role skill context injected after persisted history

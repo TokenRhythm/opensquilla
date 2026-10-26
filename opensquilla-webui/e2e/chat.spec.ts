@@ -43,7 +43,7 @@ test.describe('Chat Page', () => {
     await expect(page.locator('.topbar[data-connection-state="connected"]')).toBeVisible()
     await expect(page.locator(`.sidebar-history-row[data-session-key="${recent.key}"]`)).toBeVisible()
 
-    await page.locator('.sidebar-cmd-btn').click()
+    await page.getByTestId('sidebar-search').click()
     const palette = page.getByRole('dialog', { name: 'Search and go to' })
     await expect(palette).toBeVisible()
 
@@ -59,7 +59,7 @@ test.describe('Chat Page', () => {
   test('command palette keeps the Skills & Channels hub together in Work', async ({ page }) => {
     await expect(page.locator('.topbar[data-connection-state="connected"]')).toBeVisible()
     await expect(page.locator('.chat-textarea')).toBeFocused()
-    await page.locator('.sidebar-cmd-btn').click()
+    await page.getByTestId('sidebar-search').click()
     const palette = page.getByRole('dialog', { name: 'Search and go to' })
     await expect(palette).toBeVisible()
     const search = palette.getByRole('combobox')

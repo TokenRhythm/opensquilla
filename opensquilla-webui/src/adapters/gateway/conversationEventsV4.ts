@@ -196,7 +196,7 @@ export function canonicalConversationEventName(value: unknown): string {
   }
   const name = value.trim()
   if (BARE_EVENT_ALIASES.has(name)) return `${EVENT_PREFIX}${name}`
-  if (name === 'session.answer_generation_reset.v1') {
+  if (name === 'session.answer_generation_reset.v1' || name === 'session.answer_generation_reset.v2') {
     return 'session.event.answer_generation_reset'
   }
   if (name === 'session.turn_committed.v1') {

@@ -75,6 +75,35 @@ try {
       await manager.setBrowserAutomationState({ sessionKey: 'retained-0', taskId: 'run-1', active: false })
       const inactiveOwners = manager.browserAutomationStates.size
       const identityPreserved = identity === first.contents.id
+      // Interactive previews have no count cap. Every page belongs to a
+      // different chat and retains its form/JS state while the visible slot
+      // moves among them, even when all browser admission slots are occupied.
+      const previewIds = Array.from({ length: 6 }, (_, index) => `preview-${index}`)
+      const previewResults = await Promise.all(previewIds.map(id => manager.createSurface({
+        version: 4, surfaceId: id, kind: 'artifact-preview',
+        payload: { launchUrl: origin, expectedOrigin: origin, scopeId: `chat-${id}`, mode: 'full' },
+      })))
+      if (previewResults.some(result => !result.ok)) throw new Error(JSON.stringify(previewResults))
+      const previewContents = previewIds.map(id => manager.surfaces.get(id).contents)
+      const previewIdentities = previewContents.map(contents => contents.id)
+      for (let index = 0; index < previewIds.length; index++) {
+        await previewContents[index].executeJavaScript(
+          `document.querySelector("#draft").value=${JSON.stringify(`Draft ${index}`)};window.retainedCounter=${index + 100}`)
+      }
+      for (let round = 0; round < 2; round++) {
+        for (const id of previewIds) {
+          manager.setSurfaceRect({ surfaceId: id, x: 0, y: 0, width: 640, height: 480, visible: true })
+          manager.setSurfaceRect({ surfaceId: id, x: 0, y: 0, width: 640, height: 480, visible: false })
+        }
+      }
+      const previewStates = await Promise.all(previewContents.map(contents =>
+        contents.executeJavaScript('({draft:document.querySelector("#draft").value,counter:window.retainedCounter})')))
+      const previewIdentitiesPreserved = previewIds.every((id, index) =>
+        manager.surfaces.get(id).contents.id === previewIdentities[index])
+      const previewReservations = manager.resourceBudget.snapshot().filter(entry => entry.kind === 'preview').length
+      await Promise.all(previewIds.map(id => manager.destroySurface(id, true)))
+      const previewsDestroyed = previewContents.every(contents => contents.isDestroyed())
+      const previewReservationsAfterClose = manager.resourceBudget.snapshot().filter(entry => entry.kind === 'preview').length
       // A failed native close must keep its slot until Chromium actually exits;
       // replacing the same id cannot briefly create a second renderer in it.
       const previewRequest = { version: 4, surfaceId: 'slow-preview', kind: 'artifact-preview',
@@ -92,6 +121,8 @@ try {
       const previewRetry = await manager.createSurface(previewRequest)
       await manager.destroyAll()
       return { results, state, identityPreserved, popupDenied,
+        previewResults, previewStates, previewIdentitiesPreserved, previewReservations,
+        previewsDestroyed, previewReservationsAfterClose,
         delayedReplacement, pendingPreviewSlots, oldPreviewStillAlive, previewRetry,
         beforeCleanup, whileDisposing, afterClosing, duringReplacement, replacementResult, residentContents, staleStopIgnored,
         inactiveOwners, finalBudget: manager.resourceBudget.snapshot(),
@@ -114,12 +145,18 @@ try {
   assert.equal(result.residentContents, 8)
   assert.equal(result.staleStopIgnored, true)
   assert.equal(result.inactiveOwners, 0)
+  assert.equal(result.previewResults.filter(entry => entry.ok).length, 6)
+  assert.deepEqual(result.previewStates, Array.from({ length: 6 }, (_, index) => ({ draft: `Draft ${index}`, counter: index + 100 })))
+  assert.equal(result.previewIdentitiesPreserved, true)
+  assert.equal(result.previewReservations, 6)
+  assert.equal(result.previewsDestroyed, true)
+  assert.equal(result.previewReservationsAfterClose, 0)
   assert.equal(result.delayedReplacement.code, 'RESOURCE_RELEASING')
   assert.equal(result.pendingPreviewSlots, 1)
   assert.equal(result.oldPreviewStillAlive, true)
   assert.equal(result.previewRetry.ok, true)
   assert.deepEqual(result.finalBudget, [])
-  console.log('Native retention: 6 switches preserve form/JS/target; 8-page admission includes concurrent creation, popup and cleanup; all resources released.')
+  console.log('Native retention: browser admission remains 8; 6 previews across chats preserve form/JS/target after hiding and showing; explicit close releases every preview and all reservations.')
 } finally {
   await instance?.close()
   server.closeAllConnections()

@@ -82,6 +82,8 @@ export type ConversationEventData = ConversationEventIdentity & {
   unknown_usage_events?: number
   old_generation_epoch?: number
   new_generation_epoch?: number
+  reset_scope?: 'answer' | 'provider_call'
+  rollback_model_call_id?: string
   preserve_completed_tools?: boolean
   authoritative_text_snapshot?: string
   authoritative_reasoning_snapshot?: string
@@ -213,7 +215,7 @@ export type ConversationCompactionContent = WithIdentity<'compactionRecovery' | 
 /** The physical request model is optional for older Gateway producers. */
 export type ConversationProviderActivity = WithIdentity<'httpStatus' | 'activity_id' | 'phase' | 'reason' | 'retry_attempt' | 'retry_limit' | 'retry_after_ms' | 'heartbeat' | 'model' | 'from_model'>
 export type ConversationEnsembleProgress = WithIdentity<'event_type' | 'proposer_index' | 'proposer_label' | 'proposer_model' | 'proposer_provider' | 'watchdogMemberId' | 'sample_index' | 'elapsed_ms' | 'input_tokens' | 'output_tokens' | 'cost_usd' | 'error' | 'error_code'>
-export type ConversationAnswerReset = WithIdentity<'old_generation_epoch' | 'new_generation_epoch' | 'preserve_completed_tools' | 'authoritative_text_snapshot' | 'authoritative_reasoning_snapshot' | 'sequence' | 'terminal' | 'terminal_text_snapshot'>
+export type ConversationAnswerReset = WithIdentity<'old_generation_epoch' | 'new_generation_epoch' | 'reset_scope' | 'rollback_model_call_id' | 'preserve_completed_tools' | 'authoritative_text_snapshot' | 'authoritative_reasoning_snapshot' | 'sequence' | 'terminal' | 'terminal_text_snapshot'>
 export type ConversationSubagentCompletion = WithIdentity<'type' | 'parent_session_key' | 'child_session_key' | 'status' | 'terminal_reason' | 'message_id'> & { result?: { text?: string; [key: string]: unknown } }
 export type ConversationLifecycle = WithIdentity<'reason' | 'phase' | 'status' | 'run_status' | 'terminal_message' | 'terminal_reason' | 'message' | 'code' | 'error_class' | 'group_id' | 'to_state' | 'active_task' | 'last_task' | 'changed_task' | 'terminalOutcome' | 'modelCapacity'>
 export type ConversationTurnCompletion = ConversationLifecycle & WithIdentity<'finalText' | 'completedTurnId' | 'usage' | 'text' | 'reasoning_content' | 'delivery' | 'suppression_reason' | 'input_mode' | 'run_kind' | 'model_call_segments'>
@@ -229,4 +231,4 @@ export type ConversationUsage = Pick<ChatUsagePayload,
   | 'savings_usd' | 'savings_pct' | 'model_usage_breakdown' | 'ensemble_trace' | 'route_plan' | 'execution_legs'
   | 'model_call_segments' | 'router_model_call_id' | 'router_iteration' | 'coverage_status'
   | 'usage_unknown' | 'unknown_usage_events' | 'decision_id' | '__savings_ui_suppressed'
-> & { cache_write?: number; cache_write_tokens?: number; billed_cost?: number; total_tokens?: number; estimated_cost_component_usd?: number }
+> & { cache_write?: number; cache_write_tokens?: number; billed_cost?: number; total_tokens?: number; estimated_cost_component_usd?: number; cost_source?: string; missing_cost_entries?: number }

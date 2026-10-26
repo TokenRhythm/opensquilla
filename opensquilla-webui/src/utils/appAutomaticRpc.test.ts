@@ -2,6 +2,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { createV4SessionDirectory } from '@/adapters/gateway/sessionDirectoryV4'
 import { createV4SessionDirectoryChanges } from '@/adapters/gateway/sessionDirectoryChangesV4'
 import { useSessions } from '@/composables/useSessions'
+import { createSessionTaskAttentionStore } from '@/composables/useSessionTaskAttention'
 import { createAppAutomaticRpc } from './appAutomaticRpc'
 
 function deferred<T = void>() {
@@ -58,9 +59,132 @@ function directoryBinding(app: ReturnType<typeof setup>, code = 'UNAVAILABLE') {
   return { request, changes }
 }
 
+function liveDirectoryBinding(app: ReturnType<typeof setup>) {
+  const handlers = new Map<string, (...args: unknown[]) => void>()
+  const request = vi.fn().mockResolvedValue(undefined)
+  const attention = createSessionTaskAttentionStore(null)
+  const changes = createV4SessionDirectoryChanges({
+    generation: 1, request, ready: async () => {},
+  }, {
+    subscribe(event, handler) {
+      handlers.set(event, handler)
+      return { close() { handlers.delete(event) } }
+    },
+  })
+  changes.subscribe(change => {
+    app.lifecycle.schedule()
+    attention.handleSessionDirectoryChange(change, {
+      currentSessionKey: 'agent:main:webchat:one', currentSessionVisible: true,
+    })
+  })
+  app.resumeDirectory.mockImplementation(() => changes.resume())
+  return {
+    request, changes, attention,
+    metadataChanged() {
+      handlers.get('sessions.changed')?.({
+        schema_version: 1, key: '*', reason: 'metadata_backfilled',
+      })
+    },
+  }
+}
+
 describe('App automatic RPC lifecycle with the real directory adapter', () => {
   beforeEach(() => vi.useFakeTimers())
   afterEach(() => { vi.restoreAllMocks(); vi.useRealTimers() })
+
+  it('refreshes all loaded pages once for coalesced metadata invalidation without task side effects', async () => {
+    const app = setup(true)
+    const binding = liveDirectoryBinding(app)
+    const first = (title: string) => ({
+      ...page(title, 'running'), hasMore: true, nextCursor: 'second',
+    })
+    const second = (title: string) => ({
+      count: 1, ts: 1, hasMore: false, nextCursor: null,
+      sessions: [{ key: 'agent:main:webchat:two', title, updatedAt: 1, runStatus: 'idle' }],
+    })
+    app.request.mockResolvedValueOnce(first('WebChat')).mockResolvedValueOnce(second('WebChat'))
+    await app.lifecycle.mount()
+    await vi.advanceTimersByTimeAsync(0)
+    await app.sessions.loadMoreSessions()
+    binding.attention.handleSessionDirectoryChange({
+      key: 'agent:main:webchat:two', reason: 'taskTerminal',
+      lastTask: { id: 'completed-task', status: 'succeeded' },
+    }, { currentSessionKey: 'agent:main:webchat:one', currentSessionVisible: true })
+    const unread = binding.attention.unread.value
+
+    app.request.mockResolvedValueOnce(first('First restored name'))
+      .mockResolvedValueOnce(second('Second restored name'))
+    binding.metadataChanged()
+    binding.metadataChanged()
+    await vi.advanceTimersByTimeAsync(149)
+    expect(app.request).toHaveBeenCalledTimes(2)
+    await vi.advanceTimersByTimeAsync(1)
+    expect(app.request).toHaveBeenCalledTimes(4)
+    expect(app.sessions.sessionsList.value.map(row => [row.title, row.runStatus])).toEqual([
+      ['First restored name', 'running'], ['Second restored name', 'idle'],
+    ])
+    expect(app.sessions.sessionsList.value.some(row => row.key === '*')).toBe(false)
+    expect(binding.attention.unread.value).toBe(unread)
+    expect(binding.attention.attentionFor('*', 'idle')).toBe('none')
+    await vi.advanceTimersByTimeAsync(60_000)
+    expect(app.request).toHaveBeenCalledTimes(4)
+    app.lifecycle.dispose()
+    binding.changes.dispose()
+  })
+
+  it('reads committed metadata on mount when maintenance finished without a subscriber', async () => {
+    const app = setup(true)
+    const binding = liveDirectoryBinding(app)
+    app.request.mockResolvedValue(page('Already restored'))
+    await app.lifecycle.mount()
+    await vi.advanceTimersByTimeAsync(0)
+    expect(binding.request.mock.invocationCallOrder[0])
+      .toBeLessThan(app.request.mock.invocationCallOrder[0]!)
+    expect(app.sessions.sessionsList.value[0]?.title).toBe('Already restored')
+    expect(app.request).toHaveBeenCalledOnce()
+    app.lifecycle.dispose()
+    binding.changes.dispose()
+  })
+
+  it('folds metadata invalidation received before the subscription ack into the first snapshot', async () => {
+    const app = setup(true)
+    const binding = liveDirectoryBinding(app)
+    const lease = deferred()
+    binding.request.mockReturnValueOnce(lease.promise)
+    app.request.mockResolvedValue(page('Restored before snapshot'))
+    const mounting = app.lifecycle.mount()
+    await vi.advanceTimersByTimeAsync(0)
+    binding.metadataChanged()
+    await vi.advanceTimersByTimeAsync(150)
+    expect(app.request).not.toHaveBeenCalled()
+    lease.resolve()
+    await mounting
+    await vi.advanceTimersByTimeAsync(0)
+    expect(app.request).toHaveBeenCalledOnce()
+    expect(app.sessions.sessionsList.value[0]?.title).toBe('Restored before snapshot')
+    app.lifecycle.dispose()
+    binding.changes.dispose()
+  })
+
+  it('follows an in-flight stale snapshot once when maintenance finishes during the read', async () => {
+    const app = setup(true)
+    const binding = liveDirectoryBinding(app)
+    const oldRead = deferred<ReturnType<typeof page>>()
+    app.request.mockReturnValueOnce(oldRead.promise).mockResolvedValue(page('Restored after snapshot'))
+    await app.lifecycle.mount()
+    await vi.advanceTimersByTimeAsync(0)
+    binding.metadataChanged()
+    await vi.advanceTimersByTimeAsync(150)
+    expect(app.request).toHaveBeenCalledOnce()
+    oldRead.resolve(page('WebChat'))
+    await vi.advanceTimersByTimeAsync(0)
+    expect(app.request).toHaveBeenCalledTimes(2)
+    expect(app.sessions.sessionsList.value[0]?.title).toBe('Restored after snapshot')
+    await vi.advanceTimersByTimeAsync(60_000)
+    expect(app.request).toHaveBeenCalledTimes(2)
+    app.lifecycle.dispose()
+    binding.changes.dispose()
+  })
 
   it('keeps the initial snapshot available after rejected subscription and refreshes on successful retry', async () => {
     const app = setup(true)

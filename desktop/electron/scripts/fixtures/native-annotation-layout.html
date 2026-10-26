@@ -1,0 +1,27 @@
+<!doctype html>
+<html lang="zh-CN">
+<meta charset="utf-8">
+<title>Quarterly plan — annotation layout fixture</title>
+<style>
+  body { margin: 32px; color: #263b40; font: 18px/1.5 system-ui, sans-serif; }
+  header { height: 180px; border-bottom: 1px solid #ddd; }
+  #target { width: 360px; margin: 24px 0; font-size: 28px; line-height: 1.3; }
+  article { max-width: 560px; }
+  section { min-height: 280px; }
+  table { border-collapse: collapse; width: 100%; }
+  td, th { padding: 12px; border: 1px solid #ddd; text-align: left; }
+  button { padding: 8px; }
+</style>
+<header><p>OpenSquilla 工作文档</p><p>2026 年第四季度 · 合成数据</p></header>
+<article>
+  <h1 id="target">Quarterly plan</h1>
+  <p>这份真实 HTML 文件用于验证元素批注随滚动与缩放定位。内容不包含用户数据。</p>
+  <section>
+    <h2>增长目标</h2>
+    <table><tr><th>渠道</th><th>目标</th></tr><tr><td>自然搜索</td><td>28%</td></tr><tr><td>客户推荐</td><td>20%</td></tr></table>
+  </section>
+  <section><h2>重点行动</h2><p>改善首次使用体验，明确每一步反馈，并使修改要求始终对应选中的内容。</p></section>
+  <section><h2>验收标准</h2><p>批注输入卡片在视口边界内显示；长文本可滚动；输入过程中正文及焦点保持稳定。</p></section>
+  <button id="outside" onclick="window.clicks=(window.clicks||0)+1">Outside editor</button>
+</article>
+</html>

@@ -16,6 +16,7 @@ import {
   closeElectronAndObserveExit,
   electronProcessSnapshot,
   expectedShutdownCancellationIndices,
+  waitForFirstSendGatewayIdle,
 } from './packaged-first-send-cleanup.mjs'
 
 const quitStart = { event: 'before_quit', gatewayDrainInFlight: false }
@@ -80,6 +81,116 @@ for (const [name, records, expectedIndices, unexpectedCount] of quitLogCases) {
     - expected.size, unexpectedCount, `${name}: remaining errors`)
 }
 console.log(`First-send shutdown log classification checks passed: ${quitLogCases.length} synthetic cases`)
+
+const idleCounts = { running: 0, queued: 0, waiting: 0, reservations: 0, auxiliary: 0 }
+const idleActivity = { kind: 'ok', activeCount: 0, activity: idleCounts }
+const fingerprint = 'a'.repeat(64)
+const idleOwner = { profile_fingerprint: fingerprint, port: 18791, instance_nonce: 'do-not-log-owner-secret' }
+const connection = { status: 'ready', profileFingerprint: fingerprint,
+  protocol: 'http:', hostname: '127.0.0.1', port: 18791 }
+function idleHarness(overrides = {}) {
+  let now = 0
+  let reads = 0
+  const samples = []
+  const timeouts = []
+  return {
+    options: {
+      page: { evaluate: async () => connection }, userDataDir: 'isolated-profile', deadline: 1_000,
+      now: () => now, sleep: async ms => { now += ms }, onSample: sample => samples.push(sample),
+      loadOwnership: () => ({ status: 'valid', record: idleOwner }),
+      readActivity: async (record, options) => {
+        assert.equal(record, idleOwner, 'do not switch the authenticated owner while waiting')
+        assert.ok(options.timeoutMs > 0 && options.timeoutMs <= 1_000 - now)
+        timeouts.push(options.timeoutMs)
+        reads++
+        return idleActivity
+      },
+      ...overrides,
+    },
+    samples, timeouts, reads: () => reads, setNow: value => { now = value },
+  }
+}
+
+// Before: the UI has finished but immediate Quit sees active work and opens a
+// confirmation that this unattended fixture never answers. After: the same
+// completion path waits for signed idle and then requests ordinary Quit once.
+{
+  let activity = { kind: 'ok', activeCount: 1, activity: { ...idleCounts, running: 1 } }
+  const quit = () => activity.activeCount > 0 ? 'confirmation_required' : 'natural_exit'
+  assert.equal(quit(), 'confirmation_required')
+  let releasePoll
+  let waiting
+  let quitCalls = 0
+  const waitingForPoll = () => new Promise(resolve => { waiting = resolve })
+  const firstPoll = waitingForPoll()
+  const h = idleHarness({
+    readActivity: async record => { assert.equal(record, idleOwner); return activity },
+    sleep: () => new Promise(resolve => { releasePoll = resolve; waiting() }),
+  })
+  const completion = waitForFirstSendGatewayIdle(h.options).then(() => { quitCalls++; return quit() })
+  await firstPoll
+  assert.equal(quitCalls, 0, 'a rendered terminal answer does not bypass driver settlement')
+  activity = { kind: 'ok', activeCount: 1, activity: { ...idleCounts, auxiliary: 1 } }
+  const secondPoll = waitingForPoll()
+  releasePoll()
+  await secondPoll
+  assert.equal(quitCalls, 0, 'auxiliary completion is still active work')
+  activity = idleActivity
+  releasePoll()
+  assert.equal(await completion, 'natural_exit')
+  assert.equal(quitCalls, 1)
+  assert.deepEqual(h.samples.map(sample => sample.activity), [
+    { ...idleCounts, running: 1 }, { ...idleCounts, auxiliary: 1 }, idleCounts,
+  ])
+  assert.ok(!JSON.stringify(h.samples).includes(idleOwner.instance_nonce))
+}
+for (const kind of ['running', 'auxiliary', 'unreachable', 'late-idle']) {
+  const h = idleHarness()
+  h.options.readActivity = async () => {
+    if (kind === 'late-idle') { h.setNow(1_000); return idleActivity }
+    return kind === 'unreachable' ? { kind } : {
+      kind: 'ok', activeCount: 1, activity: { ...idleCounts, [kind]: 1 },
+    }
+  }
+  await assert.rejects(waitForFirstSendGatewayIdle(h.options), error => error.reason === 'completion_deadline')
+  assert.ok(h.samples.length > 0, 'deadline failure retains the last authenticated activity category')
+}
+for (const result of [
+  { kind: 'rejected' }, { kind: 'unsupported' }, { kind: 'ok', activeCount: 0 },
+  { ...idleActivity, activeCount: 1 },
+  { ...idleActivity, activity: { ...idleCounts, auxiliary: undefined } },
+]) {
+  const h = idleHarness({ readActivity: async () => result,
+    sleep: async () => assert.fail('invalid/unauthenticated activity must fail immediately') })
+  await assert.rejects(waitForFirstSendGatewayIdle(h.options), error =>
+    ['rejected', 'unsupported', 'invalid_activity'].includes(error.reason))
+}
+for (const wrong of [
+  { status: 'missing' },
+  { status: 'valid', record: { ...idleOwner, port: 18792 } },
+  { status: 'valid', record: { ...idleOwner, profile_fingerprint: 'b'.repeat(64) } },
+]) {
+  const h = idleHarness({ loadOwnership: () => wrong })
+  await assert.rejects(waitForFirstSendGatewayIdle(h.options), error => error.reason === 'ownership_mismatch')
+  assert.equal(h.reads(), 0)
+}
+{
+  const h = idleHarness({ deadline: 0,
+    page: { evaluate: async () => assert.fail('expired completion must not start a descriptor request') } })
+  await assert.rejects(waitForFirstSendGatewayIdle(h.options), error => error.reason === 'completion_deadline')
+  assert.equal(h.reads(), 0)
+}
+{
+  const h = idleHarness({ page: { evaluate: async () => ({ ...connection, hostname: 'unrelated.example' }) } })
+  await assert.rejects(waitForFirstSendGatewayIdle(h.options), error => error.reason === 'invalid_connection')
+  assert.equal(h.reads(), 0)
+}
+{
+  const h = idleHarness({ page: { evaluate: () => new Promise(() => {}) }, deadline: Date.now() + 25, now: Date.now })
+  await assert.rejects(waitForFirstSendGatewayIdle(h.options), error => error.reason === 'invalid_connection')
+  assert.equal(h.reads(), 0)
+}
+console.log('First-send signed-idle checks passed: active-before-quit, driver/auxiliary settlement, deadline and owner fences')
 
 const fixtureProcesses = []
 const fixtureServers = []

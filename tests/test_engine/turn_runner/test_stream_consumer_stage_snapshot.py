@@ -158,6 +158,7 @@ class _RecordingSessionManager:
         self.calls.append(("persist", session_key, summary, list(kept), kwargs))
         if self.raises is not None:
             raise self.raises("persist boom")
+        return True
 
     async def append_message(self, *args, **kwargs):  # noqa: ARG002
         return None
@@ -361,8 +362,8 @@ _CORPUS: list[_Case] = [
             DoneEvent(text="after"),
         ],
         persist_raises=RuntimeError,
-        expected_kinds=("DoneEvent",),
-        expected_done_present=True,
+        expected_kinds=("ErrorEvent",),
+        expected_done_present=False,
         expected_compaction_persist_calls=1,
         expected_prompt_refresh_calls=0,
     ),

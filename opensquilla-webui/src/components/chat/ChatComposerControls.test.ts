@@ -115,9 +115,12 @@ describe('ChatComposer model routing contract', () => {
     expect(viewSource).toContain('sendBlockedReason: effectiveSendBlockedReason,')
     expect(viewSource).toContain('&& !deliveryBlockedReason.value')
     expect(viewSource).toContain('sessionRoutingSendBlockedReason.value || liveSendBlockedReason.value')
-    expect(viewSource).toContain(
-      'deliveryBlockedReason.value || promptAnnotationSendBlockedReason.value',
-    )
+    const baseBlockedStart = viewSource.indexOf('const baseSendBlockedReason = ')
+    const baseBlockedEnd = viewSource.indexOf('const queuedSendBlockedReason = ', baseBlockedStart)
+    expect(baseBlockedStart).toBeGreaterThanOrEqual(0)
+    expect(baseBlockedEnd).toBeGreaterThan(baseBlockedStart)
+    expect(viewSource.slice(baseBlockedStart, baseBlockedEnd)).toContain('|| deliveryBlockedReason.value')
+    expect(viewSource).toContain('baseSendBlockedReason.value || promptAnnotationSendBlockedReason.value')
     expect(viewSource).not.toContain('\n  || sessionRoutingSendBlockedReason.value\n')
     expect(composerSource).toContain('|| sessionRoutingBusy || inputDisabled')
     expect(composerSource).toContain(":aria-busy=\"sendPending || sessionRoutingBusy ? 'true' : 'false'\"")

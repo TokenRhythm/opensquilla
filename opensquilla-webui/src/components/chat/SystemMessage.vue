@@ -4,6 +4,7 @@
     <span v-if="errorText" class="msg-error__text">{{ errorText }}</span>
     <span v-if="httpStatus !== undefined" class="msg-error__http">{{ t('chat.httpStatus', { status: httpStatus }) }}</span>
     <span v-if="hasPartialAnswer" class="msg-error__note">{{ t('chat.partialFailureNote') }}</span>
+    <span v-if="usageSummary" class="msg-error__usage">{{ usageSummary }}</span>
     <span v-if="settingsTarget || showResume || showRetry" class="msg-error__actions">
       <RouterLink v-if="settingsTarget" class="msg-error__action"
         :class="{ 'msg-error__capacity': isCapacityError }"
@@ -52,6 +53,7 @@ import { absoluteTime, fullTime, isoTime } from '@/utils/messageTime'
 import { chatErrorPresentation } from '@/utils/chat/chatErrorPresentation'
 import { providerHttpStatus } from '@/utils/chat/providerRecovery'
 import { localizedChatErrorMessage } from '@/utils/chat/errors'
+import { usageCoverageText } from '@/utils/chat/usageCoverage'
 import {
   hasStrictUsageBarrierReplayProof,
   isUsageAccountingBarrierMessage,
@@ -115,6 +117,22 @@ const errorRole = computed(() => props.message.restoredFromHistory ? undefined :
   'chat.errorMessage.approvalRequired', 'chat.errorMessage.needsConfirmation',
   'chat.errorMessage.runLimit',
 ].includes(presentation.value.messageKey) ? 'status' : 'alert')
+const usageSummary = computed(() => {
+  const meta = props.message.meta
+  if (!meta) return ''
+  const amounts: string[] = []
+  const addAmount = (label: string, value: number | undefined) => {
+    if (value === undefined || !Number.isFinite(value) || value < 0) return
+    const amount = value === 0 ? '$0'
+      : value < 0.0001 ? '<$0.0001' : `$${value.toFixed(6).replace(/\.?0+$/, '')}`
+    amounts.push(`${t(label)} ${amount}`)
+  }
+  addAmount('usageLogs.costSource.actual.label', meta.billedCostUsd)
+  addAmount('usageLogs.costSource.estimated.label', meta.estimatedCostUsd)
+  if (!amounts.length && meta.costUsd > 0) addAmount('chat.msgMeta.cost', meta.costUsd)
+  const coverage = usageCoverageText(meta, (key, named) => String(named ? t(key, named) : t(key)))
+  return [...amounts, coverage].filter(Boolean).join(' · ')
+})
 const isCapacityError = computed(() => presentation.value.messageKey === 'chat.errorMessage.contextLimit')
 const settingsTarget = computed(() => {
   const action = presentation.value.action
@@ -229,8 +247,14 @@ const timeFull = computed(() => fullTime(props.message.ts))
 }
 
 .msg-error__note,
+.msg-error__usage,
 .msg-error__actions {
   margin-inline-start: 0.5rem;
+}
+
+.msg-error__usage {
+  color: var(--text-dim);
+  font-size: var(--fs-xs);
 }
 
 .msg-error__http {

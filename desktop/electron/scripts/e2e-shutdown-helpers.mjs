@@ -162,10 +162,13 @@ function childHasExited(child) {
   return child.exitCode !== null || child.signalCode !== null
 }
 
-// Only a fixture that intentionally leaves activity unknown should opt into
-// this action. Keep Playwright's main-process connection until the real dialog
-// has accepted the click; app.close() closes that connection after app.quit().
-export async function requestElectronQuitWithConfirmation(app, { signal, timeoutMs }) {
+// Keep Playwright's main-process connection until the real dialog has accepted
+// the click; app.close() closes that connection after app.quit(). Fixtures that
+// intentionally leave activity unknown require the dialog by default. Isolated
+// profile cleanup may also accept the ordinary idle exit without a dialog.
+export async function requestElectronQuitWithConfirmation(app, {
+  signal, timeoutMs, requireConfirmation = true,
+}) {
   const child = app.process()
   const deadline = Date.now() + timeoutMs
   const remainingMs = () => Math.max(1, deadline - Date.now())
@@ -173,19 +176,25 @@ export async function requestElectronQuitWithConfirmation(app, { signal, timeout
   let acceptExit
   let rejectFailure
   let confirmationClicked = false
+  let confirmationSeen = false
   const windowReady = new Promise(resolve => { acceptWindow = resolve })
   const exited = new Promise(resolve => { acceptExit = resolve })
   const failed = new Promise((_, reject) => { rejectFailure = reject })
   // An abort/exit may arrive while Playwright is still dispatching app.quit().
   // Keep that failure observed until the current operation races it below.
   void failed.catch(() => {})
-  const onWindow = page => acceptWindow(page)
+  const onWindow = page => {
+    confirmationSeen = true
+    acceptWindow(page)
+  }
   const onExit = () => {
-    if (confirmationClicked) acceptExit()
+    if (confirmationClicked || (!requireConfirmation && !confirmationSeen)) acceptExit()
     else rejectFailure(new Error('Electron exited before the expected quit confirmation'))
   }
   const onAbort = () => rejectFailure(timeoutError('Expected quit confirmation', timeoutMs))
-  const wait = operation => Promise.race([operation, failed])
+  // A recorded exit/abort failure wins even if a mock or queued operation has
+  // already completed; do not accept a dialog after the process has exited.
+  const wait = operation => Promise.race([failed, operation])
   app.on('window', onWindow)
   child.on('exit', onExit)
   signal.addEventListener('abort', onAbort, { once: true })
@@ -194,8 +203,12 @@ export async function requestElectronQuitWithConfirmation(app, { signal, timeout
       throw new Error('Electron exited before the expected quit confirmation')
     }
     if (signal.aborted) throw timeoutError('Expected quit confirmation', timeoutMs)
-    await wait(app.evaluate(({ app }) => app.quit()))
-    const page = await wait(windowReady)
+    const requested = app.evaluate(({ app }) => app.quit())
+    await wait(requireConfirmation ? requested : Promise.race([requested, exited]))
+    const page = await wait(requireConfirmation
+      ? windowReady
+      : Promise.race([windowReady, exited.then(() => null)]))
+    if (page === null) return
     await wait(page.locator('[role="dialog"]').waitFor({
       state: 'visible', timeout: remainingMs(),
     }))

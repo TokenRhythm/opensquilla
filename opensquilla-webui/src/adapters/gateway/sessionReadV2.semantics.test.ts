@@ -78,6 +78,31 @@ async function install(page: SessionReadHistoryPage) {
 }
 
 describe('v2 history semantic fidelity', () => {
+  it('keeps full checkpoint bodies unchanged in both adapters without replay wrappers or answer rows', async () => {
+    const body = '[Structured Compaction Summary]\n\nCurrent Status:\nAlpha 已完成；继续 Beta。\n\nConstraints and Preferences:\n- Do not deploy.'
+    const summaries = [{
+      id: 'p4-summary', compaction_id: 'p4-S1', compaction_index: 1,
+      summary_text: body, summary_format: 'structured_v1', removed_count: 2,
+      kept_count: 1, covered_through_id: 4, created_at: 1700000000000,
+    }]
+    const pages = [
+      await readV2([wireItem()], { compaction_summaries: summaries }),
+      await readV4([message], { compaction_summaries: summaries }),
+    ]
+    for (const page of pages) {
+      expect(page.compactionSummaries[0]?.summaryText).toBe(body)
+      expect(page.compactionSummaries[0]?.summaryText).not.toContain('[Compacted Session Summaries]')
+      const installed = await install(page)
+      const maintenance = installed.messages.filter(row => row.role === 'maintenance')
+      expect(maintenance).toHaveLength(1)
+      expect(maintenance[0]).toMatchObject({
+        text: '', maintenance: { compactionId: 'p4-S1', durability: 'durable', state: 'completed' },
+      })
+      expect(installed.messages.filter(row => row.role === 'assistant')).toHaveLength(1)
+      expect(installed.messages.some(row => row.text.includes('[Structured Compaction Summary]'))).toBe(false)
+    }
+  })
+
   it.each([true, false])('keeps the existing v4 fallback policy when the page is empty=%s', async empty => {
     const proof = { canonical_available: false, canonical_complete: false, history_scope: 'latest_window' as const }
     const page = await readV2(empty ? [] : [wireItem()], proof)

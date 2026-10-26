@@ -116,6 +116,7 @@ class ReliabilityEventSink:
         """Await startup storage directly so an early-failure caller can cancel it."""
 
         try:
+            await self._runtime.prepare_device_identity(TelemetryScope.RELIABILITY)
             event = self._gateway_start_event(
                 outcome=outcome,
                 error_code=error_code,

@@ -8,6 +8,10 @@ from pathlib import Path
 PACKAGE_ROOT = Path(__file__).resolve().parents[2] / "src" / "opensquilla"
 
 APPROVED_PACKAGE_IMPORTS: frozenset[tuple[str, str]] = frozenset({
+    # Transport-neutral command intent and exported content are lower-level
+    # value contracts; contracts never imports application or archive builders.
+    ("application", "contracts"),
+    ("artifact_archives.py", "contracts"),
     # Snapshot retention names ToolContext only under TYPE_CHECKING; runtime
     # snapshot imports remain independent of the tools package.
     ("file_snapshot.py", "tools"),
@@ -58,6 +62,9 @@ APPROVED_PACKAGE_IMPORTS: frozenset[tuple[str, str]] = frozenset({
     ("cli", "eval"),
     ("cli", "gateway"),
     ("cli", "health"),
+    # Standalone CLI initializes only its application-managed default workspace;
+    # identity bootstrap is a lower-level service and never imports CLI back.
+    ("cli", "identity"),
     ("cli", "memory"),
     ("cli", "mcp_server"),
     ("cli", "migration"),

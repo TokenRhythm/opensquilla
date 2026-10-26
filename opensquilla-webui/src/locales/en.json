@@ -136,6 +136,22 @@
     "openDirectoryFailed": "Could not open the project directory. Try again.",
     "copyDirectoryFailed": "Could not copy the project directory path.",
     "projects": "Projects",
+    "addProject": "Add project",
+    "projectAction": "Project action",
+    "openExistingProject": "Open existing",
+    "saveParentDirectory": "Save in",
+    "projectLocation": "Project directory",
+    "chooseParentDirectory": "Choose parent directory",
+    "chooseExistingDirectory": "Choose existing directory",
+    "executionHost": "Computer: {host}",
+    "gatewayHost": "Gateway host",
+    "createLocationHint": "A new project directory will be created at this location.",
+    "openLocationHint": "The selected directory will be added to your projects.",
+    "createUnavailable": "This Gateway does not support creating and registering a project directly. You can still open an existing project or use the directory picker's new-folder action.",
+    "preparingProject": "Preparing…",
+    "projectOpened": "Opened project “{name}”",
+    "createProjectUnconfirmed": "There was a problem creating the project at {path}. Check the project list before trying again. {error}",
+    "openProjectFailed": "Could not open the project: {error}",
     "createProject": "Create project",
     "projectNamePlaceholder": "Project name",
     "sourceFolders": "Source folders",
@@ -281,6 +297,31 @@
     "dismiss": "Dismiss"
   },
   "workbench": {
+    "annotationUnified": {
+      "selectTarget": "Select content to annotate",
+      "start": "Annotate",
+      "stop": "Finish annotating",
+      "placeholder": "Describe a change…",
+      "recordHint": "Enter to record · Shift + Enter for a new line",
+      "record": "Keep annotating",
+      "submit": "Record {count} annotations",
+      "summary": "{count} annotations",
+      "empty": "Select text, an object or a range to describe a change.",
+      "locate": "Locate",
+      "edit": "Edit",
+      "reselect": "Select again",
+      "cancel": "Cancel this edit",
+      "delete": "Delete",
+      "queued": "Waiting to send",
+      "restoreQueued": "Cancel sending and restore annotations",
+      "otherPages": "Other pages",
+      "versionChanged": "Loaded the current working version. Select a target to annotate.",
+      "locationOnly": "Located the page. Select again to change the target.",
+      "stale": "The document changed. Select the target again.",
+      "unavailable": "Annotation is unavailable for this file or client.",
+      "submitFailed": "Could not queue annotations. Your drafts were kept.",
+      "recordToConversation": "Record in conversation"
+    },
     "tabs": {
       "copyLink": "Copy link",
       "openWeb": "Open web page",
@@ -314,7 +355,7 @@
       "hoverElement": "Click to request changes",
       "hoverRange": "Select cells, then release to describe your changes",
       "chooseContent": "First select the content to change",
-      "selectDocx": "Drag to select the text you want to change, then release to enter your request.",
+      "selectDocx": "Click a paragraph or drag to select specific text, then enter your request.",
       "selectPptx": "Click the object you want to change, then enter your request.",
       "selectXlsx": "Select a cell or drag across a range, then release to enter your request.",
       "cancelSelection": "Exit selection",
@@ -373,6 +414,7 @@
     },
     "resources": {
       "title": "Files", "count": "Files ({count})", "empty": "No files or links yet.",
+      "currentWorkingFile": "Current working file", "publishedVersion": "Published version",
       "groups": { "files": "Files", "links": "Links", "attachments": "Files", "documents": "Files", "deliverables": "Files", "urls": "Links" },
       "open": "Open {name}", "preparing": "Preparing editor…", "retry": "Retry", "preview": "Preview {name}", "download": "Download {name}", "edit": "Edit a copy of {name}", "publish": "Publish {name}",
       "imported": "{name} is ready to edit.", "published": "{name} is ready to share.",
@@ -470,9 +512,6 @@
       "exited": "Terminal exited",
       "state": { "starting": "Starting", "running": "Connected", "exited": "Exited", "error": "Unavailable" }
     },
-    "nativePreview": {
-      "capacityReached": "Four interactive previews are already open. Return to an existing preview or close one before opening another."
-    },
     "artifactAnnotation": {
       "start": "Request changes",
       "stop": "Stop annotating",
@@ -567,6 +606,15 @@
       "documentEditingRetired": "Update the client and reopen the page to send annotations as chat input."
     },
     "artifactDocument": {
+      "versionHistory": "Version history ({count})",
+      "currentVersion": "Current v{generation}",
+      "historicalVersion": "History",
+      "openLatest": "Open latest",
+      "viewDeliveredVersion": "View delivered version",
+      "viewRevision": "View this version",
+      "fixedSnapshot": "Delivered version",
+      "fixedSnapshotHint": "This is the version delivered in chat. Annotating opens the current working document and keeps the delivered version.",
+      "continueEditing": "Continue editing",
       "sections": "Artifact document sections",
       "preview": "Preview",
       "source": "Source",
@@ -3637,6 +3685,45 @@
     "bundleDifferentGateway": "Open the connected Gateway's own WebUI to download its support bundle."
   },
   "usageLogs": {
+    "capabilities": {
+      "unknown": "Unknown",
+      "partialMeter": "{value} · {count} unknown",
+      "metrics": {
+        "input_tokens": "Input tokens",
+        "output_tokens": "Output tokens",
+        "cache_read_tokens": "Cache read tokens",
+        "cache_write_tokens": "Cache write tokens",
+        "input_images": "Input images",
+        "input_video_seconds": "Input video duration",
+        "output_audio_seconds": "Output audio duration",
+        "requested_audio_seconds": "Requested audio duration",
+        "requests": "Requests",
+        "output_images": "Output images",
+        "input_audio_seconds": "Input audio",
+        "input_characters": "Input characters",
+        "requested_video_seconds": "Requested video duration",
+        "video_seconds": "Generated video duration",
+        "search_credits": "Search credits",
+        "scrape_credits": "Extraction credits",
+        "character_credits": "Character credits",
+        "cost_in_usd_ticks": "Provider cost units",
+        "input_text_tokens": "Input text tokens",
+        "output_text_tokens": "Output text tokens",
+        "input_audio_tokens": "Input audio tokens",
+        "output_audio_tokens": "Output audio tokens",
+        "input_image_tokens": "Input image tokens",
+        "output_image_tokens": "Output image tokens"
+      },
+      "units": {
+        "request": "requests",
+        "image": "images",
+        "second": "seconds",
+        "character": "characters",
+        "credit": "credits",
+        "token": "tokens",
+        "usd_tick_1e_10": "USD × 10⁻¹⁰"
+      }
+    },
     "tasks": {
       "unnamed": "Untitled task"
     },
@@ -3666,10 +3753,6 @@
       "cacheRead": "Cache R",
       "cacheWrite": "Cache W"
     },
-    "costHintTitle": "CNY values use baked-in rate {rate}. Verify against current FX for accounting use.",
-    "nativeCostHintTitle": "The original provider bill is in CNY; USD uses the fixed normalization rate recorded on the receipt.",
-    "nativeMixedCostHintTitle": "Mixed-currency or pending billing stays in canonical USD; original confirmed receipts are shown separately.",
-    "nativeBillingSubtotals": "Original receipts: {amounts}",
     "rangeHiddenHint": "{count} undated historical tasks hidden",
     "coverage": {
       "approximate": "Some historical usage is estimated from task totals.",
@@ -3727,10 +3810,10 @@
       "cacheRead": "Cache R",
       "cacheWrite": "Cache W",
       "cost": "Cost",
-      "source": "Source",
       "model": "Model"
     },
     "breakdown": {
+      "callTitle": "Call details",
       "title": "Model breakdown",
       "modelCount": "{count} models",
       "total": "{tokens} tokens · {cost}",
@@ -3739,35 +3822,28 @@
     "costSource": {
       "actual": {
         "label": "Actual",
-        "tooltip": "Actual — cost billed by the provider",
-        "short": "actual"
+        "tooltip": "Actual — cost billed by the provider"
       },
       "estimated": {
         "label": "Estimated",
-        "tooltip": "Estimated — derived locally from token counts",
-        "short": "estimated"
+        "tooltip": "Estimated — provider quote or a recorded local price"
       },
       "mixed": {
         "label": "Mixed",
-        "tooltip": "Mixed — partial billing data, rest estimated",
-        "short": "mixed"
+        "tooltip": "Mixed — partial billing data, rest estimated"
       },
       "unpriced": {
         "label": "Unpriced",
-        "tooltip": "Unpriced — no pricing table entry for this model",
-        "short": "unpriced"
+        "tooltip": "Unpriced — no pricing table entry for this model"
       },
       "none": {
-        "label": "None",
-        "tooltip": "No cost recorded",
-        "short": "none"
+        "label": "No cost recorded",
+        "tooltip": "No cost recorded"
       },
       "ephemeral": {
         "label": "Ephemeral",
-        "tooltip": "Ephemeral session — cost not yet persisted",
-        "short": "ephemeral"
-      },
-      "cacheBlindHint": "Includes estimates that price cached tokens at the full input rate — treat as an upper bound."
+        "tooltip": "Ephemeral session — cost not yet persisted"
+      }
     },
     "relTime": {
       "justNow": "just now",
@@ -3836,6 +3912,7 @@
       "continue": "Continue",
       "commandWithSkills": "Selected skills apply to a chat message. Remove the skill labels before running a command.",
       "commandDescriptions": {
+        "init": "Create or improve project instructions from the current project",
         "new": "Start a new chat",
         "compact": "Shorten the current context",
         "goal": "Set a long-running goal",
@@ -3999,6 +4076,7 @@
     "liveUnavailable": "Live updates are temporarily unavailable",
     "liveUnavailableDescription": "History remains available. Sending resumes when live updates recover.",
     "liveUnavailableConnectedDescription": "The Gateway is connected. Live updates for this session are temporarily unavailable.",
+    "liveRecoveryReloadDescription": "Live updates could not be restored. Save any unsent input, then reload this page to reconnect.",
     "reconnectLive": "Reconnect",
     "liveSendBlockedConnecting": "Live updates are reconnecting. Your draft is saved.",
     "liveSendBlockedDegraded": "Live updates are temporarily unavailable. Your draft is saved.",
@@ -4096,16 +4174,13 @@
     "subagentPrefix": "Subagent: ",
     "subagentCompletion": "Subagent completion",
     "turnFailed": "Turn failed",
-    "copyDiagnosticId": "Copy diagnostic ID",
-    "copiedDiagnosticId": "Diagnostic ID copied",
-    "copyDiagnosticFailed": "Copy failed. Select the ID above and copy it manually.",
     "errorMessage": {
       "unknown": "This request did not finish.",
       "noProvider": "No model is available.",
       "credentials": "Model service authentication failed.",
       "credits": "The model service account has insufficient credits.",
       "modelUnavailable": "The selected model is unavailable.",
-      "contextLimit": "The input exceeds the model limit.",
+      "contextLimit": "The content exceeds this model's capacity. Shorten the input or choose a larger-context model.",
       "unsupported": "This model does not support this request.",
       "imageUnsupported": "This model does not support images.",
       "ensembleImageUnsupported": "This mode does not support images.",
@@ -4118,7 +4193,7 @@
       "needsConfirmation": "Confirmation is needed to continue.",
       "toolDenied": "A required tool is not allowed.",
       "toolFailed": "A tool could not finish its work.",
-      "contextUnavailable": "The current conversation could not be processed.",
+      "contextUnavailable": "Context organization did not complete, so this request could not continue. Try again later.",
       "timeout": "The task timed out before it finished.",
       "stopped": "The task was stopped.",
       "interrupted": "The task was interrupted.",
@@ -4497,6 +4572,7 @@
       "sendingContinuing": "Sending reply · continuing run…"
     },
     "slashCommands": {
+      "initUnavailable": "This Gateway does not support project initialization. Update it and try again. Your draft was kept.",
       "side": {
         "closed": "The original side chat was closed. Your draft was kept. Edit the command before sending again to start a new side chat.",
         "description": "Open temporary side chat · /btw is an alias",
@@ -4682,10 +4758,14 @@
       "failureUnavailable": "The summarization model is unavailable",
       "failureProvider": "The model could not generate a usable summary",
       "failureTimeout": "Context organization timed out",
-      "failureRejectedDetail": "The summary was not applied; your original context is preserved. Retry, or copy the diagnostic ID for troubleshooting if it fails again.",
-      "failureUnavailableDetail": "Check the model configuration and connection, then retry. You can copy the diagnostic ID for troubleshooting.",
-      "failureRetryDetail": "You can retry context organization. If it fails again, copy the diagnostic ID for troubleshooting.",
+      "failureRejectedDetail": "The summary was not applied. You can try again later.",
+      "failureCapacityDetail": "Shorten the input or choose a model with a larger context window.",
+      "failureUnavailableDetail": "Check the model settings and network connection, or choose another model.",
+      "failureRetryDetail": "Try organizing the context again later, or choose another model.",
       "compacting": "Organizing context…",
+      "recovering": "Checking context organization status…",
+      "requestUnconfirmed": "Could not confirm the context organization request. Check the connection before trying again.",
+      "requestRejected": "The context organization request was rejected.",
       "compacted": "Context organized",
       "temporarilyReduced": "History temporarily reduced; continuing",
       "summarySaved": "Summary saved",
@@ -4693,12 +4773,12 @@
       "historyIncomplete": "Earlier context summarized; some original messages are unavailable",
       "historySummarized": "Earlier context summarized",
       "failed": "Context organization failed",
+      "incomplete": "Context organization did not complete",
       "withinBudget": "No organization needed; context has enough space",
       "noSafeHistory": "There is currently no history that can be safely organized",
       "alreadyConcise": "The current context is already concise",
       "skipped": "Context organization was not applied",
-      "cancelled": "Context organization cancelled",
-      "requestScoped": "Request-scoped; session history was not rewritten"
+      "cancelled": "Context organization cancelled"
     },
     "tool": {
       "genericCall": "Tool call",

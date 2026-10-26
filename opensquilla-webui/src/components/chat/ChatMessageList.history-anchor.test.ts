@@ -211,7 +211,8 @@ describe('ChatMessageList history anchors', () => {
       durability: 'durable',
       placement: 'transcript',
     })
-    expect(event?.textContent).toBe('Context organizedjust now')
+    expect(event?.textContent).toBe('Context organized')
+    expect(event?.querySelector('time')).toBeNull()
     expect(event?.querySelector('details')).toBeNull()
     const events = host.querySelectorAll<HTMLElement>('[data-testid="compaction-event"]')
     expect(events[1]?.textContent).toContain(

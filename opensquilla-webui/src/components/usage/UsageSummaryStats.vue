@@ -13,7 +13,6 @@
     <div class="stat control-stat">
       <div class="stat-label control-stat__label">{{ t('usageLogs.summary.totalCost') }}</div>
       <div class="stat-value mono control-stat__value control-stat__value--mono">{{ totalCost }}</div>
-      <div class="stat-hint control-stat__hint" :title="costHintTitle">{{ costHintText }}</div>
     </div>
     <div class="stat control-stat">
       <div class="stat-label control-stat__label">{{ t('usageLogs.summary.sessions') }}</div>
@@ -37,8 +36,6 @@ defineProps<{
   totalTokens: string
   tokenParts: Array<{ label: string; value: string }>
   totalCost: string
-  costHintText: string
-  costHintTitle: string
   sessionCount: string
   avgCost: string
 }>()
@@ -49,6 +46,17 @@ defineProps<{
   color: var(--text-dim);
   font-style: normal;
   margin-right: 4px;
+}
+
+@media (min-width: 761px) {
+  .usage-token-breakdown {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 2px 6px;
+  }
+  .usage-token-breakdown > span {
+    white-space: nowrap;
+  }
 }
 
 @media (max-width: 760px) {

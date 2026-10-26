@@ -22,6 +22,7 @@ from opensquilla.paths import native_io_path
 from opensquilla.project_workspaces import project_path_key
 from opensquilla.session.manager import SessionManager
 from opensquilla.session.storage import SessionStorage
+from opensquilla.tools.source_edit_contract import workspace_file_reference, workspace_reference_id
 
 
 @pytest.fixture
@@ -68,6 +69,34 @@ async def resolve(files, paths, **kwargs):
     return await files.client.post(
         "/api/v1/workspace-files/resolve", json={"paths": paths}, **kwargs
     )
+
+
+async def test_reference_resolution_http_preserves_scope_and_never_registers(files):
+    (files.root / "report.html").write_text("<h1>Existing file</h1>")
+    reference = workspace_file_reference(
+        "report.html", revision="file_" + "0" * 16, start_line=1, end_line=1,
+        session_key=files.session.session_key, workspace_id=workspace_reference_id(files.root),
+    )
+    response = await files.client.post(
+        "/api/v1/workspace-files/resolve",
+        json={"paths": ["report.html"], "reference": reference},
+    )
+    assert response.status_code == 200, response.text
+    assert response.json()["referenceScopeValidated"] is True
+    assert response.json()["files"][0]["path"] == "report.html"
+    assert "documentTarget" not in response.json()["files"][0]
+    assert reference is not None
+    reference["scope"]["workspaceId"] = "workspace_another"
+    denied = await files.client.post(
+        "/api/v1/workspace-files/resolve",
+        json={"paths": ["report.html"], "reference": reference},
+    )
+    assert denied.status_code == 404
+    malformed = await files.client.post(
+        "/api/v1/workspace-files/resolve",
+        json={"paths": ["report.html"], "reference": None},
+    )
+    assert malformed.status_code == 400
 
 
 async def read_page(files, *, path="source.py", binding=None, start=1, end=200, **kwargs):

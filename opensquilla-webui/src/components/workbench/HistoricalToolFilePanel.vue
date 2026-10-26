@@ -11,8 +11,7 @@ const props = defineProps<{
   downloadError?: boolean
 }>()
 const { t } = useI18n()
-const copyFeedback = computed(() => props.copyState === 'copied' ? t('workspaceReference.copied')
-  : props.copyState === 'error' ? t('workspaceReference.copyFailed') : '')
+const copyFeedback = computed(() => props.copyState === 'error' ? t('workspaceReference.copyFailed') : '')
 </script>
 
 <template>

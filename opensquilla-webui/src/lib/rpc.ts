@@ -3,6 +3,7 @@
 import { TRANSPORT_SESSION_FLOW_V2_CAPABILITY } from '@/contracts/transportFlowCapabilities';
 
 const ANSWER_GENERATION_RESET_CAPABILITY = 'session.answer_generation_reset.v1';
+const PROVIDER_CALL_RESET_CAPABILITY = 'session.answer_generation_reset.v2';
 const TURN_COMMITTED_CAPABILITY = 'session.turn_committed.v1';
 const PROBE_CAPABILITY = 'transport.probe.v1';
 // Preserve this client-facing export while keeping the wire/method mapping in
@@ -1146,6 +1147,7 @@ export class RpcClient {
                   maxProtocol: WEB_RPC_PROTOCOL_VERSION,
                   caps: [
                     ANSWER_GENERATION_RESET_CAPABILITY,
+                    PROVIDER_CALL_RESET_CAPABILITY,
                     TURN_COMMITTED_CAPABILITY,
                     PROBE_CAPABILITY,
                     ...(this._consumptionFlowEnabled ? [

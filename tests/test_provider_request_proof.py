@@ -54,7 +54,7 @@ def test_physical_budget_uses_wire_generation_cap_without_double_counting_thinki
         thinking=True,
         thinking_budget_tokens=10_000,
     )
-    assert provider_request_token_budget({"max_tokens": 14_096}, config) == 93_904
+    assert provider_request_token_budget({"max_tokens": 14_096}, config) == 113_904
     assert "provider_context_window_tokens" not in config.model_dump()
     assert "provider_context_window_tokens" not in repr(config)
     assert provider_request_token_budget({}, ChatConfig()) is None
@@ -71,8 +71,8 @@ def test_character_budget_preserves_explicit_cap_and_rebinds_only_derived_cap(
         provider_request_max_chars_explicit_cap=0,
     ).model_copy(update={"provider_request_max_chars_explicit_cap": explicit})
     payload = {"max_tokens": 4_000}
-    assert provider_request_token_budget(payload, config) == 24_000
-    expected = 9_999 if explicit is None else explicit or 96_000
+    assert provider_request_token_budget(payload, config) == 28_000
+    expected = 9_999 if explicit is None else explicit or 112_000
     assert provider_request_character_budget(payload, config) == expected
 
 

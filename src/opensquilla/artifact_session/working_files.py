@@ -32,6 +32,7 @@ from opensquilla.office_format import (
     office_format,
     validate_office_bytes,
 )
+from opensquilla.paths import native_io_path
 
 from .errors import ArtifactConflictError, ArtifactValidationError
 from .models import (
@@ -80,13 +81,15 @@ def checked_path(root: Path, relative: str) -> Path:
     ):
         raise ArtifactValidationError("Invalid working resource path")
     path = root
-    if root.is_symlink() or root.resolve() != root.absolute():
+    native_root = native_io_path(root)
+    if native_root.is_symlink() or native_root.resolve() != native_root.absolute():
         raise ArtifactValidationError("Working directory contains a link")
     for part in logical.parts:
         path = path / part
-        if path.is_symlink() or getattr(path, "is_junction", lambda: False)():
+        native_path = native_io_path(path)
+        if native_path.is_symlink() or getattr(native_path, "is_junction", lambda: False)():
             raise ArtifactValidationError("Working resource contains a link")
-    if not path.resolve().is_relative_to(root.resolve()):
+    if not native_io_path(path).resolve().is_relative_to(native_root.resolve()):
         raise ArtifactValidationError("Working resource is outside its directory")
     return path
 
@@ -1534,11 +1537,11 @@ def _write_office_candidate(
     payload: bytes,
 ) -> Path:
     path = office_candidate_path(binding, candidate)
-    path.parent.mkdir(parents=True, exist_ok=True)
+    native_io_path(path.parent).mkdir(parents=True, exist_ok=True)
     # Revalidate all ancestors after creation and use exclusive creation.
     path = office_candidate_path(binding, candidate)
-    if not path.exists():
-        with path.open("xb") as output:
+    if not native_io_path(path).exists():
+        with native_io_path(path).open("xb") as output:
             output.write(payload)
             output.flush()
             os.fsync(output.fileno())
@@ -1558,9 +1561,9 @@ async def discard_office_candidate(
         return
     path = office_candidate_path(binding, candidate)
     # Only delete our exact file; do not follow links or remove Agent-created siblings.
-    path.unlink(missing_ok=True)
+    native_io_path(path).unlink(missing_ok=True)
     try:
-        path.parent.rmdir()
+        native_io_path(path.parent).rmdir()
     except OSError:
         pass
 

@@ -24,6 +24,7 @@ from opensquilla.gateway.provider_runtime import (
     sync_resolved_provider_selector,
 )
 from opensquilla.gateway.setup_config_runtime import sync_media_runtime
+from opensquilla.onboarding.image_generation_state import preserve_image_routing_provenance
 from opensquilla.provider.model_catalog import shared_catalog
 from opensquilla.provider.preset_registry import legacy_profile_ids
 from opensquilla.telemetry.consent_transition import global_network_observability_transition
@@ -167,6 +168,8 @@ async def _reconcile_tokenrhythm_profile_after_config_change(
 class GatewayAppSettingsPort:
     """Bind the settings owner's model/storage operations to the running Gateway."""
 
+    _explicit_image_route_paths: set[str]
+
     profile_ids = legacy_profile_ids()
     replace = staticmethod(_update_config_in_place)
     reconcile_routing = staticmethod(reconcile_model_routing_write)
@@ -174,6 +177,9 @@ class GatewayAppSettingsPort:
     def validate_routing(self, previous: Any, candidate: Any, explicit_paths: set[str]) -> None:
         from opensquilla.onboarding.router_policy import validate_router_reactivation
 
+        self._explicit_image_route_paths = preserve_image_routing_provenance(
+            previous, candidate, explicit_paths, full_apply=self.source == "config.apply",
+        )
         previous_router = getattr(previous, "squilla_router", None)
         candidate_router = getattr(candidate, "squilla_router", None)
         owns_preset = any(
@@ -229,6 +235,7 @@ class GatewayAppSettingsPort:
         self.provider_selector = provider_selector
         self.subscription_manager = subscription_manager
         self.source = source
+        self._explicit_image_route_paths = set()
 
     def read_public_settings(self) -> SettingsObject:
         config = self.config
@@ -274,9 +281,14 @@ class GatewayAppSettingsPort:
 
         return cast(SettingsObject, _router_tier_profile_defaults(profile))
 
-    @staticmethod
-    def persist(config: GatewayConfig) -> None:
+    def persist(self, config: GatewayConfig) -> None:
+        # Candidate construction inherits the source's persistence provenance
+        # after validation. Apply these explicit choices only after that copy;
+        # config.apply has no general force-persist set for equal defaults.
+        for path in self._explicit_image_route_paths:
+            config.mark_force_persist(path)
         persist_gateway_config(config)
+        self._explicit_image_route_paths.clear()
 
     def mutation_scope(self, candidate: GatewayConfig) -> AbstractAsyncContextManager[None]:
         return global_network_observability_transition(self.config, candidate)

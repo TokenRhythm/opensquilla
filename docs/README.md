@@ -33,6 +33,8 @@ root release README with task-oriented guides.
 - [`features/tool-compression.md`](features/tool-compression.md) - compact tool
   results and handles.
 - [`features/memory.md`](features/memory.md) - durable memory and recall.
+- [`features/project-workspaces.md`](features/project-workspaces.md) - open or
+  create projects, initialize instructions, and apply project rules.
 - [`features/skills.md`](features/skills.md) - skill discovery, install, and
   authoring.
 - [`features/compaction-and-cache.md`](features/compaction-and-cache.md) -
@@ -42,6 +44,7 @@ root release README with task-oriented guides.
 
 ## Surfaces and Operations
 
+- [`releases/0.5.7.md`](releases/0.5.7.md) - OpenSquilla 0.5.7 release notes.
 - [`releases/0.5.6.md`](releases/0.5.6.md) - OpenSquilla 0.5.6 release notes.
 - [`releases/0.5.5.md`](releases/0.5.5.md) - OpenSquilla 0.5.5 release notes.
 - [`releases/0.5.4.md`](releases/0.5.4.md) - OpenSquilla 0.5.4 release notes.

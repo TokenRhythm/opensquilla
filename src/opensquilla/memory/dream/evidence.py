@@ -15,8 +15,9 @@ from opensquilla.memory.dream.models import (
 )
 
 
-def promotion_evidence_path(workspace: Path) -> Path:
-    return workspace / "memory" / ".dream_state" / "promotion_evidence.json"
+def promotion_evidence_path(workspace: Path, *, notes_dir: Path | None = None) -> Path:
+    notes = notes_dir if notes_dir is not None else workspace / "memory"
+    return notes / ".dream_state" / "promotion_evidence.json"
 
 
 def _normalize_snippet(text: str) -> str:
@@ -75,8 +76,10 @@ def _entry_from_dict(raw: dict[str, Any]) -> PromotionEvidenceEntry | None:
         return None
 
 
-def load_evidence_store(workspace: Path) -> PromotionEvidenceStore:
-    path = promotion_evidence_path(workspace)
+def load_evidence_store(
+    workspace: Path, *, notes_dir: Path | None = None,
+) -> PromotionEvidenceStore:
+    path = promotion_evidence_path(workspace, notes_dir=notes_dir)
     try:
         raw = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError):
@@ -99,8 +102,10 @@ def load_evidence_store(workspace: Path) -> PromotionEvidenceStore:
     )
 
 
-def write_evidence_store(workspace: Path, store: PromotionEvidenceStore) -> None:
-    path = promotion_evidence_path(workspace)
+def write_evidence_store(
+    workspace: Path, store: PromotionEvidenceStore, *, notes_dir: Path | None = None,
+) -> None:
+    path = promotion_evidence_path(workspace, notes_dir=notes_dir)
     path.parent.mkdir(parents=True, exist_ok=True)
     payload = {
         "version": store.version,
@@ -129,8 +134,9 @@ def update_promotion_evidence(
     *,
     now_iso: str,
     persist: bool = True,
+    notes_dir: Path | None = None,
 ) -> PromotionEvidenceStore:
-    store = load_evidence_store(workspace)
+    store = load_evidence_store(workspace, notes_dir=notes_dir)
     for candidate in candidates:
         snippet = candidate.snippet.strip()
         if not snippet:
@@ -179,7 +185,7 @@ def update_promotion_evidence(
         _increment_signal(entry, candidate.signal_kind)
     store.updated_at = now_iso
     if persist:
-        write_evidence_store(workspace, store)
+        write_evidence_store(workspace, store, notes_dir=notes_dir)
     return store
 
 

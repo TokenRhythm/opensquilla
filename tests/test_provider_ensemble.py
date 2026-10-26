@@ -59,7 +59,12 @@ from opensquilla.provider.ensemble import (
     build_ensemble_provider_from_config,
     ensemble_runtime_status,
 )
-from opensquilla.provider.failures import ProviderFailureKind
+from opensquilla.provider.failures import (
+    ProviderFailureKind,
+    ProviderRecoveryAction,
+    classify_provider_error,
+    decide_recovery_action,
+)
 from opensquilla.provider.image_projection import count_image_blocks
 from opensquilla.provider.model_catalog import ModelCatalog
 from opensquilla.provider.request_proof import project_final_request_payload
@@ -2094,6 +2099,191 @@ async def test_ensemble_forwards_uniform_proposer_message_limit_proof(
     assert error.message == "safe validation detail"
     assert error.message_limit_proof == proof
     assert [call["model"] for call in registry.calls] == ["p1", "p2"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("proposer_retries", [0, 1])
+@pytest.mark.parametrize("raw_code", ["400", "LITELLM_ERROR"])
+async def test_ensemble_forwards_uniform_native_input_overflow(
+    monkeypatch: pytest.MonkeyPatch, proposer_retries: int, raw_code: str,
+) -> None:
+    original = ErrorEvent(
+        message="Range of input length should be [1, 983616]",
+        code=raw_code, http_status=400, provider_code="LITELLM_ERROR",
+    )
+    registry = _FakeRegistry({
+        "p1": _FakePlan([original]),
+        "p2": _FakePlan([replace(original, message="second: " + original.message)]),
+        "agg": _FakePlan([]),
+    })
+    monkeypatch.setattr("opensquilla.provider.ensemble._build_provider", registry.provider_for)
+    provider = EnsembleProvider(
+        profile_name="native-overflow", proposers=[_member("p1"), _member("p2")],
+        aggregator=_member("agg"), all_failed_policy="error",
+        proposer_max_retries=proposer_retries, shuffle_candidates=False,
+    )
+    events = [event async for event in provider.chat(
+        [Message(role="user", content="Continue the active task")],
+        config=ChatConfig(provider_context_window_tokens=32768, max_tokens=2048),
+    )]
+    error = next(event for event in events if isinstance(event, ErrorEvent))
+    assert (error.message, error.code, error.http_status, error.provider_code) == (
+        original.message, original.code, original.http_status, original.provider_code,
+    )
+    kind = classify_provider_error(
+        "ensemble", error.http_status, raw_code=error.provider_code or error.code,
+        message=error.message,
+    )
+    assert decide_recovery_action(kind) is ProviderRecoveryAction.COMPACT_AND_RETRY
+    assert [call["model"] for call in registry.calls] == ["p1", "p2"]
+    assert error.usage_missing_count == 2
+    # Existing accounting emits explicit failed-attempt rows only when the
+    # proposer attempt ledger is enabled; missing receipts remain counted.
+    assert len(error.model_usage_breakdown) == (2 if proposer_retries else 0)
+    assert all(row["error_code"] == raw_code for row in error.model_usage_breakdown)
+    assert not any(isinstance(event, (DoneEvent, ProviderGenerationResetEvent)) for event in events)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("other", [
+    "mixed", "auth", "quota", "rate", "cancel", "not_started", "partial_success", "partial_text",
+])
+async def test_ensemble_native_overflow_requires_all_started_failed_candidates(
+    monkeypatch: pytest.MonkeyPatch, other: str,
+) -> None:
+    overflow = ErrorEvent(
+        message="Range of input length should be [1, 983616]",
+        code="400", http_status=400, provider_code="LITELLM_ERROR",
+    )
+    other_errors = {
+        "mixed": ErrorEvent(message="upstream failed", code="500"),
+        "auth": replace(overflow, provider_code="invalid_api_key"),
+        "quota": replace(overflow, provider_code="insufficient_quota"),
+        "rate": replace(overflow, provider_code="rate_limit_exceeded"),
+        "cancel": replace(overflow, code="cancelled", provider_code="cancelled"),
+    }
+    second_events = (
+        [TextDeltaEvent(text="usable draft"), DoneEvent(model="p2")]
+        if other == "partial_success" else
+        [TextDeltaEvent(text="incomplete draft"), overflow]
+        if other == "partial_text" else [other_errors.get(other, overflow)]
+    )
+    registry = _FakeRegistry({
+        "p1": _FakePlan([overflow]), "p2": _FakePlan(second_events), "agg": _FakePlan([]),
+    })
+    monkeypatch.setattr("opensquilla.provider.ensemble._build_provider", registry.provider_for)
+    second = _member("p2")
+    if other == "not_started":
+        second = replace(second, ready=False, unavailable_reason="deployment_unavailable")
+    provider = EnsembleProvider(
+        profile_name="native-overflow-mixed", proposers=[_member("p1"), second],
+        aggregator=_member("agg"), all_failed_policy="error",
+        min_successful_proposers=2 if other == "partial_success" else 1,
+        shuffle_candidates=False,
+    )
+    events = [event async for event in provider.chat(
+        [Message(role="user", content="Continue the active task")],
+        config=ChatConfig(provider_context_window_tokens=32768, max_tokens=2048),
+    )]
+    error = next(event for event in events if isinstance(event, ErrorEvent))
+    assert error.code == "ensemble_insufficient_proposers"
+    assert [call["model"] for call in registry.calls] == (
+        ["p1"] if other == "not_started" else ["p1", "p2"]
+    )
+    assert not any(isinstance(event, DoneEvent) for event in events)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("authorized_fallback", [False, True])
+async def test_ensemble_uniform_native_overflow_reaches_agent_capacity_boundary(
+    monkeypatch: pytest.MonkeyPatch, authorized_fallback: bool,
+) -> None:
+    from opensquilla.engine import Agent, AgentConfig
+    from opensquilla.engine import DoneEvent as AgentDoneEvent
+    from opensquilla.engine import ErrorEvent as AgentErrorEvent
+    from opensquilla.engine.runtime import _SelectorFallbackProvider
+    from opensquilla.engine.types import CompactionEvent
+    from opensquilla.provider import ModelCapabilities
+    from opensquilla.provider.selector import ModelSelector, SelectorConfig
+
+    monkeypatch.setattr("opensquilla.token_estimation._get_encoding", lambda: None)
+    overflow = ErrorEvent(
+        message="Range of input length should be [1, 983616]",
+        code="400", http_status=400, provider_code="LITELLM_ERROR",
+    )
+    registry = _AttemptRegistry({
+        model: [_FakePlan([overflow]), _FakePlan([
+            TextDeltaEvent(text="draft"), DoneEvent(model=model),
+        ])] for model in ["p1", "p2"]
+    })
+    registry.plans["agg"] = [_FakePlan([
+        TextDeltaEvent(text="Continued safely"), DoneEvent(model="agg"),
+    ])]
+    registry.plans["large"] = [_FakePlan([
+        TextDeltaEvent(text="Continued on the authorized model"), DoneEvent(model="large"),
+    ])]
+    monkeypatch.setattr("opensquilla.provider.ensemble._build_provider", registry.provider_for)
+    provider = EnsembleProvider(
+        profile_name="native-overflow-agent", proposers=[_member("p1"), _member("p2")],
+        aggregator=_member("agg"), all_failed_policy="error", shuffle_candidates=False,
+    )
+    if authorized_fallback:
+        primary = ProviderConfig(provider="ensemble", model="ensemble/native-overflow-agent")
+        large = ProviderConfig(provider="fake", model="large")
+        monkeypatch.setattr(
+            "opensquilla.provider.selector._build_provider",
+            lambda cfg: provider if cfg == primary else registry.provider_for(cfg),
+        )
+        selector = ModelSelector(SelectorConfig(primary=primary, fallbacks=[large]))
+        wrapper = _SelectorFallbackProvider(provider, selector)
+        wrapper.configure_fallback_deployment_limits([
+            (primary, 32768, 2048, ModelCapabilities()),
+            (large, 131072, 2048, ModelCapabilities()),
+        ])
+        monkeypatch.setattr(
+            "opensquilla.engine.runtime.resolve_effective_context_window",
+            lambda _catalog, model, **kwargs: (131072 if model == "large" else 32768, "catalog"),
+        )
+    else:
+        wrapper = provider
+    agent = Agent(provider=wrapper, config=AgentConfig(
+        context_window_tokens=32768,
+        context_window_known=True, max_tokens=2048, max_provider_retries=0,
+        max_overflow_retries=2, timeout=10, iteration_timeout=10,
+        provider_id="ensemble", model_id="ensemble/native-overflow-agent",
+    ))
+    history = [
+        entry for index in range(4) for entry in (
+            Message(role="user", content=f"Historical data {index}: " + "x" * 10000),
+            Message(role="assistant", content="Recorded"),
+        )
+    ]
+    agent.set_history(history)
+
+    async def unexpected_summary(*args, **kwargs):
+        raise AssertionError("Native overflow recovery must not create a durable summary")
+
+    monkeypatch.setattr("opensquilla.engine.agent.compact_context", unexpected_summary)
+    current = "Continue the existing task and preserve its authorization"
+    events = [event async for event in agent.run_turn(current)]
+    if authorized_fallback:
+        assert any(isinstance(event, AgentDoneEvent) for event in events), events
+        assert not any(isinstance(event, AgentErrorEvent) for event in events)
+        assert [call["model"] for call in registry.calls] == ["p1", "p2", "large"]
+        assert current in json.dumps([
+            message.model_dump(mode="json") for message in registry.calls[-1]["messages"]
+        ])
+        assert registry.calls[-1]["config"].provider_context_window_tokens == 131072
+    else:
+        # Ensemble has no single outer physical projection. Without an
+        # authorized capacity fallback, do not invent a safe shrink or rerun
+        # every proposer: expose the precise capacity failure once.
+        errors = [event for event in events if isinstance(event, AgentErrorEvent)]
+        assert [event.code for event in errors] == ["provider_request_too_large"]
+        assert not any(isinstance(event, AgentDoneEvent) for event in events)
+        assert [call["model"] for call in registry.calls] == ["p1", "p2"]
+    assert not any(isinstance(event, CompactionEvent) for event in events)
+    assert agent.history_snapshot()[:len(history)] == history
 
 
 @pytest.mark.asyncio
@@ -8014,21 +8204,35 @@ async def test_configured_quorum_cannot_cancel_pending_successful_proposers(
     quorum_grace_seconds: float,
 ) -> None:
     slow_gate = asyncio.Event()
+    started = {model: asyncio.Event() for model in ("p1", "p2", "p3", "p4")}
+    p1_closed = asyncio.Event()
+    p2_closed = asyncio.Event()
     p3_closed = asyncio.Event()
     p4_closed = asyncio.Event()
     fallback_started = asyncio.Event()
+    closed_at_fallback: list[tuple[bool, bool]] = []
     registry = _FakeRegistry(
         {
-            "p1": _FakePlan([ErrorEvent(message="p1 failed", code="upstream")]),
-            "p2": _FakePlan([ErrorEvent(message="p2 failed", code="upstream")]),
+            "p1": _FakePlan(
+                [ErrorEvent(message="p1 failed", code="upstream")],
+                started=started["p1"],
+                closed=p1_closed,
+            ),
+            "p2": _FakePlan(
+                [ErrorEvent(message="p2 failed", code="upstream")],
+                started=started["p2"],
+                closed=p2_closed,
+            ),
             "p3": _FakePlan(
                 [TextDeltaEvent(text="d3"), DoneEvent(model="p3")],
                 gate=slow_gate,
+                started=started["p3"],
                 closed=p3_closed,
             ),
             "p4": _FakePlan(
                 [TextDeltaEvent(text="d4"), DoneEvent(model="p4")],
                 gate=slow_gate,
+                started=started["p4"],
                 closed=p4_closed,
             ),
             "agg": _FakePlan([TextDeltaEvent(text="unused"), DoneEvent(model="agg")]),
@@ -8046,6 +8250,7 @@ async def test_configured_quorum_cannot_cancel_pending_successful_proposers(
             config: ChatConfig | None = None,
         ) -> AsyncIterator[StreamEvent]:
             async def _stream() -> AsyncIterator[StreamEvent]:
+                closed_at_fallback.append((p3_closed.is_set(), p4_closed.is_set()))
                 fallback_started.set()
                 yield TextDeltaEvent(text="single")
                 yield DoneEvent(model="single")
@@ -8067,12 +8272,96 @@ async def test_configured_quorum_cannot_cancel_pending_successful_proposers(
         shuffle_candidates=False,
     )
 
+    coordinator_waiting_for_successes = asyncio.Event()
+    candidate_tasks: dict[str, asyncio.Task[Any]] = {}
+    collect_candidate = provider._collect_candidate
+    real_wait = asyncio.wait
+
+    async def observe_candidate(**kwargs: Any) -> Any:
+        task = asyncio.current_task()
+        assert task is not None
+        candidate_tasks[kwargs["member"].provider_config.model] = task
+        return await collect_candidate(**kwargs)
+
+    async def observe_wait(tasks: Any, **kwargs: Any) -> Any:
+        waiting = set(tasks)
+        if (
+            set(candidate_tasks) == {"p1", "p2", "p3", "p4"}
+            and waiting == {candidate_tasks["p3"], candidate_tasks["p4"]}
+            and candidate_tasks["p1"].done()
+            and candidate_tasks["p2"].done()
+        ):
+            # _run_proposers has consumed both failures and entered its next
+            # wait with exactly the two successful-but-still-gated candidates.
+            coordinator_waiting_for_successes.set()
+        return await real_wait(waiting, **kwargs)
+
+    monkeypatch.setattr(provider, "_collect_candidate", observe_candidate)
+    monkeypatch.setattr(
+        "opensquilla.provider.ensemble.asyncio",
+        SimpleNamespace(**dict(vars(asyncio), wait=observe_wait)),
+    )
     consume_task = asyncio.create_task(_collect(provider))
-    await asyncio.sleep(0.05)
-    assert "agg" not in [call["model"] for call in registry.calls]
-    assert fallback_started.is_set() is False
-    slow_gate.set()
-    events = await asyncio.wait_for(consume_task, timeout=1.0)
+    coordinator_barrier = asyncio.create_task(coordinator_waiting_for_successes.wait())
+    primary_failure: BaseException | None = None
+    phase = "proposer startup and failed-proposer completion"
+    try:
+        # Event barriers prove the pending-proposer state. This is an ordering
+        # contract, not a one-second end-to-end scheduling benchmark on CI.
+        async with asyncio.timeout(10.0):
+            await asyncio.gather(
+                *(event.wait() for event in started.values()),
+                p1_closed.wait(),
+                p2_closed.wait(),
+            )
+            phase = "coordinator processing failures and retaining pending successes"
+            observed, _ = await asyncio.wait(
+                {coordinator_barrier, consume_task}, return_when=asyncio.FIRST_COMPLETED
+            )
+            assert coordinator_barrier in observed, (
+                "Ensemble completed before retaining the two pending successful proposers"
+            )
+            assert slow_gate.is_set() is False
+            assert p3_closed.is_set() is False
+            assert p4_closed.is_set() is False
+            assert "agg" not in [call["model"] for call in registry.calls]
+            assert fallback_started.is_set() is False
+
+            phase = "successful-proposer completion and fallback startup"
+            slow_gate.set()
+            await asyncio.gather(
+                p3_closed.wait(), p4_closed.wait(), fallback_started.wait()
+            )
+            assert closed_at_fallback == [(True, True)]
+            phase = "fallback stream completion"
+            events = await consume_task
+    except TimeoutError as exc:
+        primary_failure = AssertionError(
+            f"Ensemble fixture stalled during {phase}; "
+            f"started={[(model, event.is_set()) for model, event in started.items()]}; "
+            f"closed={[event.is_set() for event in (p1_closed, p2_closed, p3_closed, p4_closed)]}; "
+            f"fallback_started={fallback_started.is_set()}; "
+            f"calls={[call['model'] for call in registry.calls]}; "
+            f"consumer_done={consume_task.done()}"
+        )
+        raise primary_failure from exc
+    except BaseException as exc:
+        primary_failure = exc
+        raise
+    finally:
+        slow_gate.set()
+        for task in (coordinator_barrier, consume_task):
+            if not task.done():
+                task.cancel()
+        try:
+            await asyncio.wait_for(
+                asyncio.gather(coordinator_barrier, consume_task, return_exceptions=True),
+                timeout=10.0,
+            )
+        except TimeoutError as exc:
+            if primary_failure is None:
+                raise AssertionError("Ensemble fixture cleanup timed out") from exc
+            primary_failure.add_note("Ensemble fixture cleanup also exceeded its 10s hangguard")
 
     assert slow_gate.is_set() is True
     assert p3_closed.is_set() is True

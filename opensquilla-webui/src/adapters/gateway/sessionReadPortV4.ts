@@ -1,4 +1,4 @@
-import type { TransportCallOptions as RpcCallOptions, TransportLaneRetireReceipt } from './transportTypes'
+import type { TransportCallOptions as RpcCallOptions, TransportLaneOwner, TransportLaneRetireReceipt } from './transportTypes'
 import {
   SESSIONS_MESSAGES_HYDRATE_METHOD,
   type SessionsMessagesHydrateParams,
@@ -98,7 +98,8 @@ interface SessionReadV4Transport {
   recoveryVersion?(key: string): string
   snapshotInstalled?(key: string, version: string): void
   retireLane?(receipt: TransportLaneRetireReceipt): Promise<void> | void
-  waitForConsumption?(key: string, cursor?: { streamGeneration: string; fromSeq: number; toSeq: number }): Promise<void>
+  claimLaneOwner?(key: string, generation: number): TransportLaneOwner | undefined
+  waitForConsumption?(key: string, cursor?: { streamGeneration: string; fromSeq: number; toSeq: number; replayAccepted?: boolean }): Promise<void>
   failProtocol?(generation: number): void
 }
 
@@ -538,8 +539,12 @@ export function createV4SessionReadPort(
       let transfer: SessionSnapshotTransfer | null = null
       let terminalSnapshotError: unknown = null
       let subscribedGeneration: number | null = null
+      let laneOwner: TransportLaneOwner | undefined
       let v2Lease: SessionReadV2Lease | null = null
       let v2BaseApplied = false
+      const v2Controller = new AbortController()
+      const abortV2 = () => v2Controller.abort()
+      request.signal.addEventListener('abort', abortV2, { once: true })
 
       async function createContext(): Promise<OpenContext> {
         const admissionDeadline = performance.now() + READ_TIMEOUT_MS
@@ -640,6 +645,9 @@ export function createV4SessionReadPort(
                   initial ? Math.max(1, admissionDeadline - performance.now()) : READ_TIMEOUT_MS,
                   expectedGeneration,
                   generation => {
+                    if (subscribedGeneration !== generation || !laneOwner) {
+                      laneOwner = rpc.claimLaneOwner?.(request.sessionKey, generation)
+                    }
                     subscribedGeneration = generation
                     subscribeSent.sent(generation)
                   },
@@ -657,16 +665,13 @@ export function createV4SessionReadPort(
             }
             if (v2Enabled && !v2BaseApplied) {
               if (!v2Lease) {
-                const modern = await openV2SessionRead(rpc, request.sessionKey, expectedGeneration, request.signal)
+                const modern = await openV2SessionRead(rpc, request.sessionKey, expectedGeneration, v2Controller.signal)
                 try {
                   assertAdmissionCurrent()
                 } catch (error) {
-                  // Open is idempotent by connection/key. A replacement owner
-                  // may already have adopted this exact lease; do not close it.
-                  const currentOwner = owners.get(request.sessionKey)
-                  if (rpc.generation === expectedGeneration && (!currentOwner || currentOwner === owner)) {
-                    await modern.close()
-                  }
+                  // This releases only the obsolete consumer. A same-key view
+                  // may retain its own handle to the shared physical lease.
+                  await modern.close()
                   throw error
                 }
                 // Own the lease before base installation can fail or cancel.
@@ -947,11 +952,13 @@ export function createV4SessionReadPort(
 
       const historyRead = (historyRequest: SessionReadPortHistoryRequest) => acquireContext().then(
         context => context.readHistory(historyRequest),
-      )
+      ).catch(error => { throw mapSessionReadError(error) })
 
       async function close(): Promise<void> {
         if (closed) return
         closed = true
+        v2Controller.abort()
+        request.signal.removeEventListener('abort', abortV2)
         transfer?.release()
         // No await before the ownership/send decision: a pending ready wait
         // cannot later send subscribe after this local close.
@@ -959,6 +966,10 @@ export function createV4SessionReadPort(
         owners.delete(request.sessionKey)
         const generation = subscribedGeneration
         if (generation === null || rpc.generation !== generation) return
+        // Fence the departing consumer synchronously, before read-close or
+        // unsubscribe can yield. The server's retire receipt still owns credit.
+        const departingLane = laneOwner
+        departingLane?.beginRetirement()
         const modern = v2Lease
         v2Lease = null
         const cleanup: Promise<unknown>[] = []
@@ -979,13 +990,19 @@ export function createV4SessionReadPort(
               SESSIONS_MESSAGES_UNSUBSCRIBE_METHOD, value, validateSessionsMessagesUnsubscribeResult,
             )
             const retire = retireResult?.lane_retire
-            if (retire && rpc.retireLane) {
+            if (departingLane) {
+              void departingLane.completeRetirement(retire ?? null).catch(() => {})
+            } else if (retire && rpc.retireLane) {
               void Promise.resolve(rpc.retireLane(retire)).catch(() => {})
             }
             sent.sent(generation)
-          }).catch(error => { sent.failed(error) })
+          }).catch(error => {
+            departingLane?.failRetirement()
+            sent.failed(error)
+          })
           cleanup.push(sent.promise)
         } catch (error) {
+          departingLane?.failRetirement()
           cleanup.push(Promise.reject(error))
         }
         // Both generation-pinned cleanup requests have started before yielding.

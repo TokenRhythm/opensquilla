@@ -133,6 +133,7 @@ afterEach(() => {
   while (mounted.length) mounted.pop()!.app.unmount()
   vi.doUnmock('@/stores/rpc')
   vi.restoreAllMocks()
+  vi.useRealTimers()
   document.body.innerHTML = ''
 })
 
@@ -181,12 +182,19 @@ describe('SettingsMemoryPanel', () => {
 
     const copy = el.querySelector<HTMLButtonElement>('[data-testid="memory-import-copy-prompt"]')!
     expect(copy).toBeTruthy()
+    const copyLabel = copy.textContent
+    const copyIcon = copy.querySelector('.icon')?.innerHTML
+    vi.useFakeTimers()
     copy.click()
-    await settle()
+    await vi.advanceTimersByTimeAsync(0)
 
     expect(writeText).toHaveBeenCalledTimes(1)
     expect(writeText.mock.calls[0][0]).toContain('Imported from: <AI assistant name>')
-    expect(copy.textContent).toContain('Copied')
+    expect(copy.textContent).toBe(copyLabel)
+    expect(copy.querySelector('.icon')?.innerHTML).not.toBe(copyIcon)
+    await vi.advanceTimersByTimeAsync(1500)
+    expect(copy.querySelector('.icon')?.innerHTML).toBe(copyIcon)
+    expect(copy.textContent).toBe(copyLabel)
     expect(el.textContent).toContain(
       'To generate a preview, OpenSquilla sends the pasted text, current profile, and prior import records',
     )

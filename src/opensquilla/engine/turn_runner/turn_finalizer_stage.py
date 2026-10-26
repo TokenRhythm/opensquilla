@@ -121,9 +121,13 @@ def _turn_usage_payload(
     *,
     resolved_model: str | None,
     persisted_text: str | None = None,
+    failed_turn_usage: dict[str, Any] | None = None,
 ) -> dict[str, Any] | None:
     if done_event is None:
-        return None
+        # A failed request can have a durable receipt without a successful
+        # terminal answer. Preserve its measured components and explicit
+        # coverage gaps instead of fabricating a DoneEvent or a zero cost.
+        return dict(failed_turn_usage) if failed_turn_usage is not None else None
     model = done_event.model or resolved_model or ""
     payload = {
         "input_tokens": int(done_event.input_tokens or 0),
@@ -370,6 +374,7 @@ class TurnErrorPersistPort(Protocol):
         provider: str | None = None,
         model: str | None = None,
         fallback_hops: int = 0,
+        turn_usage: dict[str, Any] | None = None,
     ) -> None: ...
 
 
@@ -479,6 +484,10 @@ class TurnFinalizerStageInput:
     error_provider: str | None = None
     error_model: str | None = None
     error_fallback_hops: int = 0
+    # Durable provider-call projection for a terminal failure without Done.
+    # The existing turn_usage metadata carries both known cost components
+    # and usage_unknown/missing_cost_entries for unconfirmed receipts.
+    failed_turn_usage: dict[str, Any] | None = None
 
 @dataclass(frozen=True)
 class TurnFinalizerStageOutput:
@@ -661,6 +670,11 @@ class TurnFinalizerStage:
         final_text = with_unconfirmed_action_notice(final_text, turn_segments)
 
         done_event = inp.done_event
+        failed_turn_usage = (
+            inp.failed_turn_usage
+            if done_event is None and inp.error_message
+            else None
+        )
         runtime_notice_added = final_text != normalization.text
         if done_event is not None and (normalization.changed or runtime_notice_added):
             # A runtime-authored confirmation guard is visible even when the
@@ -766,6 +780,7 @@ class TurnFinalizerStage:
                     done_event,
                     resolved_model=inp.resolved_model,
                     persisted_text=final_text,
+                    failed_turn_usage=failed_turn_usage,
                 ),
                 "token_count": token_count,
             }
@@ -853,6 +868,12 @@ class TurnFinalizerStage:
                 "surface": inp.input_mode or "unknown",
                 "fallback_hops": inp.error_fallback_hops,
             }
+            if failed_turn_usage is not None and not transcript_appended:
+                # Keep one usage owner in history. A visible assistant
+                # partial already owns this metadata; an error-only turn
+                # attaches it to the ordinary error transcript instead.
+                error_kwargs["turn_usage"] = dict(failed_turn_usage)
+                error_kwargs["append_transcript"] = True
             if inp.execution_context is not None:
                 error_kwargs["turn_id"] = inp.execution_context.identity.turn_id
             if inp.error_provider is not None:

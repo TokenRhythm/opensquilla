@@ -1101,6 +1101,7 @@ def test_direct_channel_batch_turn_emits_tool_events_to_webui() -> None:
             "generation_epoch": 4,
             "model_call_id": "3.0",
             "iteration": 3,
+            "provider_call_resettable": True,
         },
     ) in bridge.events
     assert channel.sent[-1].content == "ok"
@@ -1317,9 +1318,10 @@ async def test_direct_channel_batch_turn_sends_artifact_with_adapter_file_upload
             super().__init__()
             self.files: list[tuple[str, str]] = []
 
-        async def send_file(self, chat_id: str, file_path: str) -> None:
+        async def send_file(self, chat_id: str, file_path: str) -> ChannelSendResult:
             assert Path(file_path).is_file()
             self.files.append((chat_id, Path(file_path).name))
+            return ChannelSendResult.sent(capability="native_file_upload")
 
     channel = FileUploadingChannel()
     bridge = _FakeEventBridge()
@@ -1371,9 +1373,10 @@ async def test_direct_channel_batch_turn_sends_artifact_with_original_filename(
             super().__init__()
             self.files: list[tuple[str, str]] = []
 
-        async def send_file(self, chat_id: str, file_path: str) -> None:
+        async def send_file(self, chat_id: str, file_path: str) -> ChannelSendResult:
             assert Path(file_path).is_file()
             self.files.append((chat_id, Path(file_path).name))
+            return ChannelSendResult.sent(capability="native_file_upload")
 
     channel = FileUploadingChannel()
     config = SimpleNamespace(
@@ -1426,8 +1429,8 @@ async def test_direct_channel_batch_turn_removes_delivered_markdown_image_refere
             yield DoneEvent()
 
     class FileUploadingChannel(_FakeChannel):
-        async def send_file(self, chat_id: str, file_path: str) -> None:
-            return None
+        async def send_file(self, chat_id: str, file_path: str) -> ChannelSendResult:
+            return ChannelSendResult.sent(capability="native_file_upload")
 
     channel = FileUploadingChannel()
     config = SimpleNamespace(
@@ -1480,9 +1483,10 @@ async def test_direct_channel_batch_turn_removes_artifact_markers_from_channel_t
             super().__init__()
             self.files: list[tuple[str, str]] = []
 
-        async def send_file(self, chat_id: str, file_path: str) -> None:
+        async def send_file(self, chat_id: str, file_path: str) -> ChannelSendResult:
             assert Path(file_path).is_file()
             self.files.append((chat_id, Path(file_path).name))
+            return ChannelSendResult.sent(capability="native_file_upload")
 
     channel = FileUploadingChannel()
     config = SimpleNamespace(
@@ -1919,9 +1923,10 @@ async def test_runtime_channel_stream_relay_sends_artifact_with_adapter_upload(
             async for chunk in chunks:
                 self.chunks.append(chunk)
 
-        async def send_file(self, chat_id: str, file_path: str) -> None:
+        async def send_file(self, chat_id: str, file_path: str) -> ChannelSendResult:
             assert Path(file_path).is_file()
             self.files.append((chat_id, Path(file_path).name))
+            return ChannelSendResult.sent(capability="native_file_upload")
 
     class FakeTaskRuntime:
         async def enqueue(self, envelope, message: str, *, stream_event_sink=None):
@@ -2029,6 +2034,7 @@ async def test_stream_failure_does_not_replay_attempted_artifact_at_terminal_rep
         if "Generated file: report.pdf" in message.content
     ]
     assert fallback_messages == [
+        "report.pdf: Channel delivery has no confirmed receipt; awaiting confirmation.\n"
         "Generated file: report.pdf -> available in the OpenSquilla task"
     ]
 
@@ -2060,9 +2066,10 @@ async def test_channel_file_delivery_dedupes_same_artifact_material(tmp_path) ->
             super().__init__()
             self.files: list[tuple[str, str]] = []
 
-        async def send_file(self, chat_id: str, file_path: str) -> None:
+        async def send_file(self, chat_id: str, file_path: str) -> ChannelSendResult:
             assert Path(file_path).is_file()
             self.files.append((chat_id, Path(file_path).name))
+            return ChannelSendResult.sent(capability="native_file_upload")
 
     channel = FileChannel()
     config = SimpleNamespace(attachments=SimpleNamespace(media_root=str(tmp_path)))
@@ -2107,9 +2114,10 @@ async def test_runtime_channel_stream_relay_does_not_redeliver_transcript_artifa
             async for chunk in chunks:
                 self.chunks.append(chunk)
 
-        async def send_file(self, chat_id: str, file_path: str) -> None:
+        async def send_file(self, chat_id: str, file_path: str) -> ChannelSendResult:
             assert Path(file_path).is_file()
             self.files.append((chat_id, Path(file_path).name))
+            return ChannelSendResult.sent(capability="native_file_upload")
 
     class FakeTaskRuntime:
         async def enqueue(self, envelope, message: str, *, stream_event_sink=None):
@@ -2342,6 +2350,7 @@ def test_direct_streaming_path_emits_tool_events_to_webui() -> None:
             "generation_epoch": 3,
             "model_call_id": "2.1",
             "iteration": 2,
+            "provider_call_resettable": True,
         },
     ) in bridge.events
     assert channel.sent[-1].content == "finished"
@@ -3275,9 +3284,10 @@ async def test_runtime_reply_delivers_transcript_artifact_with_adapter_upload(tm
             super().__init__()
             self.files: list[tuple[str, str]] = []
 
-        async def send_file(self, chat_id: str, file_path: str) -> None:
+        async def send_file(self, chat_id: str, file_path: str) -> ChannelSendResult:
             assert Path(file_path).is_file()
             self.files.append((chat_id, Path(file_path).name))
+            return ChannelSendResult.sent(capability="native_file_upload")
 
     class FakeTaskRuntime:
         async def wait(self, task_id: str):
@@ -3336,9 +3346,10 @@ async def test_runtime_reply_delivers_file_artifact_with_adapter_upload(tmp_path
             super().__init__()
             self.files: list[tuple[str, str]] = []
 
-        async def send_file(self, chat_id: str, file_path: str) -> None:
+        async def send_file(self, chat_id: str, file_path: str) -> ChannelSendResult:
             assert Path(file_path).is_file()
             self.files.append((chat_id, Path(file_path).name))
+            return ChannelSendResult.sent(capability="native_file_upload")
 
     class FakeTaskRuntime:
         async def wait(self, task_id: str):
@@ -3944,10 +3955,19 @@ async def test_valid_artifact_cannot_smuggle_unverified_url_or_name_in_fallback(
         SimpleNamespace(attachments=SimpleNamespace(media_root=str(tmp_path))),
         expected_session_id="session-b",
     )
-    assert undelivered == [ref.to_dict()]
-    assert _artifact_fallback_lines(undelivered) == [
+    expected_lines = [
         "Generated file: report.txt -> available in the OpenSquilla task"
     ]
+    if native:
+        expected_lines.insert(
+            0, "report.txt: This channel does not support the prepared file delivery.",
+        )
+    assert _artifact_fallback_lines(undelivered) == expected_lines
+    if native:
+        assert undelivered[0].pop("channel_delivery_issue") == (
+            "This channel does not support the prepared file delivery."
+        )
+    assert undelivered == [ref.to_dict()]
     if native:
         assert len(channel.requests) == 1
         assert channel.requests[0].name == "report.txt"

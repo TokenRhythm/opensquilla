@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from decimal import Decimal
 from typing import Any
 
 import httpx
@@ -109,7 +110,17 @@ async def _fetch_tokenrhythm_video_models() -> list[dict[str, Any]]:
             headers={"Accept": "application/json"},
         )
         response.raise_for_status()
-        return parse_tokenrhythm_video_models(response.json())
+        payload = response.json(parse_float=Decimal)
+        result = parse_tokenrhythm_video_models(payload)
+        from opensquilla.provider.media_pricing import register_media_catalog
+
+        register_media_catalog(
+            "tokenrhythm",
+            payload["data"],
+            base_url="https://tokenrhythm.studio/v1",
+            source_url=TOKENRHYTHM_PUBLIC_CATALOG_URL,
+        )
+        return result
 
 
 async def discover_video_generation_models(provider_id: str) -> dict[str, Any]:

@@ -286,6 +286,123 @@ def test_disabled_openrouter_managed_inline_refreshes_without_enabling() -> None
     assert cfg.squilla_router.tiers == _default_tiers()
 
 
+# The newer ladder can remain on disk after rolling back the recommendation.
+# Keep it distinct from today's defaults so these tests exercise persistence.
+_NON_CURRENT_MODELS = {
+    "tokenrhythm": (
+        "qwen3.8-flash", "deepseek-v4.1-flash-1017", "glm-5.3", "kimi-k3",
+    ),
+    "openrouter": (
+        "qwen/qwen3.8-flash", "deepseek/deepseek-v4.1-flash-1017",
+        "z-ai/glm-5.3", "moonshotai/kimi-k3",
+    ),
+}
+
+
+def _non_current_tiers(provider: str) -> dict[str, dict[str, str]]:
+    return {
+        name: {"provider": provider, "model": model}
+        for name, model in zip(
+            ("c0", "c1", "c2", "c3"), _NON_CURRENT_MODELS[provider], strict=True,
+        )
+    }
+
+
+@pytest.mark.parametrize("provider", ["tokenrhythm", "openrouter"])
+@pytest.mark.parametrize("action", ["custom", "disable", "enable_cross_provider"])
+def test_refreshed_managed_ladder_persists_when_becoming_custom(
+    tmp_path: Path, provider: str, action: str,
+) -> None:
+    from opensquilla.onboarding.mutations import upsert_llm_provider, upsert_router
+
+    path = tmp_path / "config.toml"
+    old_tiers = _non_current_tiers(provider)
+    path.write_text(tomli_w.dumps({
+        "config_version": LATEST_CONFIG_VERSION,
+        "llm": {"provider": provider},
+        "squilla_router": {
+            "enabled": True,
+            "preset_binding": "follow_primary",
+            "default_tier": "c2",
+            "rollout_phase": "observe",
+            "tiers": old_tiers,
+        },
+    }), encoding="utf-8")
+    cfg = load_config(path)
+    preset = get_preset(provider)
+    assert preset is not None
+    expected = preset.tier_defaults()
+    assert old_tiers != expected
+    assert tuple(expected[tier]["model"] for tier in ("c0", "c1", "c2", "c3")) != (
+        _NON_CURRENT_MODELS[provider]
+    )
+    assert cfg.squilla_router.tiers == expected
+    # Managed refresh is effective in memory without rewriting a stamped file.
+    assert tomllib.loads(path.read_text(encoding="utf-8"))["squilla_router"]["tiers"] == (
+        old_tiers
+    )
+
+    if action == "custom":
+        candidate = upsert_router(
+            cfg, mode="custom", default_tier="c2", tiers=cfg.squilla_router.tiers,
+        ).config
+    else:
+        candidate = upsert_llm_provider(
+            cfg,
+            provider_id="openai",
+            model="synthetic-model",
+            api_key="synthetic-not-a-real-key",
+            router_action=action,
+        ).config
+    assert candidate.squilla_router.preset_binding == "custom"
+    assert candidate.squilla_router.tiers == expected
+    assert cfg.squilla_router.preset_binding == "follow_primary"
+    persist_config(candidate, path=path, backup=False)
+
+    saved = tomllib.loads(path.read_text(encoding="utf-8"))
+    assert saved["squilla_router"]["tiers"] == expected
+    restored = load_config(path)
+    assert restored.squilla_router.tiers == expected
+    assert restored.squilla_router.preset_binding == "custom"
+    assert restored.squilla_router.default_tier == "c2"
+    assert restored.squilla_router.rollout_phase == "observe"
+    assert restored.squilla_router.enabled is (action != "disable")
+    assert restored.squilla_router.cross_provider_tiers is (action == "enable_cross_provider")
+
+    # The explicit ownership write must be consumed. A later unrelated save
+    # must preserve a newer edit another writer made to the custom ladder.
+    saved["squilla_router"]["tiers"]["c0"]["model"] = "external-custom-model"
+    path.write_text(tomli_w.dumps(saved), encoding="utf-8")
+    candidate.log_level = "DEBUG"
+    persist_config(candidate, path=path, backup=False)
+    assert load_config(path).squilla_router.tiers["c0"]["model"] == "external-custom-model"
+
+
+@pytest.mark.parametrize("provider", ["tokenrhythm", "openrouter"])
+@pytest.mark.parametrize("binding", [None, "custom"])
+def test_stamped_unmanaged_ladder_is_preserved_on_unrelated_save(
+    tmp_path: Path, provider: str, binding: str | None,
+) -> None:
+    path = tmp_path / "config.toml"
+    old_tiers = _non_current_tiers(provider)
+    path.write_text(tomli_w.dumps({
+        "config_version": LATEST_CONFIG_VERSION,
+        "llm": {"provider": provider},
+        "squilla_router": {
+            "enabled": True,
+            "tiers": old_tiers,
+            **({"preset_binding": binding} if binding else {}),
+        },
+    }), encoding="utf-8")
+    cfg = load_config(path)
+    assert cfg.squilla_router.tiers == old_tiers
+    cfg.log_level = "DEBUG"
+    persist_config(cfg, path=path, backup=False)
+    restored = load_config(path)
+    assert restored.squilla_router.tiers == old_tiers
+    assert restored.squilla_router.preset_binding == binding
+
+
 def test_openrouter_inline_upgrade_does_not_rebind_foreign_provider_tiers() -> None:
     tiers = _previous_openrouter_tiers()
     tiers["c1"] = {"provider": "tokenrhythm", "model": "deepseek-flash"}

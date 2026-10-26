@@ -202,13 +202,28 @@ async def test_window_and_summary_both_retain_progress_and_budget_full_arguments
     assert outcome.messages.index(checkpoint) > outcome.messages.index(messages[0])
     assert ("[Context summary]" in str(checkpoint.content)) is not refuse
     huge = [messages[0], *round_messages(0, argument="path-part " * 60_000)]
-    # A receipt cannot bypass the physical budget or silently truncate its
-    # parameters. A window that cannot carry it must be refused.
+    original_huge = [message.model_copy(deep=True) for message in huge]
+    # Full parameters remain private provenance; only the visible receipt may
+    # be bounded, with an explicit omission marker and a final physical proof.
     window = agent._recover_local_request_window(
         huge, protected_turn_start_index=0, request_context_insert_index=0,
         runtime_context_insert_index=0, input_budget_chars=4000,
     )
-    assert window is None
+    assert window is not None and window.ephemeral_only
+    receipts = agent._live_turn_execution_receipts(window.messages[1:])
+    assert receipts == agent._live_turn_execution_receipts(huge[1:])
+    assert receipts[0]["arguments"] == {"path": "path-part " * 60_000}
+    checkpoint = next(
+        message for message in window.messages if isinstance(message, _LiveTurnCheckpointMessage)
+    )
+    visible = json.loads(checkpoint._compaction_receipt_text)
+    assert visible["returned_calls"] == 1
+    assert visible["receipts"][0]["arguments_complete"] is False
+    assert "arguments" not in visible["receipts"][0]
+    config = agent._provider_admission_chat_config(CURRENT, context_window_tokens=64_000)
+    proof = project_provider_final_request(agent.provider, window.messages, config=config)
+    assert proof is not None and proof.fits
+    assert huge == original_huge
 
 
 class ProgressSensitiveProvider(OpenAIProvider):
@@ -273,6 +288,9 @@ async def test_two_executed_tools_are_not_restarted_after_live_recovery(
 
     agent = Agent(provider=provider, config=AgentConfig(
         context_window_tokens=16_000, context_window_known=True, max_tokens=4096,
+        # Exercise size recovery independently of dynamic output fitting.
+        provider_request_proof_max_chars=39_616 if mode == "size" else 0,
+        provider_request_proof_max_chars_explicit=mode == "size",
         max_iterations=6, max_provider_retries=0,
         model_capabilities=ModelCapabilities(supports_tools=True),
         tool_result_compression_enabled=False,

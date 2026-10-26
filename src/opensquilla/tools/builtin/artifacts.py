@@ -12,6 +12,7 @@ from difflib import SequenceMatcher
 from pathlib import Path
 from typing import Any
 
+from opensquilla.artifact_archives import validate_html_archive
 from opensquilla.artifact_validation import (
     ArtifactValidationError,
     is_pptx_candidate,
@@ -21,7 +22,9 @@ from opensquilla.artifacts import (
     DEFAULT_ARTIFACT_DISK_BUDGET_BYTES,
     DEFAULT_ARTIFACT_MAX_BYTES,
     ArtifactBudgetError,
+    ArtifactBundle,
     ArtifactBundleManifest,
+    ArtifactBundleSourceFile,
     ArtifactIntegrityError,
     ArtifactPathError,
     ArtifactSource,
@@ -32,6 +35,7 @@ from opensquilla.artifacts import (
     artifact_publish_max_bytes_for_name,
     collect_artifact_bundle,
 )
+from opensquilla.contracts.content_material import ContentExportError
 from opensquilla.html_format import is_html
 from opensquilla.sandbox.operation_runtime import SandboxToolDescriptor
 from opensquilla.tools.path_aliases import resolve_workspace_alias
@@ -150,6 +154,8 @@ def _publish_note(ctx: ToolContext, *, already_published: bool = False) -> str:
         )
     else:
         final_response = "An unchanged file does not need to be published again."
+    if ctx.caller_kind == CallerKind.CHANNEL:
+        final_response += " Channel delivery success is determined by its delivery receipt."
     if _should_expose_local_path(ctx):
         prefix = (
             "This file is already registered for the current surface in this turn. "
@@ -160,7 +166,7 @@ def _publish_note(ctx: ToolContext, *, already_published: bool = False) -> str:
             prefix
             + "Do not include any artifact URL in your reply. "
             + "Mention the local_path as the local entry path when the user needs to open "
-            + f"the generated file on this machine. {final_response}"
+            + f"the generated file on the execution host. {final_response}"
         )
     if already_published:
         if is_goal_owned_main_default_turn(ctx):
@@ -217,7 +223,8 @@ def _record_publication_source(
 @tool(
     name="publish_artifact",
     description=(
-        "Register an existing workspace file as a generated artifact for the current surface. "
+        "Prepare a fixed snapshot or bundle of an existing workspace file for delivery on "
+        "the current surface. This does not deploy a website or confirm a channel send receipt. "
         "Only files inside the active workspace are allowed. "
         "For exactly one file, including self-contained HTML, set bundle='none' and omit "
         "bundle_root. bundle_root is valid only with bundle='directory'. "
@@ -392,6 +399,22 @@ async def publish_artifact(
     store = ArtifactStore(ctx.artifact_media_root)
     with target.open("rb") as stream:
         source_is_html = is_html(artifact_name, artifact_mime, stream.read(4096))
+    if source_is_html:
+        # Validate the exact material that will be registered, including legacy
+        # single-file mode. Preview registration remains a separate operation.
+        if bundle_snapshot is None:
+            target_payload = target.read_bytes()
+            target_sha256 = hashlib.sha256(target_payload).hexdigest()
+            delivery_bundle = ArtifactBundle(
+                entrypoint=target.name,
+                files=(ArtifactBundleSourceFile(target.name, "text/html", target_payload),),
+            )
+        else:
+            delivery_bundle = bundle_snapshot
+        try:
+            validate_html_archive(delivery_bundle)
+        except (ContentExportError, ArtifactBudgetError, ArtifactPathError) as exc:
+            raise ToolError(str(exc)) from exc
     source_artifact_ids: set[str] | None = None
     if source_is_html:
         source_artifact_ids = {
@@ -507,8 +530,7 @@ async def publish_artifact(
                 max_bytes=max_bytes,
                 disk_budget_bytes=disk_budget_bytes,
             )
-        elif target_is_pptx:
-            assert target_payload is not None
+        elif target_payload is not None:
             ref = store.publish_bytes(
                 target_payload,
                 session_id=ctx.artifact_session_id,

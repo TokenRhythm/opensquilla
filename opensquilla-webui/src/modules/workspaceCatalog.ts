@@ -16,6 +16,12 @@ export interface WorkspaceHistoryDeletion {
   readonly deletedSessionKeys: readonly string[]
 }
 
+export interface WorkspaceCreationDefaults {
+  readonly parentPath: string | null
+  readonly hostName: string
+  readonly platform: 'windows' | 'posix'
+}
+
 export type WorkspacePathKind = 'workspace' | 'mount'
 export type WorkspacePathEntryKind = 'directory' | 'file'
 
@@ -41,7 +47,10 @@ export interface WorkspacePathSelection {
 }
 
 export interface WorkspaceCatalog {
-  list(options?: { signal?: AbortSignal }): Promise<readonly WorkspaceItem[]>
+  /** Defaults from the most recently read Gateway/profile catalog. */
+  readonly creationDefaults?: WorkspaceCreationDefaults | null
+  list(options?: { signal?: AbortSignal; timeoutMs?: number }): Promise<readonly WorkspaceItem[]>
+  create?(parentPath: string, name: string, options?: { signal?: AbortSignal }): Promise<WorkspaceItem | null>
   open(path: string, options?: { signal?: AbortSignal }): Promise<WorkspaceItem | null>
   rename(id: string, name: string, options?: { signal?: AbortSignal }): Promise<WorkspaceItem | null>
   setPinned(id: string, pinned: boolean, options?: { signal?: AbortSignal }): Promise<WorkspaceItem | null>

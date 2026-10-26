@@ -22,7 +22,7 @@ from opensquilla.gateway.session_view import (
 )
 from opensquilla.session.manager import SessionManager
 from opensquilla.session.models import SessionNode
-from opensquilla.session.storage import SessionStorage
+from opensquilla.session.storage import SessionStorage, StorageBusyError
 
 _REFUSALS = (
     "I cannot assist with that request",
@@ -201,18 +201,100 @@ def test_custom_channel_title_uses_canonical_channel_classification() -> None:
 
 @pytest.mark.parametrize("field", ["derived_title", "subject"])
 @pytest.mark.parametrize("transcript_title", ["", "Example first message"])
-def test_metadata_read_optimization_preserves_leading_generic_title_priority(
-    field: str, transcript_title: str,
+@pytest.mark.parametrize("display_name", ["WebChat", "New chat", "main"])
+def test_stored_title_does_not_depend_on_transcript_availability(
+    field: str, transcript_title: str, display_name: str,
 ) -> None:
     session = SessionNode(
-        session_key="agent:main:webchat:metadata-priority", display_name="WebChat",
+        session_key="agent:main:webchat:metadata-priority", display_name=display_name,
         **{field: "Stored title"},
+    )
+    assert session_title_from_metadata(session) == "Stored title"
+    view = build_session_view_item(
+        session, entry_count=1, task_rows=[], now_ms=1, transcript_title=transcript_title,
+    )
+    assert view["title"] == "Stored title"
+
+
+@pytest.mark.parametrize("transcript_title", ["", "Example first message"])
+def test_generic_only_title_keeps_transcript_and_placeholder_fallbacks(
+    transcript_title: str,
+) -> None:
+    session = SessionNode(
+        session_key="agent:main:webchat:unnamed", display_name="WebChat",
     )
     assert session_title_from_metadata(session) == ""
     view = build_session_view_item(
         session, entry_count=1, task_rows=[], now_ms=1, transcript_title=transcript_title,
     )
-    assert view["title"] == ("Stored title" if transcript_title else "WebChat")
+    assert view["title"] == (transcript_title or "WebChat")
+
+
+@pytest.mark.parametrize("transcript_title", ["", "Example first message"])
+def test_non_webchat_generic_name_remains_authoritative(transcript_title: str) -> None:
+    session = SessionNode(
+        session_key="agent:main:cli:literal-name",
+        display_name="WebChat",
+        derived_title="Generated title",
+    )
+    assert session_title_from_metadata(session) == "WebChat"
+    view = build_session_view_item(
+        session, entry_count=1, task_rows=[], now_ms=1, transcript_title=transcript_title,
+    )
+    assert view["title"] == "WebChat"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("field", ["derived_title", "subject"])
+async def test_unindexed_stored_title_is_consistent_across_directory_and_forks(
+    manager: SessionManager, monkeypatch: pytest.MonkeyPatch, field: str,
+) -> None:
+    key = "agent:main:webchat:unindexed-stored-title"
+    title = "Stored release review"
+    node = await manager.create(key, display_name="WebChat")
+    await manager.append_message(key, "user", "An unrelated first message")
+    await manager.update(key, **{field: title})
+    storage = manager._storage
+    # Model an upgraded transcript before its post-ready metadata backfill.
+    await storage.conn.execute(
+        "UPDATE transcript_entries SET content_byte_length = NULL WHERE session_id = ?",
+        (node.session_id,),
+    )
+    await storage.conn.commit()
+    before = (await storage.get_session(key)).model_dump()
+    busy = StorageBusyError("session_titles", waited_ms=0, retry_after_ms=100, stage="permit")
+    active_batch = AsyncMock(side_effect=busy)
+    canonical_batch = AsyncMock(side_effect=busy)
+    monkeypatch.setattr(storage, "list_user_transcript_content_batch", active_batch)
+    monkeypatch.setattr(storage, "list_canonical_user_transcript_content_batch", canonical_batch)
+    ctx = _context(manager)
+    dispatcher = get_dispatcher()
+
+    listed = await dispatcher.dispatch("list", "sessions.list", None, ctx)
+    assert listed.ok, listed.error
+    assert listed.payload["sessions"][0]["title"] == title
+    searched = await dispatcher.dispatch(
+        "search", "sessions.search", {"query": title}, ctx,
+    )
+    assert searched.ok, searched.error
+    assert searched.payload["sessions"][0]["title"] == title
+    resolved = await dispatcher.dispatch("resolve", "sessions.resolve", {"key": key}, ctx)
+    assert resolved.ok, resolved.error
+    assert resolved.payload["title"] == title
+    assert (await storage.get_session(key)).model_dump() == before
+
+    for copy_number in (2, 3):
+        forked = await dispatcher.dispatch("fork", "sessions.fork", {"key": key}, ctx)
+        assert forked.ok, forked.error
+        child = await manager.get_session(forked.payload["key"])
+        assert child is not None
+        assert child.display_name == f"{title} ({copy_number})"
+
+    active_batch.assert_not_awaited()
+    canonical_batch.assert_not_awaited()
+    parent = await storage.get_session(key)
+    assert parent.display_name == "WebChat"
+    assert getattr(parent, field) == title
 
 
 @pytest.mark.asyncio

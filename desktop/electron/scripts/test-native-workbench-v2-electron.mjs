@@ -1156,6 +1156,27 @@ try {
         surfaceId: 'artifact:v3-bridge',
         enabled: true,
       })
+      // A hash/history navigation does not emit a document loading/ready cycle.
+      // The host must still tell the UI that its armed picker was cancelled,
+      // including before the first selection/editor exists. Explicitly rearm
+      // as the provider does, then use the real Chromium pointer path below.
+      const inPageEventsBefore = events.length
+      await v3Contents.executeJavaScript("history.pushState({}, '', '#annotation-picker-regression')")
+      const inPagePickerState = await waitFor(() => events.slice(inPageEventsBefore).find(event =>
+        event.surfaceId === 'artifact:v3-bridge'
+        && event.type === 'annotation-picker-state'
+        && event.detail?.enabled === false
+        && event.detail?.reason === 'surface-navigation'), 'in-page picker cancellation without an editor')
+      const annotationInPageRearm = await manager.setArtifactAnnotationMode({
+        version: 3, surfaceId: 'artifact:v3-bridge', enabled: true,
+      })
+      if (!annotationInPageRearm.ok) throw new Error('Picker did not rearm after in-page navigation.')
+      const annotationInPageStateSync = {
+        cancellationHasInstance: inPagePickerState.detail.surfaceInstanceId
+          === manager.surfaces.get('artifact:v3-bridge').surfaceInstanceId,
+        cancellationAdvancedEpoch: inPagePickerState.detail.pickerEpoch > annotationPicker.pickerEpoch,
+        rearmAdvancedEpoch: annotationInPageRearm.pickerEpoch > inPagePickerState.detail.pickerEpoch,
+      }
       const annotationX = Math.floor(
         annotationTargetRect.x + Math.max(1, annotationTargetRect.width / 2),
       )
@@ -2803,6 +2824,7 @@ try {
         fullNavigationEventCount: fullNavigationEvents.length,
         v3AnnotationCapabilities,
         annotationPicker,
+        annotationInPageStateSync,
         annotationSelectionHidesProofV2,
         annotationUnrelatedNodeCount,
         annotationSelected: {
@@ -3113,9 +3135,13 @@ try {
     picker: true,
     trustedOverlay: true,
     overlayCopyVersion: 1,
+    overlayEditorVersion: 2,
     atomicCloseRearm: true,
   })
   assert.equal(result.annotationPicker.ok, true)
+  assert.deepEqual(result.annotationInPageStateSync, {
+    cancellationHasInstance: true, cancellationAdvancedEpoch: true, rearmAdvancedEpoch: true,
+  })
   assert.equal(
     result.annotationSelectionHidesProofV2,
     true,

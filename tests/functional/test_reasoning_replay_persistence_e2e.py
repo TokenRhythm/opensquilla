@@ -566,25 +566,14 @@ async def test_native_window_pressure_uses_production_trigger_and_real_storage(
 
 
 @pytest.mark.asyncio
-async def test_native_pressure_accepts_two_complete_summary_chunks(tmp_path, monkeypatch):
+async def test_native_pressure_uses_one_bounded_summary(tmp_path, monkeypatch):
     from opensquilla.provider.model_catalog import DeploymentModelLimits, shared_catalog
-    from opensquilla.session import compaction
 
     monkeypatch.setattr(shared_catalog(), "resolve_deployment_limits", lambda *args, **kwargs:
                         DeploymentModelLimits(200000, 4096, True, True))
-    original = compaction._chunk_entries
-
-    def two_chunks(entries, budget, **kwargs):
-        chunks = original(entries, budget, **kwargs)
-        if len(chunks) == 1 and len(chunks[0]) >= 4:
-            cut = (len(chunks[0]) // 4) * 2
-            return [chunks[0][:cut], chunks[0][cut:]]
-        return chunks
-
-    monkeypatch.setattr(compaction, "_chunk_entries", two_chunks)
     await test_compaction_task_facts_use_both_layouts_and_real_storage(
         tmp_path, monkeypatch, "tokenrhythm", "suffix", "coding", native_window=200000,
-        expected_summary_calls=2,
+        expected_summary_calls=1,
     )
 
 
@@ -596,13 +585,18 @@ async def test_failed_live_fact_acceptance_retains_field_diagnostics(tmp_path, m
 
 
 @pytest.mark.asyncio
-async def test_comparison_reuses_frozen_sqlite_input_and_locks_controls(tmp_path, monkeypatch):
+@pytest.mark.parametrize("tokenizer_mode", ["default", "unavailable"])
+async def test_comparison_reuses_frozen_sqlite_input_and_locks_controls(
+    tmp_path, monkeypatch, tokenizer_mode,
+):
     from scripts.live_compaction_comparison import (
         compare_measurements,
         read_snapshot,
         run_comparison,
     )
 
+    if tokenizer_mode == "unavailable":
+        monkeypatch.setattr(token_estimation, "_encoding", token_estimation._ENCODING_UNAVAILABLE)
     monkeypatch.setenv("OPENSQUILLA_LIVE_DISABLE_DOTENV", "1")
     snapshot = tmp_path / "frozen"
     source = tmp_path / "source"
@@ -621,7 +615,11 @@ async def test_comparison_reuses_frozen_sqlite_input_and_locks_controls(tmp_path
     exported = await harness.run_case(
         source, provider="tokenrhythm", model="deepseek-v4-flash", api_key="synthetic-key",
         observer=observer, scenario="compaction", thinking="off",
-        compaction_options=harness.CompactionCaseOptions(task_profile="coding"),
+        # Leave output headroom so admission preserves the same controls with
+        # conservative token estimates as well as a cached tokenizer.
+        compaction_options=harness.CompactionCaseOptions(
+            task_profile="coding", max_output_tokens=2048,
+        ),
         comparison_snapshot_out=snapshot,
     )
     assert exported["status"] == "comparison_snapshot_exported"
@@ -650,7 +648,10 @@ async def test_comparison_reuses_frozen_sqlite_input_and_locks_controls(tmp_path
                                       observer=observed, history_tokens=tokens, history_chars=chars)
         assert result["ok"] is True
         proof = result["comparison"]
+        assert proof["final_request"]["generation_budget"] == 2048
+        assert proof["summary_calls"] == (1 if tokens is not None else 0)
         assert proof["archive_preserved"] is True
+        assert proof["compaction_applied"] is (tokens is not None)
         assert all(proof["answer_fact_checks"].values())
         assert proof["source_sha256"] == manifest["source_sha256"]
         assert proof["capacity_samples"]

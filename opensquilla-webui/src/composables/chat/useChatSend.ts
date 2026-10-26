@@ -1,8 +1,9 @@
 import { isRetiredControlMessage } from '@/utils/retiredFeatureState'
 import { copySelectedSkills, sameSelectedSkills, type SelectedSkillRef } from '@/types/selectedSkills'
-import { copyLocalPathReferences } from '@/types/localPathReferences'
+import { copyLocalPathReferences, localPathPresentation } from '@/types/localPathReferences'
+import { copyTurnCommand, type ProjectInitTurnCommand } from '@/types/turnCommand'
 import type { AttachmentDraftConsumption } from '@/utils/chat/attachmentDrafts'
-import { normalizePageContext, pageContextForAnnotations, pageAnnotationSnapshots, type ChatPageContext } from '@/types/pageContext'
+import { normalizePageContext, pageContextForAnnotations, pageAnnotationSnapshots, assertPageContextWithinLimits, type ChatPageContext } from '@/types/pageContext'
 import { computed, ref, watch, type ComputedRef, type Ref } from 'vue'
 import i18n from '@/i18n'
 import { useToasts } from '@/composables/useToasts'
@@ -208,6 +209,7 @@ interface SendAttempt {
 export type ChatSendOutcome = 'accepted' | 'deferred' | 'not_sent' | 'retryable_failure'
 
 interface ExplicitSendPayload {
+  turnCommand?: ProjectInitTurnCommand
   attachments: Attachment[]
   intent: string | null
   forkBeforeMessageId: string | null
@@ -246,6 +248,8 @@ interface DispatchSendOptions {
   queueMode?: 'steer'
   payload?: ExplicitSendPayload
   preserveComposer?: boolean
+  /** A frozen queue payload does not depend on the current annotation editor. */
+  queuedSend?: boolean
   composerSnapshot?: ComposerSnapshot
   cancelIfComposerChanged?: boolean
   retryAttempt?: SendAttempt | null
@@ -453,6 +457,7 @@ function matchesRecoveredDraft(
     localPathReferences: string[]
     pageContext: ChatPageContext | null
     text: string
+    composerText?: string
     attachments: SendableAttachment[]
     intent: string | null
     initialCollaborationMode: CollaborationMode | null
@@ -470,6 +475,7 @@ function matchesRecoveredDraft(
     sameSelectedSkills(attempt.selectedSkills, input.selectedSkills) &&
     JSON.stringify(attempt.localPathReferences) === JSON.stringify(input.localPathReferences) &&
     attempt.text === input.text &&
+    (input.composerText === undefined || attempt.composerText === input.composerText) &&
     attempt.intent === input.intent &&
     attempt.initialCollaborationMode === input.initialCollaborationMode &&
     attempt.initialRoutingMode === input.initialRoutingMode &&
@@ -495,6 +501,8 @@ export interface UseChatSendOptions {
   durableDelivery: DurableDelivery
   activeSteerCapability?: Readonly<Ref<ChatSteerCapability | null>>
   inputText: Ref<string>
+  /** Visible user text, excluding automatically appended reference chips. */
+  commandText?: Readonly<Ref<string>>
   selectedSkills?: Ref<SelectedSkillRef[]>
   localPathReferences?: Ref<string[]>
   restoreInput?: (text: string, localPathReferences?: readonly string[]) => void
@@ -524,6 +532,7 @@ export interface UseChatSendOptions {
   pendingForkBeforeMessageId: Ref<string | null>
   draftIds?: Readonly<Ref<readonly string[]>>
   promptAnnotationSnapshots?: (ids: readonly string[]) => PromptAnnotationSnapshot[]
+  invalidatePromptAnnotations?: (snapshots: readonly PromptAnnotationSnapshot[]) => void
   acknowledgePromptAnnotations?: (
     snapshots: readonly PromptAnnotationSnapshot[],
     sessionKey: string,
@@ -531,6 +540,8 @@ export interface UseChatSendOptions {
   ) => void
   pendingWorkspaceId?: Ref<string | null>
   sendBlockedReason?: Readonly<Ref<string | null>>
+  /** Queue admission gates, excluding the unrelated live annotation draft. */
+  queuedSendBlockedReason?: Readonly<Ref<string | null>>
   /** Proven identity supplied only for an eligible, never-sent offline click. */
   offlineQueueIdentity?: Readonly<Ref<string | null>>
   deliveryIdentity?: Readonly<Ref<string | null>>
@@ -590,6 +601,7 @@ export interface UseChatSendOptions {
     text: string,
     owner?: PendingQueueOwner,
     enqueueOptions?: {
+      turnCommand?: ProjectInitTurnCommand
       confirmedPlainText?: boolean
       draftIds?: readonly string[]
       selectedSkills?: SelectedSkillRef[]
@@ -602,6 +614,7 @@ export interface UseChatSendOptions {
   enqueuePendingPayload?: (
     payload: {
       text: string
+      turnCommand?: ProjectInitTurnCommand
       draftIds?: readonly string[]
       selectedSkills?: SelectedSkillRef[]
       localPathReferences?: string[]
@@ -626,6 +639,8 @@ export interface UseChatSendOptions {
   reconcileTaskOwnership?: () => void | Promise<unknown>
   classifySlashCommand: (text: string) => Promise<SlashCommandClassification>
   isPlanModeCommand?: (text: string) => boolean
+  resolveTurnCommand?: (text: string) => ProjectInitTurnCommand | null
+  supportsTurnCommand?: (command: ProjectInitTurnCommand) => Promise<boolean>
   executeSlashCommand: (
     text: string,
     knownClassification?: SlashCommandClassification,
@@ -817,7 +832,6 @@ export function useChatSend(options: UseChatSendOptions) {
     return [...(options.draftIds?.value || [])]
       .map(value => String(value || '').trim())
       .filter((value, index, values) => Boolean(value) && values.indexOf(value) === index)
-      .slice(0, 16)
   }
 
   function acknowledgeAttemptPromptAnnotations(
@@ -2290,6 +2304,12 @@ export function useChatSend(options: UseChatSendOptions) {
 
   async function onSend(invocation: SendInvocation = {}) {
     if (disposed) return
+    try {
+      pageContextForAnnotations(options.promptAnnotationSnapshots?.(currentAnnotationDraftIds()) || [])
+    } catch (error) {
+      pushToast(error instanceof Error ? error.message : i18n.global.t('workbench.annotationUnified.submitFailed'), { tone: 'warn' })
+      return
+    }
     const key = options.sessionKey.value
     const identity = options.deliveryIdentity?.value || null
     if ([...composerSubmissions.values()].some(entry => (
@@ -2322,7 +2342,11 @@ export function useChatSend(options: UseChatSendOptions) {
     const bypassSlashCommand = invocation.bypassSlashCommand === true
     const composerText = invocation.composerText ?? options.inputText.value
     let text = (invocation.textOverride ?? options.inputText.value).trim()
-    let durableText = text
+    const commandText = (invocation.textOverride ?? options.commandText?.value
+      ?? localPathPresentation(text, composerSnapshot.localPathReferences).text).trim()
+    // A command continuation is ordinary prompt text. Preserve its literal
+    // slash count across the existing queue's one-slash escape/decoding path.
+    let durableText = bypassSlashCommand && text.startsWith('/') ? `/${text}` : text
     let sendableAttachments = composerAttachments().filter(isSendableAttachment)
     let hasPayload = Boolean(
       text || sendableAttachments.length > 0 || composerSnapshot.draftIds.length > 0,
@@ -2335,7 +2359,7 @@ export function useChatSend(options: UseChatSendOptions) {
       return
     }
 
-    if (!bypassSlashCommand && text.startsWith('//')) {
+    if (!bypassSlashCommand && commandText.startsWith('//')) {
       isLiteralSlash = true
       text = text.slice(1)
       durableText = `/${text}`
@@ -2381,6 +2405,7 @@ export function useChatSend(options: UseChatSendOptions) {
       selectedSkills: composerSnapshot.selectedSkills,
       localPathReferences: composerSnapshot.localPathReferences,
       text,
+      composerText,
       attachments: sendableAttachments,
       intent: composerSnapshot.intent,
       initialCollaborationMode: composerSnapshot.initialCollaborationMode,
@@ -2447,6 +2472,20 @@ export function useChatSend(options: UseChatSendOptions) {
       recoveredAttempt &&
       matchesRecoveredComposer()
     ) {
+      const retryAttempt = recoveredAttempt
+      if (retryAttempt.params.turnCommand) {
+        const supported = await options.supportsTurnCommand?.(retryAttempt.params.turnCommand)
+        if (
+          !deliveryStillMatches()
+          || recoveredAttempt !== retryAttempt
+          || !composerMatchesSnapshot(composerSnapshot)
+          || !queueOwnerMatchesSnapshot(composerSnapshot)
+        ) return
+        if (!supported) {
+          pushToast(i18n.global.t('chat.slashCommands.initUnavailable'), { tone: 'info' })
+          return
+        }
+      }
       return await dispatchSend(text, {
         composerText,
         draftIds: recoveredAttempt.draftIds,
@@ -2462,8 +2501,8 @@ export function useChatSend(options: UseChatSendOptions) {
 
     const slashClassification = !bypassSlashCommand
       && !isLiteralSlash
-      && text.startsWith('/')
-      ? await options.classifySlashCommand(text)
+      && commandText.startsWith('/')
+      ? await options.classifySlashCommand(commandText)
       : null
     if (slashClassification !== null) {
       if (
@@ -2485,10 +2524,11 @@ export function useChatSend(options: UseChatSendOptions) {
         || Boolean(options.taskOwnership && !options.taskOwnership.hydrationResolved.value)
       ) return
     }
+    const turnCommand = slashClassification === 'registered' ? options.resolveTurnCommand?.(commandText) ?? null : null
 
     if (composerSnapshot.selectedSkills.length && (
-      (slashClassification === 'registered' && !options.isPlanModeCommand?.(text))
-      || (!bypassSlashCommand && !isLiteralSlash && text.startsWith('!'))
+      (slashClassification === 'registered' && !turnCommand && !options.isPlanModeCommand?.(commandText))
+      || (!bypassSlashCommand && !isLiteralSlash && commandText.startsWith('!'))
     )) {
       pushToast(i18n.global.t('chat.skillPalette.commandWithSkills'), { tone: 'info' })
       return
@@ -2510,8 +2550,9 @@ export function useChatSend(options: UseChatSendOptions) {
         if (
           !bypassSlashCommand
           && !isLiteralSlash
-          && isControlInput(text)
+          && isControlInput(commandText)
           && slashClassification !== 'unknown'
+          && !turnCommand
         ) {
           // Registered slash commands and bang inputs are live controls. Running
           // them later can target a different task/session, so keep the exact
@@ -2553,6 +2594,7 @@ export function useChatSend(options: UseChatSendOptions) {
         if (invocation.cancelIfComposerChanged && composerChanged) return
         const queuedAnnotationDraftIds = composerSnapshot.draftIds
         const queuedEnqueueOptions = {
+          ...(turnCommand ? { turnCommand } : {}),
           ...(composerSnapshot.selectedSkills.length ? { selectedSkills: composerSnapshot.selectedSkills } : {}),
           ...(composerSnapshot.localPathReferences.length ? { localPathReferences: composerSnapshot.localPathReferences } : {}),
           ...(composerSnapshot.pageContext ? {
@@ -2568,6 +2610,7 @@ export function useChatSend(options: UseChatSendOptions) {
           composerChanged || (invocation.textOverride !== undefined && !invocation.consumeComposerOnQueue)
             ? options.enqueuePendingPayload?.({
               text: durableText,
+              ...(turnCommand ? { turnCommand } : {}),
               ...(composerSnapshot.selectedSkills.length ? { selectedSkills: composerSnapshot.selectedSkills } : {}),
               ...(composerSnapshot.localPathReferences.length ? { localPathReferences: composerSnapshot.localPathReferences } : {}),
               ...(composerSnapshot.pageContext ? { pageContext: composerSnapshot.pageContext } : {}),
@@ -2580,7 +2623,7 @@ export function useChatSend(options: UseChatSendOptions) {
                 ? { confirmedPlainText: true }
                 : {}),
             }, queueOwnerFromSnapshot(composerSnapshot)) ?? false
-            : slashClassification === 'unknown'
+            : slashClassification === 'unknown' || turnCommand
               ? options.enqueuePendingInput(
                 durableText,
                 queueOwnerFromSnapshot(composerSnapshot),
@@ -2605,7 +2648,7 @@ export function useChatSend(options: UseChatSendOptions) {
       }
     }
 
-    if (slashClassification !== null && slashClassification !== 'unknown') {
+    if (slashClassification !== null && slashClassification !== 'unknown' && !turnCommand) {
       const handled = await options.executeSlashCommand(text, slashClassification)
       if (typeof handled === 'object' && handled.kind === 'composer-prompt') {
         if (!deliveryStillMatches() || !composerMatchesSnapshot(composerSnapshot)
@@ -2631,7 +2674,7 @@ export function useChatSend(options: UseChatSendOptions) {
     return await dispatchSend(text, {
       composerText,
       draftIds: composerSnapshot.draftIds,
-      payload: payloadFromSnapshot(composerSnapshot),
+      payload: { ...payloadFromSnapshot(composerSnapshot), ...(turnCommand ? { turnCommand } : {}) },
       composerSnapshot,
       cancelIfComposerChanged: invocation.cancelIfComposerChanged,
       preDispatchGuard: () => deliveryStillMatches() && invocation.preDispatchGuard?.() !== false,
@@ -2656,6 +2699,7 @@ export function useChatSend(options: UseChatSendOptions) {
   ): Promise<ChatSendOutcome> {
     if (disposed) return 'not_sent'
     const text = item.text.trim()
+    const queuedCommandText = localPathPresentation(text, item.localPathReferences).text.trim()
     const dispatchText = text.startsWith('//')
       ? text.slice(1)
       : text
@@ -2683,7 +2727,8 @@ export function useChatSend(options: UseChatSendOptions) {
     if (!ownerSessionKey || options.sessionKey.value !== ownerSessionKey) {
       return preserveRetryState('not_sent')
     }
-    if (!identityStillMatches() || options.sendBlockedReason?.value) {
+    const queuedBlockedReason = options.queuedSendBlockedReason ?? options.sendBlockedReason
+    if (!identityStillMatches() || queuedBlockedReason?.value) {
       return blockedOutcome()
     }
     if (options.validateActiveProjectBeforeSend) {
@@ -2691,7 +2736,7 @@ export function useChatSend(options: UseChatSendOptions) {
       if (disposed || options.sessionKey.value !== ownerSessionKey) {
         return preserveRetryState('not_sent')
       }
-      if (!identityStillMatches() || options.sendBlockedReason?.value) return blockedOutcome()
+      if (!identityStillMatches() || queuedBlockedReason?.value) return blockedOutcome()
     }
     if (options.hasPendingAttachmentWork()) {
       if (delivery === 'steer') {
@@ -2701,6 +2746,14 @@ export function useChatSend(options: UseChatSendOptions) {
     }
     const serverStagedItem = item.pendingPersistenceState === 'staged'
       && Boolean(item.pendingInputId)
+    if (item.turnCommand && delivery === 'steer') return preserveRetryState('not_sent')
+    if (item.turnCommand && !retryAttempt?.requiresIdempotentReplay) {
+      if (!await options.supportsTurnCommand?.(item.turnCommand)) {
+        pushToast(i18n.global.t('chat.slashCommands.initUnavailable'), { tone: 'info' })
+        return preserveRetryState('not_sent')
+      }
+      if (!identityStillMatches() || options.sessionKey.value !== ownerSessionKey) return blockedOutcome()
+    }
     if (
       !serverStagedItem
       && item.attachments.some(attachment => !isSendableAttachment(attachment))
@@ -2709,8 +2762,9 @@ export function useChatSend(options: UseChatSendOptions) {
     }
     if (
       delivery === 'followup'
-      && item.text.trim().startsWith('/')
-      && !item.text.trim().startsWith('//')
+      && !item.turnCommand
+      && queuedCommandText.startsWith('/')
+      && !queuedCommandText.startsWith('//')
     ) {
       if (
         options.stream.isStreaming.value
@@ -2719,11 +2773,11 @@ export function useChatSend(options: UseChatSendOptions) {
       ) {
         return preserveRetryState('deferred')
       }
-      const slashClassification = await options.classifySlashCommand(item.text.trim())
+      const slashClassification = await options.classifySlashCommand(queuedCommandText)
       if (disposed || options.sessionKey.value !== ownerSessionKey) {
         return preserveRetryState('not_sent')
       }
-      if (options.sendBlockedReason?.value) return blockedOutcome()
+      if (queuedBlockedReason?.value) return blockedOutcome()
       if (
         options.validateActiveProjectBeforeSend
         && await refreshedActiveProjectBlocksSend()
@@ -2731,7 +2785,7 @@ export function useChatSend(options: UseChatSendOptions) {
       if (disposed || options.sessionKey.value !== ownerSessionKey) {
         return preserveRetryState('not_sent')
       }
-      if (options.sendBlockedReason?.value) return blockedOutcome()
+      if (queuedBlockedReason?.value) return blockedOutcome()
       if (
         options.stream.isStreaming.value
         || hasAuthoritativeWork()
@@ -2794,6 +2848,7 @@ export function useChatSend(options: UseChatSendOptions) {
       composerText: item.text,
       draftIds: item.draftIds || [],
       payload: {
+        ...(item.turnCommand ? { turnCommand: copyTurnCommand(item.turnCommand) } : {}),
         attachments: item.attachments,
         pageContext: item.pageContext,
         selectedSkills: copySelectedSkills(item.selectedSkills),
@@ -2804,6 +2859,7 @@ export function useChatSend(options: UseChatSendOptions) {
         forkBeforeMessageId: null,
       },
       preserveComposer: true,
+      queuedSend: true,
       preDispatchGuard: identityStillMatches,
       beforeDispatch: identityStillMatches,
       retryAttempt,
@@ -2860,7 +2916,9 @@ export function useChatSend(options: UseChatSendOptions) {
     if (!requestSessionKey) return 'not_sent'
     const blockedReason = sendOpts.idempotentReplay
       ? options.idempotentReplayBlockedReason || options.sendBlockedReason
-      : options.sendBlockedReason
+      : sendOpts.queuedSend
+        ? options.queuedSendBlockedReason ?? options.sendBlockedReason
+        : options.sendBlockedReason
     if (blockedReason?.value) return 'not_sent'
     const preDispatchAllowed = (
       stage: 'preflight' | 'before_rpc' = 'preflight',
@@ -2927,10 +2985,17 @@ export function useChatSend(options: UseChatSendOptions) {
       sendOpts.payload ? sendOpts.payload.localPathReferences : options.localPathReferences?.value,
       text,
     )
-    const requestedPageContext = normalizePageContext(sendOpts.payload?.pageContext)
-      || pageContextForAnnotations(options.promptAnnotationSnapshots?.(
-        sendOpts.draftIds ?? currentAnnotationDraftIds(),
-      ) || [])
+    let requestedPageContext: ChatPageContext | null
+    try {
+      requestedPageContext = normalizePageContext(sendOpts.payload?.pageContext)
+        || pageContextForAnnotations(options.promptAnnotationSnapshots?.(
+          sendOpts.draftIds ?? currentAnnotationDraftIds(),
+        ) || [])
+      if (requestedPageContext) assertPageContextWithinLimits(requestedPageContext)
+    } catch (error) {
+      pushToast(error instanceof Error ? error.message : i18n.global.t('workbench.annotationUnified.submitFailed'), { tone: 'warn' })
+      return 'not_sent'
+    }
     // This is deliberately before optimistic rendering, composer clearing,
     // stream state, and chat.send. A blocked draft remains exactly editable.
     if (modelImageSendBlocked(sourceAttachments)) return 'not_sent'
@@ -2940,7 +3005,6 @@ export function useChatSend(options: UseChatSendOptions) {
       : [...sendOpts.draftIds]
           .map(value => String(value || '').trim())
           .filter((value, index, values) => Boolean(value) && values.indexOf(value) === index)
-          .slice(0, 16)
     const requiresRecoveryReplay = Boolean(
       retryCandidate?.requiresIdempotentReplay
       && retryCandidate.deliveryIdentity === requestDeliveryIdentity
@@ -2958,6 +3022,7 @@ export function useChatSend(options: UseChatSendOptions) {
           selectedSkills: requestedSelectedSkills,
           localPathReferences: requestedLocalPathReferences,
           text,
+          composerText: sendOpts.composerText ?? text,
           attachments: initialSendableAttachments,
           intent,
           initialCollaborationMode,
@@ -3012,6 +3077,12 @@ export function useChatSend(options: UseChatSendOptions) {
       return 'not_sent'
     }
     const attemptPageContext = retryAttempt?.pageContext ?? requestedPageContext
+    try {
+      if (attemptPageContext != null) assertPageContextWithinLimits(attemptPageContext)
+    } catch (error) {
+      pushToast(error instanceof Error ? error.message : i18n.global.t('workbench.annotationUnified.submitFailed'), { tone: 'warn' })
+      return 'not_sent'
+    }
     const sendAttachmentIds = new Set(
       (retryAttempt?.attachments || initialSendableAttachments)
         .map(attachment => attachment.local_id),
@@ -3115,6 +3186,7 @@ export function useChatSend(options: UseChatSendOptions) {
         message: text || (attemptPageContext?.annotations?.length
           ? (attemptPageContext?.annotations || []).map(annotation => annotation.text).join('\n')
           : 'Describe these attachments'),
+        ...(sendOpts.payload?.turnCommand ? { turnCommand: copyTurnCommand(sendOpts.payload.turnCommand) } : {}),
         // The Vue client never uses the legacy cancel-style steer path. Make
         // ordinary sends explicit so a persisted session queue_mode="steer"
         // from an older client cannot silently turn them into interrupts.
@@ -3148,6 +3220,10 @@ export function useChatSend(options: UseChatSendOptions) {
         annotationId: attemptAnnotationDraftIds[index] || input.annotationId,
         documentName: localSnapshots[index]?.documentName || input.documentName,
         tagName: localSnapshots[index]?.tagName || input.tagName,
+        // This display field is not sent on the wire. Keep the captured draft
+        // value for exact ACK comparison; every wire target field above still
+        // comes from the immutable outgoing context.
+        targetText: localSnapshots[index] ? localSnapshots[index].targetText : input.targetText,
       }))
       attempt = {
         clientRequestId: params.clientRequestId!,
@@ -3346,7 +3422,10 @@ export function useChatSend(options: UseChatSendOptions) {
           'Delivery receipt is still unknown', 'DELIVERY_RECEIPT_UNKNOWN', null, true)
         res = receipt.response
       } else res = await options.turnCommands.send(acceptanceRequest, {
-        beforeDispatch: sendOpts.beforeDispatch,
+        beforeDispatch: attempt.params.turnCommand
+          ? () => sendOpts.beforeDispatch?.() !== false
+            && options.resolveTurnCommand?.('/init')?.name === attempt.params.turnCommand?.name
+          : sendOpts.beforeDispatch,
       })
       if (disposed) return 'accepted'
       notifySendAccepted(attempt)
@@ -3512,6 +3591,10 @@ export function useChatSend(options: UseChatSendOptions) {
       // Keep that WAL for the next page without reviving this one's composer,
       // queue callbacks, navigation or global error notices.
       if (disposed) return acceptedError ? 'accepted' : 'retryable_failure'
+      if (commandError?.accepted === false && ['DOCUMENT_CHANGED', 'ANNOTATION_SELECTION_STALE', 'OFFICE_SELECTION_STALE']
+        .includes(commandError.failureCode || '')) {
+        options.invalidatePromptAnnotations?.(attempt.promptAnnotations)
+      }
       if (acceptedError) notifySendAccepted(attempt)
       const stoppedBeforeAdmission = attempt.stoppedBeforeAdmission === true || (
         commandError?.failureCode === 'DELIVERY_STOPPED' && commandError.accepted === false
@@ -3767,6 +3850,11 @@ export function useChatSend(options: UseChatSendOptions) {
               const handled = (outcome: ChatSendOutcome | undefined) => outcome && outcome !== 'not_sent'
                 ? true : unavailable('chat.toast.retryUnavailable')
               if (separateExplicitDraft) {
+                if (attempt.params.turnCommand) {
+                  const supported = await options.supportsTurnCommand?.(attempt.params.turnCommand)
+                  if (!canStillRetry()) return unavailable('chat.toast.retryUnavailable')
+                  if (!supported) return unavailable('chat.slashCommands.initUnavailable')
+                }
                 if (options.validateActiveProjectBeforeSend && await refreshedActiveProjectBlocksSend()) {
                   return unavailable('chat.toast.retryUnavailable')
                 }

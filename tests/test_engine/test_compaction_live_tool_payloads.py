@@ -96,6 +96,10 @@ def test_live_tool_payload_does_not_search_arbitrary_nested_metadata(content):
 def test_live_text_tool_body_stays_raw_through_pruning_and_serialization(
     monkeypatch, form, status, provider_kind,
 ):
+    # This fixture exercises character pruning, not tokenizer availability.
+    # Keep the conservative fallback deterministic and give its independent
+    # token proof enough physical capacity for the protected live tool body.
+    monkeypatch.setattr("opensquilla.token_estimation._get_encoding", lambda: None)
     monkeypatch.setenv("OPENSQUILLA_PROVIDER_COMPACTION_PROTECT_UNRESOLVED_RESULTS", "1")
     monkeypatch.setenv("OPENSQUILLA_PROVIDER_COMPACTION_PROTECT_RECENT_RESULTS", "0")
     live_output = "LIVE-" + "x" * 3000
@@ -131,10 +135,16 @@ def test_live_text_tool_body_stays_raw_through_pruning_and_serialization(
     # boundary. Round-trip both forms exactly as persisted message replay does.
     replayed = [Message.model_validate(message.model_dump(mode="json")) for message in pruned]
     projection = project_provider_final_request(
-        provider, replayed, config=ChatConfig(provider_request_max_chars=8500),
+        provider, replayed, config=ChatConfig(
+            provider_request_max_chars=8500,
+            provider_context_window_tokens=16000,
+            max_tokens=1024,
+        ),
     )
     assert projection is not None
     assert projection.fits
+    assert projection.proof["token_estimate_source"] == "utf8_unicode_conservative"
+    assert projection.proof["token_budget_source"] == "physical_context_window"
     assert projection.proof["protected_tool_result_count"] == 1
     serialized = json.dumps(projection.payload)
     assert live_output in serialized

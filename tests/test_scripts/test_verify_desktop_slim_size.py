@@ -18,12 +18,15 @@ def _budgets(maximum_bytes: int = 8):
     return {"test": (MODULE.AssetBudget("OpenSquilla-*.zip", maximum_bytes),)}
 
 
-def test_accepts_exactly_one_artifact_within_budget(tmp_path: Path) -> None:
+@pytest.mark.parametrize("size", [7, 8])
+def test_accepts_exactly_one_artifact_within_or_at_budget(
+    tmp_path: Path, size: int
+) -> None:
     asset = tmp_path / "OpenSquilla-0.5.4.zip"
-    asset.write_bytes(b"12345678")
+    asset.write_bytes(b"x" * size)
 
     assert MODULE.verify_artifact_sizes(tmp_path, "test", budgets=_budgets()) == [
-        (asset, 8, 8)
+        (asset, size, 8)
     ]
 
 
@@ -43,10 +46,10 @@ def test_rejects_an_artifact_over_budget(tmp_path: Path) -> None:
         MODULE.verify_artifact_sizes(tmp_path, "test", budgets=_budgets())
 
 
-def test_release_budgets_are_pinned_to_v053_reduction_targets() -> None:
+def test_release_budgets_include_fixed_offline_chinese_font_allowance() -> None:
     assert [item.maximum_bytes for item in MODULE.ASSET_BUDGETS["macos"]] == [
-        360_291_400,
-        364_706_552,
+        400_886_040,
+        405_301_192,
     ]
     assert [item.maximum_bytes for item in MODULE.ASSET_BUDGETS["windows"]] == [
         423_062_346

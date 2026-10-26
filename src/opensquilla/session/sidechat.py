@@ -383,6 +383,12 @@ async def create_snapshot(storage: Any, parent_key: str, request_id: str) -> Ses
             f"VALUES ({', '.join('?' for _ in columns)})",
             [_serialize(data[column]) for column in columns],
         )
+        from opensquilla.session.usage_attribution import ensure_usage_owner_on_conn
+
+        await ensure_usage_owner_on_conn(
+            conn, child.session_id, child.epoch,
+            parent_owner=(parent.session_id, parent.epoch), kind="sidechat",
+        )
         copied = 0
         copied_user_input = False
         inherited_summary_ids: list[int] = []

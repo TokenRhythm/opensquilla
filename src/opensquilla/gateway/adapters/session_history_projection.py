@@ -17,13 +17,18 @@ from urllib.parse import quote
 
 import structlog
 
-from opensquilla.application.session_history import SessionHistoryQuery, cursor_for_entry
+from opensquilla.application.session_history import (
+    HistoryViewOwnerChangedError,
+    SessionHistoryQuery,
+    cursor_for_entry,
+)
 from opensquilla.artifact_session import (
     ArtifactSessionService,
     MutationAttempt,
     MutationAttemptStatus,
     document_mutation_outcome_from_attempt,
 )
+from opensquilla.artifact_session.repository import ArtifactSessionRepository
 from opensquilla.chat.history import transcript_entries_to_chat_messages
 from opensquilla.gateway.adapters.session_history import (
     SessionHistoryStorageAdapter,
@@ -43,6 +48,7 @@ from opensquilla.history_cursor import (
     HistoryCursorInvalidatedError,
     HistoryCursorInvalidError,
 )
+from opensquilla.recovery_read_budget import current_read_budget
 from opensquilla.session.storage import StorageBusyError, bounded_interactive_storage_reads
 from opensquilla.session.terminal_reply import append_error_ref, build_terminal_reply, safe_error_id
 from opensquilla.turn_outcome_projection import (
@@ -311,6 +317,8 @@ async def _chat_history_turn_outcomes(
         elif callable(list_tasks):
             rows = await list_tasks(session_key=session_key)
     except Exception:  # noqa: BLE001 - history remains readable without outcomes.
+        if getattr(storage, "in_committed_history_view", False) is True:
+            raise
         log.warning(
             "chat.history.turn_outcomes_failed",
             session_key=session_key,
@@ -321,12 +329,33 @@ async def _chat_history_turn_outcomes(
     if storage is not None and callable(getattr(storage, "_write_transaction", None)):
         artifact_service: ArtifactSessionService | None = None
         try:
-            artifact_service = await ArtifactSessionService.from_session_storage(storage)
-            attempts = await artifact_service.list_mutation_attempts_by_turn_ids(
-                session_key=session_key,
-                turn_ids=sorted(turn_ids),
-            )
+            if getattr(storage, "in_committed_history_view", False) is True:
+                # Schema initialization is a write and must never run on a
+                # query-only history lease. An absent ledger has no attempts
+                # in this committed version; existing ledgers use this reader.
+                async with storage.committed_read_transaction("history.artifact_ledger") as reader:
+                    async with reader.execute(
+                        "SELECT 1 FROM sqlite_master WHERE type='table' "
+                        "AND name='artifact_mutation_attempts'",
+                    ) as cursor:
+                        ledger_exists = await cursor.fetchone() is not None
+                if ledger_exists:
+                    def reject_write(_operation: str):
+                        raise RuntimeError("History artifact projections are read-only")
+
+                    artifact_service = ArtifactSessionService(ArtifactSessionRepository(
+                        reject_write, read_transaction_factory=storage.committed_read_transaction,
+                    ))
+            else:
+                artifact_service = await ArtifactSessionService.from_session_storage(storage)
+            if artifact_service is not None:
+                attempts = await artifact_service.list_mutation_attempts_by_turn_ids(
+                    session_key=session_key,
+                    turn_ids=sorted(turn_ids),
+                )
         except Exception:  # noqa: BLE001 - transcript and task history remain readable.
+            if getattr(storage, "in_committed_history_view", False) is True:
+                raise
             log.warning(
                 "chat.history.document_mutation_outcomes_failed",
                 session_key=session_key,
@@ -765,11 +794,15 @@ async def _chat_history_summaries(
         with bounded_interactive_storage_reads():
             summaries = await getter(session_key)
     except StorageBusyError:
+        if SessionHistoryStorageAdapter(mgr).in_committed_view:
+            raise
         # The message page is already available. Let callers retry the optional
         # summary metadata instead of converting a useful history response into
         # STORAGE_BUSY.
         return []
     except Exception:  # noqa: BLE001 - summaries remain optional display metadata
+        if SessionHistoryStorageAdapter(mgr).in_committed_view:
+            raise
         return []
     return [_session_summary_to_chat_payload(summary) for summary in summaries or []]
 
@@ -845,6 +878,42 @@ async def _project_fork_workspace_previews(
 
 
 async def read_chat_history_v4(params: dict | None, ctx: RpcContext) -> dict:
+    """Capture a committed view for admitted reads; preserve ordinary read routing."""
+
+    manager = _require_chat_session_manager(ctx)
+    adapter = SessionHistoryStorageAdapter(manager)
+    session_key = webchat_session_key((params or {}).get("sessionKey"))
+    # CLI bootstrap/export and HTTP callers do not use recovery admission.
+    # Keep their existing lock/reader path instead of competing for an
+    # admitted request's same-session recovery permit.
+    if (
+        current_read_budget() is not None
+        and adapter.supports_committed_view
+        and not adapter.in_committed_view
+    ):
+        view = await adapter.read_view(
+            session_key, lambda _owner: _read_chat_history_v4(params, ctx),
+        )
+        result = view.value
+        result["messages"] = await _project_fork_workspace_previews(
+            result["messages"], session_key=session_key, manager=manager,
+        )
+        try:
+            await adapter.require_current_owner(session_key, view)
+        except HistoryViewOwnerChangedError as exc:
+            raise RpcHandlerError(
+                "HISTORY_CURSOR_INVALIDATED", "Session identity changed; reload history.",
+            ) from exc
+        return result
+    result = await _read_chat_history_v4(params, ctx)
+    if not adapter.in_committed_view:
+        result["messages"] = await _project_fork_workspace_previews(
+            result["messages"], session_key=session_key, manager=manager,
+        )
+    return result
+
+
+async def _read_chat_history_v4(params: dict | None, ctx: RpcContext) -> dict:
     raw_params = params or {}
     session_key = webchat_session_key(raw_params.get("sessionKey"))
     limit = _normalize_chat_history_limit(raw_params.get("limit"))
@@ -908,7 +977,10 @@ async def read_chat_history_v4(params: dict | None, ctx: RpcContext) -> dict:
 
     try:
         with bounded_interactive_storage_reads():
-            history_lock = get_session_lock(ctx.turn_runner, session_key)
+            history_lock = (
+                None if history_adapter.in_committed_view
+                else get_session_lock(ctx.turn_runner, session_key)
+            )
             if history_lock is None:
                 (
                     page_entries,
@@ -998,9 +1070,6 @@ async def read_chat_history_v4(params: dict | None, ctx: RpcContext) -> dict:
         # bounded; clients can range-read the remainder through
         # ``content.read.v1`` using the emitted contentRef.
         content_mode="bounded",
-    )
-    messages = await _project_fork_workspace_previews(
-        messages, session_key=session_key, manager=mgr,
     )
     turn_outcomes = await _chat_history_turn_outcomes(
         ctx,

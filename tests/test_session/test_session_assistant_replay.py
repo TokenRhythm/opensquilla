@@ -215,7 +215,9 @@ async def test_compaction_rejects_replay_only_source_change():
             source_boundary_message_id=source.boundary_message_id,
             source_boundary_entry_id=source.boundary_entry_id,
         )
-        assert installed is False
+        assert installed.applied is False
+        assert installed.reason == "stale_preimage"
+        assert installed.cancellation_reconciled is False
         assert (await manager.get_transcript(node.session_key))[0].assistant_replay == changed
         assert await manager.get_summaries(node.session_key) == []
     finally:

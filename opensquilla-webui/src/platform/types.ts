@@ -318,6 +318,7 @@ export interface NativeArtifactAnnotationCapabilities {
   picker?: boolean
   trustedOverlay?: boolean
   overlayCopyVersion?: 1
+  overlayEditorVersion?: 2
   atomicCloseRearm?: true
   reason?: string
 }
@@ -335,6 +336,8 @@ export interface NativeArtifactAnnotationOverlayRequest {
   annotationId: string
   initialBody?: string
   overlayCopyVersion?: 1
+  overlayEditorVersion?: 2
+  editorState?: NativeArtifactAnnotationEditorState
   copy?: {
     targetLabel: string
     contextLabel: string
@@ -345,6 +348,22 @@ export interface NativeArtifactAnnotationOverlayRequest {
     submitLabel: string
     emptyBodyMessage: string
   }
+}
+
+export interface NativeArtifactAnnotationEditorState {
+  /** Total batch size including the current annotation. */
+  batchCount: number
+  busy: boolean
+  error?: string
+  theme?: 'light' | 'dark' | 'system'
+  action?: 'record' | 'submit'
+}
+
+export interface NativeArtifactAnnotationOverlayUpdateRequest {
+  version: 3 | 4
+  surfaceId: string
+  annotationId: string
+  editorState: NativeArtifactAnnotationEditorState
 }
 
 export interface NativeArtifactAnnotationOverlayCloseRequest {
@@ -397,6 +416,7 @@ export interface NativeWorkbenchSurfaceResult {
   retryable?: boolean
   message?: string
   surfaceInstanceId?: string
+  pickerEpoch?: number
   navigationError?: { url: string; code: string; errorCode?: number; message: string }
 }
 
@@ -419,8 +439,11 @@ export type NativeWorkbenchSurfaceEventType =
   | 'browser-opened'
   | 'browser-closed'
   | 'annotation-selected'
+  | 'annotation-picker-state'
   | 'annotation-draft-change'
   | 'annotation-submit'
+  | 'annotation-record-current'
+  | 'annotation-batch-submit'
   | 'annotation-cancel'
   | 'annotation-overlay-fallback'
 
@@ -452,6 +475,8 @@ export interface NativeWorkbenchSurfaceEvent {
     action?: string
     code?: string
     surfaceInstanceId?: string
+    enabled?: boolean
+    pickerEpoch?: number
     message?: string
     path?: string
     reason?: string
@@ -489,6 +514,7 @@ export interface NativeArtifactPreviewLeaseCreateRequest {
   mode: WorkbenchPreviewMode
   authToken?: string
   pagePath?: string
+  snapshot?: boolean
 }
 
 export interface NativeArtifactPreviewLeaseControlRequest {
@@ -526,6 +552,9 @@ export interface NativeWorkbenchApi {
   ): Promise<NativeWorkbenchSurfaceResult>
   closeArtifactAnnotationOverlay?(
     request: NativeArtifactAnnotationOverlayCloseRequest,
+  ): Promise<NativeWorkbenchSurfaceResult>
+  updateArtifactAnnotationOverlay?(
+    request: NativeArtifactAnnotationOverlayUpdateRequest,
   ): Promise<NativeWorkbenchSurfaceResult>
   getWorkbenchBrowserTarget?(request: { surfaceId: string }): Promise<NativeWorkbenchBrowserTarget>
   setBrowserAutomationState?(request: NativeBrowserAutomationState): Promise<NativeWorkbenchSurfaceResult>

@@ -17,9 +17,13 @@ import {
 import { randomUUID } from 'node:crypto'
 import { isIP } from 'node:net'
 import { fileURLToPath } from 'node:url'
+import { placeAnnotationCard, type AnnotationSide } from './annotationPlacement.js'
 import {
   NATIVE_WORKBENCH_ANNOTATION_OVERLAY_HEIGHT,
   NATIVE_WORKBENCH_ANNOTATION_OVERLAY_WIDTH,
+  NATIVE_WORKBENCH_ANNOTATION_EDITOR_WIDTH,
+  NATIVE_WORKBENCH_ANNOTATION_EDITOR_MIN_HEIGHT,
+  NATIVE_WORKBENCH_ANNOTATION_EDITOR_MAX_HEIGHT,
   parseNativeWorkbenchAnnotationGeometry,
   parseNativeWorkbenchAnnotationOverlayMessage,
   parseNativeWorkbenchAnnotationSelection,
@@ -27,6 +31,7 @@ import {
   type NativeWorkbenchAnnotationModeRequest,
   type NativeWorkbenchAnnotationOverlayCloseRequest,
   type NativeWorkbenchAnnotationOverlayShowRequest,
+  type NativeWorkbenchAnnotationOverlayUpdateRequest,
   type NativeWorkbenchAnnotationSelection,
   type NativeWorkbenchAnnotationSelectionCandidate,
 } from './native-workbench-annotation-contract.js'
@@ -58,6 +63,7 @@ import { BrowserPlaywrightDriver } from './browser-playwright.js'
 import { BrowserPointerController } from './browser-pointer-controller.js'
 import { BrowserManagedDownloads } from './browser-managed-downloads.js'
 import { showBrowserContextMenu } from './browser-context-menu.js'
+import { installTextContextMenu } from './text-context-menu.js'
 import { NativeWorkbenchPdfResourcePolicy } from './native-workbench-pdf-policy.js'
 import { BROWSER_PROMPT_PRELOAD, BrowserPromptController } from './browser-prompt.js'
 import { installDesktopZoomShortcuts } from './desktop-zoom-shortcuts.js'
@@ -205,6 +211,9 @@ interface NativeWorkbenchAnnotationOverlayBinding {
   port: MessagePortMain
   record: NativeWorkbenchSurfaceRecord
   selectionId: string
+  editorVersion: 1 | 2
+  contentHeight: number
+  placementSide?: AnnotationSide
 }
 
 interface NativeWorkbenchAnnotationOverlayRecord {
@@ -570,6 +579,41 @@ const NATIVE_WORKBENCH_ANNOTATION_OVERLAY_HTML = `<!doctype html>
     @media (prefers-reduced-motion: reduce) {
       textarea, button { transition: none; }
     }
+    :root[data-theme="light"] {
+      color-scheme: light;
+      --bg-surface: #FFFFFF; --bg-surface-2: #F0F0F2; --bg-hover: #EAEAED;
+      --text: #1D1D1F; --text-muted: #5F6066; --text-dim: #85868D;
+      --border: #E6E6E9; --border-strong: #D5D5DA;
+      --accent: #BA4D0F; --accent-hover: #A5440C; --accent-foreground: #FFFFFF;
+    }
+    :root[data-theme="dark"] {
+      color-scheme: dark;
+      --bg-surface: #202022; --bg-surface-2: #28282B; --bg-hover: #353539;
+      --text: #F5F5F7; --text-muted: #B0B0B6; --text-dim: #87878E;
+      --border: #303034; --border-strong: #444448;
+      --accent: #F26A1B; --accent-hover: #FF7A2E; --accent-foreground: #160B02;
+    }
+    #annotation-error { margin: 0; color: #D85444; font-size: 11px; overflow-wrap: anywhere; }
+    [hidden] { display: none !important; }
+    :root[data-editor-version="2"] .annotation-card {
+      display: flex; flex-direction: column; gap: 7px; height: auto; min-height: 48px;
+      max-height: 100vh; overflow: auto; padding: 12px 12px 10px 15px;
+      border-radius: 10px; box-shadow: none;
+    }
+    :root[data-editor-version="2"] .annotation-card::before { inset: 12px auto 12px 0; }
+    :root[data-editor-version="2"] .annotation-header { display: none; }
+    :root[data-editor-version="2"] textarea {
+      flex: none; min-height: 20px; max-height: 180px; padding: 0; border: 0;
+      border-radius: 0; background: transparent; line-height: 20px; box-shadow: none;
+    }
+    :root[data-editor-version="2"] footer { flex: none; min-height: 28px; gap: 7px; }
+    :root[data-editor-version="2"] .annotation-card[data-expanded="false"] footer { display: none; }
+    :root[data-editor-version="2"] button { height: 28px; font-size: 11px; font-weight: 500; }
+    :root[data-editor-version="2"] #annotation-cancel { min-width: 0; padding: 0 5px; border: 0; }
+    :root[data-editor-version="2"] #annotation-submit {
+      min-width: 28px; width: 28px; padding: 0; border-radius: 7px; font-size: 19px;
+    }
+    :root[data-editor-version="2"] .annotation-shortcut-hint { line-height: 1.4; white-space: normal; }
   </style>
 </head>
 <body>
@@ -592,6 +636,7 @@ const NATIVE_WORKBENCH_ANNOTATION_OVERLAY_HTML = `<!doctype html>
       <button id="annotation-cancel" type="button">Cancel</button>
       <button id="annotation-submit" type="submit">Add annotation</button>
     </footer>
+    <p id="annotation-error" role="alert" hidden></p>
   </form>
 </body>
 </html>`
@@ -602,6 +647,7 @@ export interface NativeWorkbenchSurfaceResult {
   retryable?: boolean
   message?: string
   surfaceInstanceId?: string
+  pickerEpoch?: number
   navigationError?: { url: string; code: string; errorCode?: number; message: string }
 }
 
@@ -828,6 +874,7 @@ export class NativeWorkbenchSurfaceManager {
   private readonly annotationOverlays = new Map<BrowserWindow, NativeWorkbenchAnnotationOverlayRecord>()
   private readonly hookedWindows = new WeakSet<BrowserWindow>()
   private readonly unresponsiveWindows = new WeakSet<BrowserWindow>()
+  private readonly ownerHtmlFullscreenWindows = new WeakSet<BrowserWindow>()
   private activeSurfaceId: string | null = null
   private htmlFullscreen: { record: NativeWorkbenchSurfaceRecord; ownerWasFullscreen: boolean } | null = null
   private readonly browserAutomationStates = new Map<string, { taskId: string; active: boolean }>()
@@ -1091,7 +1138,7 @@ export class NativeWorkbenchSurfaceManager {
       || request.kind !== 'url-preview' || request.payload.scopeId !== source.scopeId || source.owner !== owner)) {
       throw new DesktopBrowserError('TARGET_NOT_FOUND', 'The browser context is not owned by this session.', 404)
     }
-    this.hookWindow(owner)
+    this.observeWindow(owner)
     const record = this.allocateSurface(request, owner, source?.previewSession, undefined, reservation.retain())
     if (source) record.contextTargetRef = source.targetRef
     let interruptedNavigation: DesktopBrowserError | undefined
@@ -1418,6 +1465,7 @@ export class NativeWorkbenchSurfaceManager {
         picker: false,
         trustedOverlay: false,
         overlayCopyVersion: 1,
+        overlayEditorVersion: 2,
         atomicCloseRearm: true,
         reason: 'No active browser page is available.',
       }
@@ -1429,6 +1477,7 @@ export class NativeWorkbenchSurfaceManager {
         picker: false,
         trustedOverlay: false,
         overlayCopyVersion: 1,
+        overlayEditorVersion: 2,
         atomicCloseRearm: true,
         reason: 'The isolated DOM inspector is unavailable.',
       }
@@ -1448,6 +1497,7 @@ export class NativeWorkbenchSurfaceManager {
         picker: true,
         trustedOverlay: false,
         overlayCopyVersion: 1,
+        overlayEditorVersion: 2,
         atomicCloseRearm: true,
         reason: 'The trusted annotation editor is unavailable.',
       }
@@ -1458,6 +1508,7 @@ export class NativeWorkbenchSurfaceManager {
       picker: true,
       trustedOverlay: true,
       overlayCopyVersion: 1,
+      overlayEditorVersion: 2,
       atomicCloseRearm: true,
     }
   }
@@ -1577,7 +1628,8 @@ export class NativeWorkbenchSurfaceManager {
         }
       }
       this.auditAnnotationPicker(record, 'armed', 'succeeded', 'completed', startedAt)
-      return { ok: true }
+      this.emitAnnotationPickerState(record, 'armed')
+      return { ok: true, pickerEpoch }
     } catch (error) {
       if (record.annotationPickerEpoch === pickerEpoch) {
         record.annotationPickerActive = false
@@ -1633,7 +1685,7 @@ export class NativeWorkbenchSurfaceManager {
           message: cleanupFailure,
         }
       }
-      return { ok: true }
+      return { ok: true, pickerEpoch: record.annotationPickerEpoch }
     }
     if (!record.cdpReady || !record.contents.debugger.isAttached()) {
       return {
@@ -1714,6 +1766,8 @@ export class NativeWorkbenchSurfaceManager {
         port: channel.port1,
         record,
         selectionId: request.selectionId,
+        editorVersion: request.overlayEditorVersion === 2 ? 2 : 1,
+        contentHeight: NATIVE_WORKBENCH_ANNOTATION_EDITOR_MIN_HEIGHT,
       }
       overlay.binding = binding
       channel.port1.on('message', event => {
@@ -1728,13 +1782,21 @@ export class NativeWorkbenchSurfaceManager {
       overlay.view.webContents.postMessage(
         NATIVE_WORKBENCH_ANNOTATION_OVERLAY_CHANNEL,
         {
-          version: 1,
+          version: binding.editorVersion,
           initialBody: request.initialBody,
           copy: request.copy || NATIVE_WORKBENCH_ANNOTATION_OVERLAY_DEFAULT_COPY,
+          ...(binding.editorVersion === 2 ? { editorState: request.editorState } : {}),
         },
         [channel.port2],
       )
       const bounds = this.annotationOverlayBounds(record, candidate)
+      // Inspect mode has ended, but the selected target remains visible while
+      // the trusted editor owns focus. Chromium tracks this node decoration
+      // through scroll/zoom without mutating the untrusted preview document.
+      await this.cdpCommand(record, 'Overlay.highlightNode', {
+        objectId: candidate.objectId,
+        highlightConfig: NATIVE_WORKBENCH_ANNOTATION_HIGHLIGHT_CONFIG,
+      })
       this.presentAnnotationOverlay(
         overlay,
         bounds,
@@ -1762,6 +1824,26 @@ export class NativeWorkbenchSurfaceManager {
         retryable: true,
         message: errorMessage(error),
       }
+    }
+  }
+
+  updateArtifactAnnotationOverlay(request: NativeWorkbenchAnnotationOverlayUpdateRequest): NativeWorkbenchSurfaceResult {
+    const record = this.annotationRecordForUiRequest(request.surfaceId)
+    const overlay = record ? this.annotationOverlays.get(record.owner) : undefined
+    const binding = overlay?.binding
+    if (!record || !binding || binding.record !== record || binding.annotationId !== request.annotationId
+      || binding.editorVersion !== 2
+      || record.annotationCandidate?.selection.selectionId !== binding.selectionId
+      || record.annotationCandidate.documentGeneration !== record.annotationDocumentGeneration) {
+      return { ok: false, code: 'ANNOTATION_UNAVAILABLE', retryable: false,
+        message: 'The annotation editor changed before its state could be updated.' }
+    }
+    try {
+      binding.port.postMessage({ version: 2, type: 'editor-state', editorState: request.editorState })
+      return { ok: true }
+    } catch {
+      return { ok: false, code: 'ANNOTATION_UNAVAILABLE', retryable: true,
+        message: 'The annotation editor is unavailable.' }
     }
   }
 
@@ -1868,7 +1950,7 @@ export class NativeWorkbenchSurfaceManager {
       record.annotationFallbackActive = false
       this.clearAnnotationCandidate(record)
       this.setPhysicalVisibility(record, this.ownerCanShowSurfaces(record.owner))
-      return { ok: true }
+      return { ok: true, pickerEpoch }
     }
     if (overlay) this.closeAnnotationOverlayBinding(overlay, false)
     record.annotationFallbackActive = false
@@ -3166,7 +3248,8 @@ export class NativeWorkbenchSurfaceManager {
       }
       const candidate = parseNativeWorkbenchAnnotationSelection(raw)
       if (
-        generation !== record.annotationDocumentGeneration
+        record.annotationPickerEpoch !== pickerEpoch
+        || generation !== record.annotationDocumentGeneration
         || !this.isActiveAnnotationRecord(record)
       ) throw new Error('The selected preview element changed during inspection.')
       const selection: NativeWorkbenchAnnotationSelection = {
@@ -3253,7 +3336,7 @@ export class NativeWorkbenchSurfaceManager {
     // intentionally do not wait for this async routine before tearing down the
     // child renderer, so a prior timer must not outlive the surface generation.
     const startedAt = Date.now()
-    record.annotationPickerEpoch += 1
+    const pickerEpoch = ++record.annotationPickerEpoch
     const inspectModeMayBeActive = record.annotationPickerActive
     if (record.annotationFocusTimer) clearTimeout(record.annotationFocusTimer)
     record.annotationFocusTimer = null
@@ -3277,11 +3360,18 @@ export class NativeWorkbenchSurfaceManager {
     )
     if (
       cleanupFailure
+      && record.annotationPickerEpoch === pickerEpoch
       && !record.disposed
       && !record.crashed
       && !record.contents.isDestroyed()
       && record.contents.debugger.isAttached()
     ) record.annotationPickerActive = true
+    // Cancellation is picker state even when no node/editor has been selected.
+    // Publish only the still-current transition: a delayed hide/navigation
+    // cleanup must never disable a picker which the user has since rearmed.
+    if (record.annotationPickerEpoch === pickerEpoch) {
+      this.emitAnnotationPickerState(record, cleanupFailure ? 'reset-failed' : reason)
+    }
     this.auditAnnotationPicker(
       record,
       cleanupFailure ? 'failed' : 'cancelled',
@@ -3290,6 +3380,17 @@ export class NativeWorkbenchSurfaceManager {
       startedAt,
     )
     return cleanupFailure
+  }
+
+  private emitAnnotationPickerState(record: NativeWorkbenchSurfaceRecord, reason: string): void {
+    if (record.version !== NATIVE_WORKBENCH_PROTOCOL_VERSION_V3
+      && record.version !== NATIVE_WORKBENCH_PROTOCOL_VERSION_V4) return
+    this.emit(record, 'annotation-picker-state', {
+      enabled: record.annotationPickerActive,
+      reason,
+      pickerEpoch: record.annotationPickerEpoch,
+      surfaceInstanceId: record.surfaceInstanceId,
+    })
   }
 
   private async clearAnnotationInspectState(
@@ -3415,22 +3516,43 @@ export class NativeWorkbenchSurfaceManager {
       height: candidate.selection.rect.height * scaleY,
     }
     const gap = 8
+    const binding = this.annotationOverlays.get(record.owner)?.binding
+    const editorV2 = binding?.record === record && binding.editorVersion === 2
+    const width = editorV2 ? NATIVE_WORKBENCH_ANNOTATION_EDITOR_WIDTH : NATIVE_WORKBENCH_ANNOTATION_OVERLAY_WIDTH
+    const height = editorV2 ? Math.max(NATIVE_WORKBENCH_ANNOTATION_EDITOR_MIN_HEIGHT,
+      Math.min(NATIVE_WORKBENCH_ANNOTATION_EDITOR_MAX_HEIGHT, binding.contentHeight)) : NATIVE_WORKBENCH_ANNOTATION_OVERLAY_HEIGHT
+    if (editorV2) {
+      const placement = placeAnnotationCard({
+        anchor: { left: selected.x, top: selected.y, width: selected.width, height: selected.height },
+        viewport: { left: surface.x, top: surface.y, width: surface.width, height: surface.height },
+        width,
+        height,
+        preferredSide: binding.placementSide,
+      })
+      binding.placementSide = placement.side
+      return {
+        x: Math.round(placement.left),
+        y: Math.round(placement.top),
+        width: Math.floor(placement.width),
+        height: Math.floor(placement.height),
+      }
+    }
     let x = selected.x + selected.width + gap
     let y = selected.y
-    if (x + NATIVE_WORKBENCH_ANNOTATION_OVERLAY_WIDTH > surface.x + surface.width) {
-      x = selected.x - NATIVE_WORKBENCH_ANNOTATION_OVERLAY_WIDTH - gap
+    if (x + width > surface.x + surface.width) {
+      x = selected.x - width - gap
     }
-    if (x < surface.x) x = surface.x + surface.width - NATIVE_WORKBENCH_ANNOTATION_OVERLAY_WIDTH
-    if (y + NATIVE_WORKBENCH_ANNOTATION_OVERLAY_HEIGHT > surface.y + surface.height) {
-      y = selected.y + selected.height - NATIVE_WORKBENCH_ANNOTATION_OVERLAY_HEIGHT
+    if (x < surface.x) x = surface.x + surface.width - width
+    if (y + height > surface.y + surface.height) {
+      y = selected.y + selected.height - height
     }
     return {
       x: Math.round(Math.max(surface.x, Math.min(x, surface.x + surface.width
-        - NATIVE_WORKBENCH_ANNOTATION_OVERLAY_WIDTH))),
+        - width))),
       y: Math.round(Math.max(surface.y, Math.min(y, surface.y + surface.height
-        - NATIVE_WORKBENCH_ANNOTATION_OVERLAY_HEIGHT))),
-      width: Math.min(NATIVE_WORKBENCH_ANNOTATION_OVERLAY_WIDTH, surface.width),
-      height: Math.min(NATIVE_WORKBENCH_ANNOTATION_OVERLAY_HEIGHT, surface.height),
+        - height))),
+      width: Math.min(width, surface.width),
+      height: Math.min(height, surface.height),
     }
   }
 
@@ -3454,6 +3576,7 @@ export class NativeWorkbenchSurfaceManager {
     preserveFocus: boolean,
   ): void {
     if (overlay.owner.isDestroyed() || overlay.view.webContents.isDestroyed()) return
+    visible = visible && this.ownerCanShowSurfaces(overlay.owner)
     const binding = overlay.binding
     const wasFocused = preserveFocus && visible && overlay.view.webContents.isFocused()
     const currentBounds = overlay.view.getBounds()
@@ -3537,8 +3660,17 @@ export class NativeWorkbenchSurfaceManager {
     let message
     try {
       message = parseNativeWorkbenchAnnotationOverlayMessage(value)
+      if (message.version !== binding.editorVersion) throw new Error('Unexpected annotation editor version.')
     } catch {
       this.failAnnotationOverlay(binding.record, binding.annotationId, 'invalid-overlay-message')
+      return
+    }
+    if (message.type === 'content-size') {
+      if (binding.contentHeight === message.height) return
+      binding.contentHeight = message.height
+      this.presentAnnotationOverlay(overlay,
+        this.annotationOverlayBounds(binding.record, binding.record.annotationCandidate!),
+        this.ownerCanShowSurfaces(binding.record.owner), true)
       return
     }
     if (message.type === 'draft-changed') {
@@ -3548,8 +3680,9 @@ export class NativeWorkbenchSurfaceManager {
       })
       return
     }
-    if (message.type === 'submit') {
-      this.emit(binding.record, 'annotation-submit', {
+    if (message.type === 'submit' || message.type === 'record-current' || message.type === 'request-batch-submit') {
+      this.emit(binding.record, message.type === 'submit' ? 'annotation-submit'
+        : message.type === 'record-current' ? 'annotation-record-current' : 'annotation-batch-submit', {
         annotationId: binding.annotationId,
         body: message.body,
       })
@@ -3557,6 +3690,7 @@ export class NativeWorkbenchSurfaceManager {
       this.emit(binding.record, 'annotation-cancel', {
         annotationId: binding.annotationId,
         reason: 'user-cancelled',
+        ...(message.type === 'cancel-current' ? { body: message.body } : {}),
       })
     }
     // Submit/cancel are intents, not acknowledgements that Gateway state was
@@ -4877,6 +5011,7 @@ export class NativeWorkbenchSurfaceManager {
 
   private configureWebContents(record: NativeWorkbenchSurfaceRecord): void {
     const contents = record.contents
+    if (record.kind !== 'url-preview') installTextContextMenu(contents)
     if (record.kind === 'url-preview') {
       contents.on('will-frame-navigate', event => {
         if (!event.isMainFrame || record.disposed || contents.isDestroyed()
@@ -5605,7 +5740,9 @@ export class NativeWorkbenchSurfaceManager {
     }
     this.activeSurfaceId = record.id
     const bounds = this.resolveEffectiveSurfaceRect(record)
-    if (bounds) record.view.setBounds(bounds)
+    // Keep the retained page's viewport stable while the owner's video is
+    // fullscreen. Resizing even a hidden view can clamp its scroll position.
+    if (bounds && !this.ownerHtmlFullscreenWindows.has(record.owner)) record.view.setBounds(bounds)
     this.emitBrowserFindState(record)
     this.setPhysicalVisibility(record, this.ownerCanShowSurfaces(record.owner))
     const overlay = this.annotationOverlays.get(record.owner)
@@ -5648,7 +5785,7 @@ export class NativeWorkbenchSurfaceManager {
     record: NativeWorkbenchSurfaceRecord,
     visible: boolean,
   ): void {
-    visible = visible && !record.browserNavigationError
+    visible = visible && this.ownerCanShowSurfaces(record.owner) && !record.browserNavigationError
     try {
       if (!record.contents.isDestroyed()) {
         record.contents.setAudioMuted(!visible)
@@ -5694,7 +5831,7 @@ export class NativeWorkbenchSurfaceManager {
       this.setPhysicalVisibility(record, false)
       return
     }
-    record.view.setBounds(bounds)
+    if (!this.ownerHtmlFullscreenWindows.has(owner)) record.view.setBounds(bounds)
     this.setPhysicalVisibility(record, this.ownerCanShowSurfaces(owner))
     const overlay = this.annotationOverlays.get(owner)
     if (
@@ -5714,6 +5851,7 @@ export class NativeWorkbenchSurfaceManager {
   private ownerCanShowSurfaces(owner: BrowserWindow): boolean {
     return !owner.isDestroyed()
       && !this.unresponsiveWindows.has(owner)
+      && !this.ownerHtmlFullscreenWindows.has(owner)
       && owner.isVisible()
       && !owner.isMinimized()
   }
@@ -5756,7 +5894,7 @@ export class NativeWorkbenchSurfaceManager {
     return true
   }
 
-  private hookWindow(owner: BrowserWindow): void {
+  observeWindow(owner: BrowserWindow): void {
     if (this.hookedWindows.has(owner)) return
     this.hookedWindows.add(owner)
     owner.on('resize', () => this.reapplyActiveBounds(owner))
@@ -5764,6 +5902,21 @@ export class NativeWorkbenchSurfaceManager {
     owner.on('minimize', () => this.hideOwnedViews(owner))
     owner.on('show', () => this.reapplyActiveBounds(owner))
     owner.on('restore', () => this.reapplyActiveBounds(owner))
+    // Listen to the host document, not the window: a sidebar page can also
+    // enter HTML fullscreen and must remain visible in that case.
+    owner.webContents.on('enter-html-full-screen', () => {
+      this.ownerHtmlFullscreenWindows.add(owner)
+      this.hideOwnedViews(owner)
+    })
+    const restoreAfterHtmlFullscreen = () => {
+      if (!this.ownerHtmlFullscreenWindows.delete(owner)) return
+      this.reapplyActiveBounds(owner)
+    }
+    owner.webContents.on('leave-html-full-screen', restoreAfterHtmlFullscreen)
+    owner.webContents.on('did-navigate', () => {
+      this.ownerHtmlFullscreenWindows.delete(owner)
+      this.unresponsiveWindows.delete(owner)
+    })
     owner.webContents.on('zoom-changed', () => this.reapplyActiveBounds(owner))
     owner.webContents.on('unresponsive', () => {
       this.unresponsiveWindows.add(owner)
@@ -5781,10 +5934,12 @@ export class NativeWorkbenchSurfaceManager {
       }
     })
     owner.webContents.on('render-process-gone', () => {
+      this.ownerHtmlFullscreenWindows.delete(owner)
       this.unresponsiveWindows.add(owner)
       void this.destroyAll()
     })
     owner.once('closed', () => {
+      this.ownerHtmlFullscreenWindows.delete(owner)
       void this.destroyAll()
     })
   }

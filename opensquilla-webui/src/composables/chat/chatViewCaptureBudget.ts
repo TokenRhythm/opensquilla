@@ -1,21 +1,28 @@
 import { toRaw } from 'vue'
 
+export type ChatViewCaptureRejection = 'bytes' | 'nodes' | 'depth' | 'properties' | 'cycle' | 'unsafe'
+
 /** Bound departure work before JSON allocates an entire tool-result payload. */
 export function createChatViewCaptureBudget(maxBytes: number) {
   let bytes = 2 // enclosing object
   let fields = 0
   let nodes = 0
   let objectProperties = 0
+  let rejectionReason: ChatViewCaptureRejection | undefined
   const ancestors = new WeakSet<object>()
   const exhausted = Symbol('view-capture-budget')
+  function reject(reason: ChatViewCaptureRejection): never {
+    rejectionReason ??= reason
+    throw exhausted
+  }
   const add = (count: number) => {
     bytes += count
-    if (bytes > maxBytes) throw exhausted
+    if (bytes > maxBytes) reject('bytes')
   }
   function string(value: string) {
     // UTF-8 JSON is never shorter than its UTF-16 code-unit count. Reject giant
     // values in O(1), without encoding or escaping their complete contents.
-    if (value.length > maxBytes - bytes) throw exhausted
+    if (value.length > maxBytes - bytes) reject('bytes')
     add(2)
     for (let index = 0; index < value.length; index++) {
       const code = value.charCodeAt(index)
@@ -31,27 +38,28 @@ export function createChatViewCaptureBudget(maxBytes: number) {
     }
   }
   function walk(value: unknown, depth: number) {
-    if (++nodes > 20_000 || depth > 32) throw exhausted
+    if (++nodes > 20_000) reject('nodes')
+    if (depth > 32) reject('depth')
     if (value === null) { add(4); return }
     if (typeof value === 'string') { string(value); return }
     if (typeof value === 'boolean') { add(value ? 4 : 5); return }
     if (typeof value === 'number') { add(Number.isFinite(value) ? String(value).length : 4); return }
-    if (typeof value !== 'object') throw exhausted
+    if (typeof value !== 'object') reject('unsafe')
     const raw = toRaw(value)
-    if (ancestors.has(raw)) throw exhausted
+    if (ancestors.has(raw)) reject('cycle')
     const array = Array.isArray(raw)
-    if (!array && Object.getPrototypeOf(raw) !== Object.prototype && Object.getPrototypeOf(raw) !== null) throw exhausted
+    if (!array && Object.getPrototypeOf(raw) !== Object.prototype && Object.getPrototypeOf(raw) !== null) reject('unsafe')
     // Cache data only. Accessors/toJSON could perform unbounded work or return
     // a different payload after this preflight; they are not presentation data.
-    if ('toJSON' in raw) throw exhausted
+    if ('toJSON' in raw) reject('unsafe')
     ancestors.add(raw)
     add(2)
     if (array) {
-      if (raw.length > 20_000 - nodes) throw exhausted
+      if (raw.length > 20_000 - nodes) reject('nodes')
       for (let index = 0; index < raw.length; index++) {
         if (index) add(1)
         const descriptor = Object.getOwnPropertyDescriptor(raw, String(index))
-        if (descriptor && !('value' in descriptor)) throw exhausted
+        if (descriptor && !('value' in descriptor)) reject('unsafe')
         walk(descriptor?.value === undefined ? null : descriptor.value, depth + 1)
       }
     } else {
@@ -59,10 +67,10 @@ export function createChatViewCaptureBudget(maxBytes: number) {
       for (const key in raw) {
         // Omitted undefined fields still cost traversal work, even though
         // JSON does not emit them or visit their values.
-        if (++objectProperties > 20_000) throw exhausted
+        if (++objectProperties > 20_000) reject('properties')
         const descriptor = Object.getOwnPropertyDescriptor(raw, key)
         if (!descriptor) continue
-        if (!('value' in descriptor)) throw exhausted
+        if (!('value' in descriptor)) reject('unsafe')
         if (descriptor.value === undefined) continue
         if (count++) add(1)
         string(key); add(1); walk(descriptor.value, depth + 1)
@@ -72,6 +80,9 @@ export function createChatViewCaptureBudget(maxBytes: number) {
   }
   return {
     get bytes() { return bytes },
+    get rejectionReason() { return rejectionReason },
+    get visitedNodes() { return nodes },
+    get visitedProperties() { return objectProperties },
     include(key: string, value: unknown): boolean {
       if (value === undefined) return true
       try {
@@ -79,6 +90,7 @@ export function createChatViewCaptureBudget(maxBytes: number) {
         string(key); add(1); walk(value, 0)
         return true
       } catch {
+        rejectionReason ??= 'unsafe'
         return false
       }
     },

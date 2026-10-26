@@ -1,7 +1,6 @@
 import { computed, nextTick, onUnmounted, reactive, ref } from 'vue'
 import { useRoute } from 'vue-router'
 import i18n from '@/i18n'
-import { useToasts } from '@/composables/useToasts'
 import { useConfirm } from '@/composables/useConfirm'
 import { useProjectWorkspaces } from '@/composables/useProjectWorkspaces'
 import type { CronJob, CronJobFormModel, CronPanelTemplate } from '@/types/cron'
@@ -16,7 +15,6 @@ interface UseCronFormOptions {
 
 export function useCronForm(scheduler: CronScheduler, options: UseCronFormOptions) {
   const route = useRoute()
-  const { pushToast } = useToasts()
   const { confirm } = useConfirm()
   const projectWorkspaces = useProjectWorkspaces()
   const t = i18n.global.t
@@ -340,7 +338,6 @@ export function useCronForm(scheduler: CronScheduler, options: UseCronFormOption
     saving.value = true
     try {
       await scheduler.saveJob(payload, { existing })
-      pushToast(existing ? t('cronSkills.form.toastUpdated') : t('cronSkills.form.toastCreated'), { tone: 'ok' })
       panelOpen.value = false
       editingJob.value = null
       initialForm = JSON.stringify(form)

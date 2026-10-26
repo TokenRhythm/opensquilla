@@ -1294,7 +1294,12 @@ async def test_error_receipt_report_uses_member_prices_without_tracker(
     done = next(event for event in events if event.kind == "done")
 
     assert len(sink.finalized) == 1
-    assert sink.finalized[0][1].estimated_cost_nanos == 0
+    settled = sink.finalized[0][1]
+    assert settled.estimated_cost_nanos > 0
+    assert settled.estimated_cost_nanos / 1_000_000_000 == pytest.approx(
+        done.cost_usd - done.billed_cost, abs=1e-6,
+    )
+    assert settled.billed_cost_nanos / 1_000_000_000 == pytest.approx(done.billed_cost)
     breakdown_cost = sum(row["cost_usd"] for row in done.model_usage_breakdown)
     breakdown_billed = sum(
         row["billed_cost_usd"] for row in done.model_usage_breakdown

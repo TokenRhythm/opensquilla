@@ -148,7 +148,11 @@
             "properties": {
               "localPathReferences": {
                 "type": "array",
-                "items": { "type": "string", "minLength": 1, "maxLength": 32768 },
+                "items": {
+                  "type": "string",
+                  "minLength": 1,
+                  "maxLength": 32768
+                },
                 "description": "Display-only explicit local paths matching the canonical message suffix; no file access authority."
               },
               "selectedSkills": {
@@ -157,6 +161,9 @@
                 "items": {
                   "$ref": "#/$defs/SelectedSkillRef"
                 }
+              },
+              "turnCommand": {
+                "$ref": "#/$defs/TurnCommand"
               }
             }
           }
@@ -257,6 +264,22 @@
           "type": "string",
           "minLength": 1,
           "maxLength": 512
+        }
+      }
+    },
+    "TurnCommand": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "name",
+        "args"
+      ],
+      "properties": {
+        "name": {
+          "const": "project.init"
+        },
+        "args": {
+          "type": "string"
         }
       }
     }

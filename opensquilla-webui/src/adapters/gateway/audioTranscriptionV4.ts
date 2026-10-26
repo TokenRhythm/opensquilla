@@ -40,6 +40,9 @@ export function createV4AudioTranscription(http: AudioHttpTransport): AudioTrans
       const form = new FormData()
       form.append('file', input.recording, 'voice.webm')
       form.append('mime', input.mimeType)
+      if (input.sessionKey) form.append('session_key', input.sessionKey)
+      if (input.sessionId) form.append('session_id', input.sessionId)
+      if (input.sessionEpoch !== undefined) form.append('session_epoch', String(input.sessionEpoch))
       try {
         const raw = await http.requestJson<unknown>('/api/audio/transcribe', {
           method: 'POST',

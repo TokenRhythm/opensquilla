@@ -77,7 +77,6 @@ from opensquilla.engine.turn_runner.turn_finalizer_stage import (
     TranscriptAppendResult,
     TurnErrorPersistPort,
     TurnMemoryCapturePort,
-    UsageTelemetryPort,
 )
 from opensquilla.engine.usage_accounting import UsageExecutionContext
 from opensquilla.provider.model_catalog import resolve_effective_context_window
@@ -93,6 +92,11 @@ if TYPE_CHECKING:
     from opensquilla.observability.prompt_report import PromptReport
     from opensquilla.observability.turn_call_log import TurnCallLogger
     from opensquilla.provider.protocol import LLMProvider
+    from opensquilla.session.manager import (
+        CompactionPersistResult,
+        CompactionSourceSnapshot,
+        SessionManager,
+    )
     from opensquilla.tools.types import ToolContext
 
 
@@ -278,7 +282,14 @@ class _TurnRunnerPromptAssemblerAdapter(PromptAssemblerPort):
         fresh_user_session: bool = False,
         workspace_dir: str | None = None,
         webui_rendering: bool = False,
+        project_rules_snapshot: Any = None,
+        persistence_tools: frozenset[str] | None = None,
     ) -> str | tuple[str, str]:
+        prompt_options: dict[str, Any] = {}
+        if project_rules_snapshot is not None:
+            prompt_options["project_rules_snapshot"] = project_rules_snapshot
+        if persistence_tools is not None:
+            prompt_options["persistence_tools"] = persistence_tools
         return self._runner._assemble_prompt(
             agent_id,
             tool_defs,
@@ -290,6 +301,7 @@ class _TurnRunnerPromptAssemblerAdapter(PromptAssemblerPort):
             fresh_user_session=fresh_user_session,
             workspace_dir=workspace_dir,
             webui_rendering=webui_rendering,
+            **prompt_options,
         )
 
 class _TurnRunnerPipelineExecutionAdapter(PipelineExecutionPort):
@@ -969,7 +981,9 @@ class _TurnRunnerMemorySnapshotAdapter(MemorySnapshotPort):
             workspace = runner._resolve_memory_source_dir(agent_id)
             runner._memory_snapshots[snap_key] = MemorySnapshot(
                 memory_md=runner._load_memory_md(workspace),
-                daily_notes=runner._load_daily_notes(workspace),
+                daily_notes=runner._load_daily_notes(
+                    workspace, notes_dir=runner._resolve_memory_notes_dir(agent_id),
+                ),
             )
         return _MemorySnapshotResult(
             sync_manager=sync_manager,
@@ -1325,11 +1339,12 @@ class _TurnRunnerCompactionPersistAdapter(CompactionPersistPort):
         source_entries: tuple[Any, ...] | None = None,
         source_preimage: tuple[tuple[Any, ...], ...] | None = None,
         source_context_fingerprint: str | None = None,
+        source_snapshot: CompactionSourceSnapshot | None = None,
         source_boundary_message_id: str | None = None,
         source_boundary_entry_id: int | None = None,
         expected_session_id: str | None = None,
         expected_session_epoch: int | None = None,
-    ) -> bool | None:
+    ) -> CompactionPersistResult:
         from opensquilla.engine.cache_break_monitor import notify_compaction
         from opensquilla.engine.runtime import (
             _accepts_explicit_keyword_arg,
@@ -1342,10 +1357,11 @@ class _TurnRunnerCompactionPersistAdapter(CompactionPersistPort):
             compaction_lifecycle_payload,
             new_compaction_id,
         )
+        from opensquilla.session.manager import CompactionPersistResult
 
         session_manager = self._runner._session_manager
         if session_manager is None:
-            return None
+            return CompactionPersistResult(False, "writer_unavailable")
         persist_method = session_manager.persist_compaction_result
         params = inspect.signature(persist_method).parameters
         accepts_kwargs = any(
@@ -1382,6 +1398,8 @@ class _TurnRunnerCompactionPersistAdapter(CompactionPersistPort):
             persist_kwargs["source_preimage"] = source_preimage
         if "source_context_fingerprint" in params or accepts_kwargs:
             persist_kwargs["source_context_fingerprint"] = source_context_fingerprint
+        if source_snapshot is not None and ("source_snapshot" in params or accepts_kwargs):
+            persist_kwargs["source_snapshot"] = source_snapshot
         if "source_boundary_message_id" in params or accepts_kwargs:
             persist_kwargs["source_boundary_message_id"] = source_boundary_message_id
         if "source_boundary_entry_id" in params or accepts_kwargs:
@@ -1405,25 +1423,28 @@ class _TurnRunnerCompactionPersistAdapter(CompactionPersistPort):
                 kept_entries,
                 **persist_kwargs,
             )
-        if installed is False:
+        result = CompactionPersistResult.from_legacy(installed)
+        if result.reason == "commit_unconfirmed":
+            return result
+        if not result.applied:
             notify_compaction(
                 session_key,
                 source="automatic",
                 phase="agent_inline_overflow",
                 status="skipped",
-                reason="stale_preimage",
+                reason=result.reason,
                 kept_count=len(kept_entries),
                 removed_count=removed_count,
                 **compaction_effect_payload(
                     status="skipped",
-                    reason="stale_preimage",
+                    reason=result.reason,
                 ),
                 **compaction_lifecycle_payload(
                     resolved_compaction_id,
                     COMPACTION_TRIGGERED_EVENT,
                 ),
             )
-            return False
+            return result
         notify_compaction(
             session_key,
             source="automatic",
@@ -1437,7 +1458,27 @@ class _TurnRunnerCompactionPersistAdapter(CompactionPersistPort):
                 COMPACTION_PERSISTED_EVENT,
             ),
         )
-        return True
+        return result
+
+    async def refresh_source(
+        self, *, session_key: str, source_snapshot: CompactionSourceSnapshot, removed_count: int,
+        expected_session_id: str | None, expected_session_epoch: int | None,
+    ) -> CompactionSourceSnapshot:
+        """Recapture only the consumed prefix, never queued future user rows."""
+        manager = cast("SessionManager", self._runner._session_manager)
+        remaining = source_snapshot.entries[removed_count:]
+        kwargs: dict[str, Any] = {
+            "expected_session_id": expected_session_id,
+            "expected_session_epoch": expected_session_epoch,
+        }
+        if remaining:
+            kwargs["boundary_message_id"] = remaining[-1].message_id
+        else:
+            kwargs["transcript_entries"] = ()
+        snapshot = await manager.capture_compaction_source(session_key, **kwargs)
+        if not snapshot.valid or snapshot.preimage != source_snapshot.preimage[removed_count:]:
+            raise ValueError("Compaction source changed during post-commit refresh")
+        return snapshot
 
 class _TurnRunnerMemorySnapshotRefreshAdapter(MemorySnapshotRefreshPort):
     """Refresh ``runner._memory_snapshots[(agent_id, session_key)]`` after compaction.
@@ -1464,7 +1505,9 @@ class _TurnRunnerMemorySnapshotRefreshAdapter(MemorySnapshotRefreshPort):
         if private_memory_allowed:
             runner._memory_snapshots[(agent_id, session_key)] = MemorySnapshot(
                 memory_md=runner._load_memory_md(workspace),
-                daily_notes=runner._load_daily_notes(workspace),
+                daily_notes=runner._load_daily_notes(
+                    workspace, notes_dir=runner._resolve_memory_notes_dir(agent_id),
+                ),
             )
 
 class _TurnRunnerSystemPromptRefreshAdapter(SystemPromptRefreshPort):
@@ -1492,6 +1535,14 @@ class _TurnRunnerSystemPromptRefreshAdapter(SystemPromptRefreshPort):
         from opensquilla.tools.types import CallerKind
 
         tool_context = getattr(agent, "_tool_context", None)
+        authorized_tools = getattr(tool_context, "authorized_tool_names", None)
+        persistence_tools = (
+            frozenset(authorized_tools) & {"memory_save", "memory_get"}
+            if authorized_tools is not None else None
+        )
+        prompt_options: dict[str, Any] = {}
+        if persistence_tools is not None:
+            prompt_options["persistence_tools"] = persistence_tools
         assembled = self._runner._assemble_prompt(
             agent_id,
             tool_defs,
@@ -1499,6 +1550,8 @@ class _TurnRunnerSystemPromptRefreshAdapter(SystemPromptRefreshPort):
             bootstrap_context_mode=(bootstrap_context_mode),
             workspace_dir=(getattr(agent.config, "workspace_dir", None)),
             webui_rendering=(getattr(tool_context, "caller_kind", None) is CallerKind.WEB),
+            include_project_rules=False,
+            **prompt_options,
         )
         refreshed_prompt = (
             assembled[0] if isinstance(assembled, tuple) else assembled
@@ -2023,6 +2076,7 @@ class _TurnRunnerTurnErrorPersistAdapter(TurnErrorPersistPort):
         provider: str | None = None,
         model: str | None = None,
         fallback_hops: int = 0,
+        turn_usage: dict[str, Any] | None = None,
     ) -> None:
         await self._runner._persist_turn_error(
             session_key,
@@ -2035,24 +2089,5 @@ class _TurnRunnerTurnErrorPersistAdapter(TurnErrorPersistPort):
             provider=provider,
             model=model,
             fallback_hops=fallback_hops,
-        )
-
-
-class _TurnRunnerUsageTelemetryAdapter(UsageTelemetryPort):
-    """Persist content-free counters for the gateway's hourly upload loop."""
-
-    def __init__(self, runner: TurnRunner) -> None:
-        self._runner = runner
-
-    async def record_turn(self, *, run_kind: str, done_event: DoneEvent | None) -> None:
-        from opensquilla.observability.usage_telemetry import record_completed_turn
-
-        session_manager = self._runner._session_manager
-        if session_manager is None:
-            return
-        await record_completed_turn(
-            session_manager.storage,
-            config=self._runner._config,
-            run_kind=run_kind,
-            done_event=done_event,
+            **({"turn_usage": turn_usage} if turn_usage is not None else {}),
         )

@@ -29,6 +29,7 @@ export interface ArtifactPromptAnnotationReuseDetail
 export interface PageAnnotationsSentDetail {
   draftIds: string[]
   sessionKey: string
+  documentId?: string
   /** The key used by the send request before a draft/session was materialized. */
   requestSessionKey?: string
 }
@@ -89,6 +90,7 @@ export function notifyPageAnnotationsSent(
     detail: {
       draftIds: [...detail.draftIds],
       sessionKey: detail.sessionKey,
+      ...(detail.documentId ? { documentId: detail.documentId } : {}),
       ...(requestSessionKey && requestSessionKey !== detail.sessionKey
         ? { requestSessionKey }
         : {}),

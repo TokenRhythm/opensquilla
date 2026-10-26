@@ -1285,7 +1285,7 @@ describe('useSetupCatalog privacy settings', () => {
       patches: { 'privacy.disable_network_observability': true },
     })
     expect(api.sectionDirty('securityPrivacy')).toBe(false)
-    expect(pushToast).toHaveBeenCalledWith('Privacy saved.')
+    expect(pushToast).not.toHaveBeenCalled()
     app.unmount()
   })
 
@@ -1367,7 +1367,7 @@ describe('useSetupCatalog privacy settings', () => {
 })
 
 describe('useSetupCatalog capability reset', () => {
-  it('confirms a draft, resets through the advertised RPC, and preserves unrelated drafts', async () => {
+  it.each([false, true])('resets visibly without redundant success feedback while preserving restart guidance (%s)', async restartRequired => {
     let load = 0
     rpcCall.mockImplementation(async (method: string, params?: Record<string, unknown>) => {
       if (method === 'onboarding.catalog') {
@@ -1414,7 +1414,7 @@ describe('useSetupCatalog capability reset', () => {
       if (method === 'config.effective') return { fields: {} }
       if (method === 'onboarding.capability.reset') {
         expect(params).toEqual({ capabilityId: 'image_generation' })
-        return { restartRequired: false }
+        return { restartRequired }
       }
       throw new Error(`Unexpected RPC method: ${method}`)
     })
@@ -1434,6 +1434,8 @@ describe('useSetupCatalog capability reset', () => {
     })
     expect(api.sectionDirty('capabilities')).toBe(false)
     expect(api.sectionDirty('general')).toBe(true)
+    if (restartRequired) expect(pushToast).toHaveBeenCalledExactlyOnceWith(expect.stringContaining('Restart required.'))
+    else expect(pushToast).not.toHaveBeenCalled()
     app.unmount()
   })
 
@@ -2836,7 +2838,7 @@ describe('useSetupCatalog model strategy IA', () => {
       expect(api.behaviorPanel.value.autoSessionTitles).toBe(enabled)
       expect(api.sectionDirty('general')).toBe(false)
       expect(api.saveAllPending.value).toBe(false)
-      expect(pushToast).toHaveBeenCalledOnce()
+      expect(pushToast).not.toHaveBeenCalled()
 
       api.setAutoSessionTitles(!enabled)
       expect(api.sectionDirty('general')).toBe(true)
@@ -6232,7 +6234,7 @@ describe('useSetupCatalog configured provider management', () => {
       body: 'Remove DeepSeek from configured providers? Referenced providers cannot be removed.',
       primaryLabel: 'Remove provider',
     })
-    expect(pushToast).toHaveBeenCalledWith('DeepSeek was removed.')
+    expect(pushToast).not.toHaveBeenCalled()
 
     refuse = true
     await api.removeProviderProfile('deepseek')
@@ -6777,6 +6779,7 @@ describe('useSetupCatalog configured provider management', () => {
       removing: false,
     })
     expect(api.providerPanel.value.credentialRemovalPending).toBe(false)
+    expect(pushToast).not.toHaveBeenCalled()
     expect(api.providerPanel.value.llmTimeoutSeconds).toBe(321)
     expect(api.modelStrategyPanel.value.single.model).toBe('gpt-4.1')
     expect(api.providerDraftDirty.value).toBe(true)
@@ -8775,7 +8778,7 @@ describe('settings operation feedback', () => {
       api.updateCapabilityField('search', 'maxResults', 25)
       pushToast.mockClear()
       expect(await api.saveSearch()).toBe(true)
-      expect(pushToast).toHaveBeenCalledExactlyOnceWith('Search saved.')
+      expect(pushToast).not.toHaveBeenCalled()
       expect(api.behaviorPanel.value.autoSessionTitles).toBe(false)
       expect(api.modelStrategyPanel.value.single.model).toBe('unsaved-model')
       expect(api.providerPanel.value.credentialPanel?.apiKeyValue).toBe('unsubmitted-provider-key')
@@ -8819,19 +8822,17 @@ describe('settings operation feedback', () => {
     } finally { app.unmount() }
   })
 
-  it('combines primary-save completion and its Router outcome in one notification', async () => {
+  it('keeps the cross-section Router outcome without repeating visible provider-save completion', async () => {
     const { api, app } = await primaryTransitionScenario()
     try {
       api.updateProviderField('api_key', 'synthetic-primary-draft')
       pushToast.mockClear()
       expect(await api.saveProvider()).toBe(true)
-      expect(pushToast).toHaveBeenCalledTimes(1)
-      expect(pushToast.mock.calls[0]?.[0]).toContain('saved')
-      expect(pushToast.mock.calls[0]?.[0]).toContain('Saved Router tiers were preserved.')
+      expect(pushToast).toHaveBeenCalledExactlyOnceWith('Saved Router tiers were preserved.')
     } finally { app.unmount() }
   })
 
-  it('emits one notification for a settings-wide save and rebases only its submitted sections', async () => {
+  it('silently completes a visible settings-wide save and rebases only its submitted sections', async () => {
     const scenario = await primaryTransitionScenario(false, (method, params) => {
       if (method === 'config.patch.safe') Object.assign(scenario.saved, { naming: { enabled: false } })
       if (method === 'onboarding.router.configure') scenario.saved.squilla_router.enabled = params?.enabled === true
@@ -8844,7 +8845,7 @@ describe('settings operation feedback', () => {
       api.updateProviderField('api_key', 'unsubmitted-provider-draft')
       pushToast.mockClear()
       await api.saveDirtySections()
-      expect(pushToast).toHaveBeenCalledExactlyOnceWith('Settings saved.')
+      expect(pushToast).not.toHaveBeenCalled()
       expect(api.sectionDirty('general')).toBe(false)
       expect(api.sectionDirty('modelStrategy')).toBe(false)
       expect(api.providerPanel.value.credentialPanel?.apiKeyValue).toBe('unsubmitted-provider-draft')
@@ -8991,14 +8992,14 @@ describe('settings operation feedback', () => {
     } finally { app.unmount() }
   })
 
-  it('reports a multi-step model save once, after all writes and the read-back succeed', async () => {
+  it('silently completes a multi-step model save after all writes and the read-back succeed', async () => {
     const { api, app } = await primaryTransitionScenario()
     try {
       api.setRouterMode('disabled')
       api.setEnsembleProposerMaxRetries(2)
       pushToast.mockClear()
       expect(await api.saveModelStrategy()).toBe(true)
-      expect(pushToast).toHaveBeenCalledExactlyOnceWith('Model settings saved.')
+      expect(pushToast).not.toHaveBeenCalled()
     } finally { app.unmount() }
   })
 

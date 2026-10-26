@@ -292,6 +292,8 @@ export function useChatStream(options: UseChatStreamOptions) {
     peekToolTiming,
     publish: publishTurnLog,
     resetGeneration,
+    beginProviderCall,
+    rollbackProviderCall,
     resetLog,
     foldedTurn,
   } = turnLog
@@ -970,6 +972,17 @@ export function useChatStream(options: UseChatStreamOptions) {
     scheduleRender()
   }
 
+  function resetProviderCallGeneration(modelCallId: string): boolean {
+    clearRenderTimer()
+    if (!rollbackProviderCall(modelCallId)) return false
+    toolInputDrafts.clear()
+    activeModelCallId = ''
+    activeModelCallIteration = 0
+    noteStreamSignal()
+    scheduleRender()
+    return true
+  }
+
   function normalizeIncomingTextDelta(text: string): string {
     let raw = typeof text === 'string' ? text : ''
     if (
@@ -1007,6 +1020,7 @@ export function useChatStream(options: UseChatStreamOptions) {
       activeModelCallId = modelCallId
       activeModelCallIteration = iteration
     }
+    beginProviderCall(modelCallId)
     recordActivityPhase('Writing reply', `write:${streamRound.value}`)
     appendFrame({ kind: 'text', text: deltaText, presentation })
     scheduleRender()
@@ -1609,6 +1623,8 @@ export function useChatStream(options: UseChatStreamOptions) {
     resetStreamForRouterReplay,
     resetLiveTurnState,
     resetAnswerGeneration,
+    resetProviderCallGeneration,
+    beginProviderCall,
     setAssistantMessageId,
     appendDelta,
     scheduleRender,

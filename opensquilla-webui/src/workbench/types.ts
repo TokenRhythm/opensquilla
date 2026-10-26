@@ -82,6 +82,7 @@ export type WorkbenchToolbarItem =
       id: string
       label: string
       icon: IconName
+      tooltip?: string
       disabled?: boolean
       pressed?: boolean
     }
@@ -91,6 +92,7 @@ export type WorkbenchToolbarItem =
       label: string
       text: string
       icon?: IconName
+      tone?: 'neutral' | 'warning'
     }
   | {
       kind: 'select'

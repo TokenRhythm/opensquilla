@@ -15,6 +15,7 @@ import httpx
 import structlog
 from cachetools import TTLCache
 
+from opensquilla.provider.metered_http import accounted_request
 from opensquilla.result_budget import (
     DEFAULT_TOOL_RUN_BUDGET_POLICY,
     ToolRunBudgetPolicy,
@@ -205,8 +206,13 @@ async def _try_firecrawl(url: str, api_key: str) -> tuple[str, str, str] | None:
             timeout=30.0,
             **managed_network_httpx_kwargs(),
         ) as client:
-            resp = await client.post(
+            resp = await accounted_request(
+                client,
+                "POST",
                 "https://api.firecrawl.dev/v2/scrape",
+                provider="firecrawl",
+                operation="web_fetch",
+                base_url="https://api.firecrawl.dev",
                 headers={
                     "Authorization": f"Bearer {api_key}",
                     "Content-Type": "application/json",

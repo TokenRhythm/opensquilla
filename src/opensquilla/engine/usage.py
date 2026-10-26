@@ -79,21 +79,24 @@ class ModelUsage:
             price=price,
         ).cost_usd
 
-    def unbilled_estimate(self) -> CostEstimate:
+    def unbilled_estimate(self) -> CostEstimate | None:
         """Cache-aware estimate of only the unbilled token buckets."""
-        price = lookup_price(self.model_id, self.provider)
+        resolved = resolve_model_price(self.model_id, self.provider)
+        if not resolved.has_accounting_price:
+            return None
         return estimate_cost(
             input_tokens=self.unbilled_input_tokens,
             output_tokens=self.unbilled_output_tokens,
             cache_read_tokens=self.unbilled_cache_read_tokens,
             cache_write_tokens=self.unbilled_cache_write_tokens,
-            price=price,
+            price=resolved.entry,
         )
 
     @property
     def total_cost(self) -> float:
         """Canonical cost: real billed spend plus the estimate of unbilled calls."""
-        return max(0.0, float(self.billed_cost or 0.0)) + self.unbilled_estimate().cost_usd
+        estimate = self.unbilled_estimate()
+        return max(0.0, float(self.billed_cost or 0.0)) + (estimate.cost_usd if estimate else 0.0)
 
 
 @dataclass
@@ -165,32 +168,23 @@ class SessionUsage:
         """
         entries = self._cost_entries()
         if not entries:
-            return self.cost
+            return float(self._breakdown_cost_fields(self)["costUsd"])
         return sum(m.total_cost for m in entries.values())
 
     @property
     def cost_source(self) -> str:
-        """Aggregate cost source for the session row.
-
-        - ``provider_billed``: every per-model entry has a real billed total.
-        - ``mixed``: some models billed, others estimate-only.
-        - ``opensquilla_estimate``: no billed data at all, or provider returned
-          no cost for any call.
-        """
+        """Aggregate the same price evidence used by the session's model rows."""
         entries = self._cost_entries()
         if not entries:
-            if self.provider_billed_entries and self.unbilled_entries:
-                return "mixed"
-            if self.provider_billed_entries:
-                return "provider_billed"
-            return "opensquilla_estimate"
-        billed_count = sum(max(0, m.provider_billed_entries) for m in entries.values())
-        unbilled_count = sum(max(0, m.unbilled_entries) for m in entries.values())
-        if billed_count == 0:
-            return "opensquilla_estimate"
-        if unbilled_count == 0:
+            return str(self._breakdown_cost_fields(self)["costSource"])
+        sources = {self._breakdown_cost_fields(m)["costSource"] for m in entries.values()}
+        if "mixed" in sources or ("provider_billed" in sources and len(sources) > 1):
+            return "mixed"
+        if "provider_billed" in sources:
             return "provider_billed"
-        return "mixed"
+        if "opensquilla_estimate" in sources:
+            return "opensquilla_estimate"
+        return "free" if sources == {"free"} else "unavailable"
 
     def add(
         self,
@@ -203,6 +197,7 @@ class SessionUsage:
         billed_cost: float = 0.0,
         provider: str = "",
         cost_source: str | None = None,
+        token_usage_known: bool = True,
     ) -> None:
         """Accumulate token counts, tracking per-model breakdown.
 
@@ -247,7 +242,7 @@ class SessionUsage:
                     mu.provider_billed_entries += 1
                 if not provider_billed or mixed_source:
                     mu.unbilled_entries += 1
-                if not provider_billed and not mixed_source:
+                if not provider_billed and not mixed_source and token_usage_known:
                     # Pure counters only — pricing stays lazy in the cost
                     # properties/serializers so add() never blocks the event loop.
                     mu.unbilled_input_tokens += input_tokens
@@ -450,12 +445,15 @@ def _model_delta_cost(
     """Cost of one model's per-turn delta: billed delta plus the cache-aware
     estimate of the unbilled delta. A billed call no longer collapses the
     same model's unbilled calls to $0."""
+    resolved = resolve_model_price(model_id, provider)
+    if not resolved.has_accounting_price:
+        return max(0.0, float(billed_cost or 0.0))
     estimate = estimate_cost(
         input_tokens=unbilled_input_tokens,
         output_tokens=unbilled_output_tokens,
         cache_read_tokens=unbilled_cache_read_tokens,
         cache_write_tokens=unbilled_cache_write_tokens,
-        price=resolve_model_price(model_id, provider).entry,
+        price=resolved.entry,
     )
     return max(0.0, float(billed_cost or 0.0)) + estimate.cost_usd
 
@@ -511,24 +509,29 @@ def model_usage_cost_fields(
         unb_write = max(0, int(unbilled_cache_write_tokens or 0))
 
     resolved = resolve_model_price(model_id, provider)
-    est = estimate_cost(
-        input_tokens=unb_input,
-        output_tokens=unb_output,
-        cache_read_tokens=unb_read,
-        cache_write_tokens=unb_write,
-        price=resolved.entry,
+    est = (
+        estimate_cost(
+            input_tokens=unb_input,
+            output_tokens=unb_output,
+            cache_read_tokens=unb_read,
+            cache_write_tokens=unb_write,
+            price=resolved.entry,
+        )
+        if resolved.has_accounting_price
+        else None
     )
-    estimate = est.cost_usd
+    estimate = est.cost_usd if est is not None else 0.0
+    has_unbilled_tokens = bool(unb_input or unb_output or unb_read or unb_write)
     cost = billed + estimate
-    if has_billed and estimate > 0.0:
+    if has_billed and (estimate > 0.0 or (est is None and has_unbilled_tokens)):
         source = "mixed"
     elif has_billed:
         source = "provider_billed"
-    elif estimate > 0.0:
-        source = "opensquilla_estimate"
+    elif est is not None and has_unbilled_tokens:
+        source = "free" if est.basis == "free" else "opensquilla_estimate"
     else:
         source = "unavailable"
-    estimate_basis = est.basis if (unb_input or unb_output or unb_read or unb_write) else None
+    estimate_basis = est.basis if est is not None and has_unbilled_tokens else None
 
     rounded_cost = round(cost, 6)
     rounded_billed = round(billed, 6)
@@ -608,6 +611,7 @@ class UsageTracker:
         billed_cost: float = 0.0,
         provider: str = "",
         cost_source: str | None = None,
+        token_usage_known: bool = True,
     ) -> None:
         """Record token usage for a session.
 
@@ -633,6 +637,7 @@ class UsageTracker:
             billed_cost=billed_cost,
             provider=provider,
             cost_source=cost_source,
+            token_usage_known=token_usage_known,
         )
         if model_id:
             usage.model_id = model_id
@@ -651,6 +656,7 @@ class UsageTracker:
                 provider=provider,
                 billed_cost=billed_cost,
                 cost_source=cost_source,
+                token_usage_known=token_usage_known,
             )
             if model_id:
                 scoped.model_id = model_id

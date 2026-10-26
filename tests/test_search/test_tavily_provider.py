@@ -54,6 +54,7 @@ async def test_tavily_search_posts_low_cost_request_and_maps_results() -> None:
         "include_raw_content": False,
         "include_answer": False,
         "include_images": False,
+        "include_usage": True,
     }
 
     result = results[0]

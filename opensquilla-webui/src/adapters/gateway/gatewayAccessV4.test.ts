@@ -25,6 +25,7 @@ function source() {
     getConnectionEndpoint: vi.fn((): string | null => 'ws://gateway.example/ws'),
     canManageProjectWorkspaces: false,
     canChooseProject: false,
+    canCreateProjectWorkspace: false,
     auth: null as Record<string, unknown> | null,
     policy: null as Record<string, unknown> | null,
     connectionGeneration: 0,
@@ -168,6 +169,7 @@ describe('createV4GatewayAccess', () => {
     raw.isLocalOwner = true
     raw.canManageProjectWorkspaces = true
     raw.canChooseProject = true
+    raw.canCreateProjectWorkspace = true
     raw.auth = {
       principal: { authState: 'authenticated', capabilities: ['host.execute'] },
       runModePolicy: {
@@ -192,6 +194,7 @@ describe('createV4GatewayAccess', () => {
     expect(access.canExecuteHost).toBe(true)
     expect(access.hostExecuteUnavailableReason).toBeNull()
     expect(access.canChooseProject).toBe(true)
+    expect(access.canCreateProjectWorkspace).toBe(true)
     expect(access.runModePolicy).toEqual({
       allowedRunModes: ['safe', 'full'],
       defaultRunMode: 'safe',

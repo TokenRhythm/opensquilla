@@ -63,6 +63,7 @@ if TYPE_CHECKING:
         ToolUseStartEvent,
         WarningEvent,
     )
+    from opensquilla.session.manager import CompactionPersistResult, CompactionSourceSnapshot
     from opensquilla.silent_reply import SilentReplySegmentsNormalization
 
 log = structlog.get_logger(__name__)
@@ -167,19 +168,12 @@ class AgentRunPort(Protocol):
 
 @runtime_checkable
 class CompactionPersistPort(Protocol):
-    """Persist the IN-TURN ``CompactionEvent`` result + notify cache monitor.
+    """Persist an in-turn candidate, then refresh its source after a confirmed commit.
 
-    Wraps ``SessionManager.persist_compaction_result(session_key, summary,
-    kept_entries)`` followed by a completed lifecycle notification. The
-    stage handles persistence failures by emitting a failed lifecycle
-    notification and preserving pre-refresh runtime state.
-
-    Compaction refresh: This is the only remaining call site for
-    ``persist_compaction_result``. The compaction contract requires the
-    call to remain re-entrant -- the Agent has already mutated its
-    in-memory message list before the runner sees ``CompactionEvent``,
-    so the DB transcript may have more entries than ``kept_entries``.
-    The stage forwards the call verbatim.
+    The Agent may already use the candidate as its request view. The frozen
+    source, not that view, identifies which durable rows may be replaced.
+    Legacy bool/None writer results are normalized before deciding whether
+    to continue, refresh the source, or stop on an unconfirmed commit.
     """
 
     async def persist_and_notify(
@@ -200,11 +194,18 @@ class CompactionPersistPort(Protocol):
         source_entries: tuple[Any, ...] | None = None,
         source_preimage: tuple[tuple[Any, ...], ...] | None = None,
         source_context_fingerprint: str | None = None,
+        source_snapshot: CompactionSourceSnapshot | None = None,
         source_boundary_message_id: str | None = None,
         source_boundary_entry_id: int | None = None,
         expected_session_id: str | None = None,
         expected_session_epoch: int | None = None,
-    ) -> bool | None: ...
+    ) -> CompactionPersistResult | bool | None: ...
+
+    async def refresh_source(
+        self, *, session_key: str, source_snapshot: CompactionSourceSnapshot,
+        removed_count: int, expected_session_id: str | None,
+        expected_session_epoch: int | None,
+    ) -> CompactionSourceSnapshot: ...
 
 @runtime_checkable
 class MemorySnapshotRefreshPort(Protocol):
@@ -315,6 +316,41 @@ class _StreamState:
     reasoning: list[str] = field(default_factory=list)
     terminal_generation_reset: bool = False
     control_terminal_event: ControlTerminalEvent | None = None
+    compaction_source_snapshot: CompactionSourceSnapshot | None = field(default=None, repr=False)
+
+
+@dataclass(frozen=True)
+class _ProviderAttemptCheckpoint:
+    model_call_id: str
+    current_text_parts: tuple[str, ...]
+    current_text_presentation: Literal["intermediate", "answer"]
+    final_text_parts: tuple[str, ...]
+    reasoning: tuple[str, ...]
+    reasoning_parts: tuple[str, ...]
+    turn_segments: tuple[dict[str, Any], ...]
+
+    @classmethod
+    def capture(cls, model_call_id: str, state: _StreamState) -> _ProviderAttemptCheckpoint:
+        return cls(
+            model_call_id=model_call_id,
+            current_text_parts=tuple(state.current_text_parts),
+            current_text_presentation=state.current_text_presentation,
+            final_text_parts=tuple(state.final_text_parts),
+            reasoning=tuple(state.reasoning),
+            reasoning_parts=tuple(state.reasoning_parts),
+            turn_segments=tuple(copy.deepcopy(state.turn_segments)),
+        )
+
+    def restore(self, state: _StreamState) -> None:
+        state.current_text_parts[:] = self.current_text_parts
+        state.current_text_presentation = self.current_text_presentation
+        state.final_text_parts[:] = self.final_text_parts
+        state.reasoning[:] = self.reasoning
+        state.reasoning_parts[:] = self.reasoning_parts
+        state.turn_segments[:] = copy.deepcopy(self.turn_segments)
+        state.error_message = None
+        state.pending_error_event = None
+        state.done_event = None
 
 
 @dataclass(frozen=True)
@@ -414,6 +450,11 @@ def _supports_generation_reset(inp: StreamConsumerStageInput) -> bool:
         # adopted explicit surface capability negotiation.
         return True
     return bool(context.surface.supports_generation_reset)
+
+
+def _supports_provider_call_reset(inp: StreamConsumerStageInput) -> bool:
+    context = inp.execution_context
+    return context is None or bool(getattr(context.surface, "supports_provider_call_reset", True))
 
 
 # ---------------------------------------------------------------------------
@@ -1529,6 +1570,24 @@ class _CompactionHandler:
         event: CompactionEvent,
         inp: StreamConsumerStageInput,
     ) -> None:
+        from opensquilla.session.manager import CompactionPersistResult
+
+        source = event.source_snapshot
+        if source is not None and (
+            inp.state.compaction_source_snapshot is None
+            or source.context_fingerprint != (
+                inp.state.compaction_source_snapshot.context_fingerprint
+            )
+            or source.preimage != inp.state.compaction_source_snapshot.preimage
+        ):
+            event.persist_result = CompactionPersistResult(False, "stale_candidate_source")
+            return
+        # Until an explicit applied result and refresh arrive, an in-memory
+        # replacement cannot become the authoritative source of another writer.
+        if source is not None:
+            inp.state.compaction_source_snapshot = None
+            inp.agent.bind_compaction_source(None)
+        installed_result = CompactionPersistResult(False, "writer_unavailable")
         state = CompactionState(
             session_key=inp.session_key,
             agent_id=inp.agent_id,
@@ -1566,6 +1625,15 @@ class _CompactionHandler:
                     persist_kwargs["compaction_deadline_at_monotonic"] = (
                         event.compaction_deadline_at_monotonic
                     )
+                if source is not None:
+                    persist_kwargs.update({
+                        "source_snapshot": source,
+                        "source_entries": source.entries,
+                        "source_preimage": source.preimage,
+                        "source_context_fingerprint": source.context_fingerprint,
+                        "source_boundary_message_id": source.boundary_message_id,
+                        "source_boundary_entry_id": source.boundary_entry_id,
+                    })
                 if event.compaction_timeout_seconds is not None:
                     persist_kwargs["compaction_timeout_seconds"] = (
                         event.compaction_timeout_seconds
@@ -1579,14 +1647,20 @@ class _CompactionHandler:
                         inp.expected_session_epoch
                     )
                 installed = await self._persist.persist_and_notify(**persist_kwargs)
-                if installed is False:
+                installed_result = CompactionPersistResult.from_legacy(installed)
+                event.persist_result = installed_result
+                if installed_result.reason == "commit_unconfirmed":
+                    raise RuntimeError("Compaction writer did not confirm its commit result")
+                if not installed_result.applied:
                     await self._fire_after_compact(
                         state,
                         {
                             "status": "skipped",
-                            "reason": "stale_preimage",
+                            "reason": installed_result.reason,
                         },
                     )
+                    if installed_result.cancellation_reconciled:
+                        raise asyncio.CancelledError
                     return
             except asyncio.CancelledError:
                 from opensquilla.engine.cache_break_monitor import notify_compaction
@@ -1616,6 +1690,11 @@ class _CompactionHandler:
                 )
                 raise
             except CompactionTimeoutError as exc:
+                # SessionManager only raises this deadline before starting its
+                # commit task; once started, the barrier settles the real result.
+                event.persist_result = CompactionPersistResult(
+                    False, "compaction_deadline_exceeded",
+                )
                 from opensquilla.engine.cache_break_monitor import notify_compaction
                 from opensquilla.session.compaction_lifecycle import (
                     COMPACTION_TRIGGERED_EVENT,
@@ -1647,6 +1726,7 @@ class _CompactionHandler:
                 return
             except Exception as exc:  # noqa: BLE001 - preserve turn recoverability
                 log.warning("compaction_persist_failed", error=str(exc))
+                event.persist_result = CompactionPersistResult(False, "commit_unconfirmed")
                 from opensquilla.engine.cache_break_monitor import notify_compaction
                 from opensquilla.session.compaction_lifecycle import (
                     COMPACTION_TRIGGERED_EVENT,
@@ -1662,11 +1742,11 @@ class _CompactionHandler:
                     source="automatic",
                     phase="agent_inline_overflow",
                     status="failed",
-                    reason="persist_failed",
+                    reason="commit_unconfirmed",
                     message=str(exc),
                     kept_count=len(event.kept_entries),
                     summary_len=len(event.summary or ""),
-                    **compaction_effect_payload(status="failed", reason="persist_failed"),
+                    **compaction_effect_payload(status="failed", reason="commit_unconfirmed"),
                     **compaction_lifecycle_payload(
                         compaction_id,
                         COMPACTION_TRIGGERED_EVENT,
@@ -1676,12 +1756,33 @@ class _CompactionHandler:
                     state,
                     {
                         "status": "failed",
-                        "reason": "persist_failed",
+                        "reason": "commit_unconfirmed",
                         "message": str(exc),
                     },
                 )
-                return
+                # An unknown transaction outcome cannot authorize another
+                # request against either the old or candidate history.
+                raise
 
+        if installed_result.applied and source is not None:
+            try:
+                refreshed = await self._persist.refresh_source(
+                    session_key=inp.session_key, source_snapshot=source,
+                    removed_count=event.removed_count,
+                    expected_session_id=inp.expected_session_id,
+                    expected_session_epoch=inp.expected_session_epoch,
+                )
+                inp.state.compaction_source_snapshot = refreshed
+                inp.agent.bind_compaction_source(refreshed)
+                from opensquilla.session.context_view import format_compaction_summary_context
+
+                inp.agent.config.compaction_summary_context = format_compaction_summary_context(
+                    [refreshed.previous_summary],
+                ) if refreshed.previous_summary else None
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:  # applied S1 survives; another writer is disabled
+                log.warning("compaction_source_refresh_failed", error=str(exc))
         self._memory_snapshot.refresh_snapshot(
             agent_id=inp.agent_id,
             session_key=inp.session_key,
@@ -1702,6 +1803,8 @@ class _CompactionHandler:
                 "kept_entries": event.kept_entries,
             },
         )
+        if installed_result.cancellation_reconciled:
+            raise asyncio.CancelledError
 
     async def _fire_before_compact(self, state: CompactionState) -> None:
         for hook in self._compaction_hooks:
@@ -1848,8 +1951,12 @@ class StreamConsumerStage:
             DoneEvent,
             EnsembleProgressEvent,
             ErrorEvent,
+            ProviderAttemptCommittedEvent,
+            ProviderAttemptStartEvent,
             TextDeltaEvent,
+            ThinkingEndEvent,
             ThinkingEvent,
+            ThinkingStartEvent,
             ToolResultEvent,
             ToolUseDeltaEvent,
             ToolUseEndEvent,
@@ -1878,7 +1985,11 @@ class StreamConsumerStage:
         released_suppressed_source_text: str | None = None
         realtime_generation = _supports_realtime_generation(inp)
         supports_generation_reset = _supports_generation_reset(inp)
+        supports_call_reset = _supports_provider_call_reset(inp)
         deferred_generation_events: list[AgentEvent] = []
+        attempt_checkpoint: _ProviderAttemptCheckpoint | None = None
+        deferred_attempt_start = 0
+        attempt_silent_reply_state: tuple[bool, str, bool] | None = None
 
         def _is_deferred_generation_event(candidate: object) -> bool:
             return isinstance(
@@ -1886,6 +1997,8 @@ class StreamConsumerStage:
                 (
                     TextDeltaEvent,
                     ThinkingEvent,
+                    ThinkingStartEvent,
+                    ThinkingEndEvent,
                     ToolUseStartEvent,
                     ToolUseDeltaEvent,
                     ToolUseEndEvent,
@@ -1894,11 +2007,13 @@ class StreamConsumerStage:
                 ),
             )
 
-        def _drop_speculative_text() -> None:
-            deferred_generation_events[:] = [
+        def _drop_speculative_text(*, since: int = 0) -> None:
+            deferred_generation_events[since:] = [
                 candidate
-                for candidate in deferred_generation_events
-                if not isinstance(candidate, (TextDeltaEvent, ThinkingEvent))
+                for candidate in deferred_generation_events[since:]
+                if not isinstance(
+                    candidate, (TextDeltaEvent, ThinkingEvent, ThinkingStartEvent, ThinkingEndEvent)
+                )
             ]
 
         async for event in self._agent_run.run_turn(
@@ -1908,12 +2023,53 @@ class StreamConsumerStage:
             semantic_message=inp.semantic_input,
             pending_input_provider=inp.pending_input_provider,
         ):
+            # Carry the producing turn's recovery policy through live and replay
+            # projection. A CLI observer of a WebUI turn must still be protected.
+            if isinstance(event, (TextDeltaEvent, ThinkingEvent, ThinkingStartEvent,
+                                  ThinkingEndEvent)):
+                event = replace(event, provider_call_resettable=supports_call_reset)
             transformed: AgentEvent | object
             extra_yields: list[AgentEvent] = []
+            if isinstance(event, ProviderAttemptStartEvent):
+                attempt_checkpoint = _ProviderAttemptCheckpoint.capture(event.model_call_id, state)
+                deferred_attempt_start = len(deferred_generation_events)
+                attempt_silent_reply_state = (
+                    human_silent_reply_prefix_open,
+                    held_human_silent_reply_text,
+                    human_prefix_crossed_public_boundary,
+                )
+                continue
+            if isinstance(event, ProviderAttemptCommittedEvent):
+                if attempt_checkpoint is not None:
+                    if attempt_checkpoint.model_call_id != event.model_call_id:
+                        raise RuntimeError("provider attempt commit does not match its checkpoint")
+                    attempt_checkpoint = None
+                continue
             if isinstance(event, AnswerGenerationResetEvent):
-                _reset_generation_stream_state(state)
-                if not realtime_generation:
-                    _drop_speculative_text()
+                if event.reset_scope == "provider_call":
+                    if (attempt_checkpoint is None
+                            or attempt_checkpoint.model_call_id != event.rollback_model_call_id):
+                        raise RuntimeError("provider call reset does not match its checkpoint")
+                    attempt_checkpoint.restore(state)
+                    if attempt_silent_reply_state is not None:
+                        (
+                            human_silent_reply_prefix_open,
+                            held_human_silent_reply_text,
+                            human_prefix_crossed_public_boundary,
+                        ) = attempt_silent_reply_state
+                    if not realtime_generation:
+                        _drop_speculative_text(since=deferred_attempt_start)
+                else:
+                    _reset_generation_stream_state(state)
+                    held_human_silent_reply_text = ""
+                    human_silent_reply_prefix_open = gate_human_silent_reply_prefix
+                    human_prefix_crossed_public_boundary = False
+                    if not realtime_generation:
+                        _drop_speculative_text()
+                attempt_checkpoint = None
+                released_system_event_text = None
+                released_system_event_source_text = None
+                released_suppressed_source_text = None
                 terminal_snapshot = ""
                 if event.terminal:
                     terminal_snapshot = str(
@@ -1946,7 +2102,13 @@ class StreamConsumerStage:
                         ),
                         state,
                     )
-                if supports_generation_reset:
+                if (
+                    event.reset_scope == "provider_call"
+                    and not supports_call_reset
+                    and not event.terminal
+                ):
+                    transformed = _SUPPRESS
+                elif supports_generation_reset:
                     # Keep the typed failure taxonomy on the trusted
                     # in-process event until TaskRuntime has classified the
                     # durable outcome. Gateway serializers scrub these fields

@@ -11,7 +11,7 @@ import secrets
 import socket
 import sys
 import time
-from collections.abc import Callable, MutableMapping
+from collections.abc import Awaitable, Callable, MutableMapping
 from dataclasses import dataclass, field, replace
 from functools import partial
 from importlib import import_module
@@ -68,7 +68,7 @@ from opensquilla.gateway.session_lifecycle import (
 )
 from opensquilla.gateway.session_services import get_session_storage
 from opensquilla.gateway.session_streams import get_session_streams, reset_session_streams
-from opensquilla.gateway.shutdown import ShutdownRequest
+from opensquilla.gateway.shutdown import ShutdownBudget, ShutdownRequest
 from opensquilla.gateway.task_runtime import TaskRuntimeShutdownResult
 from opensquilla.gateway.terminal_activity import (
     append_activity_phase,
@@ -769,9 +769,20 @@ class ServiceContainer:
         daily_usage_task = self.daily_usage_telemetry_task
         self.daily_usage_telemetry_task = None
         if daily_usage_task is not None:
+            from opensquilla.observability.usage_telemetry import STANDALONE_CLOSE_TIMEOUT_SECONDS
+
             daily_usage_task.cancel()
+            daily_usage_task.add_done_callback(
+                lambda task: None if task.cancelled() else task.exception()
+            )
             try:
-                await daily_usage_task
+                done, _ = await asyncio.wait(
+                    {daily_usage_task}, timeout=STANDALONE_CLOSE_TIMEOUT_SECONDS,
+                )
+                if done:
+                    daily_usage_task.result()
+                else:
+                    log.debug("gateway.usage_telemetry_close_incomplete")
             except asyncio.CancelledError:
                 pass
             except Exception:
@@ -1070,6 +1081,7 @@ def _ensure_configured_agent_workspaces(
     config: GatewayConfig,
     *,
     extra_agent_ids: list[str] | None = None,
+    maintenance_policy: Any | None = None,
 ) -> None:
     """Seed bootstrap templates for explicitly configured agent workspaces."""
     if not config.workspace_dir:
@@ -1077,10 +1089,20 @@ def _ensure_configured_agent_workspaces(
 
     from opensquilla.gateway.workspace_template_upgrade import upgrade_workspace_defaults
     from opensquilla.identity.bootstrap import ensure_agent_workspace
+    from opensquilla.memory.source_protection import SourceMaintenancePolicy
+
+    maintenance_policy = maintenance_policy or SourceMaintenancePolicy(config)
 
     seen_workspaces: set[Path] = set()
 
     for agent_id in _configured_agent_ids(config, extra_agent_ids):
+        if not maintenance_policy.bootstrap_allowed(agent_id):
+            log.info(
+                "build_services.workspace_maintenance_skipped",
+                agent_id=agent_id,
+                reason="project_source_overlap",
+            )
+            continue
         result = ensure_agent_workspace(resolve_agent_workspace_dir(agent_id, config))
         physical_workspace = result.workspace_dir.resolve()
         if physical_workspace not in seen_workspaces:
@@ -1393,6 +1415,7 @@ async def dispatch_task_runtime_turn(
             event_emitter=getattr(adopter, "event_emitter", None) or emit_working_version,
             preview_service=getattr(adopter, "preview_service", None),
             office_candidate=run.envelope.metadata.get("office_candidate"),
+            annotation_selection=run.envelope.metadata.get("annotation_selection"),
         )
         await _emit_task_runtime_stream_events(
             raw_stream,
@@ -2443,6 +2466,7 @@ class GatewayServer:
     _background_completion_manager: Any = field(default=None, repr=False)
     _pid_lock: Any = field(default=None, repr=False)
     _quit_process_cleanup_task: asyncio.Task[bool] | None = field(default=None, repr=False)
+    _shutdown_phase_tasks: set[asyncio.Future[Any]] = field(default_factory=set, repr=False)
 
     def _release_pid_lock(self) -> None:
         pid_lock = self._pid_lock
@@ -2560,10 +2584,104 @@ class GatewayServer:
         """Gracefully shut down: stop channels, broadcast shutdown, close WS, stop server."""
         from opensquilla.skills.hub.management import SkillManagementService
 
-        deadline = time.monotonic() + gateway_shutdown_deadline()
-        def remaining(limit: float | None = None) -> float:
-            budget = max(0.0, deadline - time.monotonic())
-            return budget if limit is None else min(limit, budget)
+        started_at = time.monotonic()
+        budget = ShutdownBudget(
+            started_at=started_at,
+            fallback_deadline=started_at + gateway_shutdown_deadline(),
+            request=request,
+            cleanup_reserve_limit=(
+                10.0 + _WS_SHUTDOWN_CLOSE_TIMEOUT_S + _WS_SHUTDOWN_CANCEL_GRACE_S
+            ),
+            now=time.monotonic,
+        )
+        remaining = budget.remaining
+        incomplete = False
+        dependencies_settled = True
+        protected_pending: set[asyncio.Future[Any]] = set()
+        # Embedders historically constructed this dataclass with __new__.
+        if not hasattr(self, "_shutdown_phase_tasks"):
+            self._shutdown_phase_tasks = set()
+
+        def own_phase(awaitable: Awaitable[Any]) -> asyncio.Future[Any]:
+            task = asyncio.ensure_future(awaitable)
+            if task not in self._shutdown_phase_tasks:
+                self._shutdown_phase_tasks.add(task)
+
+                def finished(done: asyncio.Future[Any]) -> None:
+                    self._shutdown_phase_tasks.discard(done)
+                    _consume_websocket_close_task(done)
+
+                task.add_done_callback(finished)
+            return task
+
+        async def wait_phase(
+            awaitable: Awaitable[Any],
+            name: str,
+            *,
+            limit: float | None = None,
+            work: bool = False,
+            dependency: bool = False,
+            cancellable: bool = False,
+            required: bool = True,
+            expected_cancellation: bool = False,
+        ) -> tuple[bool, Any]:
+            nonlocal incomplete, dependencies_settled
+            if work and remaining(work=True) <= 0:
+                request_server_exit()
+            task = own_phase(awaitable)
+            try:
+                completed = await budget.wait(task, limit=limit, work=work)
+            except asyncio.CancelledError:
+                incomplete = incomplete or required
+                if dependency:
+                    dependencies_settled = False
+                if cancellable:
+                    task.cancel()
+                raise
+            if completed:
+                try:
+                    return True, task.result()
+                except asyncio.CancelledError:
+                    if not expected_cancellation:
+                        incomplete = incomplete or required
+                        if dependency:
+                            dependencies_settled = False
+                    raise
+                except Exception:
+                    incomplete = incomplete or required
+                    if dependency:
+                        dependencies_settled = False
+                    raise
+            if work and remaining(work=True) <= 0:
+                # Do not spend the reserved window traversing more expired
+                # work phases before fencing the listeners.
+                request_server_exit()
+            incomplete = incomplete or required
+            if dependency:
+                dependencies_settled = False
+            if cancellable:
+                task.cancel()
+            else:
+                protected_pending.add(task)
+            log.warning("gateway.shutdown_phase_timeout", phase=name)
+            return False, None
+
+        exits_requested = False
+
+        def request_server_exit() -> None:
+            nonlocal exits_requested
+            if exits_requested:
+                return
+            exits_requested = True
+            if self._server is not None:
+                self._server.should_exit = True
+            preview_service = getattr(self, "_preview_service", None)
+            if preview_service is not None:
+                preview_service.revoke_all()
+                preview_service.clear_listener_port()
+            preview_server = getattr(self, "_preview_server", None)
+            if preview_server is not None:
+                preview_server.should_exit = True
 
         runtime_shutdown_result: TaskRuntimeShutdownResult | None = None
         runtime_shutdown_clean = bool(
@@ -2589,9 +2707,9 @@ class GatewayServer:
 
                 terminal_manager = get_terminal_manager()
 
-                await asyncio.wait_for(
+                await wait_phase(
                     terminal_manager.close_all(),
-                    timeout=remaining(2.0),
+                    "terminals", limit=2.0, work=True,
                 )
             except TimeoutError:
                 log.warning("gateway.terminal_shutdown_timeout")
@@ -2617,7 +2735,10 @@ class GatewayServer:
                         optional_task = asyncio.ensure_future(optional_task)
                         optional_task.cancel()
                         try:
-                            await asyncio.wait_for(optional_task, timeout=remaining(2.0))
+                            await wait_phase(
+                                optional_task, "optional_start", limit=2.0,
+                                work=True, dependency=True, expected_cancellation=True,
+                            )
                         except (asyncio.CancelledError, TimeoutError):
                             pass
                         except Exception:
@@ -2634,7 +2755,10 @@ class GatewayServer:
                         warmup_task = asyncio.ensure_future(warmup_task)
                         warmup_task.cancel()
                         try:
-                            await asyncio.wait_for(warmup_task, timeout=remaining(2.0))
+                            await wait_phase(
+                                warmup_task, "warmup", limit=2.0,
+                                work=True, dependency=True, expected_cancellation=True,
+                            )
                         except (asyncio.CancelledError, TimeoutError):
                             pass
                         except Exception:
@@ -2650,9 +2774,11 @@ class GatewayServer:
             drain_budget = gateway_graceful_timeout()
             if isinstance(skill_management_service, SkillManagementService):
                 try:
-                    skills_shutdown_clean = await skill_management_service.close(
-                        timeout=remaining(drain_budget),
+                    completed, skills_clean = await wait_phase(
+                        skill_management_service.close(timeout=remaining(drain_budget)),
+                        "skills", limit=drain_budget, work=True, dependency=True,
                     )
+                    skills_shutdown_clean = completed and skills_clean
                 except Exception:
                     skills_shutdown_clean = False
                     log.exception("gateway.skill_install_shutdown_failed")
@@ -2672,7 +2798,8 @@ class GatewayServer:
                         await goal_service.prepare_shutdown()
                     except Exception:
                         log.debug("gateway.goal_service_shutdown_failed", exc_info=True)
-                goal_pause = asyncio.create_task(pause_goals())
+                        raise
+                goal_pause = own_phase(pause_goals())
             if self._services is not None and self._services.task_runtime is not None:
                 try:
                     runtime_kwargs: dict[str, Any] = {
@@ -2680,11 +2807,14 @@ class GatewayServer:
                     }
                     if request is not None:
                         runtime_kwargs["request"] = request
-                    runtime_shutdown_result = await self._services.task_runtime.shutdown(
-                        **runtime_kwargs
+                    completed, runtime_shutdown_result = await wait_phase(
+                        self._services.task_runtime.shutdown(**runtime_kwargs),
+                        "runtime", work=True, dependency=True,
                     )
                     runtime_shutdown_clean = (
-                        skills_shutdown_clean
+                        completed
+                        and dependencies_settled
+                        and skills_shutdown_clean
                         and (runtime_shutdown_result is None or runtime_shutdown_result.clean)
                     )
                 except Exception:
@@ -2700,13 +2830,26 @@ class GatewayServer:
                     log.exception("gateway.task_runtime_shutdown_failed")
 
             if goal_pause is not None:
-                await goal_pause
+                try:
+                    await wait_phase(goal_pause, "goals", work=True, dependency=True)
+                except Exception:
+                    # Failure is recorded by the phase owner; continue closing
+                    # transports while preserving the failed owner's dependencies.
+                    pass
             if self._quit_process_cleanup_task is not None:
-                process_clean = await self._quit_process_cleanup_task
-                if runtime_shutdown_clean:
+                completed, process_clean = await wait_phase(
+                    self._quit_process_cleanup_task, "owned_processes",
+                    work=True, dependency=True,
+                )
+                process_clean = completed and process_clean is not False
+                if runtime_shutdown_clean and dependencies_settled:
                     # A tool may have registered a background process after the
                     # initial quit snapshot. No driver can spawn after this fence.
-                    process_clean = await self._stop_owned_processes()
+                    completed, process_clean = await wait_phase(
+                        self._stop_owned_processes(), "owned_processes_final",
+                        work=True, dependency=True,
+                    )
+                    process_clean = completed and process_clean is not False
                 if process_clean is False:
                     runtime_shutdown_clean = False
                     runtime_shutdown_result = TaskRuntimeShutdownResult(
@@ -2735,6 +2878,7 @@ class GatewayServer:
                     remaining_auxiliary=(runtime_shutdown_result.remaining_auxiliary_count),
                 )
 
+            runtime_shutdown_clean = runtime_shutdown_clean and dependencies_settled
             if self._background_completion_manager is not None and runtime_shutdown_clean:
                 try:
                     completion_kwargs: dict[str, Any] = {"timeout": remaining(drain_budget)}
@@ -2742,12 +2886,13 @@ class GatewayServer:
                         completion_kwargs.update(
                             timeout=(request.remaining() if request.mode == "quit"
                                      else min(drain_budget, request.remaining())),
-                            cancel=request.mode == "quit", deadline=request.deadline,
+                            cancel=request.mode == "quit", deadline=budget.deadline,
                         )
-                    completion_clean = await self._background_completion_manager.close(
-                        **completion_kwargs
+                    completed, completion_clean = await wait_phase(
+                        self._background_completion_manager.close(**completion_kwargs),
+                        "background_completion", work=True, dependency=True,
                     )
-                    if completion_clean is False:
+                    if not completed or completion_clean is False:
                         runtime_shutdown_clean = False
                         runtime_shutdown_result = TaskRuntimeShutdownResult(
                             clean=False, elapsed_ms=0, abandoned_task_count=0,
@@ -2781,9 +2926,13 @@ class GatewayServer:
             if live_channel_manager is not None:
                 # Preserve time for bounded WS teardown and both existing
                 # server joins; every phase shares the same absolute deadline.
-                reserve = 10.0 + _WS_SHUTDOWN_CLOSE_TIMEOUT_S + _WS_SHUTDOWN_CANCEL_GRACE_S
                 try:
-                    await live_channel_manager.stop_all(timeout=max(0.0, remaining() - reserve))
+                    completed, _ = await wait_phase(
+                        live_channel_manager.stop_all(timeout=remaining(work=True)),
+                        "channels", work=True, dependency=True,
+                    )
+                    if not completed:
+                        raise TimeoutError("Channel shutdown remains owned")
                     log.info("gateway.channels_stopped")
                 except TimeoutError:
                     runtime_shutdown_clean = False
@@ -2800,33 +2949,20 @@ class GatewayServer:
             registry = get_registry()
             if request is not None and request.mode == "quit":
                 reason = "desktop_quit"
-            await registry.broadcast("shutdown", {"reason": reason})
+            # Request listener exit before best-effort notifications or external
+            # client teardown can consume the reserved final cleanup window.
+            request_server_exit()
+            await wait_phase(
+                registry.broadcast("shutdown", {"reason": reason}),
+                "broadcast", work=True, cancellable=True, required=False,
+            )
 
             # Close all active WS connections
-            await _close_gateway_websocket_connections(registry.all(), deadline=deadline)
+            await wait_phase(
+                _close_gateway_websocket_connections(registry.all(), deadline=budget.deadline),
+                "websockets", cancellable=True,
+            )
 
-            # Close MCP clients
-            if runtime_shutdown_clean:
-                try:
-                    from opensquilla.mcp.discovery import close_active_clients
-
-                    await close_active_clients()
-                    log.info("gateway.mcp_clients_closed")
-                except ImportError:
-                    log.debug(
-                        "gateway.mcp_clients_close_skipped_import_unavailable",
-                        exc_info=True,
-                    )
-            else:
-                log.warning("gateway.mcp_clients_close_skipped_for_live_runtime")
-
-            if runtime_shutdown_clean:
-                log.info("gateway.stopped", reason=reason)
-            else:
-                log.warning(
-                    "gateway.transports_stopped_with_runtime_residuals",
-                    reason=reason,
-                )
         finally:
             # Always stop the serve task so it is never left pending, even when a
             # teardown step above raised (close() is now invoked on every shutdown,
@@ -2835,45 +2971,88 @@ class GatewayServer:
             # is released only after a clean runtime shutdown; otherwise process
             # exit remains the ownership fence.
             try:
-                if self._server is not None:
-                    self._server.should_exit = True
+                request_server_exit()
                 if self._task is not None:
-                    try:
-                        await asyncio.wait_for(
-                            asyncio.gather(self._task, return_exceptions=True),
-                            timeout=remaining(5.0),
-                        )
-                    except TimeoutError:
+                    completed, _ = await wait_phase(
+                        asyncio.gather(self._task, return_exceptions=True),
+                        "server", limit=5.0, cancellable=True, dependency=True,
+                    )
+                    if not completed:
                         self._task.cancel()
-                preview_server = getattr(self, "_preview_server", None)
                 preview_task = getattr(self, "_preview_task", None)
                 preview_socket = getattr(self, "_preview_socket", None)
-                preview_service = getattr(self, "_preview_service", None)
-                if preview_service is not None:
-                    preview_service.revoke_all()
-                    preview_service.clear_listener_port()
-                if preview_server is not None:
-                    preview_server.should_exit = True
                 if preview_task is not None:
-                    try:
-                        await asyncio.wait_for(
-                            asyncio.gather(preview_task, return_exceptions=True),
-                            timeout=remaining(5.0),
-                        )
-                    except TimeoutError:
+                    completed, _ = await wait_phase(
+                        asyncio.gather(preview_task, return_exceptions=True),
+                        "preview_server", limit=5.0, cancellable=True, dependency=True,
+                    )
+                    if not completed:
                         preview_task.cancel()
                 if preview_socket is not None:
                     preview_socket.close()
-                if self._services is not None and runtime_shutdown_clean:
+                # An ASGI owner still finishing a request can use these shared
+                # clients too. Join both listeners before closing dependencies.
+                runtime_shutdown_clean = runtime_shutdown_clean and dependencies_settled
+                if runtime_shutdown_clean:
                     try:
-                        await self._services.close()
+                        from opensquilla.mcp.discovery import close_active_clients
+
+                        completed, _ = await wait_phase(
+                            close_active_clients(), "mcp", dependency=True,
+                        )
+                        if completed:
+                            log.info("gateway.mcp_clients_closed")
+                    except ImportError:
+                        log.debug(
+                            "gateway.mcp_clients_close_skipped_import_unavailable",
+                            exc_info=True,
+                        )
+                else:
+                    log.warning("gateway.mcp_clients_close_skipped_for_live_runtime")
+                if (
+                    self._services is not None
+                    and runtime_shutdown_clean
+                    and dependencies_settled
+                ):
+                    try:
+                        await wait_phase(self._services.close(), "services", dependency=True)
                     except Exception:
+                        incomplete = True
                         log.debug("gateway.services_close_failed", exc_info=True)
                 elif self._services is not None:
                     log.warning("gateway.services_close_skipped_for_live_runtime")
             finally:
-                if runtime_shutdown_clean and request is None:
+                # A work cutoff reserves transport cleanup, not an earlier
+                # process-exit deadline for protected writes still in flight.
+                pending = {task for task in protected_pending if not task.done()}
+                if pending:
+                    await wait_phase(
+                        asyncio.gather(*pending, return_exceptions=True),
+                        "protected_settlement",
+                    )
+                if (
+                    runtime_shutdown_clean and dependencies_settled
+                    and not incomplete and request is None
+                ):
                     self._release_pid_lock()
+        if incomplete or not dependencies_settled:
+            if runtime_shutdown_result is not None:
+                runtime_shutdown_result = replace(runtime_shutdown_result, clean=False)
+            else:
+                runtime_shutdown_result = TaskRuntimeShutdownResult(
+                    clean=False,
+                    elapsed_ms=int((time.monotonic() - started_at) * 1000),
+                    abandoned_task_count=0,
+                    remaining_driver_count=0,
+                    remaining_reservation_count=0,
+                    remaining_auxiliary_count=max(1, len(self._shutdown_phase_tasks)),
+                )
+        if request is not None and request.mode == "quit":
+            reason = "desktop_quit"
+        if runtime_shutdown_clean and dependencies_settled and not incomplete:
+            log.info("gateway.stopped", reason=reason)
+        else:
+            log.warning("gateway.transports_stopped_with_runtime_residuals", reason=reason)
         return runtime_shutdown_result
 
 
@@ -3149,8 +3328,6 @@ async def build_services(
     from opensquilla.memory.embedding_resolver import resolve_memory_embedding
 
     resolve_memory_embedding(config.memory, local_available=lambda *_: False)
-    if seed_agent_workspaces:
-        _ensure_configured_agent_workspaces(config, extra_agent_ids=extra_agent_ids)
 
     # Inject config into admin tool (needed by both gateway and standalone)
     from opensquilla.tools.builtin.admin import set_gateway_config
@@ -3344,6 +3521,15 @@ async def build_services(
     set_session_manager(session_manager)
     _set_sessions_gateway_config(config)
     session_storage = get_session_storage(session_manager)
+    from opensquilla.memory.source_protection import policy_for_storage
+
+    source_maintenance_policy = policy_for_storage(config, session_storage)
+    if seed_agent_workspaces:
+        _ensure_configured_agent_workspaces(
+            config,
+            extra_agent_ids=extra_agent_ids,
+            maintenance_policy=source_maintenance_policy,
+        )
     if session_storage is not None and callable(
         getattr(session_storage, "_write_transaction", None)
     ):
@@ -3672,6 +3858,8 @@ async def build_services(
                     memory_source=getattr(config.memory, "source", "state"),
                     on_memory_write=_on_memory_write,
                     memory_config=config.memory,
+                    memory_managers=memory_managers,
+                    maintenance_allowed=source_maintenance_policy.allows,
                     workspace_base=config.workspace_dir
                     if getattr(config.memory, "source", "state") == "workspace"
                     else None,
@@ -4258,16 +4446,19 @@ async def build_services(
         sandbox_setup_task=sandbox_setup_task,
         sandbox_upgrade_report=sandbox_upgrade_report,
     )
-    if start_standalone_telemetry:
-        try:
-            from opensquilla.observability.usage_telemetry import StandaloneUsageTelemetry
+    try:
+        from opensquilla.observability.usage_telemetry import StandaloneUsageTelemetry
 
-            svc.standalone_usage_telemetry = StandaloneUsageTelemetry(
-                config=config, legacy_storage=get_session_storage(session_manager),
-            )
+        # Every runtime owns a local counter buffer. Network workers still
+        # follow the standalone opt-in or listening Gateway readiness edge.
+        svc.standalone_usage_telemetry = StandaloneUsageTelemetry(
+            config=config, legacy_storage=get_session_storage(session_manager),
+            upload_on_close=start_standalone_telemetry,
+        )
+        if start_standalone_telemetry:
             svc.standalone_usage_telemetry.start()
-        except Exception:
-            log.debug("build_services.standalone_usage_telemetry_unavailable", exc_info=True)
+    except Exception:
+        log.debug("build_services.standalone_usage_telemetry_unavailable", exc_info=True)
     if skill_loader is not None:
         try:
             from opensquilla.skills.watcher import SkillCatalogWatcher
@@ -4359,6 +4550,7 @@ def build_turn_runner_from_services(
         memory_sync_managers=getattr(svc, "memory_sync_managers", None) or None,
         model_catalog=getattr(svc, "model_catalog", None),
         memory_retrievers=getattr(svc, "memory_retrievers", None) or None,
+        memory_managers=getattr(svc, "memory_managers", None),
         turn_capture_services=getattr(svc, "turn_capture_services", None) or None,
         session_lock_provider=_standalone_lock_provider,
         diagnostics_state=diagnostics_state,
@@ -4851,15 +5043,17 @@ async def start_gateway_server(
             prompt_cache_keepalive_service.refresh_required(session_key)
         # Lifecycle claiming and replay append now happen in one synchronous
         # call stack. Network delivery remains asynchronous and at-least-once.
-        event_payload = get_session_streams().record(
+        recorded = get_session_streams().record(
             session_key,
             "session.event.compaction",
             event_payload,
         )
+        if recorded is None:
+            return
         emit_coro = runtime_event_bridge.emit(
             session_key,
             "session.event.compaction",
-            event_payload,
+            recorded,
             replay_recorded=True,
         )
         try:
@@ -5159,6 +5353,8 @@ async def start_gateway_server(
                 "session.event.cron_result",
                 payload,
             )
+            if stream_payload is None:
+                return
             for conn_id in _sub_mgr.get_message_subscribers(origin_session_key):
                 conn = _registry.get(conn_id)
                 if conn:
@@ -5201,6 +5397,8 @@ async def start_gateway_server(
                 if event_name.startswith("session.event.")
                 else payload
             )
+            if stream_payload is None:
+                return
             conn_ids = _sub_mgr.get_message_subscribers(session_key)
             if event_name.startswith("sessions."):
                 conn_ids |= _sub_mgr.get_session_subscribers()
@@ -5274,6 +5472,7 @@ async def start_gateway_server(
             build_dream=build_dream_factory(
                 config=config,
                 turn_runner=turn_runner,
+                memory_managers=svc.memory_managers,
             ),
             should_skip=lambda: (
                 "disabled" if not getattr(config.memory.dream, "enabled", False) else None
@@ -5577,7 +5776,10 @@ async def start_gateway_server(
             )
 
             daily_usage_storage = get_session_storage(svc.session_manager)
-            if daily_usage_storage is not None:
+            daily_usage_sink = svc.standalone_usage_telemetry
+            if daily_usage_sink is not None:
+                daily_usage_sink.enable_uploads()
+            if daily_usage_storage is not None or daily_usage_sink is not None:
                 svc.daily_usage_telemetry_task = create_background_task(
                     run_daily_usage_upload_loop(daily_usage_storage, config=config)
                 )
@@ -5618,23 +5820,39 @@ async def start_gateway_server(
                 )
         _publish_legacy_ready_if_complete()
 
-    async def _start_optional_channels(generation: int) -> None:
+    channel_service_generation = svc.optional_generation
+    channels_descriptor = svc.optional_services.setdefault("channels", {})
+
+    async def _start_optional_channels(generation: int) -> str:
         """Start channel adapters after the durable core is ready."""
-        owner_generation = int(
-            getattr(svc.optional_owners.get("channels"), "owner_generation", generation)
-            or generation
-        )
+        def is_current() -> bool:
+            return (
+                channel_service_generation == svc.optional_generation
+                and svc.optional_owners.get("channels") is channels_owner
+                and generation == channels_owner.owner_generation
+            )
+
+        def publish(status: str, **details: Any) -> None:
+            channels_descriptor.update(
+                status=status,
+                state=status,
+                generation=channel_service_generation,
+                config_revision=service_config_revision,
+                owner_generation=generation,
+                **details,
+            )
+
+        if not is_current():
+            raise asyncio.CancelledError
+        # This mapping is also held by OptionalServiceOwner. Preserve its
+        # identity and discard only diagnostics owned by the previous attempt.
+        channels_descriptor.pop("error", None)
+        channels_descriptor.pop("channels", None)
         if channel_manager is None:
-            svc.optional_services["channels"] = {
-                "status": "disabled",
-                "generation": generation,
-            }
+            publish("disabled")
             _publish_legacy_ready_if_complete()
-            return
-        svc.optional_services["channels"] = {
-            "status": "starting",
-            "generation": generation,
-        }
+            return "disabled"
+        publish("starting")
         configured_channel_names = getattr(channel_manager, "_channels", {})
         if not channel_readiness_owned and isinstance(configured_channel_names, dict):
             for name in configured_channel_names:
@@ -5642,14 +5860,14 @@ async def start_gateway_server(
                 if channel_name:
                     svc.optional_services[f"channel:{channel_name}"] = {
                         "status": "starting",
-                        "generation": generation,
+                        "generation": channel_service_generation,
                         "config_revision": service_config_revision,
-                        "owner_generation": owner_generation,
+                        "owner_generation": generation,
                     }
         try:
             results = await channel_manager.start_all()
-            if generation != svc.optional_generation:
-                return
+            if not is_current():
+                raise asyncio.CancelledError
             start_errors_fn = getattr(channel_manager, "start_errors", None)
             start_errors = start_errors_fn() if start_errors_fn is not None else {}
             for name, ok in results.items():
@@ -5661,9 +5879,9 @@ async def start_gateway_server(
                 if channel_name and not channel_readiness_owned:
                     svc.optional_services[f"channel:{channel_name}"] = {
                         "status": "ready" if ok else "degraded",
-                        "generation": generation,
+                        "generation": channel_service_generation,
                         "config_revision": service_config_revision,
-                        "owner_generation": owner_generation,
+                        "owner_generation": generation,
                     }
                 if ok:
                     log.info("gateway.channel_started", channel=name)
@@ -5676,17 +5894,14 @@ async def start_gateway_server(
                         error=details.get("error"),
                         exception=details.get("exception"),
                     )
-            svc.optional_services["channels"] = {
-                "status": "ready" if all(results.values()) else "degraded",
-                "generation": generation,
-                "channels": results,
-            }
+            status = "ready" if all(results.values()) else "degraded"
+            publish(status, channels=results)
             _publish_legacy_ready_if_complete()
+            return status
         except asyncio.CancelledError:
-            svc.optional_services["channels"] = {
-                "status": "stopping",
-                "generation": generation,
-            }
+            if not is_current():
+                raise
+            publish("stopping")
             for name in (
                 configured_channel_names
                 if not channel_readiness_owned and isinstance(configured_channel_names, dict)
@@ -5695,16 +5910,14 @@ async def start_gateway_server(
                 channel_name = str(name).strip().lower()
                 if channel_name:
                     svc.optional_services.setdefault(f"channel:{channel_name}", {}).update(
-                        {"status": "stopping", "generation": generation}
+                        {"status": "stopping", "generation": channel_service_generation}
                     )
             _publish_legacy_ready_if_complete()
             raise
         except Exception as exc:  # noqa: BLE001 - one integration must not kill core.
-            svc.optional_services["channels"] = {
-                "status": "degraded",
-                "generation": generation,
-                "error": type(exc).__name__,
-            }
+            if not is_current():
+                raise asyncio.CancelledError from exc
+            publish("degraded", error=type(exc).__name__)
             for name in (
                 configured_channel_names
                 if not channel_readiness_owned and isinstance(configured_channel_names, dict)
@@ -5715,12 +5928,13 @@ async def start_gateway_server(
                     svc.optional_services.setdefault(f"channel:{channel_name}", {}).update(
                         {
                             "status": "degraded",
-                            "generation": generation,
+                            "generation": channel_service_generation,
                             "error": type(exc).__name__,
                         }
                     )
             log.warning("gateway.channel_start_failed", error=str(exc))
             _publish_legacy_ready_if_complete()
+            return "degraded"
 
     server_handle = GatewayServer(app=app, config=config)
     server_handle._pid_lock = _pid_lock
@@ -5902,7 +6116,7 @@ async def start_gateway_server(
         "channels",
         _start_optional_channels,
         config_revision=service_config_revision,
-        descriptor=svc.optional_services.setdefault("channels", {}),
+        descriptor=channels_descriptor,
     )
     optional_owners = getattr(svc, "optional_owners", None)
     if not isinstance(optional_owners, dict):
@@ -5921,8 +6135,22 @@ async def start_gateway_server(
         from opensquilla.gateway.content_length_backfill import (
             run_content_length_backfill,
         )
+        from opensquilla.gateway.session_events import (
+            SESSION_DIRECTORY_KEY,
+            build_session_directory_metadata_changed_payload,
+        )
+
+        async def _notify_directory_metadata_changed() -> None:
+            await runtime_event_bridge.emit(
+                SESSION_DIRECTORY_KEY,
+                SESSIONS_CHANGED_EVENT,
+                build_session_directory_metadata_changed_payload(),
+            )
 
         svc.content_length_backfill_task = create_background_task(
-            run_content_length_backfill(usage_storage)
+            run_content_length_backfill(
+                usage_storage,
+                notify_directory_changed=_notify_directory_metadata_changed,
+            )
         )
     return server_handle

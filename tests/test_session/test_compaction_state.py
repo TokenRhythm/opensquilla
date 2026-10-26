@@ -1,6 +1,10 @@
 from __future__ import annotations
 
+import asyncio
+from typing import Any
+
 import pytest
+from pydantic import BaseModel, Field
 
 from opensquilla.session.compaction_state import (
     CompactionObligation,
@@ -145,7 +149,8 @@ def test_closing_markup_tags_do_not_become_compaction_file_facts(role: str) -> N
     assert [item.value for item in obligations if item.kind == "file_path"] == [
         "src/parser/scan.py",
     ]
-    assert summary.files_and_artifacts == [{"path": "src/parser/scan.py"}]
+    assert summary.files_and_artifacts == []
+    assert "src/parser/scan.py" in render_structured_summary(summary)
 
 
 @pytest.mark.parametrize("path", [
@@ -160,7 +165,7 @@ def test_real_paths_remain_compaction_file_facts(path: str) -> None:
     assert [item.value for item in obligations if item.kind == "file_path"] == [path]
 
 
-def test_structured_summary_exposes_command_and_pending_tool_workset() -> None:
+def test_tool_workset_is_diagnostic_not_a_new_summary_sidecar() -> None:
     entries = [
         {
             "role": "assistant",
@@ -185,11 +190,12 @@ def test_structured_summary_exposes_command_and_pending_tool_workset() -> None:
         obligations,
     )
 
-    assert any(
-        command.startswith("uv run pytest tests/test_session/test_compaction.py")
-        for command in summary.executed_commands_and_tests
-    )
-    assert summary.pending_tool_and_approval_ids == ["call_waiting"]
+    assert any(item.kind == "command" for item in obligations)
+    assert [item.value for item in obligations if item.kind == "pending_tool_or_approval_id"] == [
+        "call_waiting",
+    ]
+    assert summary.executed_commands_and_tests == []
+    assert summary.pending_tool_and_approval_ids == []
     # A historical promise does not establish that this command is still pending.
     assert summary.open_steps == []
     assert summary.next_action is None
@@ -212,7 +218,7 @@ def test_command_mentions_are_not_promoted_to_executed_history(role: str) -> Non
         block_missing_critical=True,
     )
     assert summary.executed_commands_and_tests == []
-    assert command in render_structured_summary(summary)
+    assert command not in render_structured_summary(summary)
     assert "Executed Commands and Tests:" not in render_structured_summary(summary)
 
 
@@ -251,14 +257,16 @@ def test_actual_shell_receipt_preserves_input_not_commands_mentioned_in_output(
         {"role": "tool", "tool_call_id": "exec_1",
          "content": output},
     ]
+    obligations = extract_compaction_obligations(entries)
     summary, _ = build_structured_summary_from_text(
-        "Validation returned an exit code.", extract_compaction_obligations(entries),
+        "Validation returned an exit code.", obligations,
     )
-    assert summary.executed_commands_and_tests == ["pnpm test"]
-    assert "npm run lint" in render_structured_summary(summary)
+    assert [item.value for item in obligations if item.kind == "command"] == ["pnpm test"]
+    assert summary.executed_commands_and_tests == []
+    assert "npm run lint" not in render_structured_summary(summary)
     if exit_code:
-        assert any("validation failed" in str(item) for item in summary.known_failures)
-        # The command is recorded as executed, never labelled passed by the sidecar.
+        assert any("validation failed" in item.value for item in obligations)
+        assert summary.known_failures == []
         assert "passed" not in render_structured_summary(summary)
 
 
@@ -275,7 +283,7 @@ def test_neutral_command_reference_stays_neutral_across_two_checkpoints() -> Non
         block_missing_critical=True,
     )
     assert first.executed_commands_and_tests == second.executed_commands_and_tests == []
-    assert "pnpm test" in render_structured_summary(second)
+    assert "pnpm test" not in render_structured_summary(second)
 
 
 @pytest.mark.parametrize("result", ["exit_code=0\nDone", "pnpm test passed (quoted README text)"])
@@ -288,11 +296,11 @@ def test_legacy_shell_result_requires_actual_receipt_instead_of_completion_prose
         {"type": "tool_result", "tool_use_id": "exec_1", "result": result,
          "execution_status": {"status": "unknown", "reason": "legacy_missing_status"}},
     ]}]
-    summary, _ = build_structured_summary_from_text(
-        "Prior tool result.", extract_compaction_obligations(entries),
-    )
+    obligations = extract_compaction_obligations(entries)
+    summary, _ = build_structured_summary_from_text("Prior tool result.", obligations)
     expected = ["pnpm test"] if result.startswith("exit_code=") else []
-    assert summary.executed_commands_and_tests == expected
+    assert [item.value for item in obligations if item.kind == "command"] == expected
+    assert summary.executed_commands_and_tests == []
 
 
 @pytest.mark.parametrize("structured", [False, True])
@@ -333,9 +341,10 @@ def test_resolved_plans_and_questions_are_not_backfilled_as_current_state(struct
     assert summary.unresolved_questions == []
     assert old_plan not in rendered
     assert old_question not in rendered
-    assert "src/synthetic/main.py" in rendered
-    assert summary.pending_tool_and_approval_ids == ["call_release_note"]
-    assert coverage.status == "pass"
+    assert "src/synthetic/main.py" not in rendered
+    assert summary.pending_tool_and_approval_ids == []
+    assert coverage.status == "fail_reported"
+    assert not coverage.blocked
 
 
 def test_legacy_obligation_callers_cannot_force_superseded_state_back_into_summary() -> None:
@@ -358,7 +367,7 @@ def test_legacy_obligation_callers_cannot_force_superseded_state_back_into_summa
     ).status == "pass"
 
 
-def test_canonical_nested_tool_results_populate_failure_and_pending_workset() -> None:
+def test_canonical_nested_tool_workset_does_not_override_summary() -> None:
     entries = [
         {
             "role": "assistant",
@@ -409,16 +418,16 @@ def test_canonical_nested_tool_results_populate_failure_and_pending_workset() ->
         obligations,
     )
 
-    assert any(
-        "assertion failed" in item.get("detail", "").lower()
-        for item in summary.known_failures
-    )
-    assert any(
-        command.startswith("uv run pytest tests/test_session")
-        for command in summary.executed_commands_and_tests
-    )
-    assert summary.pending_tool_and_approval_ids == ["call_waiting"]
-    assert "call_failed" not in summary.pending_tool_and_approval_ids
+    assert any(item.kind == "failed_command_or_error" and "assertion failed" in item.value
+               for item in obligations)
+    assert any(item.kind == "command" and item.value.startswith("uv run pytest tests/test_session")
+               for item in obligations)
+    assert [item.value for item in obligations if item.kind == "pending_tool_or_approval_id"] == [
+        "call_waiting",
+    ]
+    assert summary.known_failures == []
+    assert summary.executed_commands_and_tests == []
+    assert summary.pending_tool_and_approval_ids == []
 
 
 def test_extract_compaction_obligations_prioritizes_goals_when_bounded() -> None:
@@ -481,14 +490,17 @@ def test_extract_compaction_obligations_keeps_current_workset_after_old_noise() 
     )
 
     assert len(obligations) == 64
-    assert summary.user_goal == "ship the current compaction fix."
-    assert summary.constraints_and_preferences[0] == (
-        "preserve pending operation continuity."
-    )
-    assert summary.pending_tool_and_approval_ids == [
+    assert any(item.kind == "user_goal" and item.value == "ship the current compaction fix."
+               for item in obligations)
+    assert any(item.kind == "user_constraint_or_preference"
+               and item.value == "preserve pending operation continuity." for item in obligations)
+    assert [item.value for item in obligations if item.kind == "pending_tool_or_approval_id"] == [
         "approval_pending_current",
         "call_pending_tool",
     ]
+    assert summary.user_goal == ""
+    assert summary.constraints_and_preferences == []
+    assert summary.pending_tool_and_approval_ids == []
     assert not any(
         item.kind == "file_path" and item.value == "src/legacy/noise_0.py"
         for item in obligations
@@ -527,17 +539,24 @@ def test_extract_compaction_obligations_reserves_current_workset_after_goal_nois
     )
 
     assert len(obligations) == 64
-    assert summary.user_goal == "complete the active bounded selection repair."
-    assert summary.constraints_and_preferences[0] == (
-        "retain the active pending operation."
+    assert any(
+        item.kind == "user_goal" and item.value == "complete the active bounded selection repair."
+        for item in obligations
     )
-    assert summary.pending_tool_and_approval_ids == ["call_active_pending"]
+    assert any(item.kind == "user_constraint_or_preference"
+               and item.value == "retain the active pending operation." for item in obligations)
+    assert [item.value for item in obligations if item.kind == "pending_tool_or_approval_id"] == [
+        "call_active_pending",
+    ]
+    assert summary.user_goal == ""
+    assert summary.constraints_and_preferences == []
+    assert summary.pending_tool_and_approval_ids == []
     assert all(
         item.value != "superseded historical objective 0." for item in obligations
     )
 
 
-def test_structured_summary_backfills_missing_obligations_without_blocking() -> None:
+def test_structured_summary_reports_missing_obligations_without_backfill() -> None:
     obligations = extract_compaction_obligations(
         [
             {
@@ -561,22 +580,18 @@ def test_structured_summary_backfills_missing_obligations_without_blocking() -> 
         obligations,
     )
 
-    assert coverage.status == "pass_with_backfill"
+    assert coverage.status == "fail_reported"
     assert coverage.blocked is False
     assert coverage.missing_obligations
-    assert any(
-        "src/opensquilla/session/models.py" in item for item in coverage.critical_carry_forward
-    )
-    assert any("call_exec_2" in item for item in coverage.critical_carry_forward)
-    assert summary.critical_carry_forward == coverage.critical_carry_forward
+    assert coverage.critical_carry_forward == summary.critical_carry_forward == []
 
     rendered = render_structured_summary(summary)
-    assert "Critical Carry Forward:" in rendered
-    assert "src/opensquilla/session/models.py" in rendered
-    assert "call_exec_2" in rendered
+    assert "Critical Carry Forward:" not in rendered
+    assert "src/opensquilla/session/models.py" not in rendered
+    assert "call_exec_2" not in rendered
 
 
-def test_structured_summary_preserves_decisions_and_identifiers() -> None:
+def test_structured_summary_does_not_reintroduce_extracted_decisions_and_identifiers() -> None:
     obligations = extract_compaction_obligations(
         [
             {
@@ -594,14 +609,12 @@ def test_structured_summary_preserves_decisions_and_identifiers() -> None:
         obligations,
     )
 
-    assert coverage.status == "pass_with_backfill"
-    assert summary.decisions_and_rationale == [
-        {"detail": "keep provider-specific state diagnostic-only until wired."}
-    ]
-    assert summary.important_identifiers == ["550e8400-e29b-41d4-a716-446655440000"]
+    assert coverage.status == "fail_reported"
+    assert summary.decisions_and_rationale == []
+    assert summary.important_identifiers == []
 
 
-def test_structured_summary_coverage_checks_the_replayed_backfill() -> None:
+def test_legacy_blocking_option_cannot_force_backfill() -> None:
     obligations = extract_compaction_obligations(
         [
             {
@@ -619,14 +632,14 @@ def test_structured_summary_coverage_checks_the_replayed_backfill() -> None:
         block_missing_critical=True,
     )
 
-    assert coverage.status == "pass"
+    assert coverage.status == "fail_reported"
     assert coverage.blocked is False
-    assert coverage.missing_obligations == []
-    assert summary.source_coverage["status"] == "pass"
-    assert "src/opensquilla/session/models.py" in render_structured_summary(summary)
+    assert coverage.missing_obligations
+    assert summary.source_coverage["status"] == "fail_reported"
+    assert "src/opensquilla/session/models.py" not in render_structured_summary(summary)
 
 
-def test_structured_summary_blocks_when_bounded_replay_still_misses_critical_facts() -> None:
+def test_many_missing_goals_neither_block_nor_grow_checkpoint() -> None:
     obligations = extract_compaction_obligations(
         [
             {
@@ -645,7 +658,290 @@ def test_structured_summary_blocks_when_bounded_replay_still_misses_critical_fac
         block_missing_critical=True,
     )
 
-    assert coverage.status == "fail_blocked"
-    assert coverage.blocked is True
+    assert coverage.status == "fail_reported"
+    assert coverage.blocked is False
     assert coverage.missing_obligations
-    assert summary.source_coverage["status"] == "fail_blocked"
+    assert summary.source_coverage["status"] == "fail_reported"
+    assert len(render_structured_summary(summary)) < 120
+
+
+@pytest.mark.parametrize("backfill", [False, True])
+@pytest.mark.parametrize("blocking", [False, True])
+def test_coverage_legacy_flags_are_diagnostic_only(backfill: bool, blocking: bool) -> None:
+    report = verify_summary_coverage(
+        "Use the corrected current task.",
+        [CompactionObligation(kind="user_goal", value="obsolete task", critical=True)],
+        backfill_missing=backfill,
+        block_missing_critical=blocking,
+    )
+    assert report.status == "fail_reported"
+    assert report.checked_obligations == 1
+    assert report.covered_obligations == 0
+    assert report.missing_obligations == ["user_goal: obsolete task"]
+    assert report.blocked is False
+    assert report.critical_carry_forward == []
+
+
+def test_coverage_long_source_snippet_can_match_the_unchanged_full_source() -> None:
+    source = "Error: " + "source-preserved-detail " * 30
+    obligations = extract_compaction_obligations([{"role": "tool", "content": source}])
+    error = next(item for item in obligations if item.kind == "failed_command_or_error")
+
+    # Bounding a diagnostic must not append punctuation absent from the source.
+    assert len(error.value) <= 240
+    assert error.value in source
+    report = verify_summary_coverage(source, [error])
+    assert report.status == "pass"
+    assert report.covered_obligations == 1
+
+
+def test_coverage_normalizes_source_and_summary_whitespace_symmetrically() -> None:
+    obligations = extract_compaction_obligations([{
+        "role": "assistant", "content": "Error: details  for\tthe current operation.",
+    }])
+    error = next(item for item in obligations if item.kind == "failed_command_or_error")
+    report = verify_summary_coverage("Error: details for\nthe current operation.", [error])
+    assert report.status == "pass"
+
+
+def test_command_reference_stops_at_its_inline_code_boundary() -> None:
+    obligations = extract_compaction_obligations([{
+        "role": "assistant",
+        "content": "Use `python -m app` for the previous environment; its status was corrected.",
+    }])
+    commands = [item for item in obligations if item.kind == "command_reference"]
+    assert [item.value for item in commands] == ["python -m app"]
+    assert verify_summary_coverage(
+        "`python -m app` now uses the corrected environment.", commands,
+    ).status == "pass"
+    assert verify_summary_coverage(
+        "`python -m another_app` uses the corrected environment.", commands,
+    ).status == "fail_reported"
+
+
+@pytest.mark.parametrize("source", [
+    'Verify {"command":"python -m pytest tests/test_scan.py -q","next":"inspect output"}.',
+    '{"npm":"a package manager","command":"python -m pytest tests/test_scan.py -q"}',
+])
+def test_command_reference_stops_at_json_string_field_boundary(source: str) -> None:
+    commands = [item for item in extract_compaction_obligations([
+        {"role": "user", "content": source},
+    ]) if item.kind == "command_reference"]
+    assert [item.value for item in commands] == ["python -m pytest tests/test_scan.py -q"]
+    assert verify_summary_coverage(commands[0].value, commands).status == "pass"
+    assert verify_summary_coverage(
+        "python -m pytest tests/test_scan.py", commands,
+    ).status == "fail_reported"
+
+
+def test_json_command_reference_decodes_escaping_without_changing_shell_literals() -> None:
+    import json
+
+    command = 'bash -c \'printf "%s" "a  b"; echo `hostname`\''
+    source = json.dumps({"verify": command, "next": "inspect output"})
+    commands = [item for item in extract_compaction_obligations([
+        {"role": "user", "content": source},
+    ]) if item.kind == "command_reference"]
+    assert [item.value for item in commands] == [command]
+    assert verify_summary_coverage(command, commands).status == "pass"
+    assert verify_summary_coverage(
+        command.replace("a  b", "a b"), commands,
+    ).status == "fail_reported"
+    assert verify_summary_coverage(
+        command.replace("`hostname`", "hostname"), commands,
+    ).status == "fail_reported"
+
+
+def test_package_manager_prose_does_not_swallow_later_command_reference() -> None:
+    source = "已确认是 npm 全局包 `@example/cli@1.0.0`，Node 22；之后运行 `npm test`。"
+    commands = [item for item in extract_compaction_obligations([
+        {"role": "assistant", "content": source},
+    ]) if item.kind == "command_reference"]
+    assert [item.value for item in commands] == ["npm test"]
+    assert verify_summary_coverage("npm test", commands).status == "pass"
+    assert verify_summary_coverage("npm run other", commands).status == "fail_reported"
+
+
+@pytest.mark.parametrize("source, required", [
+    ("After approval run pnpm test", "pnpm test"),
+    ("Try npm 未知参数", "npm 未知参数"),
+    ("npm 全局包 without a code literal", "npm 全局包 without a code literal"),
+    ("Run ``npm 全局包 `@example/cli` ``", "npm 全局包 `@example/cli`"),
+    ('Run bash -c \'echo {"verify":"python -V"}\'', 'bash -c \'echo {"verify":"python -V"}\''),
+    ('{"verify":"python -m pytest missing closing quote', "python -m pytest missing closing quote"),
+])
+def test_ambiguous_or_shell_command_references_are_not_dropped(source: str, required: str) -> None:
+    commands = [item for item in extract_compaction_obligations([
+        {"role": "user", "content": source},
+    ]) if item.kind == "command_reference"]
+    assert required in [item.value for item in commands]
+    assert verify_summary_coverage("unrelated summary", commands).status == "fail_reported"
+
+
+@pytest.mark.parametrize("source", [
+    "Run bash -c 'echo `hostname`' now.",
+    "Run ``bash -c 'echo `hostname`'`` now.",
+])
+def test_shell_backticks_are_not_unconditional_command_boundaries(source: str) -> None:
+    commands = [item for item in extract_compaction_obligations([
+        {"role": "assistant", "content": source},
+    ]) if item.kind == "command_reference"]
+    assert commands
+    assert "`hostname`" in commands[0].value
+    assert verify_summary_coverage("bash -c 'echo", commands).status == "fail_reported"
+
+
+@pytest.mark.parametrize("path", [
+    "docs/My  Report.md", r"C:\Program Files\My  App\report.txt", "/srv/My  Cache",
+])
+def test_quoted_paths_preserve_literal_spaces_and_windows_separators(path: str) -> None:
+    obligations = extract_compaction_obligations([
+        {"role": "assistant", "content": f"Open `{path}` for details."},
+    ])
+    paths = [item for item in obligations if item.kind == "file_path"]
+    assert [item.value for item in paths] == [path]
+    assert verify_summary_coverage(path, paths).status == "pass"
+    assert verify_summary_coverage(path.replace("  ", " "), paths).status == "fail_reported"
+
+
+def test_executed_command_literal_spaces_are_not_normalized_away() -> None:
+    command = 'python -c "print(\'a  b\')"'
+    obligations = extract_compaction_obligations([
+        {"role": "assistant", "tool_calls": [{"id": "call-literal", "name": "exec_command",
+                                               "arguments": {"command": command}}]},
+        {"role": "tool", "tool_call_id": "call-literal", "content": "exit_code=0\na  b"},
+    ])
+    executed = [item for item in obligations if item.kind == "command"]
+    assert [item.value for item in executed] == [command]
+    assert verify_summary_coverage(command, executed).status == "pass"
+    assert verify_summary_coverage(
+        command.replace("a  b", "a b"), executed,
+    ).status == "fail_reported"
+
+
+@pytest.mark.parametrize("path", ["src/parser/scan.py", "/srv/cache", "src/a+b.py"])
+def test_unquoted_path_stops_before_prose_without_requiring_an_extension(path: str) -> None:
+    paths = [item for item in extract_compaction_obligations([
+        {"role": "assistant", "content": f"Open {path} for details."},
+    ]) if item.kind == "file_path"]
+    assert [item.value for item in paths] == [path]
+    assert verify_summary_coverage(path, paths).status == "pass"
+    if "+" in path:
+        assert verify_summary_coverage(path.replace("+", "aa"), paths).status == "fail_reported"
+
+
+def test_literal_code_whitespace_in_error_prose_is_not_normalized_away() -> None:
+    obligations = extract_compaction_obligations([
+        {"role": "assistant", "content": 'Error: expected `a  b`, received `a b`.'},
+    ])
+    errors = [item for item in obligations if item.kind == "failed_command_or_error"]
+    assert errors[0].value == 'Error: expected `a  b`, received `a b`.'
+    assert verify_summary_coverage(
+        'Error: expected `a b`, received `a b`.', errors,
+    ).status == "fail_reported"
+
+
+def test_unquoted_path_boundary_does_not_hide_the_next_path() -> None:
+    paths = [item.value for item in extract_compaction_obligations([
+        {"role": "assistant", "content": "Open src/a.py src/b.py for details."},
+    ]) if item.kind == "file_path"]
+    assert set(paths) == {"src/a.py", "src/b.py"}
+
+
+def test_normalized_coverage_still_reports_real_omissions_and_noncontiguous_fragments() -> None:
+    obligations = [
+        CompactionObligation(kind="file_path", value="src/required.py"),
+        CompactionObligation(kind="important_identifier", value="att_required_identity"),
+        CompactionObligation(
+            kind="failed_command_or_error", value="Error: alpha required-middle omega",
+        ),
+        CompactionObligation(kind="tool_result_fact", value="literal trailing..."),
+    ]
+    summary, report = build_structured_summary_from_text(
+        "src/different.py att_other_identity Error: alpha omega literal trailing",
+        obligations,
+    )
+    assert report.status == "fail_reported"
+    assert report.checked_obligations == 4
+    assert report.covered_obligations == 0
+    assert len(report.missing_obligations) == 4
+    assert report.blocked is False
+    assert summary.critical_carry_forward == []
+    assert "src/required.py" not in render_structured_summary(summary)
+
+
+def test_coverage_diagnostics_bound_work_and_labels() -> None:
+    class OversizedObligations:
+        def __iter__(self):
+            for _ in range(64):
+                yield CompactionObligation(kind="file_path", value="x" * 100_000)
+            raise AssertionError("diagnostics scanned past the bounded sample")
+
+    report = verify_summary_coverage("A usable checkpoint.", OversizedObligations())
+    assert report.status == "fail_reported"
+    assert report.checked_obligations == 64
+    assert len(report.missing_obligations) == 32
+    assert all(len(label) <= 306 for label in report.missing_obligations)
+    assert not report.blocked
+
+
+def test_diagnostic_failure_does_not_discard_model_summary() -> None:
+    class UnavailableObligations:
+        def __iter__(self):
+            raise RuntimeError("diagnostic source unavailable")
+
+    body = "Current task completed; do not repeat the retired migration."
+    summary, report = build_structured_summary_from_text(body, UnavailableObligations())
+    assert summary.current_status == body
+    assert report.status == "unknown"
+    assert report.blocked is False
+    assert body in render_structured_summary(summary)
+
+
+def test_coverage_does_not_swallow_cancellation() -> None:
+    class CancelledObligations:
+        def __iter__(self):
+            raise asyncio.CancelledError
+
+    with pytest.raises(asyncio.CancelledError):
+        verify_summary_coverage("A checkpoint.", CancelledObligations())
+
+
+class _FrozenV1Summary(BaseModel):
+    """The pre-P1 payload field types, independent of the production model."""
+
+    schema_version: int = 1
+    user_goal: str = ""
+    current_status: str = ""
+    next_action: str | None = None
+    completed_steps: list[str] = Field(default_factory=list)
+    open_steps: list[str] = Field(default_factory=list)
+    files_and_artifacts: list[dict[str, str]] = Field(default_factory=list)
+    tool_results_to_remember: list[dict[str, str]] = Field(default_factory=list)
+    decisions_and_rationale: list[dict[str, str]] = Field(default_factory=list)
+    known_failures: list[dict[str, str]] = Field(default_factory=list)
+    executed_commands_and_tests: list[str] = Field(default_factory=list)
+    pending_tool_and_approval_ids: list[str] = Field(default_factory=list)
+    important_identifiers: list[str] = Field(default_factory=list)
+    constraints_and_preferences: list[str] = Field(default_factory=list)
+    do_not_repeat: list[str] = Field(default_factory=list)
+    unresolved_questions: list[str] = Field(default_factory=list)
+    critical_carry_forward: list[str] = Field(default_factory=list)
+    source_coverage: dict[str, Any] = Field(default_factory=dict)
+
+
+def test_new_checkpoint_is_readable_by_frozen_v1_payload_model() -> None:
+    body = "## Current Work\nThe corrected task is active.\n## Next Step\nVerify the current files."
+    summary, _ = build_structured_summary_from_text(
+        body,
+        [CompactionObligation(kind="failed_command_or_error", value="retired failure")],
+        block_missing_critical=True,
+    )
+    summary.source_coverage.update({"replaces_prior_context": True})
+    payload = summary.model_dump(mode="json")
+    old_reader = _FrozenV1Summary.model_validate(payload)
+    assert old_reader.current_status == body
+    assert old_reader.schema_version == 1
+    assert old_reader.known_failures == []
+    assert old_reader.source_coverage["replaces_prior_context"] is True
+    assert render_structured_summary(old_reader.model_dump()) == render_structured_summary(payload)

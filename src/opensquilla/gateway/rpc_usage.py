@@ -27,7 +27,11 @@ from opensquilla.gateway.rpc import (
     get_dispatcher,
 )
 from opensquilla.gateway.session_services import get_session_storage
-from opensquilla.gateway.usage_query import UsageQueryValidationError, query_usage_ledger
+from opensquilla.gateway.usage_query import (
+    UsageQuerySnapshotBusyError,
+    UsageQueryValidationError,
+    query_usage_ledger,
+)
 from opensquilla.provider.model_catalog import (
     resolve_effective_context_window,
     shared_catalog,
@@ -855,6 +859,8 @@ async def _query_usage(
         return await query_usage_ledger(storage, dict(query.filters or {}))
     except UsageQueryValidationError as exc:
         raise RpcHandlerError("INVALID_REQUEST", str(exc)) from exc
+    except UsageQuerySnapshotBusyError as exc:
+        raise RpcUnavailableError(str(exc)) from exc
 
 
 async def _usage_cost(

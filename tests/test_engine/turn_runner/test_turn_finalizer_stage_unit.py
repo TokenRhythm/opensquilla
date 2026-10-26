@@ -203,6 +203,7 @@ def _make_input(
     heartbeat_ack_max_chars: int = 300,
     no_memory_capture: bool = False,
     terminal_generation_reset: bool = False,
+    failed_turn_usage: dict[str, Any] | None = None,
 ) -> TurnFinalizerStageInput:
     return TurnFinalizerStageInput(
         final_text_parts=final_text_parts if final_text_parts is not None else [],
@@ -222,6 +223,7 @@ def _make_input(
         heartbeat_ack_max_chars=heartbeat_ack_max_chars,
         no_memory_capture=no_memory_capture,
         terminal_generation_reset=terminal_generation_reset,
+        failed_turn_usage=failed_turn_usage,
     )
 
 
@@ -814,6 +816,127 @@ async def test_pending_error_persists_via_error_port() -> None:
     await stage.run(inp)
     assert len(recs["turn_error_persist"].calls) == 1
     assert recs["turn_error_persist"].calls[0]["event"] is err
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("cost_usd", "billed_cost", "source", "missing", "unknown"),
+    [
+        (0.03, 0.03, "provider_billed", 0, False),
+        (0.02, 0.0, "opensquilla_estimate", 0, False),
+        (0.03, 0.03, "mixed", 1, True),
+        (0.0, 0.0, "unavailable", 1, True),
+    ],
+)
+async def test_failed_only_turn_persists_usage_on_error_without_done(
+    cost_usd: float,
+    billed_cost: float,
+    source: str,
+    missing: int,
+    unknown: bool,
+) -> None:
+    usage = {
+        "input_tokens": 10 if not unknown else 0,
+        "output_tokens": 2 if not unknown else 0,
+        "cost_usd": cost_usd,
+        "billed_cost": billed_cost,
+        "cost_source": source,
+        "missing_cost_entries": missing,
+        "usage_unknown": unknown,
+        "coverage_status": "usage_unknown" if unknown else "complete",
+        "unknown_usage_events": int(unknown),
+        "provider": "synthetic-provider",
+        "model": "synthetic-model",
+    }
+    error = ErrorEvent(message="The stream could not complete.", code="incomplete_stream")
+    stage, recs = _make_stage()
+
+    out = (await stage.run(_make_input(
+        error_message=error.message,
+        pending_error_event=error,
+        failed_turn_usage=usage,
+    ))).output
+
+    assert out.done_event is None
+    assert out.pending_error_event is error
+    assert out.transcript_appended is False
+    assert recs["transcript_append"].calls == []
+    assert recs["session_totals"].calls == []
+    persisted = recs["turn_error_persist"].calls[0]
+    assert persisted["append_transcript"] is True
+    assert persisted["turn_usage"] == usage
+    assert persisted["turn_usage"] is not usage
+
+
+@pytest.mark.asyncio
+async def test_failed_turn_partial_owns_usage_without_duplicate_error_cost() -> None:
+    usage = {
+        "input_tokens": 15,
+        "output_tokens": 3,
+        "cost_usd": 0.03,
+        "billed_cost": 0.01,
+        "estimated_cost_component_usd": 0.02,
+        "cost_source": "mixed",
+        "missing_cost_entries": 1,
+        "usage_unknown": True,
+        "coverage_status": "usage_unknown",
+        "unknown_usage_events": 1,
+    }
+    error = ErrorEvent(message="The stream could not complete.", code="incomplete_stream")
+    stage, recs = _make_stage()
+
+    out = (await stage.run(_make_input(
+        final_text_parts=["A preserved response prefix."],
+        error_message=error.message,
+        pending_error_event=error,
+        failed_turn_usage=usage,
+    ))).output
+
+    assert out.done_event is None
+    assert out.transcript_appended is True
+    transcript = recs["transcript_append"].calls[0]
+    assert transcript["turn_usage"] == usage
+    assert transcript["turn_usage"] is not usage
+    assert transcript["token_count"] is None
+    assert "turn_usage" not in recs["turn_error_persist"].calls[0]
+    assert recs["session_totals"].calls == []
+
+
+@pytest.mark.asyncio
+async def test_failed_turn_usage_is_retained_when_partial_append_declines() -> None:
+    stage, recs = _make_stage(
+        transcript_append=_RecordingTranscriptAppend(return_value=False),
+    )
+    error = ErrorEvent(message="No receipt was confirmed.", code="provider_error")
+    usage = {"missing_cost_entries": 1, "usage_unknown": True}
+
+    await stage.run(_make_input(
+        final_text_parts=["Partial response."],
+        error_message=error.message,
+        pending_error_event=error,
+        failed_turn_usage=usage,
+    ))
+
+    assert recs["turn_error_persist"].calls[0]["turn_usage"] == usage
+
+
+@pytest.mark.asyncio
+async def test_done_usage_takes_precedence_over_failed_only_projection() -> None:
+    stage, recs = _make_stage()
+    done = DoneEvent(text="Recovered.", cost_usd=0.05, billed_cost=0.05,
+                     cost_source="provider_billed")
+
+    out = (await stage.run(_make_input(
+        final_text_parts=[done.text],
+        done_event=done,
+        failed_turn_usage={"missing_cost_entries": 1, "cost_source": "unavailable"},
+    ))).output
+
+    assert out.done_event is done
+    usage = recs["transcript_append"].calls[0]["turn_usage"]
+    assert usage["cost_usd"] == pytest.approx(0.05)
+    assert usage["missing_cost_entries"] == 0
+    assert "usage_unknown" not in usage
 
 
 @pytest.mark.asyncio

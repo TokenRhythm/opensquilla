@@ -250,6 +250,116 @@ function createHarness(options: {
   }
 }
 
+describe('partial done followed by provider failure with real stream ownership', () => {
+  it.each(['settled', 'queued-successor', 'unresolved-hydration'] as const)(
+    'preserves the failure and next-owner boundary when %s',
+    (boundary) => {
+      const owner = useChatTaskOwnership()
+      owner.noteRunning('task-partial')
+      const h = createHarness({
+        withCompactionRuntime: true, taskOwnership: owner, supportsTurnCommitted: true,
+      })
+      h.activeStreamTaskId.value = 'task-partial'
+      try {
+        h.stream.startStreaming()
+        h.stream.appendDelta('Partial work before provider failure')
+        if (boundary === 'queued-successor') owner.noteQueued('task-next')
+        h.api.handlers.onWireEventFixture('session.event.done', {
+          key: h.sessionKey.value, task_id: 'task-partial', turn_id: 'task-partial',
+          epoch: 0, stream_seq: 1, text: 'Partial work before provider failure',
+        })
+        expect(h.messages.value).toEqual([expect.objectContaining({
+          role: 'assistant', text: 'Partial work before provider failure', turnId: 'task-partial',
+        })])
+        expect(owner.runningTaskId.value).toBe('')
+        if (boundary === 'unresolved-hydration') owner.beginHydration()
+        expect(owner.hasAuthoritativeWork.value).toBe(boundary !== 'settled')
+        h.applySessionRunState.mockClear()
+        h.api.handlers.onWireEventFixture('session.event.error', {
+          key: h.sessionKey.value, task_id: 'task-partial', turn_id: 'task-partial',
+          epoch: 0, stream_seq: 2, error_class: '402', http_status: 402,
+          turn_outcome: { kind: 'failed', failure_kind: 'insufficient_credits', http_status: 402 },
+        })
+        if (boundary === 'settled') {
+          expect(h.messages.value[0]?.turnOutcome).toMatchObject({
+            status: 'failed', failureKind: 'insufficient_credits', httpStatus: 402,
+          })
+          expect(h.messages.value.filter(message => message.role === 'error')).toHaveLength(1)
+          expect(h.applySessionRunState).toHaveBeenLastCalledWith(expect.objectContaining({ run_status: 'failed' }))
+          expect(h.api.awaitingCommitTaskIds.value.size).toBe(0)
+          expect(h.stream.isStreaming.value).toBe(false)
+        } else {
+          expect(h.messages.value.some(message => message.role === 'error')).toBe(false)
+          expect(h.applySessionRunState).not.toHaveBeenCalled()
+          expect(owner.hasAuthoritativeWork.value).toBe(true)
+          if (boundary === 'queued-successor') expect(owner.isQueued('task-next')).toBe(true)
+          else expect(owner.hydrationResolved.value).toBe(false)
+        }
+      } finally { h.stop() }
+    },
+  )
+})
+
+describe('provider call generation recovery', () => {
+  it('rolls back failed reasoning and text while retaining earlier complete output', () => {
+    const h = createHarness({ withCompactionRuntime: true })
+    h.activeStreamTaskId.value = 'task-live'
+    const identity = { key: h.sessionKey.value, task_id: 'task-live', turn_id: 'task-live' }
+    try {
+      h.api.handlers.onTextDelta({ ...identity, stream_seq: 1, generation_epoch: 0,
+        model_call_id: 'complete', iteration: 1, text: 'kept prefix' })
+      h.api.handlers.onWireEventFixture('session.event.thinking_start', { ...identity,
+        stream_seq: 2, generation_epoch: 0, model_call_id: 'failed', iteration: 2, block_id: 'r2' })
+      h.api.handlers.onWireEventFixture('session.event.thinking', { ...identity,
+        stream_seq: 3, generation_epoch: 0, model_call_id: 'failed', iteration: 2, block_id: 'r2', text: 'discarded reasoning' })
+      h.api.handlers.onTextDelta({ ...identity, stream_seq: 4, generation_epoch: 0,
+        model_call_id: 'failed', iteration: 2, text: ' discarded answer' })
+      h.api.handlers.onAnswerGenerationReset({ ...identity, stream_seq: 5,
+        old_generation_epoch: 0, new_generation_epoch: 1, reset_scope: 'provider_call',
+        rollback_model_call_id: 'failed', authoritative_text_snapshot: 'must not append this scalar' })
+      expect(h.streamRuntime!.foldedTurn.value.rawText).toBe('kept prefix')
+      expect(h.streamRuntime!.foldedTurn.value.thinkingText).not.toContain('discarded')
+      h.api.handlers.onTextDelta({ ...identity, stream_seq: 6, generation_epoch: 0,
+        model_call_id: 'failed', iteration: 2, text: 'late discarded' })
+      h.api.handlers.onTextDelta({ ...identity, stream_seq: 7, generation_epoch: 1,
+        model_call_id: 'replacement', iteration: 2, text: ' replacement' })
+      expect(h.streamRuntime!.foldedTurn.value.rawText).toBe('kept prefix replacement')
+    } finally { h.stop() }
+  })
+
+  it('requires canonical recovery for a live reset without a matching checkpoint', () => {
+    const onRecoveryRequired = vi.fn()
+    const h = createHarness({ withCompactionRuntime: true, onRecoveryRequired })
+    h.activeStreamTaskId.value = 'task-live'
+    try {
+      h.api.handlers.onAnswerGenerationReset({ key: h.sessionKey.value, task_id: 'task-live',
+        stream_seq: 1, old_generation_epoch: 0, new_generation_epoch: 1,
+        reset_scope: 'provider_call', rollback_model_call_id: 'unseen' })
+      expect(onRecoveryRequired).toHaveBeenCalledOnce()
+      expect(h.scheduleHistorySync).toHaveBeenCalledOnce()
+    } finally { h.stop() }
+  })
+
+  it('restores a canonical snapshot whose failed attempt has already been pruned', () => {
+    const onRecoveryRequired = vi.fn()
+    const h = createHarness({ withCompactionRuntime: true, onRecoveryRequired })
+    const identity = { key: h.sessionKey.value, task_id: 'task-live', turn_id: 'task-live' }
+    try {
+      h.api.restoreLiveTurnSnapshot({ sessionKey: h.sessionKey.value, taskId: 'task-live', events: [
+        { semanticKind: 'text-delta', payload: { ...identity, stream_seq: 1, generation_epoch: 0,
+          model_call_id: 'complete', iteration: 1, text: 'kept prefix' } },
+        { semanticKind: 'answer-generation-reset', payload: { ...identity, stream_seq: 5,
+          old_generation_epoch: 0, new_generation_epoch: 1, reset_scope: 'provider_call',
+          rollback_model_call_id: 'pruned' } },
+        { semanticKind: 'text-delta', payload: { ...identity, stream_seq: 6, generation_epoch: 1,
+          model_call_id: 'replacement', iteration: 2, text: ' replacement' } },
+      ] })
+      expect(h.streamRuntime!.foldedTurn.value.rawText).toBe('kept prefix replacement')
+      expect(onRecoveryRequired).not.toHaveBeenCalled()
+    } finally { h.stop() }
+  })
+})
+
 describe.each(['write_file', 'execute_code'] as const)('live %s input preview delivery', toolName => {
   const path = toolName === 'write_file' ? 'page.html' : ''
   const draft = (patch: Record<string, unknown> = {}) => ({
@@ -650,6 +760,19 @@ describe('router card recovery projection', () => {
     }).renderedMessages
   }
 
+  it.each([false, true])('preserves wire replay=%s as display provenance without settling the turn', replayed => {
+    const h = setup()
+    try {
+      h.api.handlers.onWireEventFixture('session.event.router_decision', decision(10), { replayed })
+      expect(h.messages.value.filter(message => message.role === 'router')).toHaveLength(1)
+      const card = h.messages.value.find(message => message.role === 'router')!
+      expect(card.routerReplayed === true).toBe(replayed)
+      expect(card.routerSettled).toBeUndefined()
+      expect(card.restoredFromHistory).toBeUndefined()
+      expect(h.queueRouterDecision).toHaveBeenCalledWith(expect.any(Object), undefined, replayed)
+    } finally { h.stop() }
+  })
+
   it('keeps the provisional row mounted when it acquires real event and call identities', () => {
     const h = setup()
     const emit = h.api.handlers.onWireEventFixture
@@ -770,7 +893,7 @@ describe('router card recovery projection', () => {
     } finally { h.stop() }
   })
 
-  it('keeps buffered replay attempts isolated while an in-place recovery installs its snapshot', () => {
+  it.each([false, true])('keeps buffered replay attempts isolated with wire replay=%s during snapshot recovery', replayed => {
     const h = setup(true)
     const emit = h.api.handlers.onWireEventFixture
     const firstText = { ...envelope(12), text: 'first', model_call_id: '1.0', iteration: 1 }
@@ -790,7 +913,7 @@ describe('router card recovery projection', () => {
       emit('session.event.router_control_replay', envelope(20))
       emit('session.event.ensemble_progress', progress(21, 'second'))
       emit('session.event.text_delta', { ...envelope(22), text: 'second', model_call_id: '2.0', iteration: 2 })
-      emit('session.event.router_decision', decision(23))
+      emit('session.event.router_decision', decision(23), { replayed })
 
       expect(h.messages.value.filter(message => message.role === 'router')).toHaveLength(1)
       expect(h.lastStreamSeq.value).toBe(12)
@@ -802,6 +925,7 @@ describe('router card recovery projection', () => {
       expect(cards.map(card => card.messageId)).toEqual([`router-${key}-10`, `router-${key}-23`])
       expect(cards.map(card => card.ensemble?.models.map(model => model.model))).toEqual([['first'], ['second']])
       expect(cards.map(card => card.routerModelCallId)).toEqual(['1.0', '2.0'])
+      expect(cards.map(card => card.routerReplayed === true)).toEqual([true, replayed])
       expect(h.lastStreamSeq.value).toBe(23)
       expect(rendered.value.filter(message => message.isRouterStrip)).toHaveLength(2)
       expect(rendered.value.find(message => message.isRouterStrip)?.routerTurnKey).toBe(originalKey)
@@ -1693,9 +1817,10 @@ describe('useChatRpcEventHandlers live snapshot restoration', () => {
       })
 
       expect(queueRouterDecision).toHaveBeenCalledOnce()
-      const [payload, identityStreamSeq] = queueRouterDecision.mock.calls[0]!
+      const [payload, identityStreamSeq, replayed] = queueRouterDecision.mock.calls[0]!
       expect(payload).not.toHaveProperty('stream_seq')
       expect(identityStreamSeq).toBe(17)
+      expect(replayed).toBe(true)
       expect(lastStreamSeq.value).toBe(900)
     } finally {
       stop()
@@ -2173,6 +2298,39 @@ describe('compaction wire events through the live stream and maintenance runtime
       expect(h.compaction!.compactStatus.value.status).toBe('failed')
       expect(h.compaction!.isCompactInFlightForCurrentSession()).toBe(false)
       expect(h.stream.isStreaming.value).toBe(false)
+    } finally { h.stop() }
+  })
+
+  it('restores an observed-only manual snapshot after returning to its session and settles it once', () => {
+    const h = createHarness({ withCompactionRuntime: true })
+    const payload = { key: h.sessionKey.value, source: 'manual', compaction_id: 'cmp-observed-return' }
+    const snapshot: SessionReadSnapshot = {
+      sessionKey: h.sessionKey.value, taskId: null, currentStreamSeq: 24,
+      events: [{ semanticKind: 'compaction-progress', payload: {
+        ...payload, status: 'observed', stage: 'summarizing', heartbeat: true, sequence: 4, stream_seq: 24,
+      } }],
+    }
+    try {
+      h.api.restoreLiveTurnSnapshot(snapshot)
+      expect(h.compaction!.compactStatus.value).toMatchObject({
+        compactionId: 'cmp-observed-return', source: 'manual', detail: 'summarizing', isBusy: true,
+      })
+      expect(h.compaction!.isCompactInFlightForCurrentSession()).toBe(true)
+      expect(h.stream.isStreaming.value).toBe(false)
+      h.compaction!.setCompactInFlight(false)
+      h.compaction!.hideCompactStatus()
+      h.api.restoreLiveTurnSnapshot(snapshot)
+      expect(h.compaction!.compactStatus.value.compactionId).toBe('cmp-observed-return')
+      expect(h.compaction!.isCompactInFlightForCurrentSession()).toBe(true)
+      const terminal = { ...payload, status: 'completed', durability: 'durable', sequence: 5, stream_seq: 25 }
+      h.api.handlers.onCompaction(terminal)
+      h.api.handlers.onCompaction(terminal)
+      expect(h.compaction!.isCompactInFlightForCurrentSession()).toBe(false)
+      expect(h.schedulePendingDrainAfterTerminal).toHaveBeenCalledOnce()
+      expect(h.stream.isStreaming.value).toBe(false)
+      expect(h.messages.value.filter(message => message.role === 'assistant')).toEqual([])
+      h.api.restoreLiveTurnSnapshot(snapshot)
+      expect(h.compaction!.compactStatus.value.status).toBe('completed')
     } finally { h.stop() }
   })
 
@@ -3769,18 +3927,53 @@ describe('useChatRpcEventHandlers ensemble handoff', () => {
 })
 
 describe('useChatRpcEventHandlers ensemble activity', () => {
-  it('marks a 65-event pending-acceptance overflow dirty instead of replaying a truncated tail', () => {
+  it('preserves fast output that arrives before the task acceptance response', () => {
     const onRecoveryRequired = vi.fn()
     const { api, activeStreamTaskId, stream, stop } = createHarness({ onRecoveryRequired })
     try {
       activeStreamTaskId.value = PENDING_STREAM_TASK_ID
-      for (let seq = 1; seq <= 65; seq++) api.handlers.onTextDelta({
-        key: 'agent:main:test', task_id: 'task-overflow', stream_seq: seq, text: String(seq),
+      for (let seq = 1; seq <= 1000; seq++) api.handlers.onTextDelta({
+        key: 'agent:main:test', task_id: 'task-fast', stream_seq: seq, text: String(seq),
       })
-      expect(onRecoveryRequired).toHaveBeenCalledOnce()
-      api.bindActiveStreamTask('task-overflow')
-      expect(stream.appendDelta).not.toHaveBeenCalled()
+      expect(onRecoveryRequired).not.toHaveBeenCalled()
+      api.bindActiveStreamTask('task-fast')
+      expect(stream.appendDelta).toHaveBeenCalledTimes(1000)
+      expect(vi.mocked(stream.appendDelta).mock.calls.map(call => call[0]))
+        .toEqual(Array.from({ length: 1000 }, (_, i) => String(i + 1)))
     } finally { stop() }
+  })
+
+  it('selects only the accepted task from many early task identities without a count-based recovery', () => {
+    const onRecoveryRequired = vi.fn()
+    const h = createHarness({ onRecoveryRequired })
+    try {
+      h.activeStreamTaskId.value = PENDING_STREAM_TASK_ID
+      for (let task = 1; task <= 20; task++) h.api.handlers.onTextDelta({
+        key: h.sessionKey.value, task_id: `early-${task}`, stream_seq: task, text: `task ${task}`,
+      })
+      expect(onRecoveryRequired).not.toHaveBeenCalled()
+      h.api.bindActiveStreamTask('early-20')
+      expect(h.stream.appendDelta).toHaveBeenCalledExactlyOnceWith('task 20')
+    } finally { h.stop() }
+  })
+
+  it('shares the byte budget between pending admission and recovery instead of silently truncating either', () => {
+    const onRecoveryRequired = vi.fn()
+    const h = createHarness({ onRecoveryRequired })
+    try {
+      h.activeStreamTaskId.value = PENDING_STREAM_TASK_ID
+      const text = 'x'.repeat(2 * 1024 * 1024)
+      for (let sequence = 1; sequence <= 24; sequence++) h.api.handlers.onTextDelta({
+        key: h.sessionKey.value, task_id: 'early', stream_seq: sequence, text,
+      })
+      expect(onRecoveryRequired).not.toHaveBeenCalled()
+      h.api.beginRecovery()
+      expect(h.api.consumeConversationEvent({ kind: 'sessions-changed', payload: { key: h.sessionKey.value, text } })).toBe('dirty')
+      expect(h.api.finishRecovery()).toBe(false)
+      expect(onRecoveryRequired).toHaveBeenCalledOnce()
+      h.api.bindActiveStreamTask('early')
+      expect(h.stream.appendDelta).not.toHaveBeenCalled()
+    } finally { h.stop() }
   })
 
   it('does not inject a transcript row for an automatically recovered connection', () => {
@@ -4535,15 +4728,95 @@ describe('recovery buffer consumption ownership', () => {
       expect(h.lastStreamSeq.value).toBe(0)
     } finally { h.stop() }
   })
-  it('declares actual overflow dirty and cannot complete installation', () => {
+  it('preserves thousands of small deltas and applies later replay immediately after the base', () => {
+    const onRecoveryRequired = vi.fn()
+    const h = createHarness({ onRecoveryRequired })
+    try {
+      h.activeStreamTaskId.value = 'task-1'
+      h.api.beginRecovery()
+      for (let sequence = 1; sequence <= 5000; sequence++) {
+        const event = token(sequence)
+        event.event.payload.text = `${sequence},`
+        expect(h.api.consumeConversationEvent(event)).toBe('applied')
+      }
+      expect(h.stream.appendDelta).not.toHaveBeenCalled()
+      expect(h.api.finishRecovery()).toBe(true)
+      expect(h.stream.appendDelta).toHaveBeenCalledTimes(5000)
+      expect(vi.mocked(h.stream.appendDelta).mock.calls.map(call => call[0]).join(''))
+        .toBe(Array.from({ length: 5000 }, (_, i) => `${i + 1},`).join(''))
+      expect(h.api.consumeConversationEvent(token(5001))).toBe('applied')
+      expect(h.lastStreamSeq.value).toBe(5001)
+      expect(h.stream.appendDelta).toHaveBeenCalledTimes(5001)
+      expect(onRecoveryRequired).not.toHaveBeenCalled()
+    } finally { h.stop() }
+  })
+
+  it('bounds retained bytes rather than token count and releases the budget for the next base', () => {
     const onRecoveryRequired = vi.fn()
     const h = createHarness({ onRecoveryRequired })
     try {
       h.api.beginRecovery()
-      for (let sequence = 1; sequence <= 64; sequence++) h.api.consumeConversationEvent(token(sequence))
-      expect(h.api.consumeConversationEvent(token(65))).toBe('dirty')
+      const event = token(1)
+      event.event.payload.text = 'x'.repeat(2 * 1024 * 1024)
+      for (let sequence = 1; sequence <= 24; sequence++) {
+        expect(h.api.consumeConversationEvent(event)).toBe('applied')
+      }
+      expect(h.api.consumeConversationEvent(event)).toBe('dirty')
       expect(onRecoveryRequired).toHaveBeenCalledOnce()
       expect(h.api.finishRecovery()).toBe(false)
+      expect(h.stream.appendDelta).not.toHaveBeenCalled()
+      h.api.beginRecovery()
+      expect(h.api.consumeConversationEvent(token(1))).toBe('applied')
+      expect(h.api.finishRecovery()).toBe(true)
+      expect(h.stream.appendDelta).toHaveBeenCalledOnce()
     } finally { h.stop() }
+  })
+
+  it('does not install a buffer invalidated by a malformed event', () => {
+    const h = createHarness()
+    try {
+      h.api.beginRecovery()
+      h.api.consumeConversationEvent(token(1))
+      expect(h.api.consumeConversationEvent({ kind: 'invalid', error: new Error('invalid frame') })).toBe('dirty')
+      expect(h.api.finishRecovery()).toBe(false)
+      expect(h.stream.appendDelta).not.toHaveBeenCalled()
+    } finally { h.stop() }
+  })
+})
+
+describe('legacy generation projection after provider recovery', () => {
+  it.each([
+    ['v1', 'done'], ['v1', 'error'], ['none', 'done'], ['none', 'error'],
+  ] as const)('accepts %s projected %s after an earlier committed step', (_caps, terminal) => {
+    const h = createHarness()
+    try {
+      h.activeStreamTaskId.value = 'task-live'
+      const identity = { key: h.sessionKey.value, task_id: 'task-live' }
+      h.api.handlers.onRunHeartbeat({
+        ...identity, generation_epoch: 0, stream_seq: 1, phase: 'tool',
+      })
+      {
+        // The gateway projects the call reset to the pre-existing v1 reset.
+        h.api.handlers.onAnswerGenerationReset({
+          ...identity, assistant_message_id: 'assistant-1', reset_scope: 'answer',
+          old_generation_epoch: 0, new_generation_epoch: 1, stream_seq: 3,
+          authoritative_text_snapshot: 'accepted prefix ', preserve_completed_tools: true,
+        })
+      }
+      h.api.handlers.onWireEventFixture(`session.event.${terminal}`, {
+        ...identity, generation_epoch: 1, stream_seq: 5,
+        text_snapshot: 'accepted prefix recovered', text: 'accepted prefix recovered',
+        ...(terminal === 'error' ? { code: 'timeout', message: 'synthetic provider failure' } : {}),
+      })
+      expect(h.stream.endStreaming).toHaveBeenCalledOnce()
+      expect(h.lastStreamSeq.value).toBe(5)
+      if (terminal === 'done') {
+        expect(h.stream.reconcileFinalText).toHaveBeenCalledWith('accepted prefix recovered')
+      } else {
+        expect(h.messages.value.some(message => message.role === 'error')).toBe(true)
+      }
+    } finally {
+      h.stop()
+    }
   })
 })

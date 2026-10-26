@@ -34,10 +34,6 @@ mkdir -p "${old_dir}" "${old_mount}" "${candidate_mount}" "${install_root}" "${u
 cleanup() {
   hdiutil detach "${candidate_mount}" -quiet >/dev/null 2>&1 || true
   hdiutil detach "${old_mount}" -quiet >/dev/null 2>&1 || true
-  if [[ -n "${app_pid:-}" ]]; then
-    kill "${app_pid}" >/dev/null 2>&1 || true
-    wait "${app_pid}" >/dev/null 2>&1 || true
-  fi
 }
 trap cleanup EXIT
 
@@ -83,27 +79,23 @@ python "${probe}" verify --home "${profile}" --label "${label}" \
 
 app_binary="${install_root}/OpenSquilla.app/Contents/MacOS/OpenSquilla"
 test -x "${app_binary}"
-OPENSQUILLA_DESKTOP_DISABLE_AUTO_UPDATE=1 \
-  "${app_binary}" --use-mock-keychain "--user-data-dir=${user_data}" \
-  >"${sandbox}/candidate-desktop.log" 2>&1 &
-app_pid=$!
-sleep 8
-kill -0 "${app_pid}"
-kill "${app_pid}" || true
-wait "${app_pid}" || true
-app_pid=""
+# The recovery gate owns the upgraded app's launch and bounded natural exit.
+# A separate fixed-delay launch can request quit before Gateway startup settles.
 
+printf 'macOS upgrade: starting packaged session recovery\n'
 node "${session_recovery_smoke}" \
   --executable "${app_binary}" \
   --user-data-dir "${user_data}" \
   --session-key agent:main:webchat:release-recovery-long-session \
   --switch-session-key agent:main:webchat:release-recovery-switch-session \
   --label "${label}"
+printf 'macOS upgrade: packaged session recovery passed\n'
 
 gateway_binary="$(find \
   "${install_root}/OpenSquilla.app/Contents/Resources/runtime/gateway" \
   -type f -name opensquilla-gateway -perm -111 -print -quit)"
 test -x "${gateway_binary}"
+printf 'macOS upgrade: inspecting retained profile\n'
 OPENSQUILLA_RECOVERY_OFFLINE=1 "${gateway_binary}" recovery inspect \
   --home "${profile}" --json >"${sandbox}/candidate-inspect.json"
 python - "${profile}" "${sandbox}/candidate-inspect.json" <<'PY'

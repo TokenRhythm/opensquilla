@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import threading
 import uuid
 from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
@@ -152,6 +153,140 @@ async def test_product_active_counts_each_surface_daily_without_creating_cohort(
     assert not await resumed.record_product_active(surface=ClientSurface.DESKTOP)
     await resumed.close()
     assert len(runtime.events) == 5
+
+
+
+async def test_daily_activity_cache_skips_state_io_for_repeated_observations(
+    tmp_path, monkeypatch,
+) -> None:
+    runtime = CapturingRuntime()
+    sink = _sink(runtime, _config(tmp_path))
+    assert await sink.record_product_active(surface=ClientSurface.CLI)
+
+    async def unexpected_io(operation):
+        raise AssertionError("completed daily activity must not read or write state again")
+
+    monkeypatch.setattr("opensquilla.telemetry.growth_sink.run_state_io", unexpected_io)
+    for _ in range(100):
+        assert not await sink.record_product_active(surface=ClientSurface.CLI)
+        sink.observe_product_active(ClientSurface.CLI)
+    assert not sink._tasks
+    assert len(runtime.events) == 1
+    await sink.close()
+
+
+async def test_activity_bursts_share_one_pending_observation(tmp_path) -> None:
+    runtime = CapturingRuntime()
+    sink = _sink(runtime, _config(tmp_path))
+    for _ in range(1_000):
+        sink.observe_product_active(ClientSurface.CLI)
+    assert len(sink._tasks) == 1
+    await sink.close()
+    assert len(runtime.events) == 1
+
+
+async def test_busy_activity_state_is_skipped_without_waiting_for_writer(tmp_path) -> None:
+    from opensquilla.profile_operation_lock import ProfileOperationLock
+
+    runtime = CapturingRuntime()
+    sink = _sink(runtime, _config(tmp_path))
+    held = threading.Event()
+    release = threading.Event()
+
+    def hold_state():
+        with ProfileOperationLock(sink.product_active_path):
+            held.set()
+            release.wait(5)
+
+    writer = asyncio.create_task(asyncio.to_thread(hold_state))
+    try:
+        assert await asyncio.to_thread(held.wait, 1)
+        assert not await asyncio.wait_for(
+            sink.record_product_active(surface=ClientSurface.CLI), 1,
+        )
+        assert not release.is_set()
+        assert not runtime.events
+    finally:
+        release.set()
+        await writer
+    assert await sink.record_product_active(surface=ClientSurface.CLI)
+    await sink.close()
+
+
+async def test_slow_activity_write_does_not_block_the_application_loop(
+    tmp_path, monkeypatch,
+) -> None:
+    from opensquilla.telemetry import growth_sink as sink_module
+
+    runtime = CapturingRuntime()
+    sink = _sink(runtime, _config(tmp_path))
+    entered = threading.Event()
+    release = threading.Event()
+    write_state = sink_module.write_product_active_state
+
+    def delayed_write(path, records):
+        entered.set()
+        assert release.wait(5)
+        write_state(path, records)
+
+    monkeypatch.setattr(sink_module, "write_product_active_state", delayed_write)
+    recording = asyncio.create_task(sink.record_product_active(surface=ClientSurface.CLI))
+    try:
+        assert await asyncio.to_thread(entered.wait, 1)
+        heartbeat = asyncio.Event()
+        asyncio.get_running_loop().call_soon(heartbeat.set)
+        await asyncio.wait_for(heartbeat.wait(), 1)
+        assert not recording.done()
+    finally:
+        release.set()
+        await recording
+        await sink.close()
+
+
+async def test_cancelled_state_write_keeps_policy_gate_until_worker_finishes(
+    tmp_path, monkeypatch,
+) -> None:
+    from opensquilla.telemetry import growth_sink as sink_module
+
+    sink = _sink(CapturingRuntime(), _config(tmp_path))
+    entered = threading.Event()
+    release = threading.Event()
+    write_state = sink_module.write_product_active_state
+
+    def delayed_write(path, records):
+        entered.set()
+        assert release.wait(5)
+        write_state(path, records)
+
+    monkeypatch.setattr(sink_module, "write_product_active_state", delayed_write)
+    recording = asyncio.create_task(sink.record_product_active(surface=ClientSurface.CLI))
+    transitioned = asyncio.Event()
+
+    async def change_policy():
+        async with sink._coordinator.transition(TelemetryScope.GROWTH):
+            transitioned.set()
+
+    transition = None
+    try:
+        assert await asyncio.to_thread(entered.wait, 1)
+        recording.cancel()
+        await asyncio.sleep(0)
+        recording.cancel()
+        transition = asyncio.create_task(change_policy())
+        await asyncio.sleep(0)
+        assert not transitioned.is_set()
+        release.set()
+        with pytest.raises(asyncio.CancelledError):
+            await recording
+        await asyncio.wait_for(transition, 1)
+        assert transitioned.is_set()
+        assert sink.product_active_path.is_file()
+    finally:
+        release.set()
+        await asyncio.gather(recording, return_exceptions=True)
+        if transition is not None:
+            await transition
+        await sink.close()
 
 
 @pytest.mark.parametrize("close_during_recovery", [False, True])
@@ -943,3 +1078,134 @@ async def test_client_launch_retry_reuses_event_id(tmp_path) -> None:
     assert first is False
     assert second is True
     assert runtime.events[0].event_id == runtime.events[1].event_id
+
+
+async def test_launch_observations_coalesce_and_close_drains_original_day(
+    tmp_path, monkeypatch,
+) -> None:
+    from opensquilla.telemetry import growth_sink as sink_module
+
+    runtime = CapturingRuntime()
+    sink = _sink(runtime, _config(tmp_path))
+    now = [STARTED_AT]
+    sink._clock = lambda: now[0]
+    entered = threading.Event()
+    release = threading.Event()
+    write_state = sink_module.write_client_launch_state
+
+    def delayed_write(path, records):
+        entered.set()
+        assert release.wait(5)
+        write_state(path, records)
+
+    monkeypatch.setattr(sink_module, "write_client_launch_state", delayed_write)
+    arguments = {
+        "surface": ClientSurface.CLI,
+        "entrypoint": ClientEntrypoint.AGENT,
+        "execution_mode": ExecutionMode.ONE_SHOT,
+    }
+    for _ in range(1_000):
+        sink.observe_client_launch(**arguments)
+    assert len(sink._tasks) == 1
+    now[0] += timedelta(days=1)
+    closing = asyncio.create_task(sink.close())
+    try:
+        assert await asyncio.to_thread(entered.wait, 1)
+        assert not closing.done()
+        assert not runtime.events
+    finally:
+        release.set()
+        await asyncio.wait_for(closing, 2)
+
+    assert len(runtime.events) == 1
+    event = runtime.events[0]
+    assert event.occurred_at_utc == STARTED_AT
+    assert event.entrypoint is ClientEntrypoint.AGENT
+    assert event.execution_mode is ExecutionMode.ONE_SHOT
+    records = read_client_launch_state(sink._client_launch_path)
+    assert len(records) == 1
+    assert next(iter(records.values())).status is GrowthMilestoneStatus.ENQUEUED
+    assert not sink._tasks
+
+
+@pytest.mark.parametrize("resumed", [False, True])
+async def test_daily_launch_cache_skips_state_io_after_acknowledgement(
+    tmp_path, monkeypatch, resumed,
+) -> None:
+    runtime = CapturingRuntime()
+    sink = _sink(runtime, _config(tmp_path))
+    arguments = {
+        "surface": ClientSurface.CLI,
+        "entrypoint": ClientEntrypoint.AGENT,
+        "execution_mode": ExecutionMode.ONE_SHOT,
+    }
+    assert await sink.record_client_launch(**arguments)
+    if resumed:
+        await sink.close()
+        sink = _sink(runtime, _config(tmp_path))
+        assert not await sink.record_client_launch(**arguments)
+
+    async def unexpected_io(operation):
+        raise AssertionError("completed daily launch must not read or write state again")
+
+    monkeypatch.setattr("opensquilla.telemetry.growth_sink.run_state_io", unexpected_io)
+    for _ in range(100):
+        assert not await sink.record_client_launch(**arguments)
+        sink.observe_client_launch(**arguments)
+    assert not sink._tasks
+    assert len(runtime.events) == 1
+    await sink.close()
+
+
+async def test_launch_cache_expires_for_new_days_and_policy_transitions(tmp_path) -> None:
+    runtime = CapturingRuntime()
+    sink = _sink(runtime, _config(tmp_path))
+    arguments = {
+        "surface": ClientSurface.CLI,
+        "entrypoint": ClientEntrypoint.AGENT,
+        "execution_mode": ExecutionMode.ONE_SHOT,
+    }
+    assert await sink.record_client_launch(**arguments)
+    async with sink._coordinator.transition(TelemetryScope.GROWTH):
+        sink._client_launch_path.unlink()
+    assert await sink.record_client_launch(**arguments)
+    sink._clock = lambda: STARTED_AT + timedelta(days=1)
+    assert await sink.record_client_launch(**arguments)
+    await sink.close()
+    assert len(runtime.events) == 3
+
+
+async def test_start_defers_recovery_io_and_owns_one_drained_worker(tmp_path, monkeypatch) -> None:
+    from opensquilla.telemetry import growth_sink as sink_module
+
+    config = _config(tmp_path)
+    _activate(config)
+    sink = _sink(CapturingRuntime(), config)
+    entered = threading.Event()
+    release = threading.Event()
+    read_state = sink_module.read_client_launch_state
+
+    def delayed_read(path):
+        entered.set()
+        assert release.wait(5)
+        return read_state(path)
+
+    monkeypatch.setattr(sink_module, "read_client_launch_state", delayed_read)
+    await asyncio.wait_for(sink.start(), 1)
+    replay_task = sink._retry_task
+    await sink.start()
+    assert sink._retry_task is replay_task
+    closing = None
+    try:
+        assert await asyncio.to_thread(entered.wait, 1)
+        closing = asyncio.create_task(sink.close())
+        await asyncio.sleep(0)
+        assert not closing.done()
+    finally:
+        release.set()
+        if closing is not None:
+            await asyncio.wait_for(closing, 2)
+        else:
+            await sink.close()
+    assert replay_task.done()
+    assert sink._retry_task is None

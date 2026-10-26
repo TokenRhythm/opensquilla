@@ -135,6 +135,22 @@
     "openDirectoryFailed": "无法打开项目目录，请重试。",
     "copyDirectoryFailed": "无法复制项目目录路径。",
     "projects": "项目",
+    "addProject": "添加项目",
+    "projectAction": "项目操作",
+    "openExistingProject": "打开已有项目",
+    "saveParentDirectory": "保存位置",
+    "projectLocation": "项目目录",
+    "chooseParentDirectory": "选择父目录",
+    "chooseExistingDirectory": "选择已有目录",
+    "executionHost": "执行主机：{host}",
+    "gatewayHost": "Gateway 所在主机",
+    "createLocationHint": "将在此位置创建新的项目目录。",
+    "openLocationHint": "将所选目录添加到项目列表。",
+    "createUnavailable": "此 Gateway 不支持直接创建并登记项目。你仍可打开已有项目，或使用目录选择器中的新建文件夹功能。",
+    "preparingProject": "正在准备…",
+    "projectOpened": "已打开项目「{name}」",
+    "createProjectUnconfirmed": "创建项目时遇到问题：{path}。重试前请先检查项目列表。{error}",
+    "openProjectFailed": "无法打开项目：{error}",
     "createProject": "创建项目",
     "projectNamePlaceholder": "项目名称",
     "sourceFolders": "源文件夹",
@@ -280,6 +296,31 @@
     "dismiss": "忽略"
   },
   "workbench": {
+    "annotationUnified": {
+      "selectTarget": "选择要修改的内容",
+      "start": "批注修改",
+      "stop": "结束批注",
+      "placeholder": "描述修改要求…",
+      "recordHint": "Enter 记录 · Shift + Enter 换行",
+      "record": "继续批注",
+      "submit": "记录到对话（{count} 处）",
+      "summary": "已记录 {count} 处",
+      "empty": "选择文字、对象或单元格区域，描述修改要求。",
+      "locate": "定位",
+      "edit": "编辑",
+      "reselect": "重选",
+      "cancel": "取消本次编辑",
+      "delete": "删除",
+      "queued": "等待提交",
+      "restoreQueued": "取消发送并恢复批注",
+      "otherPages": "其他页面",
+      "versionChanged": "已载入当前工作版本，请重新选择批注目标。",
+      "locationOnly": "已定位到所在页面，调整目标请重新选择。",
+      "stale": "文件已变化，请重新选择目标。",
+      "unavailable": "当前文件或客户端暂不支持批注。",
+      "submitFailed": "批注暂未提交，草稿已保留。",
+      "recordToConversation": "记录到对话"
+    },
     "tabs": {
       "copyLink": "复制链接",
       "openWeb": "打开网页",
@@ -313,7 +354,7 @@
       "hoverElement": "点击提出修改",
       "hoverRange": "选择单元格或区域，松开后输入修改要求",
       "chooseContent": "先选中要修改的内容",
-      "selectDocx": "拖选要修改的文字，松开后输入修改要求。",
+      "selectDocx": "单击选择段落，或拖选具体文字，再输入修改要求。",
       "selectPptx": "点击要修改的对象，直接输入修改要求。",
       "selectXlsx": "选择单元格或拖选区域，松开后输入修改要求。",
       "cancelSelection": "退出选择",
@@ -372,6 +413,7 @@
     },
     "resources": {
       "title": "文件", "count": "文件（{count}）", "empty": "暂无文件或链接。",
+      "currentWorkingFile": "当前工作文件", "publishedVersion": "已发布版本",
       "groups": { "files": "文件", "links": "链接", "attachments": "文件", "documents": "文件", "deliverables": "文件", "urls": "链接" },
       "open": "打开 {name}", "preparing": "正在准备编辑器…", "retry": "重试", "preview": "预览 {name}", "download": "下载 {name}", "edit": "创建 {name} 的可编辑副本", "publish": "发布 {name}",
       "imported": "{name} 已可编辑。", "published": "{name} 已可分享。",
@@ -469,9 +511,6 @@
       "exited": "终端已退出",
       "state": { "starting": "启动中", "running": "已连接", "exited": "已退出", "error": "不可用" }
     },
-    "nativePreview": {
-      "capacityReached": "已保留 4 个交互预览。请返回已有预览，或关闭一个后再打开新预览。"
-    },
     "artifactAnnotation": {
       "start": "请求修改",
       "stop": "退出批注模式",
@@ -566,6 +605,15 @@
       "documentEditingRetired": "请更新客户端并重新打开页面，将批注作为聊天输入发送。"
     },
     "artifactDocument": {
+      "versionHistory": "版本历史（{count}）",
+      "currentVersion": "当前 v{generation}",
+      "historicalVersion": "历史",
+      "openLatest": "打开最新",
+      "viewDeliveredVersion": "查看此次交付版本",
+      "viewRevision": "查看此版本",
+      "fixedSnapshot": "已交付版本",
+      "fixedSnapshotHint": "这是文件交付时的版本。批注修改会打开当前工作文档，原交付版本保留。",
+      "continueEditing": "继续编辑",
       "sections": "交付件文档区域",
       "preview": "预览",
       "source": "源码",
@@ -3636,6 +3684,45 @@
     "bundleDifferentGateway": "请在当前连接的 Gateway 自己提供的 WebUI 中下载支持包。"
   },
   "usageLogs": {
+    "capabilities": {
+      "unknown": "未知",
+      "partialMeter": "{value} · {count} 项未知",
+      "metrics": {
+        "input_tokens": "输入词元",
+        "output_tokens": "输出词元",
+        "cache_read_tokens": "缓存读取词元",
+        "cache_write_tokens": "缓存写入词元",
+        "input_images": "输入图片",
+        "input_video_seconds": "输入视频时长",
+        "output_audio_seconds": "输出音频时长",
+        "requested_audio_seconds": "请求音频时长",
+        "requests": "请求次数",
+        "output_images": "输出图片",
+        "input_audio_seconds": "输入音频时长",
+        "input_characters": "输入字符",
+        "requested_video_seconds": "请求视频时长",
+        "video_seconds": "生成视频时长",
+        "search_credits": "搜索积分",
+        "scrape_credits": "网页提取积分",
+        "character_credits": "字符积分",
+        "cost_in_usd_ticks": "供应商费用单位",
+        "input_text_tokens": "输入文本词元",
+        "output_text_tokens": "输出文本词元",
+        "input_audio_tokens": "输入音频词元",
+        "output_audio_tokens": "输出音频词元",
+        "input_image_tokens": "输入图片词元",
+        "output_image_tokens": "输出图片词元"
+      },
+      "units": {
+        "request": "次",
+        "image": "张",
+        "second": "秒",
+        "character": "字符",
+        "credit": "积分",
+        "token": "词元",
+        "usd_tick_1e_10": "美元 × 10⁻¹⁰"
+      }
+    },
     "tasks": {
       "unnamed": "未命名任务"
     },
@@ -3665,10 +3752,6 @@
       "cacheRead": "缓存读",
       "cacheWrite": "缓存写"
     },
-    "costHintTitle": "人民币金额使用内置汇率 {rate}。用于记账时请核对当前汇率。",
-    "nativeCostHintTitle": "原始服务商账单为人民币；美元金额按收据所载固定归一化汇率折算。",
-    "nativeMixedCostHintTitle": "混合币种或待结算账单继续使用规范化美元汇总，并单独展示已确认的原生币种收据。",
-    "nativeBillingSubtotals": "原始账单小计：{amounts}",
     "rangeHiddenHint": "已隐藏 {count} 条无日期的历史任务记录",
     "coverage": {
       "approximate": "部分历史用量按任务累计值估算。",
@@ -3726,10 +3809,10 @@
       "cacheRead": "缓存读",
       "cacheWrite": "缓存写",
       "cost": "成本",
-      "source": "来源",
       "model": "模型"
     },
     "breakdown": {
+      "callTitle": "调用明细",
       "title": "模型明细",
       "modelCount": "{count} 个模型",
       "total": "{tokens} Token · {cost}",
@@ -3738,35 +3821,28 @@
     "costSource": {
       "actual": {
         "label": "实际",
-        "tooltip": "实际 — 由服务商计费的成本",
-        "short": "实际"
+        "tooltip": "实际 — 由服务商计费的成本"
       },
       "estimated": {
         "label": "估算",
-        "tooltip": "估算 — 本地根据 Token 数推算",
-        "short": "估算"
+        "tooltip": "估算 — 采用供应商报价或已记录的本地价格"
       },
       "mixed": {
         "label": "混合",
-        "tooltip": "混合 — 部分为计费数据，其余为估算",
-        "short": "混合"
+        "tooltip": "混合 — 部分为计费数据，其余为估算"
       },
       "unpriced": {
         "label": "无定价",
-        "tooltip": "无定价 — 该模型没有定价表条目",
-        "short": "无定价"
+        "tooltip": "无定价 — 该模型没有定价表条目"
       },
       "none": {
-        "label": "无",
-        "tooltip": "未记录成本",
-        "short": "无"
+        "label": "未记录费用",
+        "tooltip": "未记录成本"
       },
       "ephemeral": {
         "label": "临时",
-        "tooltip": "临时会话 — 成本尚未持久化",
-        "short": "临时"
-      },
-      "cacheBlindHint": "包含按全价输入费率计价缓存令牌的估算 — 视为上限。"
+        "tooltip": "临时会话 — 成本尚未持久化"
+      }
     },
     "relTime": {
       "justNow": "刚刚",
@@ -3835,6 +3911,7 @@
       "continue": "继续",
       "commandWithSkills": "已选择的技能仅用于普通消息；请移除技能标签后执行命令。",
       "commandDescriptions": {
+        "init": "根据当前项目创建或完善项目指南",
         "new": "新建聊天",
         "compact": "压缩当前对话上下文",
         "goal": "设置持续执行的目标",
@@ -3998,6 +4075,7 @@
     "liveUnavailable": "实时更新暂不可用",
     "liveUnavailableDescription": "历史消息仍可查看；实时更新恢复后即可发送。",
     "liveUnavailableConnectedDescription": "Gateway 已连接。当前会话的实时更新暂时不可用。",
+    "liveRecoveryReloadDescription": "实时更新未能恢复。请保存尚未发送的内容，然后重新加载此页以恢复连接。",
     "reconnectLive": "重新连接",
     "liveSendBlockedConnecting": "正在恢复实时更新，草稿已保留。",
     "liveSendBlockedDegraded": "实时更新暂时不可用，草稿已保留。",
@@ -4095,16 +4173,13 @@
     "subagentPrefix": "子智能体：",
     "subagentCompletion": "子智能体完成",
     "turnFailed": "本轮失败",
-    "copyDiagnosticId": "复制诊断编号",
-    "copiedDiagnosticId": "诊断编号已复制",
-    "copyDiagnosticFailed": "复制失败，请选中上方编号手动复制。",
     "errorMessage": {
       "unknown": "本次请求未完成",
       "noProvider": "当前没有可用模型",
       "credentials": "模型服务身份验证未通过",
       "credits": "模型服务账户余额不足",
       "modelUnavailable": "当前模型不可用",
-      "contextLimit": "输入内容超出模型限制",
+      "contextLimit": "内容超出当前模型容量，请缩短输入或选择更大上下文的模型",
       "unsupported": "当前模型不支持此请求",
       "imageUnsupported": "当前模型不支持图片",
       "ensembleImageUnsupported": "当前模式不支持图片",
@@ -4117,7 +4192,7 @@
       "needsConfirmation": "需要确认后才能继续",
       "toolDenied": "所需工具不允许使用",
       "toolFailed": "工具未能完成操作",
-      "contextUnavailable": "无法继续处理当前对话",
+      "contextUnavailable": "上下文整理未完成，本次无法继续，请稍后重试",
       "timeout": "任务超时，未能完成",
       "stopped": "任务已停止",
       "interrupted": "任务已中断",
@@ -4496,6 +4571,7 @@
       "sendingContinuing": "正在发送回复 · 继续运行…"
     },
     "slashCommands": {
+      "initUnavailable": "此 Gateway 不支持项目初始化。请更新后重试，草稿已保留。",
       "side": {
         "closed": "原侧边聊天已关闭，已保留草稿。请修改命令后再发送，以创建新的侧边聊天。",
         "description": "打开临时侧边聊天 · /btw 为同义命令",
@@ -4681,10 +4757,14 @@
       "failureUnavailable": "用于整理上下文的模型不可用",
       "failureProvider": "模型未能生成可用的摘要",
       "failureTimeout": "上下文整理超时",
-      "failureRejectedDetail": "本次摘要未应用，原上下文已保留。可以重试；若仍失败，请复制诊断编号协助排查。",
-      "failureUnavailableDetail": "请检查模型配置和连接后重试；可复制诊断编号协助排查。",
-      "failureRetryDetail": "可以重新发起上下文整理；若仍失败，请复制诊断编号协助排查。",
+      "failureRejectedDetail": "本次整理未应用，可稍后重试。",
+      "failureCapacityDetail": "请缩短输入，或选择上下文容量更大的模型。",
+      "failureUnavailableDetail": "请检查模型配置和网络连接，或更换模型。",
+      "failureRetryDetail": "可稍后重新整理上下文，或更换模型。",
       "compacting": "正在整理上下文…",
+      "recovering": "正在确认上下文整理状态…",
+      "requestUnconfirmed": "未能确认上下文整理请求的结果。请检查连接后再重试。",
+      "requestRejected": "上下文整理请求被拒绝。",
       "compacted": "上下文已整理",
       "temporarilyReduced": "已临时精简历史，继续处理",
       "summarySaved": "摘要已保存",
@@ -4692,12 +4772,12 @@
       "historyIncomplete": "更早的上下文已汇总；部分原始消息不可用",
       "historySummarized": "更早的上下文已汇总",
       "failed": "上下文整理失败",
+      "incomplete": "本次上下文整理未完成",
       "withinBudget": "无需整理，上下文空间充足",
       "noSafeHistory": "当前没有可安全整理的历史",
       "alreadyConcise": "当前上下文已足够精简",
       "skipped": "未能应用上下文整理",
-      "cancelled": "上下文整理已取消",
-      "requestScoped": "仅对本次请求生效；会话历史未被重写"
+      "cancelled": "上下文整理已取消"
     },
     "tool": {
       "genericCall": "调用工具",

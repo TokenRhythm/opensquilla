@@ -139,6 +139,9 @@ declare global {
     closeArtifactAnnotationOverlay?: (
       payload: import('./platform/types').NativeArtifactAnnotationOverlayCloseRequest,
     ) => Promise<import('./platform/types').NativeWorkbenchSurfaceResult>
+    updateArtifactAnnotationOverlay?: (
+      payload: import('./platform/types').NativeArtifactAnnotationOverlayUpdateRequest,
+    ) => Promise<import('./platform/types').NativeWorkbenchSurfaceResult>
     getWorkbenchBrowserTarget?: (
       payload: { surfaceId: string },
     ) => Promise<import('./platform/types').NativeWorkbenchBrowserTarget>

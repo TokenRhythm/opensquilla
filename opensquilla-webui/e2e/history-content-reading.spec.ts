@@ -103,10 +103,8 @@ for (const role of ['user', 'assistant']) {
     const preview = bytes.subarray(0, 16384).toString('utf-8')
     let release!: () => void
     const ready = new Promise<void>(resolve => { release = resolve })
-    let reads = 0
     const copiedText = await recordCopies(page)
     await page.route('**/api/content/read?**', async route => {
-      reads += 1
       await ready
       const url = new URL(route.request().url())
       const raw = url.searchParams.get('view') === 'raw'
@@ -125,7 +123,9 @@ for (const role of ['user', 'assistant']) {
           revision: 'r1', view: role === 'user' ? 'raw' : 'display', byteLength: bytes.length },
       }])
       const message = page.locator(`[data-message-id="answer"].${role === 'user' ? 'msg-user' : 'msg-ai'}`)
-      await expect.poll(() => reads).toBe(1)
+      // Startup hydration can cancel and restart a request; copying must still
+      // wait for the complete body while every response remains gated.
+      await expect(page.getByTestId('chat-history-content-hydration')).toHaveText('Loading')
       await message.getByTitle('Copy', { exact: true }).click()
       expect(await copiedText()).toHaveLength(0)
       await expect(message.locator('.msg-copy-live')).not.toHaveText('Copied')
@@ -134,7 +134,8 @@ for (const role of ['user', 'assistant']) {
       const copied = (await copiedText())[0]!
       if (role === 'user') expect(copied).toBe(body)
       else expect(copied).toContain(body)
-      await expect(message.locator('.msg-copy-live')).toHaveText('Copied')
+      await expect(message.locator('.msg-copy-live')).toHaveText('')
+      await expect(message.getByTitle('Copy', { exact: true })).toBeVisible()
     } finally {
       release()
     }

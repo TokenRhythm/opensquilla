@@ -322,11 +322,9 @@ async def test_blocked_goal_pause_does_not_delay_quit_cancellation(monkeypatch, 
         goal_release.set()
         write_release.set()
         await asyncio.wait_for(asyncio.shield(close_tasks[0]), 1)
-        if runtime_residual:
-            services.close.assert_not_awaited()
-        else:
-            await asyncio.wait_for(services_closed.wait(), 1)
-            services.close.assert_awaited_once()
+        # Once a protected goal exceeded its phase cutoff, transports may
+        # close but shared dependencies remain owned until process exit.
+        services.close.assert_not_awaited()
         server._pid_lock.release.assert_not_called()
     finally:
         goal_release.set()
@@ -421,3 +419,233 @@ async def test_quit_requires_verified_persisted_process_cleanup(monkeypatch, tmp
     )
     assert await server._stop_owned_processes() is (residual is False)
     remaining.assert_awaited_once_with(str(tmp_path), "synthetic-session", "synthetic-task")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("phase", ["channels", "goals", "broadcast", "mcp", "services"])
+async def test_gateway_nonruntime_phase_observes_tighter_request(monkeypatch, phase):
+    from opensquilla.gateway import boot
+
+    entered = asyncio.Event()
+    release = asyncio.Event()
+    cancelled = asyncio.Event()
+    close_tasks = []
+    channel_budgets = []
+
+    async def blocked(**kwargs):
+        if "timeout" in kwargs:
+            channel_budgets.append(kwargs["timeout"])
+        entered.set()
+        try:
+            await release.wait()
+        except asyncio.CancelledError:
+            cancelled.set()
+            raise
+
+    services = SimpleNamespace(
+        task_runtime=None, skill_management_service=None, optional_start_task=None,
+        deferred_warmup_task=None, goal_service=None, close=AsyncMock(),
+    )
+    registry = SimpleNamespace(broadcast=AsyncMock(), all=lambda: [])
+    manager = SimpleNamespace(stop_all=AsyncMock())
+    mcp = AsyncMock()
+    if phase == "channels":
+        manager.stop_all = blocked
+    elif phase == "goals":
+        services.goal_service = SimpleNamespace(prepare_shutdown=blocked)
+    elif phase == "broadcast":
+        async def broadcast(*args):
+            await blocked()
+        registry.broadcast = broadcast
+    elif phase == "mcp":
+        mcp = blocked
+    else:
+        services.close = blocked
+
+    request = ShutdownRequest("drain", time.monotonic() + 60)
+    listener = SimpleNamespace(should_exit=False)
+    pid_lock = MagicMock()
+    server = GatewayServer(
+        app=SimpleNamespace(state=SimpleNamespace(shutdown_request=request)),
+        config=GatewayConfig(), _services=services, _channel_manager=manager,
+        _server=listener, _pid_lock=pid_lock,
+    )
+    original = server._close_impl
+
+    async def observe(*args, **kwargs):
+        close_tasks.append(asyncio.current_task())
+        return await original(*args, **kwargs)
+
+    monkeypatch.setattr(server, "_close_impl", observe)
+    monkeypatch.setattr(server, "_stop_owned_processes", AsyncMock(return_value=True))
+    monkeypatch.setattr(boot, "get_registry", lambda: registry)
+    monkeypatch.setattr(
+        "opensquilla.gateway.terminal_sessions.get_terminal_manager",
+        lambda: SimpleNamespace(close_all=AsyncMock()),
+    )
+    monkeypatch.setattr("opensquilla.mcp.discovery.close_active_clients", mcp)
+    closing = asyncio.create_task(server.close("desktop_drain"))
+    try:
+        await asyncio.wait_for(entered.wait(), 1)
+        # Leave enough final cleanup time for Windows scheduling when asserting
+        # that a best-effort notification alone does not make shutdown dirty.
+        request.update("quit", 1000 if phase == "broadcast" else 100)
+        result = await asyncio.wait_for(asyncio.shield(closing), 2)
+        assert listener.should_exit is True
+        if phase == "broadcast":
+            assert result is None or result.clean
+            assert cancelled.is_set()
+        else:
+            assert result is not None and not result.clean
+            assert not cancelled.is_set()
+            pid_lock.release.assert_not_called()
+        if phase in {"channels", "goals", "mcp"}:
+            services.close.assert_not_awaited()
+        if phase == "channels":
+            # The first budget is valid for the original drain, but the same
+            # in-flight stop must react when that request is later tightened.
+            assert 40 < channel_budgets[0] < 60
+    finally:
+        release.set()
+        await asyncio.wait_for(asyncio.gather(
+            closing, *close_tasks, *server._shutdown_phase_tasks,
+            return_exceptions=True,
+        ), 1)
+
+
+@pytest.mark.asyncio
+async def test_short_quit_bounds_channel_budget_and_preserves_settlement_window(monkeypatch):
+    from opensquilla.gateway import boot
+
+    release = asyncio.Event()
+    transports = asyncio.Event()
+    entered = asyncio.Event()
+    saved = asyncio.Event()
+    observed_budgets = []
+    close_tasks = []
+
+    async def stop_channels(*, timeout):
+        observed_budgets.append(timeout)
+        entered.set()
+        await release.wait()
+        saved.set()
+
+    request = ShutdownRequest("quit", time.monotonic() + 0.5)
+    services = SimpleNamespace(
+        task_runtime=None, skill_management_service=None, optional_start_task=None,
+        deferred_warmup_task=None, goal_service=None, close=AsyncMock(),
+    )
+    server = GatewayServer(
+        app=SimpleNamespace(state=SimpleNamespace(shutdown_request=request)),
+        config=GatewayConfig(), _services=services,
+        _channel_manager=SimpleNamespace(stop_all=stop_channels), _pid_lock=MagicMock(),
+    )
+    original = server._close_impl
+
+    async def observe(*args, **kwargs):
+        close_tasks.append(asyncio.current_task())
+        return await original(*args, **kwargs)
+
+    async def close_websockets(*args, **kwargs):
+        transports.set()
+
+    monkeypatch.setattr(server, "_close_impl", observe)
+    monkeypatch.setattr(server, "_stop_owned_processes", AsyncMock(return_value=True))
+    monkeypatch.setattr(boot, "_close_gateway_websocket_connections", close_websockets)
+    monkeypatch.setattr(
+        boot, "get_registry", lambda: SimpleNamespace(broadcast=AsyncMock(), all=lambda: []),
+    )
+    monkeypatch.setattr(
+        "opensquilla.gateway.terminal_sessions.get_terminal_manager",
+        lambda: SimpleNamespace(close_all=AsyncMock()),
+    )
+    closing = asyncio.create_task(server.close("desktop_quit"))
+    try:
+        await asyncio.wait_for(entered.wait(), 1)
+        await asyncio.wait_for(transports.wait(), 1)
+        # Subtracting absolute monotonic deadlines can round just above 0.4.
+        assert 0 < observed_budgets[0] <= 0.4 + 1e-6
+        assert not closing.done()
+        assert not saved.is_set()
+        services.close.assert_not_awaited()
+        release.set()
+        result = await asyncio.wait_for(closing, 1)
+        assert saved.is_set()
+        assert result is not None and not result.clean
+        server._pid_lock.release.assert_not_called()
+    finally:
+        release.set()
+        await asyncio.wait_for(asyncio.gather(
+            closing, *close_tasks, *server._shutdown_phase_tasks,
+            return_exceptions=True,
+        ), 1)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("preview", [False, True], ids=["server", "preview-server"])
+async def test_resistant_serve_owner_retains_shared_dependencies(monkeypatch, preview):
+    from opensquilla.gateway import boot
+
+    started = asyncio.Event()
+    cancelled = asyncio.Event()
+    release = asyncio.Event()
+    close_tasks = []
+
+    async def serve():
+        started.set()
+        try:
+            await release.wait()
+        except asyncio.CancelledError:
+            cancelled.set()
+            # Model an ASGI owner still finishing a request after cancellation.
+            await release.wait()
+
+    serve_task = asyncio.create_task(serve())
+    await started.wait()
+    services = SimpleNamespace(
+        task_runtime=None, skill_management_service=None, optional_start_task=None,
+        deferred_warmup_task=None, goal_service=None, close=AsyncMock(),
+    )
+    request = ShutdownRequest("quit", time.monotonic() + 0.2)
+    listener = SimpleNamespace(should_exit=False)
+    server = GatewayServer(
+        app=SimpleNamespace(state=SimpleNamespace(shutdown_request=request)),
+        config=GatewayConfig(), _services=services, _pid_lock=MagicMock(),
+        _server=None if preview else listener,
+        _task=None if preview else serve_task,
+        _preview_server=listener if preview else None,
+        _preview_task=serve_task if preview else None,
+    )
+    original = server._close_impl
+
+    async def observe(*args, **kwargs):
+        close_tasks.append(asyncio.current_task())
+        return await original(*args, **kwargs)
+
+    monkeypatch.setattr(server, "_close_impl", observe)
+    monkeypatch.setattr(server, "_stop_owned_processes", AsyncMock(return_value=True))
+    monkeypatch.setattr(
+        boot, "get_registry", lambda: SimpleNamespace(broadcast=AsyncMock(), all=lambda: []),
+    )
+    monkeypatch.setattr(
+        "opensquilla.gateway.terminal_sessions.get_terminal_manager",
+        lambda: SimpleNamespace(close_all=AsyncMock()),
+    )
+    mcp_close = AsyncMock()
+    monkeypatch.setattr("opensquilla.mcp.discovery.close_active_clients", mcp_close)
+    try:
+        result = await asyncio.wait_for(server.close("desktop_quit"), 1)
+        await asyncio.wait_for(cancelled.wait(), 1)
+        assert result is not None and not result.clean
+        assert listener.should_exit is True
+        assert not serve_task.done()
+        assert server._shutdown_phase_tasks
+        mcp_close.assert_not_awaited()
+        services.close.assert_not_awaited()
+        server._pid_lock.release.assert_not_called()
+    finally:
+        release.set()
+        await asyncio.wait_for(asyncio.gather(
+            serve_task, *close_tasks, *server._shutdown_phase_tasks,
+            return_exceptions=True,
+        ), 1)

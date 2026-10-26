@@ -259,9 +259,6 @@ async def run_agent_once(
     tool_workspace_dir: str | None
     if active_workspace and agent_id != "main":
         resolved_path = resolve_agent_workspace_dir(agent_id, service_cfg)
-        # Mirror gateway boot.py:594 — pre-create the per-agent dir so
-        # shell/cwd-based tools do not hit FileNotFoundError on first use.
-        resolved_path.mkdir(parents=True, exist_ok=True)
         tool_workspace_dir = str(resolved_path)
     else:
         tool_workspace_dir = active_workspace
@@ -301,6 +298,21 @@ async def run_agent_once(
     done: DoneEvent | None = None
 
     try:
+        if workspace is None and getattr(cfg, "workspace_dir_source", None) == "default":
+            from opensquilla.gateway.session_services import get_session_storage
+            from opensquilla.identity.bootstrap import ensure_agent_workspace
+            from opensquilla.memory.source_protection import policy_for_storage
+
+            # CLI pins its effective startup directory as a configured binding
+            # for compatibility. That runtime override is not a user-selected
+            # project: initialize the original application default only when no
+            # persisted project/session source overlaps it.
+            maintenance = policy_for_storage(cfg, get_session_storage(svc.session_manager))
+            if maintenance.bootstrap_allowed(agent_id):
+                ensure_agent_workspace(
+                    resolve_agent_workspace_dir(agent_id, cfg),
+                    seed_templates=seed_agent_workspaces,
+                )
         session_result = await svc.session_manager.get_or_create(
             session_key,
             agent_id=agent_id,
@@ -463,18 +475,19 @@ async def run_agent_once(
         )
 
         growth_sink = getattr(svc, "growth_event_sink", None)
-        record_launch = getattr(growth_sink, "record_client_launch", None)
+        observe_launch = getattr(growth_sink, "observe_client_launch", None)
         # Stateless CLI runs still count as client launches.
-        if callable(record_launch):
-            await record_launch(
-                surface=ClientSurface.CLI,
-                entrypoint=ClientEntrypoint.AGENT,
-                execution_mode=ExecutionMode.ONE_SHOT,
-            )
-        record_active = getattr(growth_sink, "record_product_active", None)
-        if callable(record_active):
+        if callable(observe_launch):
             with contextlib.suppress(Exception):
-                await record_active(surface=ClientSurface.CLI)
+                observe_launch(
+                    surface=ClientSurface.CLI,
+                    entrypoint=ClientEntrypoint.AGENT,
+                    execution_mode=ExecutionMode.ONE_SHOT,
+                )
+        observe_active = getattr(growth_sink, "observe_product_active", None)
+        if callable(observe_active):
+            with contextlib.suppress(Exception):
+                observe_active(surface=ClientSurface.CLI)
 
         async for event in runner.run(
             message,

@@ -80,6 +80,8 @@ export interface WorkbenchResource {
   resource: WorkbenchResourceRef
   name: string
   mime: string
+  /** Authorized workspace-relative source; presentation only, never an identity. */
+  sourcePath?: string
   /** Product-facing origin, e.g. the persisted inline Visualize widget. */
   source?: string
   /** Storage/projection visibility. Internal widgets stay out of Files. */
@@ -119,6 +121,10 @@ export interface WorkbenchPreviewResponse {
   resource: WorkbenchResource
   preview: WorkbenchPreviewDescriptor
 }
+export type WorkbenchAnnotationRequest = (
+  | { resourceRef: WorkbenchResourceRef; workspaceFile?: never; expectedSha256?: string }
+  | { resourceRef?: never; workspaceFile: { path: string; workspaceBinding: string; expectedRevision: string }; expectedSha256?: never }
+) & { idempotencyKey?: string }
 
 /**
  * Resolves the resource a user clicked to its current editable identity. The
@@ -136,6 +142,8 @@ export type WorkbenchResourceOpenResponse =
       revision: ArtifactRevision
       binding?: DocumentSourceBinding
       materialized: boolean
+      baselineUpdated?: boolean
+      previousRevisionId?: string
     }
   | {
       disposition: 'readonly'

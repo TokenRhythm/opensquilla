@@ -57,6 +57,35 @@ This is a default change, not a migration. An existing TOML value such as
 `max_concurrency = 4`, or an explicit
 `OPENSQUILLA_TASK_MAX_CONCURRENCY=4`, remains authoritative after upgrade.
 
+## Optional HTTP Request Limits
+
+The Gateway's fixed per-IP HTTP request buckets are disabled by default.
+Desktop and browser tabs can share an IP, so ordinary file reads and preview
+switches must not compete for a fixed request allowance while the Gateway is
+healthy. Authentication failure throttling, origin checks, and endpoint
+resource limits remain active independently of this setting.
+
+Deployments that require a fixed request-count policy can opt in:
+
+```toml
+[rate_limit]
+enabled = true
+max_requests = 100
+window_seconds = 60
+content_max_requests = 1200
+content_window_seconds = 60
+```
+
+`OPENSQUILLA_RATE_ENABLED=true` also enables the policy. When enabled, ordinary
+API requests share the per-IP bucket, while `/api/content/read` uses its own
+bucket. A rejected request returns HTTP 429 and `Retry-After`.
+
+Existing TOML settings remain authoritative, including `enabled = true`
+written by older versions. To adopt the new default for such a profile, set
+`enabled = false` or remove the `enabled` entry, then restart the Gateway.
+Upgrade does not infer whether a previously stored value was generated or
+chosen by an operator.
+
 ## Secret Handling
 
 Prefer environment-variable references for secrets:

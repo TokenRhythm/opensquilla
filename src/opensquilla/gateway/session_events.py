@@ -9,6 +9,16 @@ from opensquilla.contracts.adapters.sessions_changed_contract import (
     validate_sessions_changed_payload,
 )
 
+SESSION_DIRECTORY_KEY = "*"
+
+
+def build_session_directory_metadata_changed_payload() -> dict[str, Any]:
+    """Invalidate directory metadata without implying a session/task transition.
+
+    See contracts/gateway/v4/sessions/README.md for the reserved key/reason pair.
+    """
+    return build_sessions_changed_payload(SESSION_DIRECTORY_KEY, "metadata_backfilled")
+
 
 def build_sessions_changed_payload(
     session_key: str,

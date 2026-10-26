@@ -87,6 +87,69 @@ afterEach(() => {
   vi.unstubAllGlobals()
 })
 
+it('keeps a fixed HTML lease on A with normal preview capabilities until explicit Continue editing', async () => {
+  const published = { ...artifact, id: 'published-A', documentId: 'doc-current', sha256: 'a'.repeat(64) }
+  const item = createArtifactPreviewWorkbenchItem({ artifact: published, nativeHtml: false,
+    sessionKey: 'side-child', resourceIdentity: 'deliverable:published-A' })
+  const headArtifact = vi.fn(() => ({ ...published, id: 'current-B', sha256: 'b'.repeat(64) }))
+  const load = vi.fn(async () => undefined)
+  const snapshot = vi.fn(() => ({ workspace: null }))
+  const editCurrentResource = vi.fn(async () => undefined)
+  const createLease = vi.fn<ArtifactPreviewAccess['createLease']>().mockResolvedValue({
+    version: 1, lease_id: 'fixed-A', effective_mode: 'full', entrypoint: 'index.html',
+    launch_url: 'http://preview.localhost/index.html', preview_origin: 'http://preview.localhost',
+    expires_at: '2099-01-01T00:00:00Z', idle_timeout_seconds: 3600,
+    source: { kind: 'bundle', collection_status: 'complete', file_count: 2, total_bytes: 128, warning_codes: [] },
+  })
+  const definition = createArtifactWorkbenchDefinitions({
+    artifactDocuments: { load, snapshot: snapshot as never, headArtifact }, editCurrentResource,
+    artifactPreviews: { ...testArtifactPreviews, createLease, revokeLease: vi.fn(async () => undefined) },
+    baseOrigin: 'http://localhost', currentSessionId: () => 'parent', previewLeasesEnabled: true,
+    confirmRemoteResources: async () => true, pushToast: vi.fn(), t: key => key,
+    platform: { id: 'web', capabilities: {}, files: {} } as unknown as Platform,
+  })[0]!
+  const renderState: Record<string, unknown> = {}
+  const runtime = await definition.createRuntime!(item, { getRenderState: () => renderState,
+    updateRenderState: patch => Object.assign(renderState, patch), isItemOpen: () => true,
+    setExpanded: vi.fn(), reportError: vi.fn() })
+  try {
+    expect(createLease).toHaveBeenCalledWith(expect.objectContaining({ id: 'published-A', sha256: 'a'.repeat(64) }),
+      'full', 'web', expect.objectContaining({ sessionKey: 'side-child' }))
+    await runtime.handleComponentEvent?.({ type: 'artifact-head-changed', payload: { revisionId: 'B' } }, item)
+    expect(createLease).toHaveBeenCalledOnce()
+    expect(load).not.toHaveBeenCalled()
+    expect(snapshot).not.toHaveBeenCalled()
+    expect(headArtifact).not.toHaveBeenCalled()
+    const state = { active: true, hostAvailable: true, nativeSurface: false, runtimeState: renderState }
+    expect(definition.getProps!(item, state)).toMatchObject({ documentFeatures: false, artifact: { id: 'published-A' } })
+    expect(definition.getToolbarItems!(item, state).map(action => action.id)).toContain('edit-current')
+    expect(editCurrentResource).not.toHaveBeenCalled()
+    await runtime.performAction?.('edit-current', item)
+    expect(editCurrentResource).toHaveBeenCalledWith(expect.objectContaining({ type: 'deliverable', artifactId: 'published-A' }),
+      item, expect.any(Function))
+  } finally { await runtime.dispose?.('closed') }
+})
+
+it('shows only the unified annotation action for fixed HTML even when Web cannot annotate', () => {
+  const item = createArtifactPreviewWorkbenchItem({
+    artifact, nativeHtml: false, sessionKey: 'session-a', resourceIdentity: 'deliverable:artifact-1',
+  })
+  const definition = createArtifactWorkbenchDefinitions({
+    prepareAnnotation: vi.fn(async () => undefined),
+    editCurrentResource: vi.fn(async () => undefined),
+    baseOrigin: 'http://localhost', currentSessionId: () => 'session-a',
+    confirmRemoteResources: async () => true, pushToast: vi.fn(), t: key => key,
+    platform: { id: 'web', capabilities: {}, files: {} } as unknown as Platform,
+  })[0]!
+  const items = definition.getToolbarItems!(item, {
+    active: true, hostAvailable: true, nativeSurface: false, runtimeState: {},
+  })
+  expect(items.some(action => action.id === 'edit-current')).toBe(false)
+  expect(items.find(action => action.id === 'prepare-annotation')).toMatchObject({
+    disabled: true, tooltip: 'workbench.artifactAnnotation.desktopEditingOnly',
+  })
+})
+
 function nativeResource() {
   return {
     artifact,
@@ -117,6 +180,7 @@ async function createNativeRuntimeHarness(
     artifact,
     nativeHtml: true,
     sessionKey: 'session-a',
+    resourceIdentity: 'document:document-1',
   })
   const definition = createArtifactWorkbenchDefinitions({
     baseOrigin: 'http://localhost',
@@ -146,6 +210,8 @@ async function createAnnotationDraftHarness(
   atomicCloseRearm = false,
   workingDocumentId?: string,
   navigatedPage?: string,
+  overlayEditorV2 = false,
+  pickerOnly = false,
 ) {
   let currentHead = { ...artifact }
   const legacy = createLegacyArtifactWorkspace(artifact, 'session-a')
@@ -182,6 +248,9 @@ async function createAnnotationDraftHarness(
   const showOverlay = vi.fn(async (
     _request: Parameters<NonNullable<NativeWorkbenchApi['showArtifactAnnotationOverlay']>>[0],
   ): Promise<NativeWorkbenchSurfaceResult> => showOverlayResult)
+  const updateOverlay = vi.fn(async (
+    _request: Parameters<NonNullable<NativeWorkbenchApi['updateArtifactAnnotationOverlay']>>[0],
+  ): Promise<NativeWorkbenchSurfaceResult> => ({ ok: true }))
   const setSurfaceRect = vi.fn(async () => ({ ok: true as const }))
   const setAnnotationMode = vi.fn(async (
     _request: Parameters<NonNullable<NativeWorkbenchApi['setArtifactAnnotationMode']>>[0],
@@ -222,10 +291,12 @@ async function createAnnotationDraftHarness(
       picker: true,
       trustedOverlay: true,
       overlayCopyVersion: 1 as const,
+      ...(overlayEditorV2 ? { overlayEditorVersion: 2 as const } : {}),
       ...(atomicCloseRearm ? { atomicCloseRearm: true as const } : {}),
     })),
     setArtifactAnnotationMode: setAnnotationMode,
     showArtifactAnnotationOverlay: showOverlay,
+    ...(overlayEditorV2 ? { updateArtifactAnnotationOverlay: updateOverlay } : {}),
     closeArtifactAnnotationOverlay: closeOverlay,
     captureWorkbenchScreenshot: vi.fn(async () => ({
       targetRef: 'target-focused', mimeType: 'image/png' as const,
@@ -258,6 +329,7 @@ async function createAnnotationDraftHarness(
     artifact,
     nativeHtml: true,
     sessionKey: 'session-a',
+    resourceIdentity: 'document:document-1',
   })
   const definition = createArtifactWorkbenchDefinitions({
     artifactContent: { ...testArtifactContent, uploadAttachment },
@@ -323,7 +395,7 @@ async function createAnnotationDraftHarness(
       detail: { url: `${lease.preview_origin}/${navigatedPage}` },
     }, item)
   }
-  await runtime.handleNativeSurfaceEvent?.({
+  if (!pickerOnly) await runtime.handleNativeSurfaceEvent?.({
     version: 3,
     surfaceId: item.id,
     type: 'annotation-selected',
@@ -342,7 +414,7 @@ async function createAnnotationDraftHarness(
     },
   }, item)
   const annotationId = String(showOverlay.mock.calls[0]?.[0].annotationId || '')
-  expect(annotationId).not.toBe('')
+  if (!pickerOnly) expect(annotationId).not.toBe('')
 
   return {
     annotationId,
@@ -352,6 +424,7 @@ async function createAnnotationDraftHarness(
     },
     beginOverlayEdit,
     closeOverlay,
+    updateOverlay,
     completeOverlayEdit,
     createSurface,
     createAnnotation,
@@ -423,7 +496,8 @@ describe('artifact Workbench provider', () => {
         source: { kind: 'bundle', collection_status: 'complete', file_count: 3, total_bytes: 128, warning_codes: [] },
       }))
       const item = createArtifactPreviewWorkbenchItem({
-        artifact, nativeHtml, sessionKey: 'session-a', initialSectionRequestId: 1, ...options,
+        artifact, nativeHtml, sessionKey: 'session-a', initialSectionRequestId: 1,
+        resourceIdentity: 'document:document-1', ...options,
       })
       const definition = createArtifactWorkbenchDefinitions({
         artifactPreviews: { ...testArtifactPreviews, createLease, revokeLease: vi.fn(async () => undefined) },
@@ -539,6 +613,7 @@ describe('artifact Workbench provider', () => {
       await harness.runtime.update?.(createArtifactPreviewWorkbenchItem({
         artifact: { ...artifact, previewPagePath: 'editorial.html' },
         nativeHtml: true, sessionKey: 'session-a',
+        resourceIdentity: 'document:document-1',
       }))
       const expected = kind === 'known-lease'
         ? 'This client or Gateway does not support opening this subpage directly. Update and try again.'
@@ -578,6 +653,7 @@ describe('artifact Workbench provider', () => {
     await harness.runtime.update?.(createArtifactPreviewWorkbenchItem({
       artifact: { ...artifact, previewPagePath: 'editorial.html' },
       nativeHtml: true, sessionKey: 'session-a',
+      resourceIdentity: 'document:document-1',
     }))
     await vi.waitFor(() => expect(harness.renderState.previewLeaseError)
       .toBe('This client or Gateway does not support opening this subpage directly. Update and try again.'))
@@ -603,6 +679,7 @@ describe('artifact Workbench provider', () => {
       const next = createArtifactPreviewWorkbenchItem({
         artifact: { ...artifact, ...(previewPagePath ? { previewPagePath } : {}) },
         nativeHtml: true, sessionKey: 'session-a',
+        resourceIdentity: 'document:document-1',
       })
       expect(next.id).toBe(harness.item.id)
       await harness.runtime.update?.(next)
@@ -682,6 +759,37 @@ describe('artifact Workbench provider', () => {
     expect(harness.updateAnnotation).toHaveBeenCalledOnce()
   })
 
+  it('unlocks a recovered Web fallback after its interrupted draft has finished saving', async () => {
+    const h = await createAnnotationDraftHarness({ ok: true }, false, 'document-1', undefined, true)
+    const body = 'Unsubmitted draft survives leaving this preview.'
+    await h.runtime.handleNativeSurfaceEvent?.({
+      version: 3, surfaceId: h.item.id, type: 'annotation-draft-change',
+      detail: { annotationId: h.annotationId, body },
+    }, h.item)
+    await h.runtime.suspend?.(h.item)
+    await h.runtime.handleNativeSurfaceEvent?.({
+      version: 3, surfaceId: h.item.id, type: 'annotation-cancel',
+      detail: { annotationId: h.annotationId, reason: 'surface-hidden' },
+    }, h.item)
+    await h.runtime.resume?.(h.item)
+    await h.runtime.handleSurfaceRect?.({
+      itemId: h.item.id, x: 300, y: 40, width: 600, height: 500, visible: true,
+    }, h.item)
+    expect(h.renderState.annotationFallback).toMatchObject({ annotationId: h.annotationId, body })
+    expect(h.renderState.annotationBusy).toBe(false)
+    expect(h.renderState.annotationError).toBe('')
+
+    await h.runtime.handleComponentEvent?.({
+      type: 'artifact-annotation-fallback-submit', payload: { annotationId: h.annotationId, body },
+    }, h.item)
+    expect(h.renderState.annotationFallback).toBeNull()
+    expect(h.renderState.annotationBusy).toBe(false)
+    expect(h.completeOverlayEdit).toHaveBeenCalledExactlyOnceWith(h.annotationId)
+    expect(h.createAnnotation).toHaveBeenCalledOnce()
+    expect(h.discardAnnotation).not.toHaveBeenCalled()
+    await h.runtime.dispose?.('closed')
+  })
+
   it('keeps the local body and fallback when lifecycle flush fails', async () => {
     vi.useFakeTimers()
     const harness = await createAnnotationDraftHarness({
@@ -716,6 +824,8 @@ describe('artifact Workbench provider', () => {
       'workbench.artifactAnnotation.updateFailed',
       { tone: 'danger' },
     )
+    expect(harness.renderState.annotationBusy).toBe(false)
+    expect(harness.renderState.annotationError).toBe('workbench.artifactAnnotation.updateFailed')
 
     await vi.advanceTimersByTimeAsync(1_000)
     expect(harness.updateAnnotation).toHaveBeenCalledOnce()
@@ -1119,6 +1229,77 @@ describe('artifact Workbench provider', () => {
     },
   )
 
+  it('unlocks the native V2 editor after a failed record and retries the same draft', async () => {
+    const harness = await createAnnotationDraftHarness({ ok: true }, true, undefined, undefined, true)
+    expect(harness.showOverlay).toHaveBeenCalledWith(expect.objectContaining({
+      overlayEditorVersion: 2, editorState: expect.objectContaining({ action: 'record' }),
+    }))
+    harness.updateAnnotation.mockRejectedValueOnce(new Error('Storage unavailable'))
+    const record = { version: 3 as const, surfaceId: harness.item.id, type: 'annotation-record-current' as const,
+      detail: { annotationId: harness.annotationId, body: 'Keep this until recording succeeds.' } }
+    await harness.runtime.handleNativeSurfaceEvent?.(record, harness.item)
+    expect(harness.closeOverlay).not.toHaveBeenCalled()
+    expect(harness.completeOverlayEdit).not.toHaveBeenCalled()
+    expect(harness.updateOverlay).toHaveBeenLastCalledWith(expect.objectContaining({
+      annotationId: harness.annotationId,
+      editorState: expect.objectContaining({ busy: false, action: 'record', error: 'workbench.artifactAnnotation.updateFailed' }),
+    }))
+    await harness.runtime.handleNativeSurfaceEvent?.(record, harness.item)
+    expect(harness.updateAnnotation).toHaveBeenLastCalledWith(harness.annotationId, record.detail.body)
+    expect(harness.closeOverlay).toHaveBeenCalledOnce()
+    expect(harness.completeOverlayEdit).toHaveBeenCalledOnce()
+    await harness.runtime.dispose?.('closed')
+  })
+
+  it('keeps native V2 input locked between successful persistence and close acknowledgement', async () => {
+    const harness = await createAnnotationDraftHarness({ ok: true }, true, undefined, undefined, true)
+    let acknowledgeClose!: (result: NativeWorkbenchSurfaceResult) => void
+    harness.closeOverlay.mockReturnValueOnce(new Promise(resolve => { acknowledgeClose = resolve }))
+    const recording = harness.runtime.handleNativeSurfaceEvent?.({
+      version: 3, surfaceId: harness.item.id, type: 'annotation-record-current',
+      detail: { annotationId: harness.annotationId, body: 'Wait for close before more input.' },
+    }, harness.item)
+    await vi.waitFor(() => expect(harness.closeOverlay).toHaveBeenCalledOnce())
+    expect(harness.updateOverlay).toHaveBeenLastCalledWith(expect.objectContaining({
+      annotationId: harness.annotationId, editorState: expect.objectContaining({ busy: true }),
+    }))
+    acknowledgeClose({ ok: true })
+    await recording
+    expect(harness.completeOverlayEdit).toHaveBeenCalledOnce()
+    await harness.runtime.dispose?.('closed')
+  })
+
+  it('unlocks the native V2 editor after a failed close without completing the draft', async () => {
+    const harness = await createAnnotationDraftHarness({ ok: true }, true, undefined, undefined, true)
+    harness.closeOverlay.mockResolvedValueOnce({ ok: false, code: 'ANNOTATION_UNAVAILABLE', retryable: true })
+    await harness.runtime.handleNativeSurfaceEvent?.({
+      version: 3, surfaceId: harness.item.id, type: 'annotation-record-current',
+      detail: { annotationId: harness.annotationId, body: 'Retry closing this editor.' },
+    }, harness.item)
+    expect(harness.completeOverlayEdit).not.toHaveBeenCalled()
+    expect(harness.updateOverlay).toHaveBeenLastCalledWith(expect.objectContaining({
+      annotationId: harness.annotationId,
+      editorState: expect.objectContaining({ busy: false, action: 'record', error: 'workbench.artifactAnnotation.closeFailed' }),
+    }))
+    await harness.runtime.dispose?.('closed')
+  })
+
+  it('unlocks the native V2 editor after a failed cancel and retains ownership for retry', async () => {
+    const harness = await createAnnotationDraftHarness({ ok: true }, true, undefined, undefined, true)
+    harness.discardAnnotation.mockRejectedValueOnce(new Error('Storage unavailable'))
+    await harness.runtime.handleNativeSurfaceEvent?.({
+      version: 3, surfaceId: harness.item.id, type: 'annotation-cancel',
+      detail: { annotationId: harness.annotationId, body: 'Keep this if cancellation fails.', reason: 'user-cancelled' },
+    }, harness.item)
+    expect(harness.closeOverlay).not.toHaveBeenCalled()
+    expect(harness.releaseOverlayEdit).not.toHaveBeenCalled()
+    expect(harness.updateOverlay).toHaveBeenLastCalledWith(expect.objectContaining({
+      annotationId: harness.annotationId,
+      editorState: expect.objectContaining({ busy: false, action: 'record', error: 'workbench.artifactAnnotation.discardFailed' }),
+    }))
+    await harness.runtime.dispose?.('closed')
+  })
+
   it('keeps the trusted editor and draft ownership when atomic rearm fails', async () => {
     const harness = await createAnnotationDraftHarness({ ok: true }, true)
     harness.closeOverlay
@@ -1367,6 +1548,7 @@ describe('artifact Workbench provider', () => {
       nativeHtml: false,
       previewLeaseEligible: false,
       sessionKey: 'session-a',
+      resourceIdentity: 'document:document-1',
     })
     const renderState: Record<string, unknown> = {}
     const pushToast = vi.fn()
@@ -1451,7 +1633,7 @@ describe('artifact Workbench provider', () => {
     })
 
     expect(createLease).not.toHaveBeenCalled()
-    expect(load).toHaveBeenCalledOnce()
+    expect(load).not.toHaveBeenCalled()
   })
 
   it('keeps a bound attachment preview on its immutable wire identity', async () => {
@@ -1751,6 +1933,7 @@ describe('artifact Workbench provider', () => {
     const renderState: Record<string, unknown> = {}
     const pushToast = vi.fn()
     const item = createArtifactPreviewWorkbenchItem({
+      resourceIdentity: 'document:document-1',
       artifact,
       nativeHtml: true,
       sessionKey: 'session-a',
@@ -2090,7 +2273,7 @@ describe('artifact Workbench provider', () => {
       mode: 'full',
       noticeShown: false,
     })
-    expect(pushToast).toHaveBeenCalledOnce()
+    expect(pushToast).not.toHaveBeenCalled()
     expect(renderState.previewDefaultMode).toBe('full')
     await runtime.dispose?.('closed')
   })
@@ -2899,7 +3082,7 @@ describe('artifact Workbench provider', () => {
     }
   })
 
-  it('uses the explicit v1 compatibility path when a v2-era Desktop lacks the lease broker', async () => {
+  it.each([false, true])('only allows the v1 single-file fallback outside explicit history (history=%s)', async (historical) => {
     const nativeApi: NativeWorkbenchApi = {
       getCapabilities: vi.fn(async () => ({
         protocolVersions: [1, 2] as Array<1 | 2>,
@@ -2914,6 +3097,7 @@ describe('artifact Workbench provider', () => {
     const renderState: Record<string, unknown> = {}
     const previewItem = createArtifactPreviewWorkbenchItem({
       artifact: { ...artifact, id: 'art-fixture' },
+      historical,
       nativeHtml: true,
       sessionKey: 'session-a',
     })
@@ -2939,11 +3123,17 @@ describe('artifact Workbench provider', () => {
       reportError: vi.fn(),
     })
 
-    expect(renderState).toMatchObject({
-      compatibilityFallback: true,
-      previewBlocked: false,
-      previewMode: 'offline',
-    })
+    if (historical) {
+      expect(renderState.previewBlocked).toBe(true)
+      expect(renderState.compatibilityFallback).not.toBe(true)
+      expect(nativeApi.createSurface).not.toHaveBeenCalled()
+    } else {
+      expect(renderState).toMatchObject({
+        compatibilityFallback: true,
+        previewBlocked: false,
+        previewMode: 'offline',
+      })
+    }
   })
 
   it('clears a Web preview origin before revoking its lease on normal close', async () => {
@@ -3122,6 +3312,7 @@ describe('artifact Workbench provider', () => {
     const reportError = vi.fn()
     const pushToast = vi.fn()
     const item = createArtifactPreviewWorkbenchItem({
+      resourceIdentity: 'document:document-1',
       artifact,
       nativeHtml: true,
       sessionKey: 'session-a',
@@ -3291,6 +3482,7 @@ describe('artifact Workbench provider', () => {
     }
     const renderState: Record<string, unknown> = {}
     const item = createArtifactPreviewWorkbenchItem({
+      resourceIdentity: 'document:document-1',
       artifact,
       nativeHtml: true,
       sessionKey: 'session-a',
@@ -3677,6 +3869,7 @@ describe('artifact Workbench provider', () => {
     }
     const renderState: Record<string, unknown> = {}
     const item = createArtifactPreviewWorkbenchItem({
+      resourceIdentity: 'document:document-1',
       artifact,
       nativeHtml: true,
       sessionKey: 'session-a',
@@ -4537,6 +4730,174 @@ describe('working document preview refresh', () => {
       expect(h.destroySurface).not.toHaveBeenCalled()
       expect(h.createSurface).toHaveBeenCalledTimes(1)
     } finally { await h.runtime.dispose?.('closed') }
+  })
+})
+
+describe('native picker state synchronization', () => {
+  const visibleRect = { x: 300, y: 40, width: 600, height: 500, visible: true }
+  const selection = {
+    selectionId: 'after-resume', tagName: 'h1', elementPath: '[["","h1",1]]',
+    targetRef: 'target-focused', rect: { x: 1, y: 2, width: 100, height: 30 },
+  }
+  async function pickerHarness() {
+    return await createAnnotationDraftHarness({ ok: true }, false, undefined, undefined, false, true)
+  }
+  async function state(h: Awaited<ReturnType<typeof pickerHarness>>, reason: string, epoch: number,
+    instance = 'surface-instance-current', enabled = false) {
+    await h.runtime.handleNativeSurfaceEvent?.({
+      version: 3, surfaceId: h.item.id, type: 'annotation-picker-state',
+      detail: { enabled, reason, pickerEpoch: epoch, surfaceInstanceId: instance },
+    }, h.item)
+  }
+
+  it('rearms after lifecycle suspension even when the hidden layout event was coalesced', async () => {
+    const h = await pickerHarness()
+    h.setAnnotationMode.mockClear()
+    await h.runtime.suspend?.(h.item)
+    expect(h.renderState.annotationMode).toBe(false)
+    expect(h.setSurfaceRect).toHaveBeenLastCalledWith(expect.objectContaining({ visible: false }))
+    await h.runtime.resume?.(h.item)
+    await h.runtime.handleSurfaceRect?.({ ...visibleRect, itemId: h.item.id }, h.item)
+    expect(h.setAnnotationMode).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({ enabled: true }))
+    await h.runtime.handleNativeSurfaceEvent?.({
+      version: 3, surfaceId: h.item.id, type: 'annotation-selected', detail: { selection },
+    }, h.item)
+    expect(h.createAnnotation).toHaveBeenCalledOnce()
+    expect(h.showOverlay).toHaveBeenCalledOnce()
+    await h.runtime.dispose?.('closed')
+  })
+
+  it('rearms a visible preview when native hidden cancellation arrives after the latest visible rect', async () => {
+    const h = await pickerHarness()
+    h.setAnnotationMode.mockClear()
+    try {
+      // Runtime hides native content immediately, but coalesces the queued
+      // Source/Preview rectangles to their latest visible geometry. Native
+      // cancellation can finish after that visible rect has been delivered.
+      await h.runtime.handleSurfaceRect?.({ ...visibleRect, itemId: h.item.id }, h.item)
+      expect(h.setAnnotationMode).not.toHaveBeenCalled()
+      await state(h, 'surface-hidden', 2)
+
+      expect(h.setAnnotationMode).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({ enabled: true }))
+      expect(h.renderState.annotationMode).toBe(true)
+      await h.runtime.handleNativeSurfaceEvent?.({
+        version: 3, surfaceId: h.item.id, type: 'annotation-selected', detail: { selection },
+      }, h.item)
+      expect(h.createAnnotation).toHaveBeenCalledOnce()
+      expect(h.showOverlay).toHaveBeenCalledOnce()
+    } finally { await h.runtime.dispose?.('closed') }
+  })
+
+  it.each(['hidden', 'stopped', 'loading'] as const)(
+    'does not rearm a %s preview on late native hidden cancellation',
+    async condition => {
+      const h = await pickerHarness()
+      try {
+        if (condition === 'hidden') {
+          await h.runtime.handleSurfaceRect?.({ ...visibleRect, itemId: h.item.id, visible: false }, h.item)
+        } else if (condition === 'stopped') {
+          await h.runtime.performAction?.('toggle-annotation-mode', h.item)
+        } else {
+          await h.runtime.handleNativeSurfaceEvent?.({
+            version: 3, surfaceId: h.item.id, type: 'loading',
+          }, h.item)
+        }
+        h.setAnnotationMode.mockClear()
+        await state(h, 'surface-hidden', 2)
+        expect(h.setAnnotationMode).not.toHaveBeenCalled()
+        expect(h.renderState.annotationMode).toBe(false)
+      } finally { await h.runtime.dispose?.('closed') }
+    },
+  )
+
+  it('restores a ready page after native in-page navigation cancels an unconsumed picker', async () => {
+    const h = await pickerHarness()
+    h.setAnnotationMode.mockClear()
+    await state(h, 'surface-navigation', 2)
+    expect(h.setAnnotationMode).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({ enabled: true }))
+    expect(h.renderState.annotationMode).toBe(true)
+    await h.runtime.handleNativeSurfaceEvent?.({
+      version: 3, surfaceId: h.item.id, type: 'annotation-selected', detail: { selection },
+    }, h.item)
+    expect(h.showOverlay).toHaveBeenCalledOnce()
+    await h.runtime.dispose?.('closed')
+  })
+
+  it.each(['ready', 'loading'] as const)('preserves document readiness %s across a stopped preview round trip', async readiness => {
+    const h = await pickerHarness()
+    await h.runtime.performAction?.('toggle-annotation-mode', h.item)
+    if (readiness === 'loading') {
+      await h.runtime.handleNativeSurfaceEvent?.({
+        version: 3, surfaceId: h.item.id, type: 'loading',
+      }, h.item)
+    }
+    h.createSurface.mockClear()
+    await h.runtime.handleSurfaceRect?.({ ...visibleRect, itemId: h.item.id, visible: false }, h.item)
+    expect(h.renderState.annotationAvailable).toBe(false)
+    expect(h.renderState.annotationMode).toBe(false)
+    await h.runtime.suspend?.(h.item)
+    await h.runtime.resume?.(h.item)
+    await h.runtime.handleSurfaceRect?.({ ...visibleRect, itemId: h.item.id }, h.item)
+    expect(h.renderState.nativeSurfaceState).toBe(readiness)
+    expect(h.renderState.annotationMode).toBe(false)
+    expect(h.createSurface).not.toHaveBeenCalled()
+    await h.runtime.dispose?.('closed')
+  })
+
+  it('waits for full navigation readiness before restoring an immutable lease picker', async () => {
+    const h = await pickerHarness()
+    h.setAnnotationMode.mockClear()
+    await h.runtime.handleNativeSurfaceEvent?.({
+      version: 3, surfaceId: h.item.id, type: 'loading',
+    }, h.item)
+    await state(h, 'surface-navigation', 2)
+    expect(h.renderState.annotationMode).toBe(false)
+    expect(h.setAnnotationMode).not.toHaveBeenCalled()
+    await h.runtime.handleNativeSurfaceEvent?.({
+      version: 3, surfaceId: h.item.id, type: 'ready',
+    }, h.item)
+    expect(h.setAnnotationMode).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({ enabled: true }))
+    await h.runtime.dispose?.('closed')
+  })
+
+  it('does not rearm behind a hidden tab, or resurrect an explicitly stopped mode', async () => {
+    const h = await pickerHarness()
+    h.setAnnotationMode.mockClear()
+    await h.runtime.suspend?.(h.item)
+    await state(h, 'surface-hidden', 2)
+    await state(h, 'surface-navigation', 3)
+    expect(h.setAnnotationMode).not.toHaveBeenCalled()
+    await h.runtime.resume?.(h.item)
+    await h.runtime.performAction?.('toggle-annotation-mode', h.item)
+    h.setAnnotationMode.mockClear()
+    await state(h, 'picker-cancelled', 5)
+    await state(h, 'surface-navigation', 6)
+    expect(h.renderState.annotationMode).toBe(false)
+    expect(h.setAnnotationMode).not.toHaveBeenCalled()
+    await h.runtime.dispose?.('closed')
+  })
+
+  it('ignores old surface and already acknowledged picker epochs after rearming', async () => {
+    const h = await pickerHarness()
+    h.setAnnotationMode.mockResolvedValue({ ok: true, pickerEpoch: 10 })
+    await h.runtime.suspend?.(h.item)
+    await h.runtime.resume?.(h.item)
+    h.setAnnotationMode.mockClear()
+    await state(h, 'surface-hidden', 9)
+    await state(h, 'surface-navigation', 11, 'previous-surface')
+    expect(h.renderState.annotationMode).toBe(true)
+    expect(h.setAnnotationMode).not.toHaveBeenCalled()
+    await h.runtime.dispose?.('closed')
+  })
+
+  it('keeps an open annotation editor in charge of its draft when the picker stops', async () => {
+    const h = await createAnnotationDraftHarness()
+    h.setAnnotationMode.mockClear()
+    await state(h, 'surface-navigation', 2)
+    expect(h.setAnnotationMode).not.toHaveBeenCalled()
+    expect(h.discardAnnotation).not.toHaveBeenCalled()
+    expect(h.showOverlay).toHaveBeenCalledOnce()
+    await h.runtime.dispose?.('closed')
   })
 })
 

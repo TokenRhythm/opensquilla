@@ -135,6 +135,22 @@
     "openDirectoryFailed": "No se pudo abrir el directorio del proyecto. Inténtalo de nuevo.",
     "copyDirectoryFailed": "No se pudo copiar la ruta del directorio del proyecto.",
     "projects": "Proyectos",
+    "addProject": "Añadir proyecto",
+    "projectAction": "Acción del proyecto",
+    "openExistingProject": "Abrir existente",
+    "saveParentDirectory": "Guardar en",
+    "projectLocation": "Directorio del proyecto",
+    "chooseParentDirectory": "Elegir directorio principal",
+    "chooseExistingDirectory": "Elegir directorio existente",
+    "executionHost": "Equipo: {host}",
+    "gatewayHost": "Equipo del Gateway",
+    "createLocationHint": "Se creará un nuevo directorio de proyecto en esta ubicación.",
+    "openLocationHint": "El directorio seleccionado se añadirá a sus proyectos.",
+    "createUnavailable": "Este Gateway no permite crear y registrar un proyecto directamente. Puede abrir un proyecto existente o crear una carpeta desde el selector de directorios.",
+    "preparingProject": "Preparando…",
+    "projectOpened": "Proyecto «{name}» abierto",
+    "createProjectUnconfirmed": "Se produjo un problema al crear el proyecto en {path}. Revise la lista de proyectos antes de intentarlo de nuevo. {error}",
+    "openProjectFailed": "No se pudo abrir el proyecto: {error}",
     "createProject": "Crear proyecto",
     "projectNamePlaceholder": "Nombre del proyecto",
     "sourceFolders": "Carpetas de origen",
@@ -280,6 +296,31 @@
     "dismiss": "Descartar"
   },
   "workbench": {
+    "annotationUnified": {
+      "selectTarget": "Select content to annotate",
+      "start": "Annotate",
+      "stop": "Finish annotating",
+      "placeholder": "Describe a change…",
+      "recordHint": "Enter to record · Shift + Enter for a new line",
+      "record": "Keep annotating",
+      "submit": "Record {count} annotations",
+      "summary": "{count} annotations",
+      "empty": "Select text, an object or a range to describe a change.",
+      "locate": "Locate",
+      "edit": "Edit",
+      "reselect": "Select again",
+      "cancel": "Cancel this edit",
+      "delete": "Delete",
+      "queued": "Waiting to send",
+      "restoreQueued": "Cancel sending and restore annotations",
+      "otherPages": "Other pages",
+      "versionChanged": "Loaded the current working version. Select a target to annotate.",
+      "locationOnly": "Located the page. Select again to change the target.",
+      "stale": "The document changed. Select the target again.",
+      "unavailable": "Annotation is unavailable for this file or client.",
+      "submitFailed": "Could not queue annotations. Your drafts were kept.",
+      "recordToConversation": "Record in conversation"
+    },
     "tabs": {
       "copyLink": "Copiar enlace",
       "openWeb": "Abrir página web",
@@ -313,7 +354,7 @@
       "hoverElement": "Haga clic para solicitar cambios",
       "hoverRange": "Seleccione celdas y suelte para describir los cambios",
       "chooseContent": "Primero seleccione el contenido que desea cambiar",
-      "selectDocx": "Arrastre para seleccionar el texto que desea cambiar y suelte para escribir su solicitud.",
+      "selectDocx": "Haga clic en un párrafo o arrastre para seleccionar texto específico y escriba su solicitud.",
       "selectPptx": "Haga clic en el objeto que desea cambiar y escriba su solicitud.",
       "selectXlsx": "Seleccione una celda o arrastre para seleccionar un rango y suelte para escribir su solicitud.",
       "cancelSelection": "Salir de la selección",
@@ -364,6 +405,7 @@
     },
     "resources": {
       "title": "Archivos", "count": "Archivos ({count})", "empty": "Aún no hay archivos ni enlaces.",
+      "currentWorkingFile": "Archivo de trabajo actual", "publishedVersion": "Versión publicada",
       "groups": { "files": "Archivos", "links": "Enlaces", "attachments": "Archivos", "documents": "Archivos", "deliverables": "Archivos", "urls": "Enlaces" },
       "open": "Abrir {name}", "preparing": "Preparando el editor…", "retry": "Reintentar", "preview": "Vista previa de {name}", "download": "Descargar {name}", "edit": "Editar una copia de {name}", "publish": "Publicar {name}",
       "imported": "Ya puedes editar {name}.", "published": "Ya puedes compartir {name}.",
@@ -450,9 +492,6 @@
       "outputGap": "Terminal output was interrupted",
       "exited": "Terminal exited",
       "state": { "starting": "Starting", "running": "Connected", "exited": "Exited", "error": "Unavailable" }
-    },
-    "nativePreview": {
-      "capacityReached": "Ya hay cuatro vistas previas interactivas abiertas. Vuelve a una existente o cierra una antes de abrir otra."
     },
     "artifactAnnotation": {
       "start": "Solicitar cambios",
@@ -548,6 +587,15 @@
       "documentEditingRetired": "Actualiza el cliente y vuelve a abrir la página para enviar anotaciones como mensajes."
     },
     "artifactDocument": {
+      "versionHistory": "Historial de versiones ({count})",
+      "currentVersion": "Actual v{generation}",
+      "historicalVersion": "Historial",
+      "openLatest": "Abrir última versión",
+      "viewDeliveredVersion": "Ver versión entregada",
+      "viewRevision": "Ver esta versión",
+      "fixedSnapshot": "Versión entregada",
+      "fixedSnapshotHint": "Esta es la versión entregada en el chat. Al anotar se abre el documento de trabajo actual y se conserva la versión entregada.",
+      "continueEditing": "Seguir editando",
       "sections": "Secciones del documento del artefacto",
       "preview": "Vista previa",
       "source": "Código fuente",
@@ -3536,6 +3584,45 @@
     "bundleDifferentGateway": "Abra la WebUI del Gateway conectado para descargar su paquete de soporte."
   },
   "usageLogs": {
+    "capabilities": {
+      "unknown": "Desconocido",
+      "partialMeter": "{value} · {count} desconocidos",
+      "metrics": {
+        "input_tokens": "Tokens de entrada",
+        "output_tokens": "Tokens de salida",
+        "cache_read_tokens": "Tokens leídos de caché",
+        "cache_write_tokens": "Tokens escritos en caché",
+        "input_images": "Imágenes de entrada",
+        "input_video_seconds": "Duración del vídeo de entrada",
+        "output_audio_seconds": "Duración del audio de salida",
+        "requested_audio_seconds": "Duración de audio solicitada",
+        "requests": "Solicitudes",
+        "output_images": "Imágenes generadas",
+        "input_audio_seconds": "Audio de entrada",
+        "input_characters": "Caracteres de entrada",
+        "requested_video_seconds": "Duración de vídeo solicitada",
+        "video_seconds": "Duración de vídeo generada",
+        "search_credits": "Créditos de búsqueda",
+        "scrape_credits": "Créditos de extracción",
+        "character_credits": "Créditos de caracteres",
+        "cost_in_usd_ticks": "Unidades de coste del proveedor",
+        "input_text_tokens": "Tokens de texto de entrada",
+        "output_text_tokens": "Tokens de texto de salida",
+        "input_audio_tokens": "Tokens de audio de entrada",
+        "output_audio_tokens": "Tokens de audio de salida",
+        "input_image_tokens": "Tokens de imagen de entrada",
+        "output_image_tokens": "Tokens de imagen de salida"
+      },
+      "units": {
+        "request": "solicitudes",
+        "image": "imágenes",
+        "second": "segundos",
+        "character": "caracteres",
+        "credit": "créditos",
+        "token": "tokens",
+        "usd_tick_1e_10": "USD × 10⁻¹⁰"
+      }
+    },
     "tasks": {
       "unnamed": "Tarea sin título"
     },
@@ -3565,10 +3652,6 @@
       "cacheRead": "Lectura de caché",
       "cacheWrite": "Escritura de caché"
     },
-    "costHintTitle": "Los valores en CNY usan la tasa fija integrada {rate}. Verifícala con el tipo de cambio actual para uso contable.",
-    "nativeCostHintTitle": "La factura original del proveedor está en CNY; el valor USD usa la tasa fija registrada en el recibo.",
-    "nativeMixedCostHintTitle": "La facturación en monedas mixtas o pendiente permanece en USD canónicos; los recibos originales confirmados se muestran por separado.",
-    "nativeBillingSubtotals": "Recibos originales: {amounts}",
     "rangeHiddenHint": "{count} tareas históricas sin fecha ocultas",
     "coverage": {
       "approximate": "Parte del uso histórico se estima a partir de los totales por tarea.",
@@ -3626,10 +3709,10 @@
       "cacheRead": "Lectura de caché",
       "cacheWrite": "Escritura de caché",
       "cost": "Coste",
-      "source": "Origen",
       "model": "Modelo"
     },
     "breakdown": {
+      "callTitle": "Detalles de llamadas",
       "title": "Desglose por modelo",
       "modelCount": "{count} modelos",
       "total": "{tokens} tokens · {cost}",
@@ -3638,35 +3721,28 @@
     "costSource": {
       "actual": {
         "label": "Real",
-        "tooltip": "Real: coste facturado por el proveedor",
-        "short": "real"
+        "tooltip": "Real: coste facturado por el proveedor"
       },
       "estimated": {
         "label": "Estimado",
-        "tooltip": "Estimado: derivado localmente a partir de los recuentos de tokens",
-        "short": "estimado"
+        "tooltip": "Estimación — cotización del proveedor o precio local registrado"
       },
       "mixed": {
         "label": "Mixto",
-        "tooltip": "Mixto: datos de facturación parciales, el resto estimado",
-        "short": "mixto"
+        "tooltip": "Mixto: datos de facturación parciales, el resto estimado"
       },
       "unpriced": {
         "label": "Sin precio",
-        "tooltip": "Sin precio: no hay entrada en la tabla de precios para este modelo",
-        "short": "sin precio"
+        "tooltip": "Sin precio: no hay entrada en la tabla de precios para este modelo"
       },
       "none": {
-        "label": "Ninguno",
-        "tooltip": "No se registró ningún coste",
-        "short": "ninguno"
+        "label": "Coste no registrado",
+        "tooltip": "No se registró ningún coste"
       },
       "ephemeral": {
         "label": "Efímera",
-        "tooltip": "Sesión efímera: el coste aún no se ha persistido",
-        "short": "efímera"
-      },
-      "cacheBlindHint": "Incluye estimaciones que valoran los tokens en caché a la tarifa de entrada completa — considérelo un límite superior."
+        "tooltip": "Sesión efímera: el coste aún no se ha persistido"
+      }
     },
     "relTime": {
       "justNow": "ahora mismo",
@@ -3735,6 +3811,7 @@
       "continue": "Continue",
       "commandWithSkills": "Selected skills apply to a chat message. Remove the skill labels before running a command.",
       "commandDescriptions": {
+        "init": "Crear o mejorar las instrucciones a partir del proyecto actual",
         "new": "Iniciar un chat nuevo",
         "compact": "Reducir el contexto actual",
         "goal": "Establecer un objetivo continuo",
@@ -3896,6 +3973,7 @@
     "liveUnavailable": "Las actualizaciones en tiempo real no están disponibles temporalmente",
     "liveUnavailableDescription": "El historial sigue disponible. El envío se reanudará cuando se recuperen las actualizaciones en tiempo real.",
     "liveUnavailableConnectedDescription": "La pasarela está conectada. Las actualizaciones en tiempo real de esta sesión no están disponibles temporalmente.",
+    "liveRecoveryReloadDescription": "No se pudieron restaurar las actualizaciones en tiempo real. Guarda los mensajes sin enviar y recarga esta página para volver a conectar.",
     "reconnectLive": "Volver a conectar",
     "liveSendBlockedConnecting": "Se están restaurando las actualizaciones en tiempo real. Tu borrador está guardado.",
     "liveSendBlockedDegraded": "Las actualizaciones en tiempo real no están disponibles temporalmente. Tu borrador está guardado.",
@@ -3993,16 +4071,13 @@
     "subagentPrefix": "Subagente: ",
     "subagentCompletion": "Finalización del subagente",
     "turnFailed": "El turno falló",
-    "copyDiagnosticId": "Copiar ID de diagnóstico",
-    "copiedDiagnosticId": "ID de diagnóstico copiado",
-    "copyDiagnosticFailed": "No se pudo copiar. Selecciona el ID de arriba y cópialo manualmente.",
     "errorMessage": {
       "unknown": "Esta solicitud no se completó.",
       "noProvider": "No hay ningún modelo disponible.",
       "credentials": "Falló la autenticación con el servicio del modelo.",
       "credits": "La cuenta del servicio del modelo no tiene saldo suficiente.",
       "modelUnavailable": "El modelo seleccionado no está disponible.",
-      "contextLimit": "La entrada supera el límite del modelo.",
+      "contextLimit": "El contenido supera la capacidad del modelo. Acorta la entrada o elige un modelo con más contexto.",
       "unsupported": "Este modelo no admite esta solicitud.",
       "imageUnsupported": "Este modelo no admite imágenes.",
       "ensembleImageUnsupported": "Este modo no admite imágenes.",
@@ -4015,7 +4090,7 @@
       "needsConfirmation": "Se necesita confirmación para continuar.",
       "toolDenied": "Una herramienta necesaria no está permitida.",
       "toolFailed": "Una herramienta no pudo completar su trabajo.",
-      "contextUnavailable": "No se pudo procesar la conversación actual.",
+      "contextUnavailable": "No se completó la organización del contexto y esta solicitud no pudo continuar. Inténtalo más tarde.",
       "timeout": "La tarea no terminó dentro del tiempo disponible.",
       "stopped": "La tarea se detuvo.",
       "interrupted": "La tarea se interrumpió.",
@@ -4394,6 +4469,7 @@
       "sendingContinuing": "Enviando respuesta · continuando la ejecución…"
     },
     "slashCommands": {
+      "initUnavailable": "Este Gateway no admite la inicialización de proyectos. Actualícelo e inténtelo de nuevo. Se conservó el borrador.",
       "side": {
         "closed": "El chat lateral original se cerró. Se conservó tu borrador. Edita el comando antes de enviarlo de nuevo para crear otro chat lateral.",
         "description": "Abrir chat lateral temporal · alias /btw",
@@ -4579,10 +4655,14 @@
       "failureUnavailable": "El modelo de resumen no está disponible",
       "failureProvider": "El modelo no pudo generar un resumen utilizable",
       "failureTimeout": "La organización del contexto agotó el tiempo de espera",
-      "failureRejectedDetail": "El resumen no se aplicó; el contexto original se conserva. Inténtalo de nuevo o copia el identificador de diagnóstico si vuelve a fallar.",
-      "failureUnavailableDetail": "Comprueba la configuración del modelo y la conexión y vuelve a intentarlo. Puedes copiar el identificador de diagnóstico.",
-      "failureRetryDetail": "Puedes volver a organizar el contexto. Si vuelve a fallar, copia el identificador de diagnóstico.",
+      "failureRejectedDetail": "El resumen no se aplicó. Puedes volver a intentarlo más tarde.",
+      "failureCapacityDetail": "Acorta la entrada o elige un modelo con una ventana de contexto mayor.",
+      "failureUnavailableDetail": "Comprueba la configuración del modelo y la conexión de red, o elige otro modelo.",
+      "failureRetryDetail": "Vuelve a organizar el contexto más tarde o elige otro modelo.",
       "compacting": "Compactando el contexto",
+      "recovering": "Comprobando el estado de compactación del contexto…",
+      "requestUnconfirmed": "No se pudo confirmar la solicitud de compactación del contexto. Comprueba la conexión antes de volver a intentarlo.",
+      "requestRejected": "Se rechazó la solicitud de compactación del contexto.",
       "compacted": "Contexto compactado",
       "temporarilyReduced": "Historial reducido temporalmente; continuando",
       "summarySaved": "Resumen guardado",
@@ -4590,12 +4670,12 @@
       "historyIncomplete": "Contexto anterior resumido; algunos mensajes originales no están disponibles",
       "historySummarized": "Contexto anterior resumido",
       "failed": "Error al compactar",
+      "incomplete": "No se completó la organización del contexto",
       "withinBudget": "Contexto dentro del presupuesto.",
       "noSafeHistory": "Actualmente no hay historial que se pueda resumir de forma segura",
       "alreadyConcise": "El contexto actual ya es suficientemente conciso",
       "skipped": "No se aplicó la compactación del contexto.",
-      "cancelled": "Compactación cancelada",
-      "requestScoped": "Solo para esta solicitud; no se reescribió el historial de la sesión"
+      "cancelled": "Compactación cancelada"
     },
     "tool": {
       "genericCall": "Llamada a herramienta",

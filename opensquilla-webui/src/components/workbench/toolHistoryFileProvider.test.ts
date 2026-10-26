@@ -86,6 +86,7 @@ describe('historical file provider', () => {
   })
 
   it('changes only wrapping and copies the complete recorded body, including an empty file', async () => {
+    vi.useFakeTimers()
     const { item, state, definition, runtime, renderState } = await setup()
     runtime.performAction!('wrap', item)
     expect(state.wrapLines).toBe(true)
@@ -93,19 +94,26 @@ describe('historical file provider', () => {
     const empty = createToolHistoryFileItem({ kind: 'write', path: 'empty.txt', content: '' },
       { sessionKey: 'session-a', toolId: 'empty-one' })!
     runtime.performAction!('copy', empty)
-    await vi.waitFor(() => expect(state.copyState).toBe('copied'))
+    await Promise.resolve()
     expect(copyTextWithFallback).toHaveBeenLastCalledWith('')
+    expect(state.copyState).toBe('copied')
+    expect(definition.getToolbarItems!(empty, renderState())[1]).toMatchObject({ icon: 'check', label: 'chat.copy' })
+    await vi.advanceTimersByTimeAsync(1600)
+    expect(state.copyState).toBe('idle')
+    expect(definition.getToolbarItems!(empty, renderState())[1]).toMatchObject({ icon: 'copy', label: 'chat.copy' })
     runtime.dispose!('closed')
   })
 
-  it('ignores late copy completion after disposal and clears feedback timers', async () => {
+  it.each(['success', 'failure'])('ignores late copy %s after disposal and clears feedback timers', async outcome => {
     vi.useFakeTimers()
     let resolve!: () => void
-    vi.mocked(copyTextWithFallback).mockReturnValueOnce(new Promise<void>(done => { resolve = done }))
+    let reject!: (error: Error) => void
+    vi.mocked(copyTextWithFallback).mockReturnValueOnce(new Promise<void>((done, fail) => { resolve = done; reject = fail }))
     const { item, state, runtime } = await setup()
     runtime.performAction!('copy', item)
     runtime.dispose!('closed')
-    resolve()
+    if (outcome === 'success') resolve()
+    else reject(new Error('clipboard denied'))
     await Promise.resolve()
     expect(state.copyState).toBe('idle')
     expect(vi.getTimerCount()).toBe(0)

@@ -2492,9 +2492,11 @@ async def test_bootstrap_uses_canonical_project_path_and_snapshot(
 
 
 @pytest.mark.asyncio
-async def test_legacy_messages_subscribe_preserves_project_workspace_snapshot(
+@pytest.mark.parametrize("method", ["sessions.messages.subscribe", "sessions.messages.hydrate"])
+async def test_messages_metadata_preserves_registration_without_physical_validation(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    method: str,
 ) -> None:
     async with open_stack(tmp_path / "sessions.db") as stack:
         project_path = tmp_path / "project"
@@ -2521,7 +2523,7 @@ async def test_legacy_messages_subscribe_preserves_project_workspace_snapshot(
         response = await asyncio.wait_for(
             get_dispatcher().dispatch(
                 "subscribe-unavailable",
-                "sessions.messages.subscribe",
+                method,
                 {"key": session.session_key},
                 stack.context,
             ),
@@ -2864,6 +2866,8 @@ async def test_explicit_standard_project_drives_real_sandbox_filesystem_runtime(
             assert outcomes["outside_after_standard"] is False
             assert [operation.kind for operation in native_operations] == ["write_text"]
 
+            # The ordinary Full turn uses the configured default workspace.
+            (tmp_path / "default-workspace").mkdir()
             full_completed = asyncio.Event()
 
             class FullRunner:

@@ -1,5 +1,6 @@
 // @vitest-environment happy-dom
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
+import type { OfficeSelection } from '@/types/officeSelection'
 import { createOfficePreviewSession, type OfficePreviewOptions } from './officePreviewAdapter'
 
 type ViewerCallbacks = {
@@ -10,6 +11,7 @@ type ViewerCallbacks = {
   onSlideChange?: (index: number, total: number) => void
   onSheetChange?: (index: number, total: number) => void
   onViewportChange?: () => void
+  onScaleChange?: () => void
 }
 const vendor = vi.hoisted(() => ({
   callbacks: {} as ViewerCallbacks,
@@ -24,6 +26,7 @@ vi.mock('@silurus/ooxml/tiff', () => ({ tiff: {} }))
 function model() {
   return { destroy: vendor.release, pageCount: 2, slideCount: 2, pageSize: () => ({ widthPt: 600, heightPt: 800 }),
     slideWidth: 960, slideHeight: 540, getElementContextAt: vi.fn(async (): Promise<unknown> => null),
+    getElementBoundsByIds: vi.fn(async () => [] as Array<{ bounds: { x: number; y: number; width: number; height: number; rotation: number } }>),
     getNotes: vi.fn((index: number) => index === 1 ? '中文演讲者备注\n<script>保持纯文本</script>' : null),
     renderPage: vi.fn(async (canvas: HTMLCanvasElement, _index: number, opts: { width: number }) => { canvas.width = opts.width; canvas.height = Math.round(opts.width * 4 / 3) }),
     renderSlide: vi.fn(async (canvas: HTMLCanvasElement, _index: number, opts: { width: number }) => { canvas.width = opts.width; canvas.height = Math.round(opts.width * 9 / 16) }),
@@ -59,12 +62,13 @@ vi.mock('@silurus/ooxml/pptx', () => ({
 vi.mock('@silurus/ooxml/xlsx', () => ({ XlsxViewer: class {
   canvasElement = document.createElement('canvas')
   constructor(container: HTMLElement, opts: ViewerCallbacks) { container.append(this.canvasElement); vendor.callbacks = opts }
-  load = vendor.load
+  async load(data: ArrayBuffer) { await vendor.load(data); vendor.callbacks.onSheetChange?.(0, 2) }
   destroy = vendor.destroy
   fitWidth = vi.fn(); fitPage = vi.fn(); zoomIn = vi.fn(); zoomOut = vi.fn(); relayout = vi.fn()
   getScale = () => 1; setScale = vi.fn()
   getCellAt = vi.fn(() => ({ row: 1, col: 1 }))
-  getCellViewportRect = vi.fn(() => ({ x: 50, y: 22, width: 80, height: 24 }))
+  getCellViewportRect = vi.fn((cell: { row: number; col: number }) => ({ x: 50 + (cell.col - 1) * 80, y: 22 + (cell.row - 1) * 24, width: 80, height: 24 }))
+  scrollToCell = vi.fn(async () => {})
   setSelection = vendor.clear
   getSelectionContext = vendor.getSelectionContext
   async prevSheet() { vendor.callbacks.onSheetChange?.(0, 2) }
@@ -253,7 +257,7 @@ describe('Office paged reading API', () => {
     expect(h.onSelection).not.toHaveBeenCalled()
     width = 900; await h.session.resize()
     expect(vendor.setScale.mock.calls.slice(-1)[0]![0]).toBeCloseTo(852 / 960)
-    expect(h.onSelection).toHaveBeenLastCalledWith(null)
+    expect(h.onSelection).not.toHaveBeenCalled()
     expect(h.onLocation).toHaveBeenCalledTimes(locations)
     h.session.destroy()
   })
@@ -318,5 +322,143 @@ describe('Office paged reading API', () => {
     expect(vendor.release).not.toHaveBeenCalled()
     finish(); await vi.waitFor(() => expect(vendor.release).toHaveBeenCalledTimes(1))
     expect(source.renderSlide).toHaveBeenCalledTimes(1)
+  })
+})
+
+describe('Office annotation geometry and locating', () => {
+  it('commits final partial text rectangles and keeps its anchor after the input takes focus', async () => {
+    const source = model(); source.collectPageRuns.mockResolvedValue([{ x: 0, y: 0, w: 100, h: 100 }])
+    vendor.load.mockResolvedValue(source)
+    const onSelectionCommitDetail = vi.fn(), onAnchorChange = vi.fn()
+    const h = await harness('docx', { onSelectionCommitDetail, onAnchorChange })
+    const canvas = h.container.querySelector('canvas')!
+    let left = 0
+    vi.spyOn(canvas, 'getBoundingClientRect').mockImplementation(() => new DOMRect(left, 0, 400, 300))
+    vi.spyOn(h.container, 'getBoundingClientRect').mockReturnValue(new DOMRect(0, 0, 800, 600))
+    const text = document.createTextNode('前缀最终文字后缀'); h.container.append(text)
+    h.session.setSelectionMode(true)
+    canvas.dispatchEvent(new PointerEvent('pointerdown', { clientX: 50, clientY: 50, button: 0, pointerId: 1, bubbles: true }))
+    const range = document.createRange(); range.setStart(text, 2); range.setEnd(text, 6)
+    Object.defineProperty(range, 'getClientRects', { value: () => [new DOMRect(20, 40, 70, 18), new DOMRect(20, 58, 30, 18)] })
+    document.getSelection()!.addRange(range)
+    const selection = { format: 'docx', kind: 'text', text: '最终文字', pageIndexes: [0], truncated: false }
+    vendor.getSelectionContext.mockReturnValue(selection)
+    window.dispatchEvent(new PointerEvent('pointerup', { button: 0, pointerId: 1 }))
+    await flushFrame(); await flushFrame(); await flushFrame()
+    expect(onSelectionCommitDetail).toHaveBeenCalledExactlyOnceWith({ selection,
+      anchor: expect.objectContaining({ rect: { left: 20, top: 40, width: 70, height: 36 }, rects: expect.any(Array), visible: true }) })
+    h.session.setSelectionMode(false, true)
+    document.getSelection()!.removeAllRanges()
+    left = 100
+    h.container.dispatchEvent(new Event('scroll'))
+    await flushFrame()
+    expect(onAnchorChange).toHaveBeenLastCalledWith(expect.objectContaining({ rect: { left: 120, top: 40, width: 70, height: 36 } }))
+    h.session.clearTransientSelection!()
+    expect(onAnchorChange).toHaveBeenLastCalledWith(null)
+    expect(onSelectionCommitDetail).toHaveBeenCalledTimes(1)
+    h.session.destroy()
+  })
+
+  it('keeps a locked PPT target across zoom, reports no target on another slide, and restores it on return', async () => {
+    const source = model()
+    source.getElementBoundsByIds.mockResolvedValue([{ bounds: { x: 120, y: 60, width: 240, height: 90, rotation: 0 } }])
+    vendor.load.mockResolvedValue(source)
+    const onAnchorChange = vi.fn(), h = await harness('pptx', { onAnchorChange })
+    let size = 1
+    vi.spyOn(h.container.querySelector('canvas')!, 'getBoundingClientRect').mockImplementation(() => new DOMRect(100, 50, 960 * size, 540 * size))
+    vi.spyOn(h.container, 'getBoundingClientRect').mockReturnValue(new DOMRect(0, 0, 1600, 1000))
+    const selection: OfficeSelection = { format: 'pptx', kind: 'element', slideIndex: 0, shapeId: '9', truncated: false }
+    h.session.setSelectionMode(true)
+    await h.session.locateSelection!(selection)
+    h.session.setSelectionMode(false, true)
+    size = 1.25
+    await h.session.zoomIn()
+    expect(onAnchorChange).toHaveBeenLastCalledWith(expect.objectContaining({ rect: { left: 250, top: 125, width: 300, height: 112.5 } }))
+    await h.session.next()
+    expect(onAnchorChange).toHaveBeenLastCalledWith(null)
+    await h.session.previous()
+    expect(onAnchorChange).toHaveBeenLastCalledWith(expect.objectContaining({ rect: { left: 250, top: 125, width: 300, height: 112.5 } }))
+    expect(h.onSelection).toHaveBeenLastCalledWith(selection)
+    h.session.destroy()
+  })
+
+  it('tracks a canvas resize published after zoom returns while the outer viewport stays unchanged', async () => {
+    let publishResize!: () => void
+    const observe = vi.fn(), disconnect = vi.fn()
+    vi.stubGlobal('ResizeObserver', class {
+      constructor(callback: () => void) { publishResize = callback }
+      observe = observe
+      disconnect = disconnect
+    })
+    try {
+      const source = model()
+      source.getElementBoundsByIds.mockResolvedValue([{ bounds: { x: 120, y: 60, width: 240, height: 90, rotation: 0 } }])
+      vendor.load.mockResolvedValue(source)
+      const onAnchorChange = vi.fn(), h = await harness('pptx', { onAnchorChange })
+      const canvas = h.container.querySelector('canvas')!
+      let size = 1
+      vi.spyOn(canvas, 'getBoundingClientRect').mockImplementation(() => new DOMRect(100, 50, 960 * size, 540 * size))
+      vi.spyOn(h.container, 'getBoundingClientRect').mockReturnValue(new DOMRect(0, 0, 1600, 1000))
+      expect(observe).toHaveBeenCalledWith(canvas)
+      const selection: OfficeSelection = { format: 'pptx', kind: 'element', slideIndex: 0, shapeId: '9', truncated: false }
+      h.session.setSelectionMode(true)
+      await h.session.locateSelection!(selection)
+      h.session.setSelectionMode(false, true)
+      await h.session.zoomIn()
+      size = 1.25
+      publishResize()
+      await flushFrame()
+      expect(onAnchorChange).toHaveBeenLastCalledWith(expect.objectContaining({ rect: { left: 250, top: 125, width: 300, height: 112.5 } }))
+      size = 1.5
+      vendor.callbacks.onScaleChange?.()
+      await flushFrame()
+      expect(onAnchorChange).toHaveBeenLastCalledWith(expect.objectContaining({ rect: { left: 280, top: 140, width: 360, height: 135 } }))
+      h.session.destroy()
+      expect(disconnect).toHaveBeenCalledOnce()
+      onAnchorChange.mockClear(); publishResize(); await flushFrame()
+      expect(onAnchorChange).not.toHaveBeenCalled()
+    } finally { vi.unstubAllGlobals() }
+  })
+
+  it('anchors the final multi-cell selection, including a disjoint second area', async () => {
+    const onSelectionCommitDetail = vi.fn(), h = await harness('xlsx', { onSelectionCommitDetail })
+    const canvas = h.container.querySelector('canvas')!
+    vi.spyOn(canvas, 'getBoundingClientRect').mockReturnValue(new DOMRect(10, 20, 700, 400))
+    vi.spyOn(h.container, 'getBoundingClientRect').mockReturnValue(new DOMRect(0, 0, 800, 600))
+    h.session.setSelectionMode(true)
+    canvas.dispatchEvent(new PointerEvent('pointerdown', { clientX: 70, clientY: 60, button: 0, pointerId: 2, bubbles: true }))
+    vendor.getSelectionContext.mockReturnValue({ format: 'xlsx', kind: 'range', sheetIndex: 0, sheetName: 'Sheet 1',
+      selection: { areas: [{ kind: 'cells', top: 1, bottom: 3, left: 1, right: 2 }, { kind: 'cells', top: 5, bottom: 5, left: 4, right: 4 }] },
+      cells: [], truncated: false })
+    window.dispatchEvent(new PointerEvent('pointerup', { button: 0, pointerId: 2 }))
+    await flushFrame(); await flushFrame(); await flushFrame()
+    expect(onSelectionCommitDetail).toHaveBeenCalledExactlyOnceWith({
+      selection: expect.objectContaining({ ranges: ['A1:B3', 'D5:D5'] }),
+      anchor: expect.objectContaining({ viewport: { left: 10, top: 20, width: 700, height: 400 }, rects: [
+        { left: 60, top: 42, width: 160, height: 72 }, { left: 300, top: 138, width: 80, height: 24 },
+      ] }),
+    })
+    h.session.destroy()
+  })
+
+  it('locates a unique PPT object by its public shape ID, but reports only a page for an unresolved shape', async () => {
+    const source = model()
+    source.getElementBoundsByIds.mockResolvedValue([{ bounds: { x: 120, y: 60, width: 240, height: 90, rotation: 0 } }])
+    vendor.load.mockResolvedValue(source)
+    const h = await harness('pptx', { revisionId: 'r3' })
+    vi.spyOn(h.container.querySelector('canvas')!, 'getBoundingClientRect').mockReturnValue(new DOMRect(100, 50, 960, 540))
+    vi.spyOn(h.container, 'getBoundingClientRect').mockReturnValue(new DOMRect(0, 0, 1200, 800))
+    const selection: OfficeSelection = { format: 'pptx', kind: 'element', slideIndex: 1, shapeId: '9', truncated: false }
+    h.session.setSelectionMode(true)
+    expect(await h.session.locateSelection!(selection, { revisionId: 'r2' })).toEqual({ status: 'stale', anchor: null })
+    expect(source.getElementBoundsByIds).not.toHaveBeenCalled()
+    expect(await h.session.locateSelection!(selection, { revisionId: 'r3' })).toMatchObject({
+      status: 'exact', anchor: { rect: { left: 220, top: 110, width: 240, height: 90 } },
+    })
+    expect(source.getElementBoundsByIds).toHaveBeenCalledWith(1, ['9'])
+    expect(await h.session.locateSelection!({ ...selection, shapeId: undefined })).toEqual({ status: 'location-only', anchor: null })
+    expect(await h.session.locateSelection!({ ...selection, slideIndex: 99 })).toEqual({ status: 'unavailable', anchor: null })
+    expect(h.onSelectionCommit).not.toHaveBeenCalled()
+    h.session.destroy()
   })
 })

@@ -265,6 +265,8 @@
       ],
       "path_patterns": [
         "desktop/electron/scripts/test-native-workbench*.mjs",
+        "desktop/electron/scripts/test-text-context-menu-electron.mjs",
+        "desktop/electron/src/*context-menu.ts",
         "desktop/electron/scripts/test-desktop-zoom*.mjs",
         "desktop/electron/scripts/test-native-workbench-v2-electron.mjs",
         "desktop/electron/scripts/test-unsafe-legacy-recovery-no-write.mjs",

@@ -1,4 +1,5 @@
 import { spawnSync } from 'node:child_process'
+import { createHash } from 'node:crypto'
 import { existsSync, statSync } from 'node:fs'
 import { lstat, readdir, readFile, stat } from 'node:fs/promises'
 import { dirname, join, resolve, sep } from 'node:path'
@@ -284,12 +285,25 @@ async function verifyRuntime(root, label, { platform, executeCommands }) {
     }
   }
 
+  // Require the bundled asset itself: a warm user TEMP cache must not conceal
+  // an incomplete package when the tokenizer smoke runs below.
+  const tokenizerAssets = files.filter((path) => path.endsWith(join(
+    'tiktoken-cache', '9b5ad71b2ce5302211f9c61530b329a4922fc6a4',
+  )))
+  if (tokenizerAssets.length !== 1) {
+    fail(`${label} must contain exactly one bundled cl100k_base encoding asset`)
+  } else if (createHash('sha256').update(await readFile(tokenizerAssets[0])).digest('hex')
+    !== '223921b76ee99bde995b7ff738513eef100fb51d18c93597a113bcffe865b2a7') {
+    fail(`${label} bundled cl100k_base encoding checksum mismatch`)
+  }
+
   const binary = requireGatewayBinary(root, label, platform)
   if (executeCommands) {
     if (!binary) return
     verifyGatewayCommand(binary, label, ['--_desktop-tool-search-probe'])
     verifyGatewayCommand(binary, label, ['--help'])
     verifyGatewayCommand(binary, label, ['diagnostics', 'smoke-imports'], { timeout: 120000 })
+    verifyGatewayCommand(binary, label, ['diagnostics', 'smoke-tokenizer'], { timeout: 120000 })
     verifyGatewayCommand(binary, label, ['diagnostics', 'smoke-router'], { timeout: 120000 })
   }
 

@@ -127,17 +127,31 @@ async def test_adapter_without_batch_capability_can_still_read_titles(
     }
 
 
-@pytest.mark.parametrize("field", ["display_name", "derived_title", "subject"])
+@pytest.mark.parametrize(
+    ("field", "display_name"),
+    [
+        ("display_name", None),
+        ("derived_title", None),
+        ("derived_title", "WebChat"),
+        ("subject", None),
+        ("subject", "WebChat"),
+    ],
+)
 async def test_authoritative_titles_do_not_need_a_reader_when_pool_is_full(
-    manager: SessionManager, monkeypatch: pytest.MonkeyPatch, field: str,
+    manager: SessionManager, monkeypatch: pytest.MonkeyPatch,
+    field: str, display_name: str | None,
 ) -> None:
     storage = manager._storage
     for node in await storage.list_sessions():
         await manager.update(node.session_key, **{
-            "display_name": None, field: "Stored authoritative title",
+            "display_name": display_name, field: "Stored authoritative title",
         })
     batch = AsyncMock(side_effect=AssertionError("authoritative title needs no body read"))
+    canonical = AsyncMock(side_effect=AssertionError("authoritative title needs no archive read"))
+    single = AsyncMock(side_effect=AssertionError("authoritative title needs no per-session read"))
     monkeypatch.setattr(storage, "list_user_transcript_content_batch", batch)
+    monkeypatch.setattr(storage, "list_canonical_user_transcript_content_batch", canonical)
+    monkeypatch.setattr(storage, "get_transcript", single)
     pool = RecoveryReadPool(
         storage._open_recovery_reader, initialize=storage._initialize_recovery_reader
     )
@@ -170,9 +184,40 @@ async def test_authoritative_titles_do_not_need_a_reader_when_pool_is_full(
         }
         assert pool.active_count == 4
         batch.assert_not_awaited()
+        canonical.assert_not_awaited()
+        single.assert_not_awaited()
     finally:
         release.set()
         await asyncio.gather(*readers)
+
+
+async def test_mixed_list_reads_transcript_titles_only_for_unnamed_sessions(
+    manager: SessionManager, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    storage = manager._storage
+    nodes = sorted(await storage.list_sessions(), key=lambda node: node.session_key)
+    await manager.update(nodes[0].session_key, derived_title="Stored generated title")
+    await manager.update(nodes[1].session_key, subject="Stored subject")
+    batch = AsyncMock(wraps=storage.list_user_transcript_content_batch)
+    canonical = AsyncMock(side_effect=AssertionError("no refused title needs recovery"))
+    single = AsyncMock(side_effect=AssertionError("batch must not cause per-session reads"))
+    monkeypatch.setattr(storage, "list_user_transcript_content_batch", batch)
+    monkeypatch.setattr(storage, "list_canonical_user_transcript_content_batch", canonical)
+    monkeypatch.setattr(storage, "get_transcript", single)
+
+    response = await get_dispatcher().dispatch(
+        "mixed-titles", "sessions.list", None, context(manager),
+    )
+
+    assert response.ok, response.error
+    assert {row["key"]: row["title"] for row in response.payload["sessions"]} == {
+        nodes[0].session_key: "Stored generated title",
+        nodes[1].session_key: "Stored subject",
+        nodes[2].session_key: "Synthetic title 2",
+    }
+    batch.assert_awaited_once_with([nodes[2].session_id], limit_per_session=3)
+    canonical.assert_not_awaited()
+    single.assert_not_awaited()
 
 
 @pytest.mark.parametrize("failed_read", [1, 2])

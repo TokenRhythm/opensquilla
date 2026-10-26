@@ -10,7 +10,7 @@ describe('ChatView missing-session wiring', () => {
     const accepted = chatViewSource.slice(start, end)
     const guard = accepted.indexOf('if (!isProvisionalDraftSession()) return')
     const clearDraft = accepted.indexOf('pendingSessionIntent.value = null')
-    const bootstrap = accepted.indexOf('startSessionBootstrap({ includeHistory: false, force: true })')
+    const bootstrap = accepted.indexOf('startSessionBootstrap({ includeHistory: true, force: true })')
     expect(guard).toBeGreaterThanOrEqual(0)
     expect(clearDraft).toBeGreaterThan(guard)
     expect(bootstrap).toBeGreaterThan(clearDraft)

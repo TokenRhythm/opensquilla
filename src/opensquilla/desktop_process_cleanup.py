@@ -173,17 +173,26 @@ def configure_desktop_process_cleanup(
             "protocol": PROTOCOL, "launch_digest": digest,
             "state_dir": str(root), "closed": False,
         }, instance_nonce, initial=True)
-        with _connect_owner_database(_owner_database_path(root)) as connection:
-            connection.execute("BEGIN IMMEDIATE")
-            connection.execute(
-                "INSERT OR IGNORE INTO desktop_process_launches VALUES (?, 0)", (digest,),
-            )
-            row = connection.execute(
-                "SELECT closed FROM desktop_process_launches WHERE launch_digest = ?", (digest,),
-            ).fetchone()
-            if row is None or row["closed"] != 0:
-                raise RuntimeError("Desktop process launch is closing")
-            connection.execute("COMMIT")
+        try:
+            with _connect_owner_database(_owner_database_path(root)) as connection:
+                connection.execute("BEGIN IMMEDIATE")
+                connection.execute(
+                    "INSERT OR IGNORE INTO desktop_process_launches VALUES (?, 0)", (digest,),
+                )
+                row = connection.execute(
+                    "SELECT closed FROM desktop_process_launches WHERE launch_digest = ?",
+                    (digest,),
+                ).fetchone()
+                if row is None or row["closed"] != 0:
+                    raise RuntimeError("Desktop process launch is closing")
+                connection.execute("COMMIT")
+        except BaseException:
+            # The manifest is only useful once the durable admission row exists.
+            # Remove it when registry initialization fails so a retry with the
+            # same launch authority is not mistaken for an active instance.
+            with contextlib.suppress(OSError):
+                path.unlink()
+            raise
         _active_scope = scope
 
 
@@ -191,6 +200,54 @@ def release_desktop_process_cleanup(instance_nonce: str) -> None:
     global _active_scope
     if _active_scope is not None and _active_scope.launch_digest == _launch_digest(instance_nonce):
         _active_scope = None
+
+
+def abort_desktop_process_cleanup(ownership_dir: Path, instance_nonce: str) -> None:
+    """Roll back a launch that failed before Desktop ownership was acquired.
+
+    ``configure_desktop_process_cleanup`` runs before the gateway ownership
+    record is written so that no tool can launch outside the Desktop fence.
+    If that later record write fails, the launch never became observable and
+    its admission row and manifest must not strand a permanently open scope.
+    """
+    global _active_scope
+    digest = _launch_digest(instance_nonce)
+    deadline = time.monotonic() + 5.0
+    from opensquilla.process_tree import _connect_owner_database, _owner_database_path
+
+    try:
+        with _launch_lock(ownership_dir, digest, deadline):
+            path = _manifest_path(ownership_dir, digest)
+            payload = _read_manifest(path, instance_nonce)
+            if payload is None:
+                return
+            if payload.get("closed"):
+                return
+            state_dir_raw = payload.get("state_dir")
+            if not isinstance(state_dir_raw, str):
+                raise RuntimeError("Desktop process ownership state is invalid")
+            database = _owner_database_path(state_dir_raw)
+            with _connect_owner_database(
+                database, timeout_seconds=max(0.001, deadline - time.monotonic()),
+            ) as connection:
+                connection.execute("BEGIN IMMEDIATE")
+                owner_count = connection.execute(
+                    "SELECT COUNT(*) FROM desktop_process_launch_owners "
+                    "WHERE launch_digest = ?", (digest,),
+                ).fetchone()[0]
+                if owner_count:
+                    connection.execute("ROLLBACK")
+                    raise RuntimeError("Desktop process launch already owns a process")
+                connection.execute(
+                    "DELETE FROM desktop_process_launches WHERE launch_digest = ?",
+                    (digest,),
+                )
+                connection.execute("COMMIT")
+            with contextlib.suppress(FileNotFoundError):
+                path.unlink()
+    finally:
+        if _active_scope is not None and _active_scope.launch_digest == digest:
+            _active_scope = None
 
 
 def desktop_process_scope(scope: _TaskProcessScope | None) -> _TaskProcessScope | None:

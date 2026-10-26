@@ -1,6 +1,7 @@
 import { copySelectedSkills, sameSelectedSkills, type SelectedSkillRef } from '@/types/selectedSkills'
 import { copyLocalPathReferences, localPathPresentation } from '@/types/localPathReferences'
-import { normalizePageContext, type ChatPageContext } from '@/types/pageContext'
+import { assertPageContextWithinLimits, normalizePageContext, type ChatPageContext } from '@/types/pageContext'
+import { copyTurnCommand, type ProjectInitTurnCommand } from '@/types/turnCommand'
 import { computed, nextTick, ref, shallowReactive, toRaw, watch, type Ref } from 'vue'
 import type {
   Attachment,
@@ -122,6 +123,7 @@ export interface PendingQueueOwnerContext {
 
 export interface PendingQueuePayload {
   text: string
+  turnCommand?: ProjectInitTurnCommand
   localPathReferences?: string[]
   draftIds?: readonly string[]
   selectedSkills?: SelectedSkillRef[]
@@ -138,6 +140,7 @@ export interface PendingSteerPayload {
 }
 
 export interface UseChatPendingQueueOptions {
+  supportsTurnCommand?: (command: ProjectInitTurnCommand) => Promise<boolean>
   sessionKey: Ref<string>
   ownerContext?: Readonly<Ref<PendingQueueOwnerContext | null>>
   inputText: Ref<string>
@@ -368,6 +371,7 @@ export function useChatPendingQueue(options: UseChatPendingQueueOptions) {
       clientRequestId: item.pendingClientRequestId!,
       clientMessageId: item.pendingClientMessageId!,
       text: item.text,
+      ...(item.turnCommand ? { turnCommand: copyTurnCommand(item.turnCommand) } : {}),
       ...(item.localPathReferences?.length ? { localPathReferences: copyLocalPathReferences(item.localPathReferences, item.text) } : {}),
       ...(item.retiredAnnotationInput ? { retiredAnnotationInput: true } : {}),
       ...(item.pageContext ? { pageContext: normalizePageContext(item.pageContext)! } : {}),
@@ -410,6 +414,7 @@ export function useChatPendingQueue(options: UseChatPendingQueueOptions) {
     const item = {
       pendingUiId: record.pendingInputId,
       text: record.text,
+      ...(record.turnCommand ? { turnCommand: copyTurnCommand(record.turnCommand) } : {}),
       ...(record.localPathReferences?.length ? { localPathReferences: copyLocalPathReferences(record.localPathReferences, record.text) } : {}),
       ...((record.retiredAnnotationInput || record.promptAnnotationIds?.length)
         ? { retiredAnnotationInput: true } : {}),
@@ -612,9 +617,21 @@ export function useChatPendingQueue(options: UseChatPendingQueueOptions) {
       }
       let refreshedLostUpload = false
       try {
+        try {
+          if (item.pageContext != null) assertPageContextWithinLimits(item.pageContext)
+        } catch (error) {
+          // Hydration retries staging. An unchanged invalid row must not write
+          // another WAL revision and trigger hydration indefinitely.
+          if (item.pendingPersistenceState === 'retryable') return
+          throw new PendingInputQueueError('invalid', error instanceof Error ? error.message : 'Invalid page context.', false)
+        }
         while (true) {
           if (!identityAllowsDelivery(item)) return
           if (wasRemoved(sessionKey, pendingInputId)) return
+          if (item.turnCommand && !await options.supportsTurnCommand?.(item.turnCommand)) {
+            await writeWalItem(item, 'local_only')
+            return
+          }
           if (item.attachments.length > 0 && options.prepareAttachmentsForSend) {
             const preparationIsCurrent = () => (
               (!item.pendingDeliveryIdentity || (
@@ -664,12 +681,21 @@ export function useChatPendingQueue(options: UseChatPendingQueueOptions) {
               }
               return
             }
+            if (item.turnCommand && !await options.supportsTurnCommand?.(item.turnCommand)) {
+              // The RPC has not started. Retain an older ambiguous attempt,
+              // but do not claim a server copy for this revoked admission.
+              item.pendingMayHaveServerCopy = previouslyMayHaveServerCopy
+              await writeWalItem(item, 'local_only')
+              return
+            }
+            if (!identityAllowsDelivery(item) || wasRemoved(sessionKey, pendingInputId)) return
             const response = await pendingInputQueue!.enqueue({
                 key: item.ownerSessionKey || options.sessionKey.value,
                 pendingInputId,
                 clientRequestId: item.pendingClientRequestId,
                 clientMessageId: item.pendingClientMessageId,
                 message: providerMessage || item.pageContext?.annotations?.map(item => item.text).join('\n') || 'Describe these attachments',
+                ...(item.turnCommand ? { turnCommand: copyTurnCommand(item.turnCommand) } : {}),
                 ...serializeChatFiles(sendable),
                 ...(item.pageContext ? { pageContext: item.pageContext } : {}),
                 ...(item.selectedSkills?.length ? { selectedSkills: copySelectedSkills(item.selectedSkills) } : {}),
@@ -918,6 +944,7 @@ export function useChatPendingQueue(options: UseChatPendingQueueOptions) {
         if (!item) {
           item = {
             pendingUiId: pendingInputId,
+            ...(serverItem.turnCommand ? { turnCommand: copyTurnCommand(serverItem.turnCommand) } : {}),
             text: typeof serverItem.displayText === 'string'
               ? serverItem.displayText
               : serverItem.message || '',
@@ -944,6 +971,11 @@ export function useChatPendingQueue(options: UseChatPendingQueueOptions) {
           continue
         }
         if (item.selectedSkills?.length && !sameSelectedSkills(item.selectedSkills, serverItem.selectedSkills)) {
+          await writeWalItem(item, 'retryable')
+          options.onPendingPersistenceError?.('server_rejected')
+          continue
+        }
+        if (JSON.stringify(item.turnCommand ?? null) !== JSON.stringify(serverItem.turnCommand ?? null)) {
           await writeWalItem(item, 'retryable')
           options.onPendingPersistenceError?.('server_rejected')
           continue
@@ -1074,6 +1106,7 @@ export function useChatPendingQueue(options: UseChatPendingQueueOptions) {
     const item: ChatPendingItem = {
       pendingUiId: createClientRequestId(),
       text: payload.text,
+      ...(payload.turnCommand ? { turnCommand: copyTurnCommand(payload.turnCommand) } : {}),
       ...(payload.localPathReferences?.length ? { localPathReferences: copyLocalPathReferences(payload.localPathReferences, payload.text) } : {}),
       ...(payload.pageContext ? { pageContext: normalizePageContext(payload.pageContext)! } : {}),
       ...(payload.selectedSkills?.length ? { selectedSkills: copySelectedSkills(payload.selectedSkills) } : {}),
@@ -1082,7 +1115,8 @@ export function useChatPendingQueue(options: UseChatPendingQueueOptions) {
       // Creation belongs to the in-flight first turn, never to its follow-ups.
       intent: payload.intent === 'new_chat' ? null : payload.intent ?? null,
       ...(payload.confirmedPlainText ? { confirmedPlainText: true } : {}),
-      ...(payload.deliveryIdentity ? { pendingDeliveryIdentity: payload.deliveryIdentity } : {}),
+      ...((payload.deliveryIdentity || (payload.turnCommand && options.deliveryIdentity?.value))
+        ? { pendingDeliveryIdentity: payload.deliveryIdentity || options.deliveryIdentity!.value! } : {}),
       ownerSessionKey: options.sessionKey.value,
       ...(ownerRequestId ? { ownerRequestId } : {}),
     }
@@ -1128,6 +1162,7 @@ export function useChatPendingQueue(options: UseChatPendingQueueOptions) {
     text: string,
     owner?: PendingQueueOwner,
     enqueueOptions?: {
+      turnCommand?: ProjectInitTurnCommand
       confirmedPlainText?: boolean
       draftIds?: readonly string[]
       selectedSkills?: SelectedSkillRef[]
@@ -1137,7 +1172,9 @@ export function useChatPendingQueue(options: UseChatPendingQueueOptions) {
       deliveryIdentity?: string
     },
   ): boolean | Promise<boolean> {
-    if (isControlInput(text) && !enqueueOptions?.confirmedPlainText) return false
+    const commandText = localPathPresentation(text,
+      enqueueOptions?.localPathReferences ?? options.localPathReferences?.value).text
+    if (isControlInput(commandText) && !enqueueOptions?.confirmedPlainText && !enqueueOptions?.turnCommand) return false
     const composerSkills = copySelectedSkills(options.selectedSkills?.value)
     const composerPaths = copyLocalPathReferences(options.localPathReferences?.value, options.inputText.value)
     const composerText = options.inputText.value
@@ -1147,6 +1184,7 @@ export function useChatPendingQueue(options: UseChatPendingQueueOptions) {
     const composerRevision = options.composerRevision?.value
     const queued = enqueuePendingPayload({
       text,
+      ...(enqueueOptions?.turnCommand ? { turnCommand: copyTurnCommand(enqueueOptions.turnCommand) } : {}),
       selectedSkills: copySelectedSkills(enqueueOptions?.selectedSkills ?? composerSkills),
       localPathReferences: copyLocalPathReferences(enqueueOptions?.localPathReferences ?? composerPaths, text),
       ...(enqueueOptions?.pageContext ? { pageContext: enqueueOptions.pageContext } : {}),
@@ -1775,6 +1813,37 @@ export function useChatPendingQueue(options: UseChatPendingQueueOptions) {
       && (!item.pendingDeliveryIdentity || item.pendingDeliveryIdentity === options.deliveryIdentity?.value)
   }
 
+  async function restoreQueuedAnnotations(
+    pendingUiId: string,
+    restore: (item: ChatPendingItem) => void,
+  ): Promise<boolean> {
+    const item = pendingQueue.value.find(candidate => candidate.pendingUiId === pendingUiId)
+    if (!item?.pageContext || item.deliveryState || item.steerAttempt
+      || item.pendingPersistenceState === 'saving' || item.pendingPersistenceState === 'cancelling'
+      || !canRestoreToComposer(item) || hasUneditablePendingAttachments(item)) return false
+    const stillOwnsComposer = composerOwnershipGuard()
+    const restoredAttachments = (item.attachments || []).map(attachment => (
+      item.pendingPersistenceState === 'staged' && attachment.kind === 'staged' && attachment.file
+        ? { ...attachment, expires_at: 0 }
+        : attachment
+    ))
+    if (durableItem(item) && !await cancelDurableItem(item, { retainAfterCancel: true })) return false
+    if (!stillOwnsComposer() || !canRestoreToComposer(item)
+      || !pendingQueue.value.includes(item)) return false
+    // Restore durable context first. A local storage failure leaves the cancelled
+    // queue item available for another recovery attempt.
+    restore(item)
+    restoreSkills([item])
+    restoreCombinedInput([item, currentComposerInput()])
+    options.pendingAttachments.value = [...restoredAttachments, ...options.pendingAttachments.value]
+    options.pendingSessionIntent.value = options.pendingSessionIntent.value || item.intent || null
+    options.autoResizeTextarea()
+    const index = pendingQueue.value.indexOf(item)
+    if (index >= 0) pendingQueue.value.splice(index, 1)
+    if (durableItem(item)) await forgetDurableItem(item, 'removed').catch(() => {})
+    return true
+  }
+
   async function cancelForComposer(
     item: ChatPendingItem,
     stillOwnsComposer: () => boolean,
@@ -1845,6 +1914,7 @@ export function useChatPendingQueue(options: UseChatPendingQueueOptions) {
       && (
         pendingQueue.value[tailIndex]?.deliveryState
         || pendingQueue.value[tailIndex]?.steerAttempt
+        || pendingQueue.value[tailIndex]?.pageContext
       )
     ) tailIndex--
     if (tailIndex < 0) return false
@@ -1879,12 +1949,14 @@ export function useChatPendingQueue(options: UseChatPendingQueueOptions) {
     const visible = pendingQueue.value.filter(
       p => !p.deliveryState
         && !p.steerAttempt
+        && !p.pageContext
         && canRestoreToComposer(p)
         && !hasUneditablePendingAttachments(p),
     )
     const retained = pendingQueue.value.filter(
       p => p.deliveryState
         || p.steerAttempt
+        || p.pageContext
         || !canRestoreToComposer(p)
         || hasUneditablePendingAttachments(p),
     )
@@ -2322,6 +2394,7 @@ export function useChatPendingQueue(options: UseChatPendingQueueOptions) {
     isReordering,
     maxPending: MAX_PENDING,
     enqueuePendingPayload,
+    restoreQueuedAnnotations,
     enqueuePendingInput,
     enqueuePendingSteerAttempt,
     removePendingChip,

@@ -128,6 +128,17 @@ from opensquilla.session.recovery_reads import (
     current_read_budget,
     recovery_read_scope,
 )
+from opensquilla.session.title_text import (
+    _SESSION_TITLE_CONTENT_SQL,
+    SESSION_TITLE_MAX_BODY_BYTES,
+    SESSION_TITLE_PREVIEW_CHARS,
+)
+from opensquilla.session.usage_attribution import (
+    USAGE_ATTRIBUTION_SCHEMA,
+    backfill_usage_attribution_on_conn,
+    ensure_usage_attribution_on_conn,
+    read_usage_attributions_on_conn,
+)
 from opensquilla.session.usage_ledger import (
     UsageBackfillBatch,
     UsageBackfillCursor,
@@ -145,16 +156,31 @@ from opensquilla.session.usage_ledger import (
     UsageLedgerConflictError,
     UsageLedgerState,
     UsageLegacyBaseline,
-    nanos_to_usd,
     usd_to_nanos,
     validate_usage_billing_receipt,
     validate_usage_completion,
     validate_usage_event_start,
     validate_usage_item,
 )
+from opensquilla.session.usage_metering_store import (
+    USAGE_METERING_SCHEMA,
+    append_settlement_on_conn,
+    overlay_session_cost_totals_on_conn,
+    overlay_turn_cost_totals_on_conn,
+    read_metering_on_conn,
+    read_settlements_on_conn,
+    write_metering_on_conn,
+)
+from opensquilla.session.usage_titles import resolve_usage_titles_on_conn
 from opensquilla.turn_outcome_projection import (
     attach_fork_terminal_outcome_projection,
     turn_id_from_context,
+)
+from opensquilla.usage_metering import (
+    UsageItemMetering,
+    UsageMeter,
+    UsagePriceSnapshot,
+    UsageSettlementRevision,
 )
 from opensquilla.usage_reasons import normalize_usage_unknown_reason
 
@@ -481,6 +507,9 @@ _BOUNDED_INTERACTIVE_READS: ContextVar[bool] = ContextVar(
 _READ_CONNECTION: ContextVar[tuple[Any, Any] | None] = ContextVar(
     "opensquilla_session_read_connection", default=None,
 )
+_COMMITTED_HISTORY_VIEW: ContextVar[Any | None] = ContextVar(
+    "opensquilla_committed_history_view", default=None,
+)
 
 
 def _read_path_diagnostics_enabled() -> bool:
@@ -643,21 +672,6 @@ def _serialized_read[**P, R](
 # changing the semantic session schema version used by upgrade compatibility.
 SCHEMA_VERSION = 26
 MAX_PENDING_CHAT_INPUTS = 5
-# Title/search enrichment only needs a bounded prefix.  Keep this separate
-# from the history wire preview because these helpers return plain strings and
-# otherwise can pull a full legacy body across the SQLite/Python boundary.
-SESSION_TITLE_PREVIEW_CHARS = 4 * 1024
-SESSION_TITLE_MAX_BODY_BYTES = 64 * 1024
-# 仅在 metadata 已筛出 <=64KiB 的候选后投影正文。先截 JSON 会丢掉图片
-# base64 后的 display_text，必须在 SQLite 内提取可见正文再限制返回长度。
-_SESSION_TITLE_CONTENT_SQL = f"""CASE WHEN json_valid(content) THEN CASE
-    WHEN json_type(content, '$.display_text') = 'text'
-      OR (json_type(content, '$.text') = 'text'
-          AND json_type(content, '$.attachments') = 'array')
-    THEN json_object('display_text',
-         substr({USER_DISPLAY_TEXT_SQL}, 1, {SESSION_TITLE_PREVIEW_CHARS}))
-    ELSE substr(content, 1, {SESSION_TITLE_PREVIEW_CHARS}) END
-    ELSE substr(content, 1, {SESSION_TITLE_PREVIEW_CHARS}) END"""
 # Read ordinary envelopes completely before applying display semantics. This
 # is a storage parse budget, separate from both title and wire preview limits.
 # Larger/unindexed rows retain a prefix and an explicit *actual* truncation bit;
@@ -2092,6 +2106,8 @@ class SessionStorage:
         self._conn: Any | None = None
         self._connection_generation = 0
         self._transcript_reader: Any | None = None
+        self._committed_reader: Any | None = None
+        self._committed_reader_lock = asyncio.Lock()
         self._recovery_read_pool: RecoveryReadPool | None = None
         self._pending_reader_operations: set[asyncio.Task[Any]] = set()
         self._operation_lock = asyncio.Lock()
@@ -2111,6 +2127,8 @@ class SessionStorage:
         self._monotonic = time.monotonic
         self._random = random.random
         self._restart_abandoned_session_keys: tuple[str, ...] = ()
+        # Removing a catalog entry does not authorize maintenance of its files.
+        self.protected_project_paths: set[str] = set()
 
     @property
     def restart_abandoned_session_keys(self) -> tuple[str, ...]:
@@ -2151,6 +2169,23 @@ class SessionStorage:
 
         self._legacy_project_adoption_generation += 1
 
+    def _protect_session_workspace(
+        self,
+        *,
+        agent_id: str | None,
+        execution_workspace: Any,
+        origin: Any,
+    ) -> None:
+        """Remember user roots before maintenance, without adopting or authorizing them."""
+
+        from opensquilla.project_workspaces import protected_session_workspace_path
+
+        path = protected_session_workspace_path(
+            agent_id=agent_id, execution_workspace=execution_workspace, origin=origin,
+        )
+        if path is not None:
+            self.protected_project_paths.add(path)
+
     async def connect(
         self,
         *,
@@ -2159,6 +2194,7 @@ class SessionStorage:
         if (
             self._conn is not None
             or self._transcript_reader is not None
+            or self._committed_reader is not None
         ):
             await self.close()
         self._poisoned = False
@@ -2185,6 +2221,22 @@ class SessionStorage:
             # loop. Keep SQLite's startup busy budget while another opener may
             # be upgrading, then restore short waits before serving requests.
             await self._initialize_schema(goal_pause_reason=goal_pause_reason)
+            async with self._conn.execute("SELECT path FROM project_workspaces") as cursor:
+                self.protected_project_paths.update(row[0] for row in await cursor.fetchall())
+            # Recovery can open legacy tables with only a subset of today's
+            # columns. Missing metadata means no binding to classify, not an
+            # invalid database that should prevent startup or recovery.
+            async with self._conn.execute("PRAGMA table_info(sessions)") as cursor:
+                columns = {row[1] for row in await cursor.fetchall()}
+            projection = ", ".join(
+                name if name in columns else f"NULL AS {name}"
+                for name in ("agent_id", "execution_workspace", "origin")
+            )
+            async with self._conn.execute(
+                f"SELECT {projection} FROM sessions"  # noqa: S608 - fixed column allowlist
+            ) as cursor:
+                for row in await cursor.fetchall():
+                    self._protect_session_workspace(**dict(row))
             await self._conn.execute(f"PRAGMA busy_timeout={_SQLITE_BUSY_TIMEOUT_MS}")
             await self._open_transcript_reader(journal_mode)
         except BaseException:
@@ -2203,19 +2255,24 @@ class SessionStorage:
         if self._recovery_read_pool is not None:
             await self._recovery_read_pool.close()
         async with self._operation_lock:
-            async with self._transcript_reader_lock:
+            async with self._committed_reader_lock, self._transcript_reader_lock:
                 reader, self._transcript_reader = self._transcript_reader, None
                 conn, self._conn = self._conn, None
                 try:
-                    if self._pending_reader_operations:
-                        await self._finish_sqlite_call(asyncio.gather(
-                            *self._pending_reader_operations, return_exceptions=True,
-                        ))
-                    if reader is not None:
-                        await reader.close()
+                    try:
+                        if self._pending_reader_operations:
+                            await self._finish_sqlite_call(asyncio.gather(
+                                *self._pending_reader_operations, return_exceptions=True,
+                            ))
+                    finally:
+                        try:
+                            await self._close_committed_reader()
+                        finally:
+                            if reader is not None:
+                                await self._finish_sqlite_call(reader.close())
                 finally:
                     if conn is not None:
-                        await conn.close()
+                        await self._finish_sqlite_call(conn.close())
 
     def _warn_transcript_reader_fallback_once(
         self,
@@ -2322,6 +2379,29 @@ class SessionStorage:
         register_connection(self._db_path, "recovery_reader", reader)
         return reader
 
+    async def _open_committed_reader(self) -> None:
+        """Open under the snapshot gate; its owner shields all initialization."""
+
+        reader = await aiosqlite.connect(self._db_path, isolation_level=None)
+        try:
+            register_connection(self._db_path, "committed_reader", reader)
+            await self._initialize_recovery_reader(reader)
+            async with reader.execute("PRAGMA query_only") as cursor:
+                row = await cursor.fetchone()
+            if row is None or int(row[0]) != 1:
+                raise RuntimeError("Committed reader query-only mode unavailable")
+        except BaseException:
+            await self._finish_sqlite_call(reader.close())
+            raise
+        self._committed_reader = reader
+
+    async def _close_committed_reader(self) -> None:
+        """Retire only the snapshot reader, while holding its exclusive gate."""
+
+        reader, self._committed_reader = self._committed_reader, None
+        if reader is not None:
+            await self._finish_sqlite_call(reader.close())
+
     async def _initialize_recovery_reader(self, reader: Any) -> None:
         """Configure an already-owned reader; the pool handles every failure."""
 
@@ -2389,6 +2469,50 @@ class SessionStorage:
             ) from exc
 
 
+    @property
+    def supports_committed_history_view(self) -> bool:
+        """Whether history can capture a view independently of the writer."""
+
+        return self._conn is not None and self._transcript_reader is not None
+
+    @property
+    def in_committed_history_view(self) -> bool:
+        """True only inside this storage's owned, budgeted history transaction."""
+
+        return _COMMITTED_HISTORY_VIEW.get() is self
+
+    async def read_committed_history_view[T](
+        self, operation: str, read: Callable[[], Awaitable[T]],
+    ) -> T:
+        """Capture related history queries on one exclusive committed WAL lease.
+
+        The caller supplies a recovery budget. Nested storage methods reuse the
+        selected reader through _READ_CONNECTION. The pool retains its permit
+        until native work and transaction rollback have finished, even when the
+        caller's deadline/cancellation has already ended its wait.
+        """
+
+        if self.in_committed_history_view:
+            return await read()
+        if not self.supports_committed_history_view:
+            raise RuntimeError("Committed history views require independent WAL storage")
+        if current_read_budget() is None:
+            raise RuntimeError("Committed history views require a recovery read budget")
+        generation = self.connection_generation
+
+        async def capture(reader: Any) -> T:
+            if generation != self.connection_generation or reader is self._conn:
+                raise RuntimeError("History reader no longer owns the admitted storage generation")
+            await self._finish_sqlite_call(reader.execute("BEGIN"))
+            token = _COMMITTED_HISTORY_VIEW.set(self)
+            try:
+                return await read()
+            finally:
+                _COMMITTED_HISTORY_VIEW.reset(token)
+                # RecoveryReadPool._release owns rollback and physical cleanup.
+
+        return await self._run_recovery_read(operation, capture)
+
     def _raise_if_poisoned(self) -> None:
         if self._poisoned:
             raise StorageConnectionPoisonedError(
@@ -2398,6 +2522,7 @@ class SessionStorage:
     @contextlib.contextmanager
     def _transaction_diagnostics(
         self, operation: str, role: str,
+        *, connection: Callable[[], Any] | None = None,
     ) -> Iterator[_TransactionTiming | None]:
         # Local opt-in only. Bound volume even if the switch is left enabled.
         if not self._diagnostics_enabled or self._diagnostic_count >= 256:
@@ -2421,6 +2546,7 @@ class SessionStorage:
         finally:
             phase = timing.phase
             timing.advance("finished")
+            observed_connection = connection() if connection is not None else self._conn
             # The caller has released its gate; no SQL, handlers or awaits are
             # added inside the transaction. These are await spans, not SQL CPU.
             log.info("session_storage.transaction_timing", extra={
@@ -2432,12 +2558,13 @@ class SessionStorage:
                     "duration_ms": max(0.0, (timing.phase_started - started) * 1000),
                     "timings": timing.timings,
                     "exception_type": type(failure).__name__ if failure else None,
-                    "backend": connection_backend(self._conn),
+                    "backend": connection_backend(observed_connection),
                     **sqlite_failure(failure),
-                    **(connection_snapshot(self._db_path, current_connection=self._conn)
+                    **(connection_snapshot(self._db_path, current_connection=observed_connection)
                        if failure else {}),
                     "connection_in_transaction": (
-                        bool(self._conn.in_transaction) if self._conn is not None else None
+                        bool(observed_connection.in_transaction)
+                        if observed_connection is not None else None
                     ),
                     "poisoned": self._poisoned,
                     "capture_limit_reached": sequence == 256,
@@ -2445,14 +2572,18 @@ class SessionStorage:
             })
 
     @contextlib.contextmanager
-    def _observe_operation(self, operation: str) -> Iterator[None]:
+    def _observe_operation(
+        self, operation: str, *, track_writer: bool = True,
+    ) -> Iterator[None]:
         started = self._monotonic()
-        self._operation_holder = (operation, started)
+        if track_writer:
+            self._operation_holder = (operation, started)
         try:
             yield
         finally:
             hold_ms = max(0, int((self._monotonic() - started) * 1000))
-            self._operation_holder = None
+            if track_writer:
+                self._operation_holder = None
             if hold_ms >= 250:
                 log.warning(
                     "session_storage.slow_operation operation=%s hold_ms=%d",
@@ -2488,9 +2619,11 @@ class SessionStorage:
         self._poisoned = True
         if self._recovery_read_pool is not None:
             await self._recovery_read_pool.close()
-        async with self._transcript_reader_lock:
+        async with self._committed_reader_lock, self._transcript_reader_lock:
             reader, self._transcript_reader = self._transcript_reader, None
             conn, self._conn = self._conn, None
+            with contextlib.suppress(BaseException):
+                await self._close_committed_reader()
             if self._pending_reader_operations:
                 await self._finish_sqlite_call(asyncio.gather(
                     *self._pending_reader_operations, return_exceptions=True,
@@ -2720,6 +2853,81 @@ class SessionStorage:
                                 timing.advance("rollback_await_ms")
                             await self._rollback_transaction(conn, qualified_operation)
 
+    @asynccontextmanager
+    async def committed_read_transaction(self, operation: str) -> AsyncIterator[Any]:
+        """Read one committed WAL snapshot without occupying the writer gate.
+
+        The dedicated query-only connection is exclusive for the entire snapshot.
+        Ordinary transcript reads cannot join its transaction, and all mutations
+        still go through the canonical writer. Memory/non-WAL databases retain
+        the serialized connection path because independent snapshots are unsafe.
+        Bodies must use only read SQL on the yielded connection, without taking
+        the writer gate or closing storage while holding this reader's gate.
+        Inside an admitted history view, reuse its snapshot and leave transaction
+        cleanup to the outer recovery lease.
+        """
+
+        if self.in_committed_history_view:
+            self._raise_if_poisoned()
+            selected = _READ_CONNECTION.get()
+            budget = current_read_budget()
+            if (
+                selected is None or selected[0] is not self
+                or selected[1] is self._conn or budget is None
+            ):
+                raise RuntimeError("Committed history view no longer owns its reader")
+            budget.check()
+            yield selected[1]
+            return
+
+        generation = self.connection_generation
+        if self._transcript_reader is None:
+            async with self.read_transaction(operation) as conn:
+                yield conn
+            return
+
+        qualified_operation = f"read.{operation}"
+        with self._transaction_diagnostics(
+            qualified_operation, "committed_read", connection=lambda: self._committed_reader,
+        ) as timing:
+            async with self._committed_reader_lock:
+                self._raise_if_poisoned()
+                if generation != self.connection_generation:
+                    raise RuntimeError("Storage connection changed while waiting for a snapshot")
+                if timing is not None:
+                    timing.advance("begin_await_ms")
+                if self._committed_reader is None:
+                    await self._finish_sqlite_call(self._open_committed_reader())
+                conn = self._committed_reader
+                assert conn is not None
+                with self._observe_operation(qualified_operation, track_writer=False):
+                    try:
+                        await self._finish_sqlite_call(conn.execute("BEGIN"))
+                        if timing is not None:
+                            timing.advance("body_ms")
+                        yield conn
+                    finally:
+                        if bool(conn.in_transaction):
+                            if timing is not None:
+                                timing.advance("rollback_await_ms")
+                            try:
+                                await self._finish_sqlite_call(conn.rollback())
+                            except BaseException as exc:
+                                # Cancellation propagates only after rollback
+                                # settles. A failed reader must never poison the
+                                # independent writer or be reused in a transaction.
+                                if (
+                                    not isinstance(exc, asyncio.CancelledError)
+                                    or conn.in_transaction
+                                ):
+                                    log.error(
+                                        "session_storage.committed_read_rollback_failed "
+                                        "operation=%s",
+                                        qualified_operation,
+                                    )
+                                    await self._close_committed_reader()
+                                raise
+
     async def _initialize_schema(
         self,
         *,
@@ -2803,6 +3011,8 @@ class SessionStorage:
         )
         await self._conn.execute(_CREATE_USAGE_LEDGER_STATE)
         await self._conn.execute(_CREATE_USAGE_LEGACY_BASELINES)
+        for statement in (*USAGE_METERING_SCHEMA, *USAGE_ATTRIBUTION_SCHEMA):
+            await self._conn.execute(statement)
         await self._conn.execute(_CREATE_IDX_USAGE_EVENTS_COMPLETED)
         await self._conn.execute(_CREATE_IDX_USAGE_EVENTS_SESSION_COMPLETED)
         await self._conn.execute(_CREATE_IDX_USAGE_EVENTS_AGENT_COMPLETED)
@@ -2833,6 +3043,9 @@ class SessionStorage:
         await self._migrate_transcript_content_revision_column()
         await self._conn.execute(_CREATE_IDX_TRANSCRIPT_TITLE_CANDIDATES)
         await self._conn.execute(_CREATE_IDX_COMPACTED_TRANSCRIPT_TITLE_CANDIDATES)
+        # Usage-owner titles query transcript length metadata and candidate indexes.
+        # Install those dependencies before backfilling owners in legacy databases.
+        await backfill_usage_attribution_on_conn(self._conn)
         await self._migrate_transcript_turn_usage_column()
         await self._migrate_transcript_turn_context_column()
         await self._migrate_summary_metadata_columns()
@@ -3731,6 +3944,7 @@ class SessionStorage:
                 "usage event id and execution identity refer to different records"
             )
         self._assert_usage_start_matches(by_event, event)
+        await ensure_usage_attribution_on_conn(conn, event)
         created = insert_cursor.rowcount == 1
         return by_event, created
 
@@ -3738,6 +3952,8 @@ class SessionStorage:
         self,
         conn: Any,
         event: UsageEventStart,
+        *,
+        preserve_session_epoch: bool = False,
     ) -> UsageEventStart:
         """Fill default live attribution from the current session row.
 
@@ -3767,6 +3983,19 @@ class SessionStorage:
         root_turn_id = event.root_turn_id or event.turn_id
         goal_id = None
         durable_child = False
+        durable_owner = False
+        async with conn.execute(
+            "SELECT session_id,session_epoch FROM usage_attribution_runs WHERE execution_id=?",
+            (event.execution_id,),
+        ) as cur:
+            run_owner = await cur.fetchone()
+        if run_owner is not None:
+            if run_owner["session_id"] != event.session_id:
+                raise UsageLedgerConflictError("usage execution owner cannot change")
+            # Later calls in the same execution retain its captured generation,
+            # including tool requests admitted after the session was reset.
+            event = replace(event, session_epoch=int(run_owner["session_epoch"]))
+            durable_owner = True
         if event.turn_id:
             async with conn.execute(
                 "SELECT * FROM agent_tasks WHERE task_id = ?", (event.turn_id,)
@@ -3774,6 +4003,9 @@ class SessionStorage:
                 physical_task = await cur.fetchone()
             if physical_task is not None:
                 task_details = _json_object_or_none(physical_task["details"]) or {}
+                durable_owner = durable_owner or (
+                    task_details.get("session_id"), task_details.get("session_epoch")
+                ) == (event.session_id, event.session_epoch)
                 metadata = task_details.get("metadata") or {}
                 parent_id = metadata.get("parent_task_id")
                 if not parent_id and root_turn_id != event.turn_id:
@@ -3846,9 +4078,9 @@ class SessionStorage:
                     )
                 goal_id = goal_context.goal_id
         event = replace(event, root_turn_id=root_turn_id, goal_id=goal_id)
-        if goal_id is not None:
-            # A child can finish after reset. Its immutable task generation must
-            # never be rebound to the session's newer current epoch.
+        if goal_id is not None or durable_child or durable_owner or preserve_session_epoch:
+            # A captured execution can make its first call after reset. Its
+            # generation must never be rebound to the session's current epoch.
             return event
         async with conn.execute(
             """
@@ -3869,16 +4101,25 @@ class SessionStorage:
             session_epoch=max(0, int(session_row["epoch"] or 0)),
         )
 
-    async def start_usage_event(self, event: UsageEventStart) -> UsageEventRecord:
+    async def start_usage_event(
+        self,
+        event: UsageEventStart,
+        *,
+        preserve_session_epoch: bool = False,
+    ) -> UsageEventRecord:
         """Durably reserve a provider-call identity before the request is sent.
 
         Repeating the exact call is idempotent. Reusing either unique identity
         with different attribution raises ``UsageLedgerConflictError``.
+        Callers with an execution scope must preserve its captured generation;
+        only legacy callers without one resolve the current session epoch.
         """
 
         validate_usage_event_start(event)
         async with self._write_transaction("start_usage_event") as conn:
-            resolved_event = await self._resolve_live_usage_start_on_conn(conn, event)
+            resolved_event = await self._resolve_live_usage_start_on_conn(
+                conn, event, preserve_session_epoch=preserve_session_epoch,
+            )
             validate_usage_event_start(resolved_event)
             record, created = await self._start_usage_event_on_conn(conn, resolved_event)
             if created and record.goal_id is not None:
@@ -4052,6 +4293,7 @@ class SessionStorage:
         *,
         items: Sequence[UsageEventItem] = (),
         receipts: Sequence[UsageItemBillingReceipt] = (),
+        metering: Mapping[int, UsageItemMetering] | None = None,
     ) -> UsageEventRecord:
         """Atomically finalize one event, its model items, and native receipts."""
 
@@ -4062,6 +4304,10 @@ class SessionStorage:
             record, changed = await self._finalize_usage_event_on_conn(
                 conn, event_id, completion, items, receipts
             )
+            if metering:
+                await write_metering_on_conn(conn, event_id, metering)
+                if changed and any(not value.token_usage_known for value in metering.values()):
+                    await self._refresh_usage_owner_costs_on_conn(conn, record)
             if changed and record.goal_id is not None:
                 await conn.execute(
                     """UPDATE session_goals SET
@@ -4659,26 +4905,38 @@ class SessionStorage:
         return [_usage_baseline_from_row(row) for row in rows]
 
     @_serialized_read
-    async def resolve_usage_session_keys(
+    async def resolve_usage_sessions(
         self,
-        session_ids: Sequence[str],
-    ) -> dict[str, str]:
-        """Resolve only currently live session ids to navigable session keys."""
+        session_epochs: Sequence[tuple[str, int]],
+    ) -> dict[tuple[str, int], dict[str, str]]:
+        """Resolve navigation and current title only for the live generation."""
 
-        unique_ids = list(dict.fromkeys(value for value in session_ids if value))
-        resolved: dict[str, str] = {}
+        requested = set(session_epochs)
+        unique_ids = list(dict.fromkeys(value for value, _ in session_epochs if value))
+        resolved: dict[tuple[str, int], dict[str, str]] = {}
+        live_nodes: list[dict[str, Any]] = []
         for start in range(0, len(unique_ids), _SQLITE_VARIABLE_CHUNK_SIZE):
             chunk = unique_ids[start : start + _SQLITE_VARIABLE_CHUNK_SIZE]
             placeholders = ", ".join("?" for _ in chunk)
             async with self.conn.execute(
-                "SELECT session_id, session_key FROM sessions "
+                "SELECT session_id, epoch, session_key, agent_id, display_name, derived_title, "
+                "subject FROM sessions "
                 f"WHERE session_id IN ({placeholders}) "  # noqa: S608
                 "ORDER BY session_id, session_key",
                 chunk,
             ) as cur:
                 rows = await cur.fetchall()
             for row in rows:
-                resolved.setdefault(str(row["session_id"]), str(row["session_key"]))
+                identity = (str(row["session_id"]), int(row["epoch"]))
+                if identity in requested and identity not in resolved:
+                    live_nodes.append(dict(row))
+                    resolved[identity] = {
+                        "sessionKey": str(row["session_key"]),
+                        "title": "",
+                    }
+        titles = await resolve_usage_titles_on_conn(self.conn, live_nodes)
+        for identity, title in titles.items():
+            resolved[identity]["title"] = title
         return resolved
 
     @_serialized_read
@@ -4806,8 +5064,12 @@ class SessionStorage:
         ) as cur:
             identity = await cur.fetchone()
 
-        billed_cost = nanos_to_usd(int(row["billed_cost_nanos"] or 0))
-        estimated_cost = nanos_to_usd(int(row["estimated_cost_nanos"] or 0))
+        settled = await overlay_turn_cost_totals_on_conn(
+            self.conn, {turn_id: dict(row)}, session_id=session_id, session_epoch=session_epoch,
+        )
+        row = settled[turn_id]
+        billed_cost = float(row["billed_cost_usd_exact"])
+        estimated_cost = float(row["estimated_cost_usd_exact"])
         missing_entries = max(0, int(row["missing_cost_entries"] or 0))
         unknown_events = max(0, int(row["unknown_event_count"] or 0))
         incomplete = max(0, int(row["incomplete_finalized_count"] or 0))
@@ -4826,9 +5088,11 @@ class SessionStorage:
             "cached_tokens": max(0, int(row["cache_read_tokens"] or 0)),
             "cache_write_tokens": max(0, int(row["cache_write_tokens"] or 0)),
             "total_tokens": max(0, int(row["total_tokens"] or 0)),
-            "cost_usd": nanos_to_usd(int(row["cost_nanos"] or 0)),
+            "cost_usd": float(row["cost_usd_exact"]),
             "billed_cost": billed_cost,
             "estimated_cost_component_usd": estimated_cost,
+            "has_billed_component": int(row["provider_billed_entries"] or 0) > 0,
+            "has_estimated_component": int(row["estimated_cost_entries"] or 0) > 0,
             "cost_source": cost_source,
             "missing_cost_entries": missing_entries,
             "coverage_status": coverage_status,
@@ -4872,7 +5136,8 @@ class SessionStorage:
             if event.turn_id:
                 grouped.setdefault(event.turn_id, []).append(event)
 
-        projections: dict[str, dict[str, Any]] = {}
+        totals_by_turn: dict[str, dict[str, Any]] = {}
+        coverage_by_turn: dict[str, tuple[int, bool]] = {}
         for stable_turn_id, events in grouped.items():
             totals = {
                 "input_tokens": 0,
@@ -4921,12 +5186,23 @@ class SessionStorage:
                 estimated_cost_entries += int(event.estimated_cost_nanos > 0)
                 incomplete = incomplete or event.coverage_status != "complete"
 
-            billed_cost = nanos_to_usd(totals["billed_cost_nanos"])
-            estimated_cost = nanos_to_usd(totals["estimated_cost_nanos"])
+            totals["provider_billed_entries"] = provider_billed_entries
+            totals["estimated_cost_entries"] = estimated_cost_entries
+            totals_by_turn[stable_turn_id] = totals
+            coverage_by_turn[stable_turn_id] = (unknown_events, incomplete)
+
+        totals_by_turn = await overlay_turn_cost_totals_on_conn(
+            self.conn, totals_by_turn, session_id=session_id, session_epoch=session_epoch,
+        )
+        projections: dict[str, dict[str, Any]] = {}
+        for stable_turn_id, totals in totals_by_turn.items():
+            unknown_events, incomplete = coverage_by_turn[stable_turn_id]
+            billed_cost = float(totals["billed_cost_usd_exact"])
+            estimated_cost = float(totals["estimated_cost_usd_exact"])
             coverage_status = (
                 "usage_unknown" if unknown_events or incomplete else "complete"
             )
-            latest = events[-1]
+            latest = grouped[stable_turn_id][-1]
             projections[stable_turn_id] = {
                 "input_tokens": totals["input_tokens"],
                 "output_tokens": totals["output_tokens"],
@@ -4934,15 +5210,17 @@ class SessionStorage:
                 "cached_tokens": totals["cached_tokens"],
                 "cache_write_tokens": totals["cache_write_tokens"],
                 "total_tokens": totals["total_tokens"],
-                "cost_usd": nanos_to_usd(totals["cost_nanos"]),
+                "cost_usd": float(totals["cost_usd_exact"]),
                 "billed_cost": billed_cost,
                 "estimated_cost_component_usd": estimated_cost,
+                "has_billed_component": totals["provider_billed_entries"] > 0,
+                "has_estimated_component": totals["estimated_cost_entries"] > 0,
                 "cost_source": rollup_cost_source(
                     billed_cost_usd=billed_cost,
                     estimated_cost_component_usd=estimated_cost,
                     missing_cost_entries=totals["missing_cost_entries"],
-                    provider_billed_entries=provider_billed_entries,
-                    estimated_cost_entries=estimated_cost_entries,
+                    provider_billed_entries=totals["provider_billed_entries"],
+                    estimated_cost_entries=totals["estimated_cost_entries"],
                 ),
                 "missing_cost_entries": totals["missing_cost_entries"],
                 "coverage_status": coverage_status,
@@ -5033,28 +5311,56 @@ class SessionStorage:
         captured by that baseline.
         """
 
-        stable_key = canonicalize_session_key(session_key)
         async with self._write_transaction("reconcile_session_usage_totals") as conn:
-            async with conn.execute(
-                "SELECT * FROM sessions WHERE session_key = ?",
-                (stable_key,),
-            ) as cur:
-                session_row = await cur.fetchone()
-            if session_row is None:
-                return None
-            actual_epoch = max(0, int(session_row["epoch"] or 0))
-            actual_session_id = str(session_row["session_id"])
-            if actual_epoch != expected_epoch or (
-                expected_session_id is not None
-                and actual_session_id != expected_session_id
-            ):
-                await self._raise_stale_epoch(
-                    conn,
-                    session_key=stable_key,
-                    expected_epoch=expected_epoch,
-                )
-            session_id = actual_session_id
+            return await self._reconcile_session_usage_totals_on_conn(
+                conn,
+                session_key=session_key,
+                expected_epoch=expected_epoch,
+                expected_session_id=expected_session_id,
+            )
 
+    async def _reconcile_session_usage_totals_on_conn(
+        self,
+        conn: Any,
+        *,
+        session_key: str,
+        expected_epoch: int,
+        expected_session_id: str | None = None,
+    ) -> SessionNode | None:
+        stable_key = canonicalize_session_key(session_key)
+        async with conn.execute(
+            "SELECT * FROM sessions WHERE session_key = ?",
+            (stable_key,),
+        ) as cur:
+            session_row = await cur.fetchone()
+        if session_row is None:
+            return None
+        actual_epoch = max(0, int(session_row["epoch"] or 0))
+        actual_session_id = str(session_row["session_id"])
+        if actual_epoch != expected_epoch or (
+            expected_session_id is not None and actual_session_id != expected_session_id
+        ):
+            await self._raise_stale_epoch(
+                conn,
+                session_key=stable_key,
+                expected_epoch=expected_epoch,
+            )
+        session_id = actual_session_id
+
+        async with conn.execute(
+            """
+            SELECT * FROM usage_legacy_baselines
+            WHERE session_id = ? AND session_epoch = ?
+            """,
+            (session_id, expected_epoch),
+        ) as cur:
+            baseline = await cur.fetchone()
+        if baseline is None:
+            await self._repair_post_cutover_usage_baselines_on_conn(
+                conn,
+                captured_at_ms=_now_ms(),
+                session_key=stable_key,
+            )
             async with conn.execute(
                 """
                 SELECT * FROM usage_legacy_baselines
@@ -5063,166 +5369,155 @@ class SessionStorage:
                 (session_id, expected_epoch),
             ) as cur:
                 baseline = await cur.fetchone()
-            if baseline is None:
-                await self._repair_post_cutover_usage_baselines_on_conn(
-                    conn,
-                    captured_at_ms=_now_ms(),
-                    session_key=stable_key,
-                )
-                async with conn.execute(
-                    """
-                    SELECT * FROM usage_legacy_baselines
-                    WHERE session_id = ? AND session_epoch = ?
-                    """,
-                    (session_id, expected_epoch),
-                ) as cur:
-                    baseline = await cur.fetchone()
-            if baseline is None:
-                # No cutover means this storage is not ledger-authoritative;
-                # preserve the legacy DoneEvent rollup path.
-                return None
+        if baseline is None:
+            # No cutover means this storage is not ledger-authoritative;
+            # preserve the legacy DoneEvent rollup path.
+            return None
 
-            async with conn.execute(
-                """
-                SELECT
-                    COALESCE(SUM(CASE WHEN status = 'finalized' THEN input_tokens ELSE 0 END), 0)
-                        AS input_tokens,
-                    COALESCE(SUM(CASE WHEN status = 'finalized' THEN output_tokens ELSE 0 END), 0)
-                        AS output_tokens,
-                    COALESCE(SUM(CASE WHEN status = 'finalized'
-                        THEN cache_read_tokens ELSE 0 END), 0)
-                        AS cache_read_tokens,
-                    COALESCE(SUM(CASE WHEN status = 'finalized'
-                        THEN cache_write_tokens ELSE 0 END), 0)
-                        AS cache_write_tokens,
-                    COALESCE(SUM(CASE WHEN status = 'finalized' THEN cost_nanos ELSE 0 END), 0)
-                        AS cost_nanos,
-                    COALESCE(SUM(CASE WHEN status = 'finalized'
-                        THEN billed_cost_nanos ELSE 0 END), 0)
-                        AS billed_cost_nanos,
-                    COALESCE(SUM(CASE WHEN status = 'finalized'
-                        THEN estimated_cost_nanos ELSE 0 END), 0)
-                        AS estimated_cost_nanos,
-                    COALESCE(SUM(CASE
-                        WHEN status = 'finalized' THEN missing_cost_entries
-                        ELSE MAX(1, missing_cost_entries)
-                    END), 0) AS missing_cost_entries,
-                    COALESCE(SUM(CASE
-                        WHEN status = 'finalized' AND cost_source IN ('provider_billed', 'mixed')
-                        THEN 1 ELSE 0 END), 0) AS provider_billed_entries,
-                    COALESCE(SUM(CASE
-                        WHEN status = 'finalized' AND estimated_cost_nanos > 0
-                        THEN 1 ELSE 0 END), 0) AS estimated_cost_entries
-                FROM usage_events
-                WHERE session_id = ? AND session_epoch = ? AND origin = 'live_provider'
-                """,
-                (session_id, expected_epoch),
-            ) as cur:
-                live = await cur.fetchone()
-            assert live is not None
-            async with conn.execute(
-                """
-                SELECT provider, model
-                FROM usage_events
-                WHERE session_id = ? AND session_epoch = ?
-                  AND origin = 'live_provider' AND status = 'finalized'
-                ORDER BY completed_at_ms DESC, call_index DESC, event_id DESC
-                LIMIT 1
-                """,
-                (session_id, expected_epoch),
-            ) as cur:
-                latest_identity = await cur.fetchone()
+        async with conn.execute(
+            """
+            SELECT
+                COALESCE(SUM(CASE WHEN status = 'finalized' THEN input_tokens ELSE 0 END), 0)
+                    AS input_tokens,
+                COALESCE(SUM(CASE WHEN status = 'finalized' THEN output_tokens ELSE 0 END), 0)
+                    AS output_tokens,
+                COALESCE(SUM(CASE WHEN status = 'finalized'
+                    THEN cache_read_tokens ELSE 0 END), 0)
+                    AS cache_read_tokens,
+                COALESCE(SUM(CASE WHEN status = 'finalized'
+                    THEN cache_write_tokens ELSE 0 END), 0)
+                    AS cache_write_tokens,
+                COALESCE(SUM(CASE WHEN status = 'finalized' THEN cost_nanos ELSE 0 END), 0)
+                    AS cost_nanos,
+                COALESCE(SUM(CASE WHEN status = 'finalized'
+                    THEN billed_cost_nanos ELSE 0 END), 0)
+                    AS billed_cost_nanos,
+                COALESCE(SUM(CASE WHEN status = 'finalized'
+                    THEN estimated_cost_nanos ELSE 0 END), 0)
+                    AS estimated_cost_nanos,
+                COALESCE(SUM(CASE
+                    WHEN status = 'finalized' THEN missing_cost_entries
+                    ELSE MAX(1, missing_cost_entries)
+                END), 0) AS missing_cost_entries,
+                COALESCE(SUM(CASE
+                    WHEN status = 'finalized' AND cost_source IN ('provider_billed', 'mixed')
+                    THEN 1 ELSE 0 END), 0) AS provider_billed_entries,
+                COALESCE(SUM(CASE
+                    WHEN status = 'finalized' AND estimated_cost_nanos > 0
+                    THEN 1 ELSE 0 END), 0) AS estimated_cost_entries
+            FROM usage_events
+            WHERE session_id = ? AND session_epoch = ? AND origin = 'live_provider'
+            """,
+            (session_id, expected_epoch),
+        ) as cur:
+            live = await cur.fetchone()
+        assert live is not None
+        live = await overlay_session_cost_totals_on_conn(
+            conn, live, session_id=session_id, session_epoch=expected_epoch
+        )
+        async with conn.execute(
+            """
+            SELECT provider, model
+            FROM usage_events
+            WHERE session_id = ? AND session_epoch = ?
+              AND origin = 'live_provider' AND status = 'finalized'
+            ORDER BY completed_at_ms DESC, call_index DESC, event_id DESC
+            LIMIT 1
+            """,
+            (session_id, expected_epoch),
+        ) as cur:
+            latest_identity = await cur.fetchone()
 
-            input_tokens = max(0, int(baseline["input_tokens"] or 0)) + max(
-                0, int(live["input_tokens"] or 0)
-            )
-            output_tokens = max(0, int(baseline["output_tokens"] or 0)) + max(
-                0, int(live["output_tokens"] or 0)
-            )
-            cache_read = max(0, int(baseline["cache_read_tokens"] or 0)) + max(
-                0, int(live["cache_read_tokens"] or 0)
-            )
-            cache_write = max(0, int(baseline["cache_write_tokens"] or 0)) + max(
-                0, int(live["cache_write_tokens"] or 0)
-            )
-            cost_nanos = max(0, int(baseline["cost_nanos"] or 0)) + max(
-                0, int(live["cost_nanos"] or 0)
-            )
-            billed_nanos = max(0, int(baseline["billed_cost_nanos"] or 0)) + max(
-                0, int(live["billed_cost_nanos"] or 0)
-            )
-            estimated_nanos = max(0, int(baseline["estimated_cost_nanos"] or 0)) + max(
-                0, int(live["estimated_cost_nanos"] or 0)
-            )
-            missing_entries = max(0, int(baseline["missing_cost_entries"] or 0)) + max(
-                0, int(live["missing_cost_entries"] or 0)
-            )
-            baseline_source = str(baseline["cost_source"] or "none")
-            cost_source = rollup_cost_source(
-                billed_cost_usd=nanos_to_usd(billed_nanos),
-                estimated_cost_component_usd=nanos_to_usd(estimated_nanos),
-                missing_cost_entries=missing_entries,
-                provider_billed_entries=(
-                    int(baseline_source in {"provider_billed", "mixed"})
-                    + max(0, int(live["provider_billed_entries"] or 0))
-                ),
-                estimated_cost_entries=(
-                    int(int(baseline["estimated_cost_nanos"] or 0) > 0)
-                    + max(0, int(live["estimated_cost_entries"] or 0))
-                ),
-            )
-            cursor = await conn.execute(
-                """
-                UPDATE sessions
-                SET input_tokens = ?, output_tokens = ?, total_tokens = ?,
-                    total_tokens_fresh = 1, estimated_cost_usd = ?, total_cost_usd = ?,
-                    billed_cost_usd = ?, estimated_cost_component_usd = ?,
-                    cost_source = ?, missing_cost_entries = ?,
-                    cache_read = ?, cache_write = ?,
-                    model_override = COALESCE(?, model_override),
-                    model_provider = COALESCE(?, model_provider)
-                WHERE session_key = ? AND session_id = ? AND epoch = ?
-                """,
+        input_tokens = max(0, int(baseline["input_tokens"] or 0)) + max(
+            0, int(live["input_tokens"] or 0)
+        )
+        output_tokens = max(0, int(baseline["output_tokens"] or 0)) + max(
+            0, int(live["output_tokens"] or 0)
+        )
+        cache_read = max(0, int(baseline["cache_read_tokens"] or 0)) + max(
+            0, int(live["cache_read_tokens"] or 0)
+        )
+        cache_write = max(0, int(baseline["cache_write_tokens"] or 0)) + max(
+            0, int(live["cache_write_tokens"] or 0)
+        )
+        billed_exact = (
+            Decimal(baseline["billed_cost_nanos"] or 0) / 10**9 + live["billed_cost_usd_exact"]
+        )
+        estimated_exact = (
+            Decimal(baseline["estimated_cost_nanos"] or 0) / 10**9
+            + live["estimated_cost_usd_exact"]
+        )
+        total_usd = float(billed_exact + estimated_exact)
+        billed_usd, estimated_usd = float(billed_exact), float(estimated_exact)
+        missing_entries = max(0, int(baseline["missing_cost_entries"] or 0)) + max(
+            0, int(live["missing_cost_entries"] or 0)
+        )
+        baseline_source = str(baseline["cost_source"] or "none")
+        cost_source = rollup_cost_source(
+            billed_cost_usd=billed_usd,
+            estimated_cost_component_usd=estimated_usd,
+            missing_cost_entries=missing_entries,
+            provider_billed_entries=(
+                int(baseline_source in {"provider_billed", "mixed"})
+                + max(0, int(live["provider_billed_entries"] or 0))
+            ),
+            estimated_cost_entries=(
+                int(int(baseline["estimated_cost_nanos"] or 0) > 0)
+                + max(0, int(live["estimated_cost_entries"] or 0))
+            ),
+        )
+        cursor = await conn.execute(
+            """
+            UPDATE sessions
+            SET input_tokens = ?, output_tokens = ?, total_tokens = ?,
+                total_tokens_fresh = 1, estimated_cost_usd = ?, total_cost_usd = ?,
+                billed_cost_usd = ?, estimated_cost_component_usd = ?,
+                cost_source = ?, missing_cost_entries = ?,
+                cache_read = ?, cache_write = ?,
+                model_override = COALESCE(?, model_override),
+                model_provider = COALESCE(?, model_provider)
+            WHERE session_key = ? AND session_id = ? AND epoch = ?
+            """,
+            (
+                input_tokens,
+                output_tokens,
+                input_tokens + output_tokens,
+                total_usd,
+                total_usd,
+                billed_usd,
+                estimated_usd,
+                cost_source,
+                missing_entries,
+                cache_read,
+                cache_write,
                 (
-                    input_tokens,
-                    output_tokens,
-                    input_tokens + output_tokens,
-                    nanos_to_usd(cost_nanos),
-                    nanos_to_usd(cost_nanos),
-                    nanos_to_usd(billed_nanos),
-                    nanos_to_usd(estimated_nanos),
-                    cost_source,
-                    missing_entries,
-                    cache_read,
-                    cache_write,
-                    (
-                        str(latest_identity["model"])
-                        if latest_identity is not None and latest_identity["model"]
-                        else None
-                    ),
-                    (
-                        str(latest_identity["provider"])
-                        if latest_identity is not None and latest_identity["provider"]
-                        else None
-                    ),
-                    stable_key,
-                    session_id,
-                    expected_epoch,
+                    str(latest_identity["model"])
+                    if latest_identity is not None and latest_identity["model"]
+                    else None
                 ),
+                (
+                    str(latest_identity["provider"])
+                    if latest_identity is not None and latest_identity["provider"]
+                    else None
+                ),
+                stable_key,
+                session_id,
+                expected_epoch,
+            ),
+        )
+        if int(cursor.rowcount or 0) != 1:
+            await self._raise_stale_epoch(
+                conn,
+                session_key=stable_key,
+                expected_epoch=expected_epoch,
             )
-            if int(cursor.rowcount or 0) != 1:
-                await self._raise_stale_epoch(
-                    conn,
-                    session_key=stable_key,
-                    expected_epoch=expected_epoch,
-                )
-            async with conn.execute(
-                "SELECT * FROM sessions WHERE session_key = ?",
-                (stable_key,),
-            ) as cur:
-                updated = await cur.fetchone()
-            assert updated is not None
-            return SessionNode(**_deserialize_row(dict(updated)))
+        async with conn.execute(
+            "SELECT * FROM sessions WHERE session_key = ?",
+            (stable_key,),
+        ) as cur:
+            updated = await cur.fetchone()
+        assert updated is not None
+        return SessionNode(**_deserialize_row(dict(updated)))
 
     @_serialized_read
     async def query_usage_event_items(
@@ -5267,6 +5562,93 @@ class SessionStorage:
                 rows = await cur.fetchall()
             receipts.extend(_usage_billing_receipt_from_row(row) for row in rows)
         return receipts
+
+    async def _refresh_usage_owner_costs_on_conn(
+        self,
+        conn: Any,
+        record: UsageEventRecord,
+    ) -> None:
+        if record.origin != "live_provider":
+            return
+        # Preturn media and delayed jobs may settle outside a normal turn's
+        # compatibility rollup. Refresh only the exact reserved generation.
+        async with conn.execute(
+            "SELECT session_key FROM sessions WHERE session_id=? AND epoch=?",
+            (record.session_id, record.session_epoch),
+        ) as cur:
+            owners = await cur.fetchall()
+        for owner in owners:
+            await self._reconcile_session_usage_totals_on_conn(
+                conn,
+                session_key=owner[0],
+                expected_epoch=record.session_epoch,
+                expected_session_id=record.session_id,
+            )
+
+    async def append_usage_settlement(
+        self,
+        event_id: str,
+        ordinal: int,
+        revision: UsageSettlementRevision,
+        *,
+        meters: Sequence[UsageMeter] = (),
+        price_snapshot: UsagePriceSnapshot | None = None,
+    ) -> dict[str, Any]:
+        """Append a replacement valuation without recording another provider call."""
+        async with self._write_transaction("append_usage_settlement") as conn:
+            changed = await append_settlement_on_conn(
+                conn, event_id, ordinal, revision, meters=meters, price_snapshot=price_snapshot
+            )
+            rows = await read_settlements_on_conn(conn, [event_id])
+            record = await self._get_usage_event_on_conn(conn, event_id=event_id)
+            if changed and record is not None:
+                await self._refresh_usage_owner_costs_on_conn(conn, record)
+            result = next(row for row in rows if row["ordinal"] == ordinal)
+            return {
+                **result,
+                "goal_id": record.goal_id if record else None,
+                "transition_applied": changed,
+            }
+
+    @_serialized_read
+    async def get_usage_accounting_revision(self) -> int:
+        """Monotonic ledger mutation token, committed in the writer transaction."""
+        async with self.conn.execute(
+            "SELECT revision FROM usage_accounting_state WHERE singleton=1"
+        ) as cursor:
+            row = await cursor.fetchone()
+        return int(row[0]) if row else 0
+
+    @_serialized_read
+    async def query_usage_settlements(
+        self,
+        event_ids: Sequence[str],
+        *,
+        history: bool = False,
+    ) -> list[dict[str, Any]]:
+        return await read_settlements_on_conn(
+            self.conn, list(dict.fromkeys(event_ids)), history=history
+        )
+
+    @_serialized_read
+    async def query_usage_item_metering(self, event_ids: Sequence[str]) -> list[dict[str, Any]]:
+        return await read_metering_on_conn(self.conn, list(dict.fromkeys(event_ids)))
+
+    @_serialized_read
+    async def query_usage_price_snapshots(self, snapshot_ids: Sequence[str]) -> dict[str, Any]:
+        result = {}
+        for snapshot_id in dict.fromkeys(snapshot_ids):
+            async with self.conn.execute(
+                "SELECT payload_json FROM usage_price_snapshots WHERE snapshot_id=?", (snapshot_id,)
+            ) as cur:
+                row = await cur.fetchone()
+            if row is not None:
+                result[snapshot_id] = json.loads(row[0])
+        return result
+
+    @_serialized_read
+    async def query_usage_attributions(self, execution_ids: Sequence[str]) -> dict[str, Any]:
+        return await read_usage_attributions_on_conn(self.conn, execution_ids)
 
     @_serialized_read
     async def get_usage_billing_receipt_state(
@@ -5650,6 +6032,9 @@ class SessionStorage:
         trusted_at: int | None,
         now_ms: int,
     ) -> ProjectWorkspace:
+        # Protect before yielding to SQLite; a failed registration may only
+        # conservatively suppress maintenance, never grant it permission.
+        self.protected_project_paths.add(path)
         async with conn.execute(
             "SELECT * FROM project_workspaces WHERE path_key = ?",
             (path_key,),
@@ -5938,6 +6323,18 @@ class SessionStorage:
             where_values.append(expected_session_epoch)
 
         async with self._write_transaction("update_session_fields") as conn:
+            if {"agent_id", "execution_workspace", "origin"} & updates.keys():
+                async with conn.execute(
+                    "SELECT agent_id, execution_workspace, origin FROM sessions "
+                    "WHERE session_key = ?", (session_key,),
+                ) as cur:
+                    previous_workspace = await cur.fetchone()
+                if previous_workspace is not None:
+                    workspace_fields = dict(previous_workspace)
+                    workspace_fields.update({
+                        key: value for key, value in updates.items() if key in workspace_fields
+                    })
+                    self._protect_session_workspace(**workspace_fields)
             previous_epoch: int | None = None
             if "epoch" in updates:
                 async with conn.execute(
@@ -6267,6 +6664,10 @@ class SessionStorage:
         node.session_key = canonicalize_session_key(node.session_key)
         node.agent_id = normalize_agent_id(node.agent_id)
         data = node.model_dump()
+        self._protect_session_workspace(
+            agent_id=node.agent_id, execution_workspace=node.execution_workspace,
+            origin=node.origin,
+        )
         columns = list(data)
         sql = (
             f"INSERT INTO sessions ({', '.join(columns)}) "
@@ -6306,6 +6707,10 @@ class SessionStorage:
             session_epoch=expected_session_epoch,
         )
         data = node.model_dump()
+        self._protect_session_workspace(
+            agent_id=node.agent_id, execution_workspace=node.execution_workspace,
+            origin=node.origin,
+        )
         cols = list(data.keys())
         placeholders = ", ".join("?" for _ in cols)
         update_columns = []
@@ -6412,6 +6817,10 @@ class SessionStorage:
         """Replace one origin only while identity, binding, and origin still match."""
 
         session_key = canonicalize_session_key(expected_session.session_key)
+        self._protect_session_workspace(
+            agent_id=expected_session.agent_id,
+            execution_workspace=expected_session.execution_workspace, origin=origin,
+        )
         async with self._write_transaction("compare_and_set_session_origin") as conn:
             await _verify_project_workspace_guard(
                 conn,
@@ -13197,6 +13606,11 @@ class SessionStorage:
     ) -> None:
         """Archive and rotate one session identity in a single transaction."""
 
+        self._protect_session_workspace(
+            agent_id=node.agent_id, execution_workspace=node.execution_workspace,
+            origin=node.origin,
+        )
+
         node.session_key = canonicalize_session_key(node.session_key)
         node.agent_id = normalize_agent_id(node.agent_id)
         if not expected_session_id:
@@ -13579,12 +13993,25 @@ class SessionStorage:
             )
 
         pending_dispatch_client_message_id: str | None = None
+        if session_node is not None:
+            self._protect_session_workspace(
+                agent_id=session_node.agent_id,
+                execution_workspace=session_node.execution_workspace,
+                origin=session_updates.get("origin", session_node.origin),
+            )
         async with self._write_transaction("accept_turn") as conn:
             async with conn.execute(
-                "SELECT origin FROM sessions WHERE session_key = ?", (entry.session_key,),
+                "SELECT agent_id, execution_workspace, origin FROM sessions "
+                "WHERE session_key = ?", (entry.session_key,),
             ) as sidechat_cursor:
                 sidechat_row = await sidechat_cursor.fetchone()
             if sidechat_row is not None:
+                if "origin" in session_updates:
+                    self._protect_session_workspace(
+                        agent_id=sidechat_row["agent_id"],
+                        execution_workspace=sidechat_row["execution_workspace"],
+                        origin=session_updates["origin"],
+                    )
                 origin = json.loads(sidechat_row["origin"] or "{}")
                 sidechat = origin.get("sidechat")
                 if isinstance(sidechat, dict):
@@ -15937,8 +16364,10 @@ class SessionStorage:
         an anchor in this session; missing, foreign, or deleted anchors fail
         instead of becoming an unpositioned latest read.
         """
-        if content_mode not in {"full", "bounded", "tool_preview"}:
-            raise ValueError("content_mode must be 'full', 'bounded' or 'tool_preview'")
+        if content_mode not in {"full", "bounded", "tool_preview", "metadata"}:
+            raise ValueError(
+                "content_mode must be 'full', 'bounded', 'tool_preview', or 'metadata'"
+            )
         page_size = max(1, int(limit))
         fetch_size = page_size + 1
         # SQLite performs the substring before the row crosses the Python
@@ -15958,13 +16387,6 @@ class SessionStorage:
                 "THEN json_type(content) = 'array' ELSE 0 END"
             )
             envelope_sql = "NULL"
-        details_sql = (
-            "NULL AS tool_calls, NULL AS tool_call_id, NULL AS reasoning_content, "
-            "NULL AS assistant_replay, NULL AS turn_usage, NULL AS turn_context"
-            if tool_preview else
-            f"tool_calls, tool_call_id, reasoning_content, {replay_sql} AS assistant_replay, "
-            "turn_usage, turn_context"
-        )
         provenance_sql = (
             "NULL AS provenance_kind, NULL AS provenance_origin_session_id, "
             "NULL AS provenance_source_session_key, NULL AS provenance_source_channel, "
@@ -15974,6 +16396,24 @@ class SessionStorage:
             "provenance_source_channel, provenance_source_tool"
         )
         visible_roles_sql = "AND role IN ('user', 'assistant')" if tool_preview else ""
+
+        # Archive discovery must not pull a huge tool argument or reasoning
+        # body into Python just to identify the next original entry to read.
+        metadata_only = content_mode == "metadata"
+        if metadata_only:
+            content_sql, truncated_sql, envelope_sql = "NULL", "1", "NULL"
+        tool_calls_sql = "NULL" if metadata_only else "tool_calls"
+        reasoning_sql = "NULL" if metadata_only else "reasoning_content"
+        usage_sql = "NULL" if metadata_only else "turn_usage"
+        context_sql = "NULL" if metadata_only else "turn_context"
+        details_sql = (
+            "NULL AS tool_calls, NULL AS tool_call_id, NULL AS reasoning_content, "
+            "NULL AS assistant_replay, NULL AS turn_usage, NULL AS turn_context"
+            if tool_preview else
+            f"{tool_calls_sql} AS tool_calls, tool_call_id, "
+            f"{reasoning_sql} AS reasoning_content, {replay_sql} AS assistant_replay, "
+            f"{usage_sql} AS turn_usage, {context_sql} AS turn_context"
+        )
 
         cursor = before
         ascending = False
@@ -16132,11 +16572,88 @@ class SessionStorage:
             entries.reverse()
         return entries, has_more
 
+    async def get_canonical_transcript_fragment(
+        self,
+        session_id: str,
+        *,
+        message_id: str | None = None,
+        entry_id: int | None = None,
+        offset: int = 0,
+        limit: int = 4096,
+        revision: str | None = None,
+    ) -> dict[str, Any]:
+        """Read a bounded JSON fragment of one original entry, never a summary.
+
+        Offsets count Unicode characters in the serialized JSON, not bytes or
+        tokens. Existing content-range reads omit tool_calls; this projection
+        includes the original arguments and results without fetching an entire
+        oversized record into Python. Both identity alternatives remain scoped
+        to the admitted session, including archived original_entry_id values.
+        """
+        if ((message_id is None) == (entry_id is None)
+                or offset < 0 or not 1 <= limit <= 4096):
+            raise ValueError("Specify one entry identity and a valid bounded range")
+        key = "message_id" if message_id is not None else "id"
+        archive_key = "message_id" if message_id is not None else "original_entry_id"
+        identity = message_id if message_id is not None else entry_id
+        sql = f"""
+            WITH original AS (
+                SELECT id, message_id, role, content, tool_calls, tool_call_id,
+                       reasoning_content, created_at, content_revision,
+                       'active' AS source, 0 AS source_rank
+                FROM transcript_entries WHERE session_id = ? AND {key} = ?
+                UNION ALL
+                SELECT original_entry_id AS id, message_id, role, content,
+                       tool_calls, tool_call_id, reasoning_content, created_at,
+                       content_revision, 'compacted' AS source, 1 AS source_rank
+                FROM compacted_transcript_entries
+                WHERE session_id = ? AND {archive_key} = ?
+            ), selected AS (
+                SELECT * FROM original ORDER BY source_rank LIMIT 1
+            ), envelope AS (
+                SELECT id, message_id, source, created_at, content_revision,
+                       json_object('entry_id', id, 'message_id', message_id,
+                           'role', role, 'content', content,
+                           'tool_calls', CASE WHEN json_valid(tool_calls)
+                               THEN json(tool_calls) ELSE tool_calls END,
+                           'tool_call_id', tool_call_id,
+                           'reasoning_content', reasoning_content,
+                           'created_at', created_at) AS body
+                FROM selected
+            )
+            SELECT id, message_id, source, created_at, content_revision,
+                   length(body) AS total_chars, substr(body, ?, ?) AS text
+            FROM envelope
+        """
+        rows = await self._read_history_query(
+            sql, [session_id, identity, session_id, identity, offset + 1, limit],
+            operation="canonical_fragment",
+        )
+        if not rows:
+            raise ContentNotFoundError("Original entry was not found in this session")
+        row = dict(rows[0])
+        current_revision = (
+            f"{row['source']}:{row['id']}:{row['created_at']}:"
+            f"{row['content_revision'] or 0}:{row['total_chars']}"
+        )
+        if revision is not None and revision != current_revision:
+            raise ContentNotFoundError("Original entry changed; restart the fragment read")
+        if offset > row["total_chars"]:
+            raise ContentRangeError("Fragment offset exceeds original entry length")
+        return {
+            "entry_id": row["id"], "message_id": row["message_id"],
+            "source": row["source"], "revision": current_revision,
+            "offset": offset, "total_chars": row["total_chars"], "text": row["text"],
+        }
+
     async def get_canonical_transcript_coverage(
         self,
         session_id: str,
     ) -> CanonicalTranscriptCoverage:
         """Read canonical coverage and current session metadata in one snapshot."""
+        # A replacement that only rewrites a checkpoint archives no new rows.
+        # Accept its positive boundary only when an earlier row-removing summary
+        # already covered it; all archive/count checks below still apply.
         sql = """
             SELECT
                 session.compaction_count,
@@ -16160,7 +16677,23 @@ class SessionStorage:
                  WHERE summary.session_id = session.session_id
                    AND (
                      summary.compaction_id IS NULL
-                     OR (summary.removed_count = 0 AND summary.covered_through_id > 0)
+                     OR (
+                       summary.removed_count = 0 AND summary.covered_through_id > 0
+                       AND NOT (
+                         summary.summary_format = 'structured_v1'
+                         AND COALESCE(CASE WHEN json_valid(summary.summary_payload) THEN
+                           json_type(summary.summary_payload,
+                             '$.source_coverage.replaces_prior_context') = 'true'
+                         ELSE 0 END, 0)
+                         AND EXISTS (
+                           SELECT 1 FROM session_summaries AS prior
+                           WHERE prior.session_id = summary.session_id
+                             AND prior.id < summary.id
+                             AND prior.removed_count > 0
+                             AND prior.covered_through_id = summary.covered_through_id
+                         )
+                       )
+                     )
                      OR COALESCE((
                        SELECT COUNT(*)
                        FROM compacted_transcript_entries AS archived
@@ -17336,9 +17869,22 @@ class SessionStorage:
         source_matches = True
         archive_rows: list[dict[str, Any]] | None = None
         if expected_source_entries is not None:
-            source_rows = await self._read_transcript_rows(
-                node.session_id, len(expected_source_entries),
-            )
+            read_started = self._monotonic()
+            try:
+                source_rows = await self._read_transcript_rows(
+                    node.session_id, len(expected_source_entries),
+                )
+            except sqlite3.OperationalError as exc:
+                if not _is_sqlite_busy(exc):
+                    raise
+                # No rewrite transaction has started. Preserve that evidence
+                # rather than letting callers mistake a read refusal for an unknown commit.
+                raise StorageBusyError(
+                    "rewrite_compacted_session",
+                    waited_ms=max(0, int((self._monotonic() - read_started) * 1000)),
+                    retry_after_ms=_SQLITE_BUSY_TIMEOUT_MS,
+                    stage="preflight_read", resource="sqlite_reader",
+                ) from exc
             source_matches = await asyncio.to_thread(
                 _compaction_source_matches, source_rows, expected_source_entries,
                 expected_source_preimage, archived_entries or [], entries,
@@ -17417,10 +17963,29 @@ class SessionStorage:
                     SessionContextState(**_deserialize_row(dict(row)))
                     for row in context_rows
                 ]
+                recovery_kwargs: dict[str, Any] = {}
+                if expected_context_fingerprint.startswith("canonical:"):
+                    try:
+                        boundary = int(expected_context_fingerprint.split(":", 2)[1])
+                    except (ValueError, IndexError):
+                        return False
+                    if boundary <= 0:
+                        return False
+                    # Recovery candidates are bound to archived bytes as well
+                    # as damaged checkpoint metadata. Reuse the canonical
+                    # reader on this transaction; ordinary commits do no read.
+                    canonical_rows = await self._fetch_canonical_transcript_rows(
+                        conn, node.session_id,
+                    )
+                    recovery_kwargs = {
+                        "canonical_entries": _decode_transcript_rows(canonical_rows),
+                        "canonical_boundary": boundary,
+                    }
                 if (
                     compaction_context_fingerprint(
                         context_states=current_context_states,
                         summaries=current_summaries,
+                        **recovery_kwargs,
                     )
                     != expected_context_fingerprint
                 ):

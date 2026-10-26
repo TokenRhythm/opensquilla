@@ -289,6 +289,45 @@ def _add_session(
     connection.commit()
 
 
+def test_legacy_schema_usage_attribution_backfill_is_idempotent(tmp_path: Path) -> None:
+    path = tmp_path / "legacy.db"
+    connection = _database(path)
+    _add_session(
+        connection, key="agent:main:legacy", session_id="legacy-session",
+        content="legacy", suffix="legacy",
+    )
+    connection.close()
+
+    prepare_session_schema(path)
+    with sqlite3.connect(path) as upgraded:
+        owner = upgraded.execute(
+            "SELECT session_id, session_epoch, root_session_id, attribution_status "
+            "FROM usage_attribution_owners"
+        ).fetchall()
+        revision = upgraded.execute("SELECT revision FROM usage_accounting_state").fetchone()
+        assert owner == [("legacy-session", 0, "legacy-session", "complete")]
+        # Upgrading usage attribution must preserve deferred transcript backfill:
+        # install the title-query schema without scanning or rewriting old bodies.
+        for table, index in (
+            ("transcript_entries", "idx_transcript_title_candidates"),
+            ("compacted_transcript_entries", "idx_compacted_transcript_title_candidates"),
+        ):
+            assert upgraded.execute(
+                f"SELECT content, content_byte_length FROM {table}"
+            ).fetchall() == [("legacy", None)]
+            assert index in {
+                row[1] for row in upgraded.execute(f"PRAGMA index_list({table})")
+            }
+
+    prepare_session_schema(path)
+    with sqlite3.connect(path) as replayed:
+        assert replayed.execute(
+            "SELECT revision FROM usage_accounting_state"
+        ).fetchone() == revision
+        assert replayed.execute("SELECT COUNT(*) FROM usage_attribution_runs").fetchone() == (1,)
+        assert replayed.execute("SELECT COUNT(*) FROM usage_events").fetchone() == (1,)
+
+
 def test_merge_session_database_imports_complete_supported_session_graph(
     tmp_path: Path,
 ) -> None:

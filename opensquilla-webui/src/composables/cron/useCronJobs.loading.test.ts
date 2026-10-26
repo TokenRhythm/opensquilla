@@ -76,6 +76,28 @@ async function settle() {
 // Single-flight ownership, capacity backoff, and activation races are covered
 // by useCronJobs.lifecycle.test.ts. These cases retain feedback-specific guards.
 describe('cron refresh feedback', () => {
+  it('shows toggled and deleted jobs through refreshed data without redundant success toasts', async () => {
+    const { scheduler } = createScheduler()
+    const job = { id: 'saved', enabled: true }
+    scheduler.listJobs.mockResolvedValueOnce([job])
+      .mockResolvedValueOnce([{ ...job, enabled: false }])
+      .mockResolvedValueOnce([])
+    const { state } = mount(scheduler)
+    await state.loadData()
+
+    await state.toggleJob(job)
+    await settle()
+    expect(scheduler.setEnabled).toHaveBeenCalledExactlyOnceWith('saved', false)
+    expect(state.jobs.value[0]?.enabled).toBe(false)
+
+    await state.removeJob('saved')
+    await settle()
+    expect(scheduler.remove).toHaveBeenCalledExactlyOnceWith('saved')
+    expect(state.jobs.value).toEqual([])
+    expect(scheduler.listJobs).toHaveBeenCalledTimes(3)
+    expect(pushToast).not.toHaveBeenCalled()
+  })
+
   it('keeps automatic refresh errors visible without discarding last-good data', async () => {
     const { scheduler, finishRun } = createScheduler()
     scheduler.listJobs.mockResolvedValueOnce([{ id: 'saved' }])

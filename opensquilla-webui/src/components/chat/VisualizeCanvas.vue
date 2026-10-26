@@ -317,8 +317,10 @@ async function exportCanvas(mode: 'copy' | 'download' | 'html') {
       assertCurrent(); downloadBlob(png, filename)
     }
     assertCurrent()
-    exportFeedback.value = t(mode === 'copy' ? 'imageClipboard.copiedImage' : 'visualize.downloadStarted')
-    exportFeedbackTimer = setTimeout(clearExportFeedback, 3000)
+    if (mode !== 'copy') {
+      exportFeedback.value = t('visualize.downloadStarted')
+      exportFeedbackTimer = setTimeout(clearExportFeedback, 3000)
+    }
   } catch (cause) {
     const failure = preparationError ?? cause
     if (alive && scope.value === expectedScope && receiptVersion.value === expectedReceiptVersion && exportRequest === controller

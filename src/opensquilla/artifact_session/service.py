@@ -246,6 +246,7 @@ class ArtifactSessionService:
         self, *, session_key: str, session_id: str, name: str,
         initial_artifact: ArtifactBlobRef, actor: Actor, working_source: dict[str, str],
         validate_session: Callable[[Any], Awaitable[None]] | None = None,
+        kind: ArtifactKind = ArtifactKind.HTML,
     ) -> tuple[CommitResult, bool]:
         """Register trusted source metadata and an internal initial version as one unit."""
         from .working_files import WorkingFiles
@@ -268,6 +269,7 @@ class ArtifactSessionService:
             name=_bounded_text(name, "name", max_bytes=512),
             initial_artifact=_blob(initial_artifact),
             actor=_actor(actor), working_source=normalized, validate_session=validate_session,
+            kind=kind,
         )
 
     async def adopt_generated_deliverable(

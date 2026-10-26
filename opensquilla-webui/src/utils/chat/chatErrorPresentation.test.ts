@@ -56,12 +56,6 @@ describe('Chat user error presentation', () => {
     ['tool_policy_denied', 'toolDenied', undefined],
     ['turn_tool_error_budget_exceeded', 'toolFailed', undefined],
     ['tool_failure_loop_exhausted', 'toolFailed', undefined],
-    ['compaction_refused_empty_summary', 'contextUnavailable', undefined],
-    ['context_unsalvageable', 'contextUnavailable', undefined],
-    ['compaction_failed', 'contextUnavailable', undefined],
-    ['compaction_not_smaller', 'contextUnavailable', undefined],
-    ['compaction_exhausted', 'contextUnavailable', undefined],
-    ['compaction_deadline_exceeded', 'contextUnavailable', undefined],
   ] as const)('keeps the %s cause ahead of generic provider metadata', (code, key, action) => {
     expect(chatErrorPresentation({ code, failureKind: 'rate_limited' })).toEqual({
       messageKey: `chat.errorMessage.${key}`, ...(action ? { action } : {}),
@@ -69,6 +63,21 @@ describe('Chat user error presentation', () => {
     expect(chatErrorPresentation({ reason: code, failureKind: 'rate_limited' })).toEqual({
       messageKey: `chat.errorMessage.${key}`, ...(action ? { action } : {}),
     })
+  })
+
+  it.each([
+    'compaction_refused_empty_summary', 'context_unsalvageable', 'compaction_failed',
+    'compaction_not_smaller', 'compaction_exhausted', 'compaction_deadline_exceeded',
+  ])('keeps a known provider cause visible when context recovery ends with %s', code => {
+    expect(chatErrorPresentation({ code })).toEqual({ messageKey: 'chat.errorMessage.contextUnavailable' })
+    expect(chatErrorPresentation({ reason: code, failureKind: 'unknown' })).toEqual({ messageKey: 'chat.errorMessage.contextUnavailable' })
+    expect(chatErrorPresentation({ code, failureKind: 'auth_invalid' })).toEqual({
+      messageKey: 'chat.errorMessage.credentials', action: 'open-provider-settings',
+    })
+    expect(chatErrorPresentation({ reason: code, failureKind: 'rate_limited' })).toEqual({ messageKey: 'chat.errorMessage.rateLimited' })
+    expect(chatErrorPresentation({ code, failureKind: 'transport_transient' })).toEqual({ messageKey: 'chat.errorMessage.unavailable' })
+    expect(chatErrorPresentation({ code, terminalStatus: 'timeout', failureKind: 'auth_invalid' })).toEqual({ messageKey: 'chat.errorMessage.timeout' })
+    expect(chatErrorPresentation({ code, terminalStatus: 'cancelled', failureKind: 'auth_invalid' })).toEqual({ messageKey: 'chat.errorMessage.stopped' })
   })
 
   it.each([
@@ -178,6 +187,10 @@ describe('Chat user error presentation', () => {
     }
     expect(localizedChatErrorMessage(undefined, 'secret', false, undefined, 'failed', { reason: 'no_provider' }))
       .toBe('当前没有可用模型')
+    expect(localizedChatErrorMessage('compaction_exhausted', 'debug ref: abcdef01'))
+      .toBe('上下文整理未完成，本次无法继续，请稍后重试')
+    expect(localizedChatErrorMessage('provider_request_too_large', 'debug ref: abcdef01'))
+      .toBe('内容超出当前模型容量，请缩短输入或选择更大上下文的模型')
   })
 
   it.each(['chat.errorMessage.noProvider', ''])(

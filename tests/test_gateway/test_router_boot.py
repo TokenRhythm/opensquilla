@@ -188,7 +188,7 @@ def test_task_runtime_hard_deadline_honors_explicit_config() -> None:
     assert _task_runtime_turn_hard_deadline_s(config) == 12.5
 
 
-def test_gateway_server_close_releases_pid_lock_when_shutdown_step_fails() -> None:
+def test_gateway_server_close_retains_pid_lock_when_shutdown_step_fails() -> None:
     from opensquilla.gateway import boot
 
     released: list[str] = []
@@ -201,19 +201,20 @@ def test_gateway_server_close_releases_pid_lock_when_shutdown_step_fails() -> No
         async def stop_all(self, *, timeout: float | None = None) -> None:
             raise RuntimeError("channel stop failed")
 
+    pid_lock = FakePidLock()
     server = boot.GatewayServer(
         app=SimpleNamespace(),
         config=GatewayConfig(),
         _channel_manager=FailingChannelManager(),
-        _pid_lock=FakePidLock(),
+        _pid_lock=pid_lock,
     )
 
     async def run_case() -> None:
         with pytest.raises(RuntimeError, match="channel stop failed"):
             await server.close()
 
-        assert released == ["released"]
-        assert server._pid_lock is None
+        assert released == []
+        assert server._pid_lock is pid_lock
 
     asyncio.run(run_case())
 
@@ -1329,6 +1330,7 @@ async def test_build_services_defers_sandbox_startup_until_gateway_ready(
         assert events == ["runtime"]
         assert scheduled == []
         assert services.sandbox_setup_task is None
+        assert services.tool_registry.get("agent_file") is None
     finally:
         await services.close()
     assert events == ["runtime", "runtime_reset"]
@@ -2089,6 +2091,8 @@ async def test_start_gateway_server_wires_cron_failure_dispatcher(
         mcp={"enabled": False},
     )
 
+    # Explicit shared roots must already exist; startup no longer creates projects.
+    Path(config.workspace_dir).mkdir(parents=True)
     services = await build_services(
         config=config,
         tool_registry=registry,

@@ -79,6 +79,7 @@
             v-for="annotation in promptAnnotations"
             :key="annotation.annotationId"
             class="chat-prompt-annotation-chip"
+            :class="{ 'is-stale': annotation.freshness === 'stale' }"
             :data-annotation-id="annotation.annotationId"
             role="group"
           >
@@ -111,7 +112,6 @@
                 type="button"
                 class="chat-prompt-annotation-chip__main"
                 :title="annotation.body"
-                :disabled="Boolean(annotation.selection)"
                 @click="emit('jumpPromptAnnotation', annotation.annotationId)"
               >
                 <span class="chat-prompt-annotation-chip__target">
@@ -119,6 +119,9 @@
                 </span>
                 <span class="chat-prompt-annotation-chip__text">
                   {{ annotation.body || t('chat.promptAnnotations.emptyDraft') }}
+                </span>
+                <span v-if="annotation.freshness === 'stale'" class="chat-prompt-annotation-chip__stale">
+                  {{ t('workbench.annotationUnified.stale') }}
                 </span>
               </button>
               <button
@@ -246,6 +249,40 @@
                 @close="closeAddMenu"
               />
             </div>
+            <div ref="runModeAnchorEl" class="chat-settings-anchor chat-run-mode-anchor">
+              <button
+                class="btn btn--ghost chat-run-mode-btn"
+                :class="[`chat-run-mode-btn--${runMode}`, {
+                  'is-active': runModeOpen,
+                  'is-locked': runModeLocked,
+                }]"
+                :title="runModeLocked ? undefined : runModeLabel"
+                :aria-label="`${t('chat.composer.runMode')}: ${runModeLabel}`"
+                aria-haspopup="dialog"
+                :aria-expanded="runModeOpen ? 'true' : 'false'"
+                :aria-disabled="runModeLocked ? 'true' : 'false'"
+                :aria-describedby="runModeLocked ? runModeLockTooltipId : undefined"
+                :disabled="runModeLocked"
+                @click="toggleRunMode"
+              >
+                <Icon name="shield" :size="16" aria-hidden="true" />
+                <span class="chat-run-mode-btn__label">{{ runModeLabel }}</span>
+              </button>
+              <span
+                v-if="runModeLocked"
+                :id="runModeLockTooltipId"
+                class="chat-run-mode-lock-tip"
+                role="tooltip"
+              >{{ runModeLockMessage }}</span>
+              <ChatComposerRunMode
+                v-if="runModeOpen"
+                :run-mode="runMode"
+                :allowed-run-modes="allowedRunModes"
+                :safe-setup-available="safeSetupAvailable"
+                @close="runModeOpen = false"
+                @set-run-mode="emit('setRunMode', $event)"
+              />
+            </div>
             <div
               v-if="showProjectContext && projectWorkspace"
               class="chat-project-chip"
@@ -287,40 +324,6 @@
               <Icon class="chat-project-choose__chevron" name="chevronDown" :size="12" />
             </button>
 
-            <div ref="runModeAnchorEl" class="chat-settings-anchor chat-run-mode-anchor">
-              <button
-                class="btn btn--ghost chat-run-mode-btn"
-                :class="[`chat-run-mode-btn--${runMode}`, {
-                  'is-active': runModeOpen,
-                  'is-locked': runModeLocked,
-                }]"
-                :title="runModeLocked ? undefined : runModeLabel"
-                :aria-label="`${t('chat.composer.runMode')}: ${runModeLabel}`"
-                aria-haspopup="dialog"
-                :aria-expanded="runModeOpen ? 'true' : 'false'"
-                :aria-disabled="runModeLocked ? 'true' : 'false'"
-                :aria-describedby="runModeLocked ? runModeLockTooltipId : undefined"
-                :disabled="runModeLocked"
-                @click="toggleRunMode"
-              >
-                <Icon name="shield" :size="16" aria-hidden="true" />
-                <span class="chat-run-mode-btn__label">{{ runModeLabel }}</span>
-              </button>
-              <span
-                v-if="runModeLocked"
-                :id="runModeLockTooltipId"
-                class="chat-run-mode-lock-tip"
-                role="tooltip"
-              >{{ runModeLockMessage }}</span>
-              <ChatComposerRunMode
-                v-if="runModeOpen"
-                :run-mode="runMode"
-                :allowed-run-modes="allowedRunModes"
-                :safe-setup-available="safeSetupAvailable"
-                @close="runModeOpen = false"
-                @set-run-mode="emit('setRunMode', $event)"
-              />
-            </div>
             <ChatComposerGoalMode
               v-if="policy.goal"
               :active="goalDraftArmed"
@@ -357,7 +360,7 @@
               >
                 <Icon v-if="sessionRoutingMode === 'squilla_router'" name="router" :size="17" />
                 <Icon v-else-if="sessionRoutingMode === 'llm_ensemble'" name="fork" :size="17" />
-                <Icon v-else name="agents" :size="17" aria-hidden="true" />
+                <span v-else class="chat-model-routing-btn__dot" aria-hidden="true" />
                 <span class="chat-model-routing-btn__label">{{ modelRoutingTriggerLabel }}</span>
                 <span v-if="modelRoutingUsesDefault" class="chat-model-routing-btn__default">{{ t('chat.newTaskModel.defaultBadge') }}</span>
                 <Icon class="chat-model-routing-btn__chevron" name="chevronDown" :size="12" />
@@ -580,6 +583,7 @@ const props = withDefaults(defineProps<{
   voiceRecording: boolean
   voiceReady: boolean
   projectWorkspace?: { id: string; name: string; path: string } | null
+  /** Settled presentation; sendBlockedMessage independently gates operations. */
   projectWorkspaceStatus?: 'none' | 'resolving' | 'ready' | 'unavailable' | 'removed' | 'unknown' | 'error'
   projectBindingBusy?: boolean
   projectStatusMessage?: string
@@ -1268,6 +1272,7 @@ defineExpose<ChatComposerExpose>({
   text-overflow: ellipsis;
   white-space: nowrap;
 }
+.chat-prompt-annotation-chip__stale { color: var(--warn); font-size: 11px; }
 
 .chat-prompt-annotation-chip__target {
   padding: 0.125rem 0.375rem;
@@ -1802,6 +1807,22 @@ button.attachment-chip__primary:focus-visible {
   text-align: left;
 }
 
+.chat-model-routing-btn__dot {
+  flex: 0 0 17px;
+  width: 17px;
+  height: 17px;
+  display: grid;
+  place-items: center;
+}
+
+.chat-model-routing-btn__dot::before {
+  content: "";
+  width: 5px;
+  height: 5px;
+  border-radius: 50%;
+  background: var(--accent);
+}
+
 .chat-model-routing-btn__default {
   flex-shrink: 0;
   color: var(--text-dim);
@@ -1953,6 +1974,14 @@ button.attachment-chip__primary:focus-visible {
 .chat-send-control {
   position: relative;
   display: inline-flex;
+  /* Reserve the Stop target while a chat's task ownership is still loading.
+     Send remains visually smaller, but swapping controls cannot resize the
+     footer and push the textarea up. Keep both buttons on the same right edge. */
+  flex: 0 0 44px;
+  min-width: 44px;
+  min-height: 44px;
+  align-items: center;
+  justify-content: flex-end;
   border-radius: var(--radius-full);
 }
 

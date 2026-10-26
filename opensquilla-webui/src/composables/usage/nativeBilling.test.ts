@@ -33,13 +33,23 @@ function receipt(
 }
 
 describe('native billing display contract', () => {
+  it('shows plain monetary amounts while distinguishing unpriced usage from confirmed zero', () => {
+    const unpriced = { costSource: 'unavailable', missingCostEntries: 1 }
+    expect(formatUsageCost(0, 'USD', 7.25, 4, unpriced)).toBe('Unpriced')
+    expect(formatUsageCost(0, 'CNY', 7.25, 4, unpriced)).toBe('Unpriced')
+    expect(formatUsageCost(1, 'USD', 7.25, 4, {
+      costSource: 'mixed', costSourceCounts: { provider_billed: 1, unavailable: 1 },
+    })).toBe('$1.0000')
+    expect(formatUsageCost(0, 'USD', 7.25, 4, {
+      costSource: 'provider_billed', missingCostEntries: 0,
+    })).toBe('$0.0000')
+  })
+
   it('shows a fully covered confirmed CNY receipt as exact', () => {
     const source = receipt('CNY', '6.975', '1000000000')
 
     expect(nativeBillingDisplay(source, 1)).toMatchObject({
       exactCny: 6.975,
-      useCanonicalUsd: false,
-      subtotalText: '¥6.975',
     })
     expect(formatUsageCost(1, 'CNY', 7.25, 4, source)).toBe('¥6.9750')
     expect(formatUsageCost(1, 'USD', 7.25, 4, source)).toBe('$1.0000')
@@ -57,7 +67,6 @@ describe('native billing display contract', () => {
 
     expect(nativeBillingDisplay(source, 1)).toMatchObject({
       exactCny: null,
-      useCanonicalUsd: true,
     })
     expect(formatUsageCost(1, 'CNY', 7.25, 4, source)).toBe('¥7.2500')
   })
@@ -69,7 +78,6 @@ describe('native billing display contract', () => {
 
     expect(nativeBillingDisplay(source, 0)).toMatchObject({
       exactCny: null,
-      useCanonicalUsd: true,
     })
     expect(formatUsageCost(0, 'CNY', 7.25, 4, source)).toBe('¥0.0000')
   })
@@ -82,7 +90,6 @@ describe('native billing display contract', () => {
 
     expect(nativeBillingDisplay(source, 1)).toMatchObject({
       exactCny: 6.975,
-      useCanonicalUsd: false,
     })
     expect(formatUsageCost(1, 'CNY', 7.25, 4, source)).toBe('¥6.9750')
   })
@@ -124,8 +131,6 @@ describe('native billing display contract', () => {
     expect(formatUsageCost(0.5, 'CNY', 7.25, 4, pending)).toBe('¥3.6250')
     expect(nativeBillingDisplay(mixed, 3)).toMatchObject({
       exactCny: null,
-      useCanonicalUsd: true,
-      subtotalText: '¥6.975 · $2',
     })
     expect(formatUsageCost(3, 'CNY', 7.25, 4, mixed)).toBe('¥21.7500')
   })

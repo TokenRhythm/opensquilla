@@ -59,6 +59,7 @@ EXPECTED_SESSION_CONTROL_METHODS = (
 )
 EXPECTED_WORKSPACE_METHODS = (
     "workspaces.list",
+    "workspaces.create",
     "workspaces.open",
     "workspaces.update",
     "workspaces.pin",
@@ -152,6 +153,7 @@ _WORKSPACE = {
 }
 
 _VALID_REGISTRATION_RESULTS: dict[str, dict[str, Any]] = {
+    "workspaces.create": {"workspace": _WORKSPACE},
     "workspaces.open": {"workspace": _WORKSPACE},
     "workspaces.update": {"workspace": _WORKSPACE},
     "workspaces.pin": {"workspace": _WORKSPACE},
@@ -209,7 +211,7 @@ _VALID_REGISTRATION_RESULTS: dict[str, dict[str, Any]] = {
 @pytest.mark.parametrize(
     ("methods", "register"),
     (
-        (EXPECTED_WORKSPACE_METHODS[1:6], register_workspace_catalog_contract),
+        (EXPECTED_WORKSPACE_METHODS[1:7], register_workspace_catalog_contract),
         (
             EXPECTED_MIGRATION_OPERATIONS_METHODS,
             register_migration_operations_contract,
@@ -249,7 +251,7 @@ async def test_final_contract_bindings_call_each_implementation_exactly_once(
 @pytest.mark.parametrize(
     ("methods", "register"),
     (
-        (EXPECTED_WORKSPACE_METHODS[1:6], register_workspace_catalog_contract),
+        (EXPECTED_WORKSPACE_METHODS[1:7], register_workspace_catalog_contract),
         (
             EXPECTED_MIGRATION_OPERATIONS_METHODS,
             register_migration_operations_contract,
@@ -282,7 +284,7 @@ async def test_final_contract_bindings_fail_closed_on_invalid_success_payload(
 
 def test_final_contract_bindings_preserve_non_guest_policy() -> None:
     for method in (
-        *EXPECTED_WORKSPACE_METHODS[1:6],
+        *EXPECTED_WORKSPACE_METHODS[1:7],
         *EXPECTED_MIGRATION_OPERATIONS_METHODS,
     ):
         assert GATEWAY_METHOD_CONTRACTS[method].guest_allowed is False

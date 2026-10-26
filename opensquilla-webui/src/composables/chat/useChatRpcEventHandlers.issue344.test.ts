@@ -421,6 +421,107 @@ describe('issue #344 — live stream is bound to a single task', () => {
     expect(messages.value[0]?.usage).toBeUndefined()
   })
 
+  it.each(['session.event.error', 'task.failed'])(
+    'keeps a failed outcome received after partial done through %s',
+    async (failureEvent) => {
+      await loadLocaleMessages('en')
+      i18n.global.locale.value = 'en'
+      const { api, stream, messages, activeTaskId, options, scope } = makeHarness('task-B')
+      options.supportsTurnCommitted = () => true
+      vi.mocked(stream.endStreaming).mockImplementation(() => {
+        stream.isStreaming.value = false
+        messages.value.push({ role: 'assistant', text: 'Work in progress before provider failure', ts: 'now' })
+      })
+      const failure = {
+        key: SESSION, task_id: 'task-B', turn_id: 'task-B', epoch: 0,
+        stream_seq: 2, error_class: '402', http_status: 402,
+        terminal_reason: 'error',
+        turn_outcome: { kind: 'failed', reason: '402', error_class: '402',
+          failure_kind: 'insufficient_credits', http_status: 402, retryable: false },
+      }
+      try {
+        api.handlers.onWireEventFixture('session.event.done', {
+          key: SESSION, task_id: 'task-B', turn_id: 'task-B', epoch: 0,
+          stream_seq: 1, text: 'Work in progress before provider failure',
+        })
+        expect(activeTaskId.value).toBe(FINISHED_STREAM_TASK_ID)
+        expect(api.awaitingCommitTaskIds.value.has('task-B')).toBe(true)
+        api.handlers.onWireEventFixture(failureEvent, failure)
+        api.handlers.onWireEventFixture('task.failed', { ...failure, stream_seq: 3 })
+        api.handlers.onWireEventFixture('session.event.error', { ...failure, stream_seq: 4 })
+        // A delayed duplicate done must not turn the failed turn into success.
+        api.handlers.onWireEventFixture('session.event.done', {
+          key: SESSION, task_id: 'task-B', stream_seq: 5, text: 'partial',
+        })
+
+        expect(messages.value.filter(message => message.role === 'error')).toHaveLength(1)
+        expect(messages.value[0]).toMatchObject({
+          role: 'assistant', text: 'Work in progress before provider failure', turnId: 'task-B',
+          turnOutcome: { status: 'failed', failureKind: 'insufficient_credits', httpStatus: 402 },
+        })
+        expect(messages.value[1]).toMatchObject({ role: 'error', terminalNotice: true,
+          turnOutcome: { status: 'failed', failureKind: 'insufficient_credits', httpStatus: 402 } })
+        expect(messages.value[1]?.text).toMatch(/credit/i)
+        expect(stream.endStreaming).toHaveBeenCalledTimes(1)
+        expect(stream.startStreaming).not.toHaveBeenCalled()
+        expect(api.awaitingCommitTaskIds.value.has('task-B')).toBe(false)
+        expect(options.applySessionRunState).toHaveBeenLastCalledWith(expect.objectContaining({ run_status: 'failed' }))
+      } finally { scope.stop() }
+    },
+  )
+
+  it.each(['new-task', 'old-epoch'])(
+    'does not adopt an earlier done turn failure after %s',
+    (boundary) => {
+      const { api, stream, messages, activeTaskId, options, scope } = makeHarness('task-A')
+      vi.mocked(stream.endStreaming).mockImplementation(() => {
+        stream.isStreaming.value = false
+        messages.value.push({ role: 'assistant', text: 'partial A', ts: 'now' })
+      })
+      try {
+        api.handlers.onWireEventFixture('session.event.done', {
+          key: SESSION, task_id: 'task-A', epoch: 0, stream_seq: 1, text: 'partial A',
+        })
+        if (boundary === 'new-task') {
+          activeTaskId.value = 'task-B'
+          stream.isStreaming.value = true
+          messages.value.push({ role: 'user', text: 'New task B', turnId: 'task-B', ts: 'now' })
+        } else options.currentEpoch.value = 1
+        vi.mocked(options.applySessionRunState).mockClear()
+        api.handlers.onWireEventFixture('session.event.error', {
+          key: SESSION, task_id: 'task-A', epoch: 0, stream_seq: 2,
+          error_class: '402', http_status: 402,
+          turn_outcome: { kind: 'failed', failure_kind: 'insufficient_credits' },
+        })
+        expect(messages.value.some(message => message.role === 'error')).toBe(false)
+        expect(options.applySessionRunState).not.toHaveBeenCalled()
+        expect(stream.endStreaming).toHaveBeenCalledTimes(1)
+      } finally { scope.stop() }
+    },
+  )
+
+  it('does not replace a provider failure with a later done receipt', () => {
+    const { api, stream, messages, activeTaskId, options, scope } = makeHarness('task-B')
+    vi.mocked(stream.endStreaming).mockImplementation(() => {
+      stream.isStreaming.value = false
+      messages.value.push({ role: 'assistant', text: 'partial answer', ts: 'now' })
+    })
+    try {
+      api.handlers.onWireEventFixture('session.event.error', {
+        key: SESSION, task_id: 'task-B', stream_seq: 1, error_class: '402', http_status: 402,
+        turn_outcome: { kind: 'failed', failure_kind: 'insufficient_credits', http_status: 402 },
+      })
+      api.handlers.onWireEventFixture('session.event.done', {
+        key: SESSION, task_id: 'task-B', stream_seq: 2, text: 'partial answer',
+      })
+      expect(activeTaskId.value).toBe(FINISHED_STREAM_TASK_ID)
+      expect(messages.value.filter(message => message.role === 'error')).toHaveLength(1)
+      expect(messages.value[0]?.turnOutcome?.status).toBe('failed')
+      expect(stream.endStreaming).toHaveBeenCalledTimes(1)
+      expect(options.applySessionRunState).toHaveBeenLastCalledWith(expect.objectContaining({ run_status: 'failed' }))
+    } finally { scope.stop() }
+  })
+
   it("does not end the current stream on a stale task's terminal sessions.changed", () => {
     const { api, stream, options } = makeHarness('task-B')
     api.handlers.onWireEventFixture('sessions.changed', {
@@ -774,7 +875,7 @@ describe('issue #344 — live stream is bound to a single task', () => {
     expect(stream.appendToolCall).toHaveBeenCalledWith(earlyTool)
   })
 
-  it('marks overflow dirty and installs the complete authoritative text instead of a truncated tail', () => {
+  it('retains early deltas beyond the former frame cap until the response binds their task', () => {
     const { api, stream, options, scope } = makeHarness(PENDING_STREAM_TASK_ID)
 
     for (let index = 0; index < 70; index++) {
@@ -788,60 +889,36 @@ describe('issue #344 — live stream is bound to a single task', () => {
 
     api.bindActiveStreamTask('task-B')
 
-    expect(options.onRecoveryRequired).toHaveBeenCalledOnce()
-    expect(stream.appendDelta).not.toHaveBeenCalled()
+    expect(options.onRecoveryRequired).not.toHaveBeenCalled()
     const completeText = Array.from({ length: 70 }, (_, index) => `delta-${index}`).join('')
-    api.beginRecovery()
-    api.restoreLiveTurnSnapshot({
-      sessionKey: SESSION, taskId: 'task-B', currentStreamSeq: 70, streamGeneration: 'stream-1',
-      events: [{ semanticKind: 'text-delta', payload: { key: SESSION, task_id: 'task-B', text: completeText } }],
-    })
-    expect(api.finishRecovery()).toBe(true)
-    expect(stream.appendDelta).toHaveBeenCalledOnce()
-    expect(vi.mocked(stream.appendDelta).mock.calls[0]?.[0]).toBe(completeText)
+    expect(stream.appendDelta).toHaveBeenCalledTimes(70)
+    expect(vi.mocked(stream.appendDelta).mock.calls.map(([text]) => text).join('')).toBe(completeText)
     expect(options.lastStreamSeq.value).toBe(70)
     scope.stop()
   })
 
-  it('marks terminal bucket overflow dirty and recovers only the authoritative task terminal', () => {
-    const oldest = makeHarness(PENDING_STREAM_TASK_ID)
+  it.each([0, 8])('retains terminal candidates beyond the former task cap and consumes only task-%i', (boundIndex) => {
+    const { api, stream, options, messages, activeTaskId, scope } = makeHarness(PENDING_STREAM_TASK_ID)
     for (let index = 0; index < 9; index++) {
-      oldest.api.handlers.onWireEventFixture('task.failed', {
+      api.handlers.onWireEventFixture('task.failed', {
         task_id: `task-${index}`,
         session_key: SESSION,
         terminal_message: `Task ${index} failed.`,
       })
     }
 
-    oldest.api.bindActiveStreamTask('task-0')
-    expect(oldest.stream.endStreaming).not.toHaveBeenCalled()
-    expect(oldest.options.onRecoveryRequired).toHaveBeenCalledOnce()
-
-    const newest = makeHarness(PENDING_STREAM_TASK_ID)
-    for (let index = 0; index < 9; index++) {
-      newest.api.handlers.onWireEventFixture('task.failed', {
-        task_id: `task-${index}`,
-        session_key: SESSION,
-        terminal_message: `Task ${index} failed.`,
-      })
-    }
-
-    newest.api.bindActiveStreamTask('task-8')
-    expect(newest.options.onRecoveryRequired).toHaveBeenCalledOnce()
-    expect(newest.stream.endStreaming).not.toHaveBeenCalled()
-    newest.api.beginRecovery()
-    newest.api.restoreLiveTurnSnapshot({
-      sessionKey: SESSION, taskId: 'task-8', currentStreamSeq: 9,
-      events: [{ semanticKind: 'turn-failed', payload: {
-        key: SESSION, task_id: 'task-8', terminal_message: 'Task 8 failed.',
-      } }],
-    })
-    expect(newest.api.finishRecovery()).toBe(true)
-    expect(newest.stream.endStreaming).toHaveBeenCalledTimes(1)
-    expect(newest.messages.value[newest.messages.value.length - 1]?.text).toBe('This request did not finish.')
-    expect(newest.options.lastStreamSeq.value).toBe(9)
-    oldest.scope.stop()
-    newest.scope.stop()
+    expect(stream.endStreaming).not.toHaveBeenCalled()
+    expect(messages.value).toEqual([])
+    api.bindActiveStreamTask(`task-${boundIndex}`)
+    expect(options.onRecoveryRequired).not.toHaveBeenCalled()
+    expect(stream.endStreaming).toHaveBeenCalledOnce()
+    expect(messages.value).toHaveLength(1)
+    expect(messages.value[0]?.text).toBe('This request did not finish.')
+    expect(activeTaskId.value).toBe(FINISHED_STREAM_TASK_ID)
+    expect(options.applySessionRunState).toHaveBeenLastCalledWith(expect.objectContaining({
+      last_task: expect.objectContaining({ task_id: `task-${boundIndex}` }),
+    }))
+    scope.stop()
   })
 
   it("accepts the exact Stop target's cancelled terminal without poisoning the render id", () => {

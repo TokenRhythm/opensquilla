@@ -20,6 +20,7 @@ const { t } = useI18n()
 const platform = usePlatform()
 const access = inject(WORKSPACE_FILES_KEY, null)
 const panel = ref<HTMLElement | null>(null)
+const textPreview = ref<HTMLElement | null>(null)
 const loading = ref(false)
 const failed = ref(false)
 const unsupported = ref(false)
@@ -70,6 +71,20 @@ function download() {
   if (blob.value && props.file) emit('action', 'download', props.file)
 }
 function showActions(event: MouseEvent | KeyboardEvent) {
+  const isContextMenu = event.type === 'contextmenu' || event instanceof KeyboardEvent
+    && (event.key === 'ContextMenu' || event.shiftKey && event.key === 'F10')
+  if (isContextMenu) {
+    const target = event.target instanceof Element ? event.target : null
+    // Leave editing and selected preview text to the browser/Desktop menu.
+    // The file menu still owns unselected content, the header and its trigger.
+    if (target?.closest('input, textarea, select, [contenteditable="true"], [contenteditable="plaintext-only"], [contenteditable=""]')) return
+    const body = textPreview.value
+    const selection = body?.ownerDocument.getSelection()
+    if (body && target && body.contains(target) && selection && !selection.isCollapsed
+      && selection.toString() && selection.rangeCount > 0
+      && Array.from({ length: selection.rangeCount }, (_, index) => selection.getRangeAt(index))
+        .every(range => body.contains(range.commonAncestorContainer))) return
+  }
   if (props.file) void actionsMenu.value?.show(event, props.file)
 }
 function handleAction(action: WorkspaceFileAction, file: WorkspaceFile) {
@@ -108,7 +123,7 @@ function formatType(file: WorkspaceFile): string {
         <p v-else-if="failed" role="alert">{{ t('workspaceReference.unavailable') }}</p>
         <p v-else-if="unsupported" role="status">{{ t('workspaceReference.unsupported') }} · {{ file.mime }} · {{ formatSize(file.size) }}</p>
         <img v-else-if="imageUrl" :src="imageUrl" :alt="file.name" />
-        <pre v-else tabindex="0"><code>{{ content }}</code></pre>
+        <pre v-else ref="textPreview" tabindex="0"><code>{{ content }}</code></pre>
         <footer v-if="blob">
           <button type="button" class="btn btn--primary" @click="download"><Icon name="download" :size="14" />{{ t(platform.files.saveArtifact ? 'resourceActions.saveAs' : 'chat.download') }}</button>
         </footer>

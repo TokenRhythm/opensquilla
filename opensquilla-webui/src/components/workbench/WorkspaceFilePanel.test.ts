@@ -293,15 +293,26 @@ describe('workspace source panel', () => {
     expect(el.querySelector('[aria-current="location"]')?.getAttribute('data-line')).toBe('450')
   })
 
-  it('delegates whole-file copy to its runtime and surfaces pending/failure state', async () => {
+  it('delegates whole-file copy and renders check, pending, and failure states without changing its action name', async () => {
     const { el, state, onEvent } = await mount({ snapshot: page() })
     const copy = el.querySelector<HTMLButtonElement>('button[aria-label="Copy file contents"]')!
     copy.click()
     expect(onEvent).toHaveBeenLastCalledWith({ type: 'workspace-file-copy' })
+    const icon = copy.innerHTML
+    expect(copy.title).toBe('Copy file contents')
     state.copying = true
     await nextTick()
     expect(copy.disabled).toBe(true)
     state.copying = false
+    state.copied = true
+    await nextTick()
+    expect(copy.innerHTML).not.toBe(icon)
+    expect(copy.title).toBe('Copy file contents')
+    expect(copy.getAttribute('aria-label')).toBe('Copy file contents')
+    state.copied = false
+    await nextTick()
+    expect(copy.innerHTML).toBe(icon)
+    expect(copy.title).toBe('Copy file contents')
     state.copyErrorKey = 'workspaceReference.copyFailed'
     await nextTick()
     expect(el.querySelector('[role="alert"]')?.textContent).toContain('Could not copy')

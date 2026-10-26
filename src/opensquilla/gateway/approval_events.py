@@ -351,12 +351,15 @@ def register_approval_event_bridge(
             if session_key:
                 # The queue may have committed on its storage worker. Keep
                 # stream persistence off the Gateway loop as well.
-                payload = await asyncio.to_thread(
+                recorded = await asyncio.to_thread(
                     get_session_streams().record,
                     session_key,
                     event_name,
                     payload,
                 )
+                if recorded is None:
+                    return
+                payload = recorded
             emit_coro = event_bridge.broadcast_scoped(
                 event_name,
                 payload,

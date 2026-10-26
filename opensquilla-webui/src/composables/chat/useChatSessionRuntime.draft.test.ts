@@ -1,14 +1,18 @@
-import { describe, expect, it, vi } from 'vitest'
-import { ref } from 'vue'
+import { afterEach, describe, expect, it, vi } from 'vitest'
+import { effectScope, nextTick, ref } from 'vue'
 
 import { useChatSessionRuntime } from './useChatSessionRuntime'
 import { useChatTaskOwnership } from './useChatTaskOwnership'
+import { useChatComposerShortcuts } from './useChatComposerShortcuts'
+import { createMemoryChatDraftStorage, useChatDraftPersistence } from './useChatDraftPersistence'
+import { useLocalPathDraft } from './useLocalPathDraft'
 import type { ChatMessage } from '@/types/chat'
 
 describe('useChatSessionRuntime project drafts', () => {
   it('clears composer state when an explicit new task replaces an empty draft', () => {
     const sessionKey = ref('agent:main:webchat:project-a-draft')
     const resetDraftComposer = vi.fn()
+    const resetInputHistory = vi.fn()
     const taskOwnership = useChatTaskOwnership()
     taskOwnership.noteRunning('task-project-a')
     const activeStreamTaskId = ref('task-project-a')
@@ -62,6 +66,7 @@ describe('useChatSessionRuntime project drafts', () => {
       resetSavingsPopupCooldown: vi.fn(),
       restoreWidgetState: vi.fn(),
       resetStreamLiveTurnState: vi.fn(),
+      resetInputHistory,
       resetDraftComposer,
     })
 
@@ -69,6 +74,7 @@ describe('useChatSessionRuntime project drafts', () => {
 
     expect(sessionKey.value).toBe('agent:main:webchat:project-b-draft')
     expect(resetDraftComposer).toHaveBeenCalledOnce()
+    expect(resetInputHistory).toHaveBeenCalledOnce()
     expect(taskOwnership.runningTaskId.value).toBe('')
     expect(taskOwnership.queuedTaskIds.value.size).toBe(0)
     expect(taskOwnership.hydrationResolved.value).toBe(true)
@@ -165,5 +171,122 @@ describe('useChatSessionRuntime project drafts', () => {
 
     resolveHistory()
     await history
+  })
+})
+
+describe('session navigation with composer history and persisted drafts', () => {
+  afterEach(() => { vi.unstubAllGlobals() })
+
+  it.each([
+    [0, 'ArrowUp'], [0, 'ArrowDown'], [1, 'ArrowUp'], [1, 'ArrowDown'],
+    [5, 'ArrowUp'], [5, 'ArrowDown'],
+  ] as const)('preserves B draft and paths with %i history entries after %s', async (count, key) => {
+    vi.stubGlobal('HTMLTextAreaElement', class {})
+    const scope = effectScope()
+    const sessionA = 'agent:main:webchat:history-a'
+    const sessionB = 'agent:main:webchat:history-b'
+    const sessionKey = ref(sessionA)
+    const messages = ref<ChatMessage[]>(Array.from({ length: 5 }, (_, index) => ({
+      role: 'user', text: `A request ${index + 1}`, ts: null,
+    })))
+    const draft = useLocalPathDraft()
+    const storage = createMemoryChatDraftStorage()
+    const savedB = JSON.stringify({
+      version: 1, text: 'B saved draft', selectedSkills: [], localPaths: ['C:\\B-draft.pdf'],
+    })
+    storage.setItem(`opensquilla.chat.draft:${sessionB}`, savedB)
+    scope.run(() => useChatDraftPersistence({
+      sessionKey, inputText: draft.composerText, localPaths: draft.localPaths, storage,
+    }))
+    const shortcuts = useChatComposerShortcuts({
+      inputText: draft.inputText,
+      textareaText: draft.composerText,
+      localPathReferences: draft.localPaths,
+      restoreInput: draft.restoreInput,
+      composing: ref(false),
+      messages,
+      pendingQueue: ref([]),
+      canQueueMore: ref(true),
+      slashOpen: ref(false),
+      slashIdx: ref(0),
+      filteredSlashCmds: ref([]),
+      isStreaming: ref(false),
+      isSafariWebKit: () => false,
+      autoResizeTextarea: vi.fn(),
+      handleSlashInput: vi.fn(),
+      closeSlashMenu: vi.fn(),
+      completeSlashCmd: vi.fn(),
+      activateSlashCmd: vi.fn(),
+      popPendingTail: () => false,
+      enqueuePendingInput: () => false,
+      sendCurrentInput: vi.fn(),
+    })
+    const resetDraftComposer = vi.fn(() => { draft.inputText.value = '' })
+    const runtime = useChatSessionRuntime({
+      sessionKey, messages,
+      pendingSessionIntent: ref(null),
+      routerDecisionPending: ref(null),
+      currentEpoch: ref(0),
+      lastStreamSeq: ref(0),
+      activeTaskGroups: ref(new Set<string>()),
+      aborted: ref(false),
+      lastHeaderRole: ref(''),
+      lastHeaderDay: ref(''),
+      usageAccum: ref({
+        input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: null,
+        routedTurns: 0, sessionSaved: 0,
+      }),
+      usageModel: ref(''),
+      createSessionKey: () => '',
+      persistSession: target => { sessionKey.value = target },
+      cancelSessionBootstrap: vi.fn(),
+      startSessionBootstrap: () => {
+        messages.value = Array.from({ length: count }, () => ({
+          role: 'user', text: 'B previous request', ts: null,
+        }))
+        return {
+          generation: 1,
+          criticalRequestsQueued: Promise.resolve(),
+          history: Promise.resolve({ ok: true }),
+          live: Promise.resolve({ authoritative: true, live: false, backgroundOnly: false }),
+        }
+      },
+      loadCurrentSessionUsage: vi.fn(),
+      applySessionRunState: vi.fn(),
+      setCompactInFlight: vi.fn(),
+      hideCompactStatus: vi.fn(),
+      clearPendingQueue: vi.fn(),
+      switchPendingQueue: vi.fn(),
+      adoptPendingQueue: vi.fn(),
+      resetSavingsPopupCooldown: vi.fn(),
+      restoreWidgetState: vi.fn(),
+      resetStreamLiveTurnState: vi.fn(),
+      resetInputHistory: shortcuts.resetInputHistory,
+      resetDraftComposer,
+    })
+    const press = (key: string) => {
+      const event = { key, target: null, preventDefault: vi.fn() } as unknown as KeyboardEvent
+      shortcuts.onTextareaKeydown(event)
+      return event
+    }
+
+    try {
+      press('ArrowUp')
+      expect(draft.composerText.value).toBe('A request 5')
+      // Switch before the input-save watcher flushes, as a real sidebar click can.
+      await runtime.switchToSession(sessionB)
+      expect(draft.composerText.value).toBe('B saved draft')
+      expect(draft.localPaths.value).toEqual(['C:\\B-draft.pdf'])
+      expect(resetDraftComposer).not.toHaveBeenCalled()
+      const event = press(key)
+      await nextTick()
+
+      expect(event.preventDefault).not.toHaveBeenCalled()
+      expect(draft.inputText.value).toBe('B saved draft\nC:\\B-draft.pdf')
+      expect(storage.getItem(`opensquilla.chat.draft:${sessionB}`)).toBe(savedB)
+      expect(storage.getItem(`opensquilla.chat.draft:${sessionA}`)).toBe('A request 5')
+    } finally {
+      scope.stop()
+    }
   })
 })

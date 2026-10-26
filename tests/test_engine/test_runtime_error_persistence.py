@@ -303,6 +303,46 @@ async def test_stream_failure_keeps_durable_ref_and_execution_context() -> None:
     assert any(f"(ref: {errors[0].error_id})" in content for _, _, content in manager.messages)
 
 
+@pytest.mark.parametrize("partial", [False, True])
+async def test_failed_turn_without_receipt_persists_unknown_usage_without_success(partial) -> None:
+    class FailingProvider(_SingleReplyProvider):
+        async def _stream(self) -> AsyncIterator[object]:
+            if partial:
+                yield ProviderText(text="Incomplete synthetic response")
+            yield ProviderError(message="unauthorized", code="401", http_status=401)
+
+    usage = {
+        "cost_usd": 0.0, "billed_cost": 0.0, "cost_source": "unavailable",
+        "estimated_cost_component_usd": 0.0, "missing_cost_entries": 1,
+        "coverage_status": "usage_unknown", "usage_unknown": True,
+        "unknown_usage_events": 1,
+    }
+    projection = AsyncMock(return_value=usage)
+    manager = _RecordingSessionManager()
+    manager.storage = SimpleNamespace(get_turn_usage_projection=projection)
+    sink = SimpleNamespace(start=AsyncMock(), finalize=AsyncMock(), mark_unknown=AsyncMock())
+    runner = TurnRunner(
+        provider_selector=_ProviderSelector(FailingProvider()), session_manager=manager,
+        usage_event_sink=sink, config=SimpleNamespace(context_window_tokens=100_000),
+    )
+    events = [event async for event in runner.run(
+        "Synthetic request", "agent:main:webchat:usage-unknown",
+        ToolContext(is_owner=True, caller_kind=CallerKind.WEB),
+        no_memory_capture=True, input_mode="text",
+    )]
+
+    assert sum(event.kind == "error" for event in events) == 1
+    assert not any(event.kind == "done" for event in events)
+    projection.assert_awaited_once()
+    assert projection.await_args.kwargs["session_id"] == "session-old"
+    assert projection.await_args.kwargs["session_epoch"] == 7
+    persisted = [row for row in manager.append_calls if row.get("turn_usage")]
+    assert len(persisted) == 1
+    assert persisted[0]["turn_usage"] == usage
+    assert persisted[0]["role"] == ("assistant" if partial else "system")
+    sink.mark_unknown.assert_awaited_once()
+
+
 @pytest.mark.asyncio
 async def test_stream_error_records_without_session_manager_and_does_not_duplicate() -> None:
     records: list[dict[str, Any]] = []

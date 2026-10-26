@@ -404,40 +404,44 @@ describe('workbench store', () => {
     expect(disposed).toEqual(['native-7:closed'])
   })
 
-  it('bounds new interactive native artifact owners without evicting or blocking existing tabs', () => {
+  it('opens interactive previews across sessions without a count limit or evicting existing tabs', () => {
     const store = useWorkbenchStore()
     const native = (index: number): WorkbenchItem => ({
       ...item(`native-artifact-${index}`, { type: 'session', id: `session-${index}` }),
       hostKind: 'native-webcontents',
     })
+    const rejected = vi.fn()
+    const disposed = vi.fn()
+    const stop = store.onAdmissionRejected(rejected)
+    store.onLifecycle(event => { if (event.type === 'dispose') disposed(event) })
     for (let index = 0; index < 4; index += 1) {
       store.setSessionScope(`session-${index}`)
       expect(store.openItem(native(index))).toBe(true)
     }
-    const rejected = vi.fn()
-    const lifecycle = vi.fn()
-    const stop = store.onAdmissionRejected(rejected)
-    store.onLifecycle(lifecycle)
     const selected = store.activeItemId
-    expect(store.openItem(native(4), { activate: false })).toBe(false)
-    expect(rejected).toHaveBeenCalledExactlyOnceWith({
-      reason: 'native-preview-capacity', item: native(4), limit: 4,
-    })
-    expect(lifecycle).not.toHaveBeenCalled()
+    for (let index = 4; index < 12; index += 1) {
+      expect(store.openItem(native(index), { activate: false })).toBe(true)
+    }
+    expect(rejected).not.toHaveBeenCalled()
+    expect(disposed).not.toHaveBeenCalled()
     expect(store.activeItemId).toBe(selected)
-    expect(store.items).toHaveLength(4)
+    expect(store.items).toHaveLength(12)
     store.setSessionScope('session-0')
+    expect(store.activeItemId).toBe('native-artifact-0')
+    expect(store.visibleItems.map(entry => entry.id)).toEqual(['native-artifact-0'])
     expect(store.openItem({ ...native(0), title: 'Updated revision' })).toBe(true)
     expect(store.activeItem?.title).toBe('Updated revision')
-    expect(rejected).toHaveBeenCalledTimes(1)
+    expect(store.items).toHaveLength(12)
     expect(store.openItem(item('ordinary-code'))).toBe(true)
     expect(store.openItem(browserItem('agent-browser', 'session-0'))).toBe(true)
     store.closeItem('native-artifact-1')
-    expect(store.openItem(native(4), { activate: false })).toBe(true)
-    expect(store.items.filter(entry => entry.kind === 'artifact-preview' && entry.hostKind === 'native-webcontents')).toHaveLength(4)
+    expect(disposed).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({
+      item: expect.objectContaining({ id: 'native-artifact-1' }), reason: 'closed',
+    }))
+    expect(store.openItem(native(1), { activate: false })).toBe(true)
+    expect(store.items.filter(entry => entry.kind === 'artifact-preview' && entry.hostKind === 'native-webcontents')).toHaveLength(12)
+    expect(rejected).not.toHaveBeenCalled()
     stop()
-    expect(store.openItem(native(5))).toBe(false)
-    expect(rejected).toHaveBeenCalledTimes(1)
   })
 
   it('adopts native browser pages beyond eight retained tabs across sessions', () => {

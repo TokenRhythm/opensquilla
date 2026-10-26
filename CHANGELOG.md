@@ -6,6 +6,34 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ## [Unreleased]
 
+## [0.5.7] - 2026-10-23
+
+### Added
+
+- Preview annotations for HTML, Word, PowerPoint, and Excel, with instructions
+  collected in the chat composer and published versions preserved separately
+  from working files.
+- Project creation and opening, `/init` for project instructions, and Workbench
+  panels for files, terminals, and side conversations.
+- Inline interactive visualizations, Mermaid diagrams, and richer Markdown
+  rendering during streaming replies.
+- In-conversation text search (Ctrl/Cmd+F), including archived history.
+- Configurable text-to-video generation through TokenRhythm or OpenRouter,
+  with generated MP4 delivery and recovery of accepted video jobs.
+
+### Changed
+
+- Available updates download in the background on supported Windows and macOS
+  Desktop builds, with confirmation before installation.
+- Project instructions are read at the start of each turn.
+- Clearer usage accounting for media and delegated tasks, with smaller
+  background telemetry batches and updated dependencies.
+
+### Fixed
+
+- More reliable manual and automatic compaction, conversation switching,
+  streaming recovery, retained previews, and Desktop startup and shutdown.
+
 ## [0.5.6] - 2026-09-30
 
 ### Added

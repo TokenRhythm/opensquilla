@@ -129,6 +129,7 @@ def load_or_create_identity(
     *,
     now: datetime | None = None,
     uuid_factory: Callable[[], uuid.UUID] | None = None,
+    lock_timeout: float = _IDENTITY_LOCK_TIMEOUT_SECONDS,
 ) -> RandomTelemetryIdentity:
     """Return one stable identity, atomically creating it only when absent.
 
@@ -138,7 +139,7 @@ def load_or_create_identity(
 
     target = Path(path).expanduser()
     normalized_kind = TelemetryIdentityKind(kind)
-    with ProfileOperationLock(target, timeout=_IDENTITY_LOCK_TIMEOUT_SECONDS):
+    with ProfileOperationLock(target, timeout=lock_timeout):
         existing = read_identity(target, expected_kind=normalized_kind)
         if existing is not None:
             return existing

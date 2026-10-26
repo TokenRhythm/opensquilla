@@ -65,7 +65,7 @@ function readerResourceSample(page: Page): Promise<ReaderResourceSample> {
   }).__retentionReaderResources)
 }
 
-async function installLauncherGateway(page: Page, projectA: boolean, projectB = projectA, artifacts: Wire[] = []) {
+async function installLauncherGateway(page: Page, projectA: boolean, projectB = projectA, artifacts: Wire[] = [], modernRecovery = false, initialSessionEpoch = 0) {
   const requests: Array<{ method: string; key: string; params?: Wire }> = []
   const materializedProjects = new Set<string>()
   let holdMetadata = true
@@ -75,11 +75,32 @@ async function installLauncherGateway(page: Page, projectA: boolean, projectB = 
   let emitTerminalOutput: (data: string) => void = () => { throw new Error('Terminal is not connected') }
   let terminalTarget: unknown
   let terminalSeq = 0
+  let holdCurrentSnapshot = false
+  let holdCurrentMetadata = false
+  let deliveryId = 0
+  const deliveryEpoch = 'launcher-delivery'
+  const currentSnapshotReplies: Array<() => void> = []
+  const currentMetadataReplies: Array<() => void> = []
+  let emitRecovery = () => { throw new Error('Gateway is not connected') }
+  const runningTask = { task_id: 'launcher-running-task', turn_id: 'launcher-running-task',
+    status: 'running', started_at: 1_800_000_000 }
+  const initialStreamSequence = initialSessionEpoch === 0 ? 1 : 0
   const workspace = { id: 'launcher-project', name: 'Launcher project', path: 'C:/fixtures/launcher',
     available: true, removed: false, taskCount: 2, pinned: false }
   const project = (key: string) => materializedProjects.has(key) || (key === A ? projectA : key === B && projectB)
   const metadata = (key: string) => ({ workspaceId: project(key) ? workspace.id : null,
-    projectWorkspace: project(key) ? workspace : null })
+    projectWorkspace: project(key) ? workspace : null,
+    ...(modernRecovery && key === A ? { epoch: initialSessionEpoch, current_stream_seq: initialStreamSequence, run_status: 'running',
+      active_task: runningTask, tasks: [runningTask] } : {}) })
+  const snapshot = (key: string) => sessionMessagesSnapshotPayload(key, modernRecovery && key === A ? {
+    epoch: initialSessionEpoch, task_id: runningTask.task_id, current_stream_seq: initialStreamSequence,
+    // The nonzero cold-open variant must install its epoch from metadata, not
+    // incidentally from a replayed stream event that arrives before metadata.
+    events: initialSessionEpoch === 0 ? [{ event: 'session.event.text_delta', payload: {
+      key, session_key: key, task_id: runningTask.task_id, turn_id: runningTask.turn_id, epoch: initialSessionEpoch,
+      stream_generation: 'e2e-stream-generation', stream_seq: 1, text: 'The current answer is still generating.',
+    } }] : [],
+  } : {})
   const history = (key: string) => chatHistoryPayload([A, B].includes(key) ? [
     { id: `${key}-user`, role: 'user', text: `Question ${key === A ? 'A' : 'B'}`, timestamp: 1_800_000_000 },
     { id: `${key}-answer`, role: 'assistant', text: `Answer ${key === A ? 'A' : 'B'} is ready.`, timestamp: 1_800_000_001, artifacts: key === A ? artifacts : [] },
@@ -99,6 +120,13 @@ async function installLauncherGateway(page: Page, projectA: boolean, projectB = 
     kind: 'workspace-root', name: workspace.name, path: workspace.path, workspaceBinding: 'a'.repeat(64),
   } }))
   await page.routeWebSocket(/\/ws$/, ws => {
+    emitRecovery = () => {
+      holdCurrentSnapshot = true
+      holdCurrentMetadata = true
+      ws.send(JSON.stringify({ type: 'event', event: 'transport.flow.dirty', payload: {
+        delivery_epoch: deliveryEpoch, dirty_keys: [A], global_dirty: false,
+      } }))
+    }
     emitTerminalOutput = data => ws.send(JSON.stringify({ type: 'event', event: 'terminal.output', payload: {
       terminalId: 'launcher-pty', target: terminalTarget, seq: ++terminalSeq, data, encoding: 'utf8',
     } }))
@@ -114,9 +142,37 @@ async function installLauncherGateway(page: Page, projectA: boolean, projectB = 
         ws.send(helloOkResponse({ features: { methods: ['sessions.messages.subscribe', 'sessions.messages.hydrate',
           'sessions.messages.snapshot', 'sessions.messages.unsubscribe', 'sessions.sidechat.create',
           'sessions.sidechat.close', 'sessions.create', 'sessions.routing.get', 'workspaces.list', 'workspaces.open',
-          'terminal.create', 'terminal.resize', 'terminal.close', 'terminal.consume', 'terminal.write'] },
+           'terminal.create', 'terminal.resize', 'terminal.close', 'terminal.consume', 'terminal.write',
+           ...(modernRecovery ? ['sessions.messages.snapshot.read', 'sessions.messages.resume',
+             'sessions.messages.snapshot.release', 'transport.flow.update'] : [])] },
+        ...(modernRecovery ? { policy: { concurrent_history_reads: true,
+          transport_flow: { delivery_epoch: deliveryEpoch, window_frames: 128, window_bytes: 4 * 1024 * 1024 } } } : {}),
         auth: { principal: { capabilities: ['chat.read', 'chat.write', 'host.execute'] },
           runModePolicy: { allowedRunModes: ['safe', 'full'], defaultRunMode: 'full' } } }))
+        return
+      }
+      if (frame.method === 'transport.flow.update') {
+        respond({ delivery_epoch: deliveryEpoch, ack_delivery_id: Number(frame.params?.ack_delivery_id || 0),
+          dirty_keys: [], global_dirty: false })
+        return
+      }
+      if (frame.method === 'sessions.messages.snapshot.read') {
+        const reply = () => {
+          const value = snapshot(key)
+          const bytes = Buffer.from(JSON.stringify(value))
+          respond({ key, sync_revision: frame.params?.sync_revision, snapshot_id: `launcher-${frame.params?.sync_revision}`,
+            segment_index: 0, segment_count: 1, byte_length: bytes.length, encoding: 'base64-json-utf8',
+            data: bytes.toString('base64'), stream_generation: value.stream_generation,
+            current_stream_seq: value.current_stream_seq, task_id: value.task_id, session_id: null, session_epoch: initialSessionEpoch,
+            delivery: { delivery_epoch: deliveryEpoch, delivery_id: ++deliveryId } })
+        }
+        if (key === A && holdCurrentSnapshot) currentSnapshotReplies.push(reply)
+        else reply()
+        return
+      }
+      if (frame.method === 'sessions.messages.resume' || frame.method === 'sessions.messages.snapshot.release') {
+        respond({ ...frame.params, ...(frame.method === 'sessions.messages.resume'
+          ? { session_id: null, session_epoch: initialSessionEpoch, replay_to_seq: frame.params?.stream_seq } : { retired: true }) })
         return
       }
       if (frame.method === 'sessions.create') {
@@ -146,11 +202,14 @@ async function installLauncherGateway(page: Page, projectA: boolean, projectB = 
         'chat.history': history(key),
         'sessions.messages.subscribe': sessionMessagesSubscribePayload(key, metadata(key)),
         'sessions.messages.hydrate': sessionMessagesHydratePayload(key, metadata(key)),
-        'sessions.messages.snapshot': sessionMessagesSnapshotPayload(key),
+        'sessions.messages.snapshot': snapshot(key),
         'sessions.routing.get': { key, mode: 'direct', revision: 0, source: 'default', initialized: true, appliesTo: 'next_accepted_turn' },
         'sandbox.run_mode.preference.get': { runMode: 'full', source: 'config' },
       }
       const reply = () => respond(payloads[frame.method] ?? {})
+      if (key === A && holdCurrentMetadata && ['sessions.messages.subscribe', 'sessions.messages.hydrate'].includes(frame.method)) {
+        currentMetadataReplies.push(reply); return
+      }
       if (key === B && frame.method === 'chat.history' && holdHistory) { historyReplies.push(reply); return }
       if (key === B && ['sessions.messages.subscribe', 'sessions.messages.hydrate'].includes(frame.method) && holdMetadata) {
         metadataReplies.push(reply); return
@@ -159,6 +218,11 @@ async function installLauncherGateway(page: Page, projectA: boolean, projectB = 
     })
   })
   return { requests,
+    recoverCurrentSession: () => emitRecovery(),
+    currentSnapshotPending: () => currentSnapshotReplies.length,
+    currentMetadataPending: () => currentMetadataReplies.length,
+    releaseCurrentSnapshot: () => { holdCurrentSnapshot = false; currentSnapshotReplies.splice(0).forEach(reply => reply()) },
+    releaseCurrentMetadata: () => { holdCurrentMetadata = false; currentMetadataReplies.splice(0).forEach(reply => reply()) },
     terminalOutput: (data: string) => emitTerminalOutput(data),
     releaseMetadata: () => { holdMetadata = false; metadataReplies.splice(0).forEach(reply => reply()) },
     releaseHistory: () => { holdHistory = false; historyReplies.splice(0).forEach(reply => reply()) },
@@ -254,6 +318,78 @@ async function openLauncher(page: Page, count: number) {
     if (index > 0) expect(box.top).toBeGreaterThanOrEqual(boxes[index - 1]!.bottom)
   }
   return { host, cards }
+}
+
+for (const initialSessionEpoch of [0, 7]) {
+test(`same-session delivery recovery at epoch ${initialSessionEpoch} keeps launcher cards stable and defers terminal creation until metadata settles`, async ({ page }, info) => {
+  const gateway = await installLauncherGateway(page, false, false, [], true, initialSessionEpoch)
+  gateway.releaseMetadata(); gateway.releaseHistory()
+  const errors: string[] = []
+  page.on('pageerror', error => errors.push(error.message))
+  await openLauncher(page, 3)
+  await expect(page.locator('.chat-stop-btn')).toBeVisible()
+  expect(await page.evaluate(() => Boolean(window.opensquillaDesktop))).toBe(false)
+  const launcher = page.getByTestId('workbench-start-panel')
+  const terminal = launcher.locator('[data-panel-kind="terminal"]')
+  await page.evaluate(() => {
+    const original = document.querySelector('[data-testid="workbench-start-panel"]')
+    const capture = () => {
+      const panel = document.querySelector('[data-testid="workbench-start-panel"]')
+      return { sameNode: panel === original, cards: Array.from(panel?.querySelectorAll<HTMLButtonElement>('[data-panel-kind]') || []).map(card => {
+        const label = card.querySelector('.app-workbench__new-panel-option-copy > span')!
+        const rect = label.getBoundingClientRect()
+        return { kind: card.dataset.panelKind, disabled: card.disabled, text: card.innerText,
+          labelX: Math.round(rect.x * 10) / 10, labelY: Math.round(rect.y * 10) / 10 }
+      }) }
+    }
+    const probe = { running: true, baseline: capture(), frames: [] as ReturnType<typeof capture>[] }
+    ;(window as unknown as { __launcherRecoveryProbe: typeof probe }).__launcherRecoveryProbe = probe
+    const sample = () => {
+      if (!probe.running) return
+      probe.frames.push(capture())
+      requestAnimationFrame(sample)
+    }
+    requestAnimationFrame(sample)
+  })
+  const renderedFrames = () => page.evaluate(async () => {
+    for (let index = 0; index < 8; index++) await new Promise<void>(resolve => requestAnimationFrame(() => resolve()))
+  })
+  for (let cycle = 0; cycle < 2; cycle++) {
+    gateway.recoverCurrentSession()
+    await expect.poll(gateway.currentSnapshotPending).toBeGreaterThan(0)
+    await renderedFrames()
+    gateway.releaseCurrentSnapshot()
+    await expect.poll(gateway.currentMetadataPending).toBeGreaterThan(0)
+    await renderedFrames()
+    if (cycle === 0) {
+      gateway.releaseCurrentMetadata()
+      await expect(terminal).toBeEnabled()
+      await renderedFrames()
+    }
+  }
+  const evidence = await page.evaluate(() => {
+    const probe = (window as unknown as { __launcherRecoveryProbe: {
+      running: boolean; baseline: unknown; frames: unknown[]
+    } }).__launcherRecoveryProbe
+    probe.running = false
+    return { baseline: probe.baseline, frames: probe.frames }
+  })
+  await writeFile(info.outputPath('launcher-recovery-frames.json'), JSON.stringify(evidence, null, 2))
+  expect(evidence.frames.length).toBeGreaterThanOrEqual(32)
+  for (const frame of evidence.frames) expect(frame).toEqual(evidence.baseline)
+  // A visible, previously available action may be clicked while authority is
+  // refreshing, but must not execute against the old workspace binding.
+  await terminal.click()
+  await renderedFrames()
+  expect(gateway.requests.filter(request => request.method === 'terminal.create')).toHaveLength(0)
+  await expect(page.getByTestId('terminal-panel')).toHaveCount(0)
+  gateway.releaseCurrentMetadata()
+  await expect(page.getByTestId('terminal-panel')).toContainText('Connected')
+  const creates = gateway.requests.filter(request => request.method === 'terminal.create')
+  expect(creates).toHaveLength(1)
+  expect(creates[0]!.params?.target).toEqual({ kind: 'default-agent', agentId: 'main' })
+  expect(errors).toEqual([])
+})
 }
 
 for (const withProject of [false, true]) {

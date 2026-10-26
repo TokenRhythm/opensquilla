@@ -9,6 +9,8 @@ function nonEmptyText(value: unknown): string {
 }
 
 function usageRowIdentity(row: UsageSession, sessionKey: string, sessionLabel: string): string {
+  if (row.sessionKind === 'root' && row.taskGroupId) return `task:${row.taskGroupId}`
+  if (row.sessionId && row.sessionEpoch != null) return `${row.sessionId}:${row.sessionEpoch}`
   return nonEmptyText(sessionKey)
     || nonEmptyText(row.sessionId)
     || nonEmptyText(row.session)
@@ -17,7 +19,6 @@ function usageRowIdentity(row: UsageSession, sessionKey: string, sessionLabel: s
 
 export function useUsageSessionRows(options: {
   visibleSessions: ComputedRef<UsageSession[]>
-  rangeHiddenHint: ComputedRef<string>
   sortCol: Ref<string>
   sortAsc: Ref<boolean>
   sessionTimestamp: (row: UsageSession) => number | null
@@ -41,7 +42,10 @@ export function useUsageSessionRows(options: {
       const timestamp = options.sessionTimestamp(row)
       const modified = timestamp != null ? options.relTime(timestamp) : '-'
       const bd = row.modelBreakdown
-      const hasModelBreakdown = !!(bd && bd.length > 1)
+      const hasModelBreakdown = !!(bd && (bd.length > 1 || bd.some(item =>
+        (item.capability && item.capability !== 'llm' && item.capability !== 'unknown')
+        || item.meters?.some(meter => meter.unit !== 'token'),
+      )))
 
       return {
         raw: row,
@@ -61,7 +65,7 @@ export function useUsageSessionRows(options: {
 
   const sessionsMeta = computed(() => {
     const n = sortedRows.value.length
-    return [t('usageLogs.sessions.count', { count: n }), options.rangeHiddenHint.value].filter(Boolean).join(' · ')
+    return t('usageLogs.sessions.count', { count: n })
   })
 
   return { sortedRows, sessionsMeta }

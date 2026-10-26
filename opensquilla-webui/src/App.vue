@@ -18,27 +18,41 @@
         <img class="sidebar-brand-mark" :src="brandMarkUrl" alt="" aria-hidden="true" />
         <span class="sidebar-brand-text">OpenSquilla</span>
       </div>
-      <button
-        ref="sidebarDockToggleRef"
-        class="sidebar-dock-toggle"
-        :aria-label="t('chrome.collapseSidebar')"
-        aria-controls="sidebar-nav"
-        :aria-expanded="effectiveSidebarOpen"
-        :aria-keyshortcuts="sidebarToggleAriaShortcut"
-        aria-describedby="sidebar-toggle-tip-expanded"
-        data-testid="sidebar-toggle-expanded"
-        @click="toggleDock('sidebar-button')"
-      >
-        <Icon name="sidebar-visible" :size="18" />
-        <span
-          id="sidebar-toggle-tip-expanded"
-          class="sidebar-toggle-tip sidebar-toggle-tip--sidebar"
-          role="tooltip"
+      <div class="sidebar-brand-actions">
+        <button
+          type="button"
+          class="sidebar-search-button"
+          data-testid="sidebar-search"
+          :aria-label="t('chrome.searchChats')"
+          :title="commandPaletteHint ? `${t('chrome.searchChats')} (${commandPaletteHint})` : t('chrome.searchChats')"
+          aria-haspopup="dialog"
+          :aria-expanded="commandPaletteOpen"
+          @click="openCommandPalette"
         >
-          <span>{{ t('chrome.toggleSidebar') }}</span>
-          <kbd v-if="sidebarToggleHint">{{ sidebarToggleHint }}</kbd>
-        </span>
-      </button>
+          <Icon name="search" :size="18" />
+        </button>
+        <button
+          ref="sidebarDockToggleRef"
+          class="sidebar-dock-toggle"
+          :aria-label="t('chrome.collapseSidebar')"
+          aria-controls="sidebar-nav"
+          :aria-expanded="effectiveSidebarOpen"
+          :aria-keyshortcuts="sidebarToggleAriaShortcut"
+          aria-describedby="sidebar-toggle-tip-expanded"
+          data-testid="sidebar-toggle-expanded"
+          @click="toggleDock('sidebar-button')"
+        >
+          <Icon name="sidebar-visible" :size="18" />
+          <span
+            id="sidebar-toggle-tip-expanded"
+            class="sidebar-toggle-tip sidebar-toggle-tip--sidebar"
+            role="tooltip"
+          >
+            <span>{{ t('chrome.toggleSidebar') }}</span>
+            <kbd v-if="sidebarToggleHint">{{ sidebarToggleHint }}</kbd>
+          </span>
+        </button>
+      </div>
     </div>
 
     <!-- Always-visible flat nav index. Bounded and self-scrolling under a
@@ -53,7 +67,7 @@
         :title="newChatHint ? `${t('chrome.newTaskTitle')} (${newChatHint})` : t('chrome.newTaskTitle')"
         @click="startNewChatInstant"
       >
-        <Icon name="plus" :size="17" />
+        <Icon name="plus" :size="18" />
         <span class="sidebar-new-session__label">{{ t('chrome.newTask') }}</span>
         <!-- Badge tracks the configured binding and hides when the shortcut is
              disabled (Settings → Keyboard), so it never advertises a dead key. -->
@@ -87,7 +101,6 @@
       :has-more="hasMore"
       :current-key="sidebarCurrentKey"
       :contract-debug-enabled="contractDebugEnabled"
-      :search-hint="commandPaletteHint"
       :can-manage-projects="gatewayAccess.canManageProjectWorkspaces"
       :can-create-projects="gatewayAccess.canChooseProject"
       @select="switchToSession"
@@ -106,7 +119,6 @@
       @project-edit="openProjectEditor"
       @project-delete-history="onProjectDeleteHistory"
       @project-remove="onProjectRemove"
-      @search="openCommandPalette"
     />
 
     <!-- Fixed footer: settings and the desktop update entry -->
@@ -283,15 +295,15 @@
                  out-in no longer incurs the old remount/fetch "dead gap". -->
             <template v-if="route.meta.routeTransition === 'none'">
               <KeepAlive v-if="route.meta.keepAlive" :max="12">
-                <component :is="Component" :key="route.meta.viewKey || route.name" />
+                <component :is="Component" :key="route.meta.viewKey || route.name" v-bind="isChatRoute ? { surfaceVisible: !mainPaneHidden } : {}" />
               </KeepAlive>
-              <component v-else :is="Component" :key="route.meta.viewKey || route.name" />
+              <component v-else :is="Component" :key="route.meta.viewKey || route.name" v-bind="isChatRoute ? { surfaceVisible: !mainPaneHidden } : {}" />
             </template>
             <Transition v-else name="route-fade" mode="out-in">
               <KeepAlive v-if="route.meta.keepAlive" :max="12">
-                <component :is="Component" :key="route.meta.viewKey || route.name" />
+                <component :is="Component" :key="route.meta.viewKey || route.name" v-bind="isChatRoute ? { surfaceVisible: !mainPaneHidden } : {}" />
               </KeepAlive>
-              <component v-else :is="Component" :key="route.meta.viewKey || route.name" />
+              <component v-else :is="Component" :key="route.meta.viewKey || route.name" v-bind="isChatRoute ? { surfaceVisible: !mainPaneHidden } : {}" />
             </Transition>
           </router-view>
           </SettingsBackgroundRoute>
@@ -316,6 +328,9 @@
         :session-id="workbenchSessionKey"
         :session-loading="chatRouteHeader.model.sessionKey.value !== workbenchSessionKey
           || chatRouteHeader.model.sessionLoading.value"
+        :session-refreshing="chatRouteHeader.model.sessionKey.value === workbenchSessionKey
+          && chatRouteHeader.model.sessionRefreshing.value"
+        :session-context="chatRouteHeader.model.sessionContext.value"
         :session-durable="chatRouteHeader.model.sessionKey.value === workbenchSessionKey
           && chatRouteHeader.model.sessionDurable.value"
         :session-preparable="chatRouteHeader.model.sessionKey.value === workbenchSessionKey
@@ -386,7 +401,7 @@
   </nav>
 
   <Teleport to="body">
-    <ToastHost />
+    <ToastHost :mobile-tabbar-visible="!mobileKeyboardOpen" />
   </Teleport>
 
   <ConfirmModal />
@@ -395,10 +410,16 @@
     v-if="gatewayAccess.canChooseProject"
     :open="projectCreateOpen && !projectCreateConfirming && !projectSourcePickerOpen"
     :name="projectCreateName"
+    :mode="projectCreateMode"
     :source-path="projectCreateSourcePath"
     :busy="projectCreateBusy"
     :source-picking="projectCreateSourcePicking"
+    :creation-available="gatewayAccess.canCreateProjectWorkspace === true"
+    :host-name="projectWorkspaces.creationDefaults.value?.hostName || undefined"
+    :host-platform="projectWorkspaces.creationDefaults.value?.platform"
+    :error="projectCreateError"
     @update:name="projectCreateName = $event"
+    @update:mode="changeProjectCreateMode"
     @choose-source="chooseProjectSourceDirectory"
     @close="closeProjectCreator"
     @create="createProjectWorkspace"
@@ -501,6 +522,7 @@ import { useToasts } from './composables/useToasts'
 import { useConfirm } from './composables/useConfirm'
 import { useProjectWorkspaces } from './composables/useProjectWorkspaces'
 import { useProjectWorkspaceEditor } from './composables/useProjectWorkspaceEditor'
+import { projectWorkspaceTarget, validProjectDirectoryName, type ProjectWorkspaceMode } from './utils/projectWorkspaceCreation'
 import { useFreshTaskDraft } from './composables/useFreshTaskDraft'
 import { useNavigation } from './app/useNavigation'
 import { bindDesktopSessionDeepLinks } from './app/desktopSessionDeepLinks'
@@ -806,6 +828,9 @@ const projectWorkspaces = useProjectWorkspaces()
 const freshTaskDraft = useFreshTaskDraft()
 const projectCreateOpen = ref(false)
 const projectCreateName = ref('')
+const projectCreateMode = ref<ProjectWorkspaceMode>('open')
+const projectCreateError = ref('')
+let projectCreateInstance = 0
 const projectCreateSourcePath = ref('')
 const projectCreateBusy = ref(false)
 const projectCreateSourcePicking = ref(false)
@@ -835,13 +860,7 @@ watch(
       scheduleSessionRefresh()
       return
     }
-    projectCreateOpen.value = false
-    projectCreateName.value = ''
-    projectCreateSourcePath.value = ''
-    projectCreateBusy.value = false
-    projectCreateSourcePicking.value = false
-    projectCreateConfirming.value = false
-    projectSourcePickerOpen.value = false
+    resetProjectCreator()
     closeProjectEditor()
   },
 )
@@ -1435,14 +1454,11 @@ function startProjectTask(workspaceId: string) {
   })
 }
 
-function projectNameFromPath(path: string): string {
-  const normalized = path.trim().replace(/[\\/]+$/, '')
-  return normalized.split(/[\\/]/).pop() || normalized
-}
-
 function resetProjectCreator() {
+  projectCreateInstance += 1
   projectCreateOpen.value = false
   projectCreateName.value = ''
+  projectCreateError.value = ''
   projectCreateSourcePath.value = ''
   projectCreateBusy.value = false
   projectCreateSourcePicking.value = false
@@ -1452,7 +1468,10 @@ function resetProjectCreator() {
 
 function openProjectCreator() {
   if (!gatewayAccess.canChooseProject) return
+  projectCreateInstance += 1
+  projectCreateMode.value = 'open'
   projectCreateName.value = ''
+  projectCreateError.value = ''
   projectCreateSourcePath.value = ''
   projectCreateBusy.value = false
   projectCreateSourcePicking.value = false
@@ -1460,6 +1479,29 @@ function openProjectCreator() {
   projectSourcePickerOpen.value = false
   projectCreateOpen.value = true
 }
+
+function changeProjectCreateMode(mode: ProjectWorkspaceMode) {
+  if (projectCreateBusy.value || projectCreateSourcePicking.value
+    || (mode === 'create' && !gatewayAccess.canCreateProjectWorkspace)) return
+  projectCreateInstance += 1
+  projectCreateMode.value = mode
+  projectCreateSourcePath.value = mode === 'create'
+    ? projectWorkspaces.creationDefaults.value?.parentPath || '' : ''
+  projectCreateError.value = ''
+}
+
+watch(projectWorkspaces.creationDefaults, defaults => {
+  if (projectCreateOpen.value && projectCreateMode.value === 'create'
+    && !projectCreateSourcePath.value && !projectCreateBusy.value) {
+    projectCreateSourcePath.value = defaults?.parentPath || ''
+  }
+})
+
+watch(() => [gatewayAccess.deliveryIdentity, gatewayAccess.loadConnectionEndpoint(), gatewayAccess.subscriptionEpoch],
+  () => {
+    resetProjectCreator()
+    if (gatewayAccess.canManageProjectWorkspaces) scheduleSessionRefresh()
+  })
 
 function closeProjectCreator() {
   if (projectCreateBusy.value) return
@@ -1469,9 +1511,7 @@ function closeProjectCreator() {
 function onProjectPathChosen(path: string) {
   if (!projectCreateOpen.value || !gatewayAccess.canChooseProject) return
   projectCreateSourcePath.value = path
-  if (!projectCreateName.value.trim()) {
-    projectCreateName.value = projectNameFromPath(path)
-  }
+  projectCreateError.value = ''
 }
 
 function onProjectSourcePathChosen(path: string) {
@@ -1495,69 +1535,64 @@ async function chooseProjectSourceDirectory() {
   }
 
   projectCreateSourcePicking.value = true
+  const instance = projectCreateInstance
   try {
-    const choice = await nativePicker()
+    const choice = await nativePicker({ initialPath: projectCreateSourcePath.value || undefined })
     const selected = String(choice?.path || '').trim()
-    if (selected) onProjectPathChosen(selected)
+    if (selected && instance === projectCreateInstance) onProjectPathChosen(selected)
   } catch (err) {
-    pushToast(t('workspaces.directoryPickerFailed', { error: errorMessage(err) }), {
+    if (instance === projectCreateInstance) pushToast(t('workspaces.directoryPickerFailed', { error: errorMessage(err) }), {
       tone: 'danger',
     })
   } finally {
-    projectCreateSourcePicking.value = false
+    if (instance === projectCreateInstance) projectCreateSourcePicking.value = false
   }
 }
 
-async function createProjectWorkspace(payload: { name: string; path: string }) {
+async function createProjectWorkspace(payload: { mode: ProjectWorkspaceMode; name: string; path: string }) {
   if (
     !projectCreateOpen.value
     || !gatewayAccess.canChooseProject
     || projectCreateBusy.value
     || projectCreateSourcePicking.value
     || projectSourcePickerOpen.value
+    || payload.mode !== projectCreateMode.value
   ) return
   const name = payload.name.trim()
   const path = payload.path.trim()
-  if (!name || !path) return
+  const creating = payload.mode === 'create'
+  if (!path || (creating && (!gatewayAccess.canCreateProjectWorkspace || !validProjectDirectoryName(name)))) return
+  const instance = projectCreateInstance
+  const target = creating
+    ? projectWorkspaceTarget(path, name, projectWorkspaces.creationDefaults.value?.platform) : path
+  projectCreateError.value = ''
   projectCreateConfirming.value = true
   await nextTick()
   const trusted = await confirm({
     title: t('workspaces.trustTitle'),
-    body: t('workspaces.trustBody', { path }),
+    body: t('workspaces.trustBody', { path: target }),
     primaryLabel: t('workspaces.trustConfirm'),
     primaryClass: 'btn--primary',
   })
+  if (instance !== projectCreateInstance || !projectCreateOpen.value || !gatewayAccess.canChooseProject) return
   if (!trusted) {
     projectCreateConfirming.value = false
     return
   }
   projectCreateBusy.value = true
-  const existingWorkspaceIds = new Set(
-    projectWorkspaces.workspaces.value.map(workspace => workspace.id),
-  )
   try {
-    const workspace = await projectWorkspaces.openWorkspace(path)
+    const workspace = creating
+      ? await projectWorkspaces.createWorkspace(path, name)
+      : await projectWorkspaces.openWorkspace(path)
+    if (instance !== projectCreateInstance) return
     if (!workspace) throw new Error('Gateway returned an empty project.')
-    const alreadyExists = existingWorkspaceIds.has(workspace.id)
-    const renamedExisting = alreadyExists && workspace.name !== name
-    if (workspace.name !== name) {
-      await projectWorkspaces.renameWorkspace(workspace.id, name)
-    }
     resetProjectCreator()
-    if (alreadyExists) {
-      pushToast(t(
-        renamedExisting
-          ? 'workspaces.projectExistingRenamed'
-          : 'workspaces.projectAlreadyExists',
-        { name },
-      ), { tone: 'info' })
-    } else {
-      pushToast(t('workspaces.projectCreated', { name }), { tone: 'ok' })
-    }
   } catch (err) {
+    if (instance !== projectCreateInstance) return
     projectCreateBusy.value = false
     projectCreateConfirming.value = false
-    pushToast(t('workspaces.createProjectFailed', { error: errorMessage(err) }), { tone: 'danger' })
+    projectCreateError.value = t(creating ? 'workspaces.createProjectUnconfirmed' : 'workspaces.openProjectFailed',
+      { path: target, error: errorMessage(err) })
   }
 }
 
@@ -1587,7 +1622,6 @@ async function onProjectDeleteHistory(workspaceId: string) {
     dispatchLocalSessionsDeleted(deleted, APP_SESSION_SYNC_SOURCE)
     await loadSessions()
     if (leaveDeletedTask) void openDefaultDraft()
-    pushToast(t('workspaces.historyDeleted'), { tone: 'ok' })
   } catch (err) {
     pushToast(t('workspaces.deleteHistoryFailed', { error: errorMessage(err) }), { tone: 'danger' })
   }
@@ -1632,7 +1666,7 @@ async function onProjectRemove(workspaceId: string) {
   }
 }
 
-// Command palette: ⌘K / Ctrl+K and the rail "Search / Go to…" row both open it.
+// Command palette: ⌘K / Ctrl+K and the sidebar header search both open it.
 // Its action commands route back through the existing handlers so behaviour stays
 // single-sourced (new chat opens a draft, Settings reuses the footer path).
 function openCommandPalette() {
@@ -1688,7 +1722,6 @@ async function onCopySidebarSessionLink(key: string) {
     })
     sidebarClipboardWrite = write.catch(() => undefined)
     await write
-    if (isCurrent()) pushToast(t('chat.copied'), { tone: 'ok' })
   } catch {
     if (isCurrent()) pushToast(t('chat.toast.copyFailed'), { tone: 'danger' })
   }
@@ -1710,7 +1743,6 @@ async function onRenameSession({ key, title }: { key: string; title: string }) {
     applyConfirmedTitle(key, next)
     const local = localChatSessions.value[key]
     if (local) localChatSessions.value[key] = { ...local, title: next }
-    pushToast('Session renamed', { tone: 'ok' })
   } catch (err: unknown) {
     if (pendingSessionRenames.get(key) !== sequence) return
     console.warn('[App] session rename error:', errorMessage(err))
@@ -1778,7 +1810,6 @@ async function onBulkDeleteSessions(keys: string[]) {
   appStore.removePendingApprovalsForSessions(deleted)
   dispatchLocalSessionsDeleted(deleted, APP_SESSION_SYNC_SOURCE)
   const failedCount = Math.max(0, uniqueKeys.length - deleted.size)
-  pushToast(t('shared.sidebar.bulkDeleteDone', { count: deleted.size }), { tone: 'ok' })
   if (failedCount > 0 || (result.errors?.length || 0) > 0) {
     console.warn('[App] session deletion partial failure:', result.errors)
     pushToast(t('shared.sidebar.bulkDeletePartial', { count: failedCount || result.errors?.length || 0 }), { tone: 'danger' })
@@ -1798,7 +1829,6 @@ async function onDeleteSession(key: string) {
     pushToast('Failed to delete session', { tone: 'danger' })
     return
   }
-  pushToast('Session deleted', { tone: 'ok' })
   const deleted = new Set([key])
   removeLocalSessions(deleted)
   sessionTaskAttention.removeMany(deleted)

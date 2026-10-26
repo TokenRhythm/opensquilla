@@ -36,9 +36,12 @@ class _FakeContext:
 
 @pytest.fixture(autouse=True)
 def restore_ca_environment() -> Iterator[None]:
-    """Keep hook tests from exporting a temporary CA bundle to later tests."""
+    """Keep hook tests from exporting temporary trust or tokenizer paths."""
 
-    original = {name: os.environ.get(name) for name in _CA_ENV_VARS}
+    original = {
+        name: os.environ.get(name)
+        for name in (*_CA_ENV_VARS, "TIKTOKEN_CACHE_DIR", "DATA_GYM_CACHE_DIR")
+    }
     try:
         yield
     finally:
@@ -81,6 +84,45 @@ def test_non_frozen_runtime_is_untouched(
     ca_hook.ensure_frozen_default_ca_trust()
 
     assert os.environ["SSL_CERT_FILE"] == "   "
+
+
+def test_frozen_tokenizer_uses_bundled_cache(
+    ca_hook: ModuleType, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.delenv("TIKTOKEN_CACHE_DIR", raising=False)
+    monkeypatch.delenv("DATA_GYM_CACHE_DIR", raising=False)
+    monkeypatch.setattr(sys, "_MEIPASS", str(tmp_path), raising=False)
+    cache = tmp_path / "tiktoken-cache"
+    cache.mkdir()
+
+    ca_hook.ensure_frozen_tokenizer_cache()
+    assert "TIKTOKEN_CACHE_DIR" not in os.environ
+    _set_frozen(monkeypatch)
+    ca_hook.ensure_frozen_tokenizer_cache()
+    assert os.environ["TIKTOKEN_CACHE_DIR"] == str(cache)
+
+
+@pytest.mark.parametrize("variable", ["TIKTOKEN_CACHE_DIR", "DATA_GYM_CACHE_DIR"])
+@pytest.mark.parametrize("value", ["", "/operator/tokenizer-cache"])
+def test_frozen_tokenizer_preserves_explicit_cache_configuration(
+    ca_hook: ModuleType,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    variable: str,
+    value: str,
+) -> None:
+    monkeypatch.delenv("TIKTOKEN_CACHE_DIR", raising=False)
+    monkeypatch.delenv("DATA_GYM_CACHE_DIR", raising=False)
+    monkeypatch.setenv(variable, value)
+    _set_frozen(monkeypatch)
+    monkeypatch.setattr(sys, "_MEIPASS", str(tmp_path), raising=False)
+    (tmp_path / "tiktoken-cache").mkdir()
+
+    ca_hook.ensure_frozen_tokenizer_cache()
+
+    assert os.environ[variable] == value
+    if variable == "DATA_GYM_CACHE_DIR":
+        assert "TIKTOKEN_CACHE_DIR" not in os.environ
 
 
 @pytest.mark.parametrize("variable", ["SSL_CERT_FILE", "SSL_CERT_DIR"])

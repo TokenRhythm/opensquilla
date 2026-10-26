@@ -17,6 +17,7 @@ from opensquilla.search.types import (
     SearchResult,
 )
 from opensquilla.secrets import clean_header_secret
+from opensquilla.usage_request import accounted_request
 
 _API_URL = "https://cloud-iqs.aliyuncs.com/search/unified"
 # The unified endpoint rejects queries longer than 500 characters outright.
@@ -107,8 +108,13 @@ class IqsSearchProvider:
                 trust_env=self._trust_env,
                 transport=self._transport,
             ) as client:
-                response = await client.post(
+                response = await accounted_request(
+                    client,
+                    "POST",
                     _API_URL,
+                    provider=self.name,
+                    operation="web_search",
+                    base_url="https://cloud-iqs.aliyuncs.com",
                     json=body,
                     headers={
                         "Authorization": f"Bearer {self._api_key}",

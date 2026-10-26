@@ -40,12 +40,13 @@ function rawUser(bytes = 32 * 1024): ChatRenderedMessage {
 }
 
 async function mountList(messages: ChatRenderedMessage[] = [assistant()], renderMarkdown = (value: string) => value,
-  contentCacheScope?: string | null, trailing?: () => ReturnType<typeof h>) {
+  contentCacheScope?: string | null, trailing?: () => ReturnType<typeof h>, previewReadOnly = false) {
   const host = document.createElement('div')
   document.body.appendChild(host)
   const props = reactive({
     messages, sessionKey, scrollEpoch: 0, shareMode: false, contentCacheScope, contentCacheGeneration: 0,
-    previewReadOnly: false,
+    previewReadOnly,
+    onContentHydrated: vi.fn(),
     selectedMessageIds: new Set<string>(), stripTimePrefix: (value: string) => value,
     renderMarkdown, fmtTok: (value: number) => String(value),
     subagentSummary: (value: string) => value, subagentBody: (value: string) => value,
@@ -85,6 +86,41 @@ afterEach(() => {
 })
 
 describe('ChatMessageList inline history content', () => {
+  it('keeps a cached preview inert to automatic body reads and resumes after authoritative installation', async () => {
+    const read = vi.spyOn(ContentRangeCache.prototype, 'readDisplay').mockResolvedValue('Complete answer')
+    const { props } = await mountList([assistant()], value => value, undefined, undefined, true)
+    await settleHydration()
+    expect(read).not.toHaveBeenCalled()
+    expect(props.onContentHydrated).not.toHaveBeenCalled()
+    props.previewReadOnly = false
+    await settleHydration()
+    expect(read).toHaveBeenCalledOnce()
+    expect(props.onContentHydrated).toHaveBeenCalledOnce()
+  })
+
+  it('retires an in-flight body read before entering preview and rejects its late writeback', async () => {
+    let finishOld!: (value: string) => void
+    let oldSignal: AbortSignal | undefined
+    const read = vi.spyOn(ContentRangeCache.prototype, 'readDisplay')
+      .mockImplementationOnce((_ref, options) => { oldSignal = options?.signal; return new Promise(resolve => { finishOld = resolve }) })
+      .mockResolvedValueOnce('Current answer')
+    const { host, props } = await mountList()
+    await settleHydration()
+    props.previewReadOnly = true
+    await settleHydration()
+    expect(oldSignal?.aborted).toBe(true)
+    finishOld('Retired answer')
+    await settleHydration()
+    expect(read).toHaveBeenCalledTimes(1)
+    expect(props.onContentHydrated).not.toHaveBeenCalled()
+    expect(host.querySelector('[data-testid="assistant-body"]')?.textContent).toBe('Preview')
+    props.previewReadOnly = false
+    await settleHydration()
+    expect(read).toHaveBeenCalledTimes(2)
+    expect(props.onContentHydrated).toHaveBeenCalledTimes(1)
+    expect(host.querySelector('[data-testid="assistant-body"]')?.textContent).toBe('Current answer')
+  })
+
   it('waits for an automatic pending body read before returning the hydrated find target', async () => {
     let resolveBody!: (text: string) => void
     const read = vi.spyOn(ContentRangeCache.prototype, 'readDisplay')

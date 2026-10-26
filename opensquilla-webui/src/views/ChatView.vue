@@ -146,10 +146,10 @@
           :transport-state="gatewayConnectionState"
           :transport-phase="gatewayAccess.connectionPhase"
           :resume-source="gatewayAccess.resumeSource"
-          :action="recoveryNoticeState.startsWith('live-') ? 'retry-live' : 'retry-history'"
+          :action="recoveryNoticeState.startsWith('live-') ? (chatSessionBootstrap.liveRecoveryRequiresReload.value ? 'reload-page' : 'retry-live') : 'retry-history'"
           :busy="chatSessionBootstrap.retryBusy.value"
           @dismiss="chatSessionBootstrap.dismissRecoveryNotice()"
-          @retry="recoveryNoticeState.startsWith('live-') ? retryLive() : retryHistory()"
+          @retry="retrySessionRecoveryNotice"
         />
         <div v-if="showTemporaryConversationEmpty" class="chat-temporary-empty" data-testid="temporary-conversation-empty">
           <Icon name="chat" :size="32" aria-hidden="true" />
@@ -298,9 +298,10 @@
           :aria-live="compactStatus.tone === 'err' ? 'assertive' : 'polite'"
           aria-atomic="true"
         >
-          <span class="chat-compaction-event__marker" aria-hidden="true" />
-          <span class="chat-compaction-event__title">{{ compactStatus.message }}</span>
-          <span v-if="compactStatus.detail" class="chat-compaction-event__detail">
+          <CompactionRecoveryMarker v-if="temporaryCompactionRecovery" />
+          <span v-else class="chat-compaction-event__marker" aria-hidden="true" />
+          <span class="chat-compaction-event__title">{{ temporaryCompactionRecovery ? t('chat.compact.compacted') : compactStatus.message }}</span>
+          <span v-if="compactStatus.detail && !temporaryCompactionRecovery" class="chat-compaction-event__detail">
             {{ compactStatus.detail }}
           </span>
         </div>
@@ -516,6 +517,7 @@
       :stopping="isStopPending"
       @clear="clearPendingQueue"
       @edit="editPendingMessage"
+      @restore-annotations="restorePendingAnnotations"
       @remove="removePendingChip"
       @reorder="reorderPendingItem"
       @reorder-end="endPendingReorder"
@@ -604,7 +606,7 @@
       :voice-recording="voiceRecording"
       :voice-ready="voiceReady"
       :project-workspace="activeWorkspace"
-      :project-workspace-status="activeWorkspaceStatus"
+      :project-workspace-status="activeWorkspacePresentationStatus"
       :project-binding-busy="projectBindingBusy || workbenchSessionPreparing || sessionHasActiveWork || goalBusy || planModeBusy || modelRoutingSettingsBusy"
       :project-status-message="activeProjectStatusMessage"
       :prompt-annotations="activePromptAnnotations"
@@ -778,6 +780,7 @@ import { useSetupStatus } from '@/composables/setup/useSetupStatus'
 import { useAppStore } from '@/stores/app'
 import { useSandboxSetupStore } from '@/stores/sandboxSetup'
 import { useArtifactPromptAnnotationsStore } from '@/stores/artifactPromptAnnotations'
+import { pageAnnotationSnapshots, assertPageContextWithinLimits } from '@/types/pageContext'
 import { useWorkbenchResourcesStore } from '@/stores/workbenchResources'
 import { useWorkbenchStore } from '@/workbench/store'
 import { usePlatform } from '@/platform'
@@ -788,6 +791,7 @@ import {
   reuseArtifactPromptAnnotation,
 } from '@/workbench/promptAnnotations'
 import ConversationLiveEdge from '@/components/chat/ConversationLiveEdge.vue'
+import CompactionRecoveryMarker from '@/components/chat/CompactionRecoveryMarker.vue'
 import ConversationSurface from '@/components/chat/ConversationSurface.vue'
 import { MAIN_CONVERSATION_POLICY, conversationSlashActionAllowed, type ConversationPolicy } from '@/modules/conversationPolicy'
 import PromptCacheKeepaliveDialog from '@/components/chat/PromptCacheKeepaliveDialog.vue'
@@ -829,6 +833,7 @@ import { useDeliverableUpdateIndicator } from '@/composables/chat/useDeliverable
 import { useChatRouteHeaderBridge, type ChatRouteHeaderAction } from '@/composables/chat/useChatRouteHeaderBridge'
 import { configureWorkbenchSessionCollaboration, configureWorkbenchSessionRouting, useWorkbenchSessionPreparation } from '@/composables/chat/useWorkbenchSessionPreparation'
 import { useChatFind } from '@/composables/chat/useChatFind'
+import { useCopyFeedback } from '@/composables/chat/useCopyFeedback'
 import { useChatFindPresentation } from '@/composables/chat/useChatFindPresentation'
 import { isChatFindShortcut } from '@/utils/chat/chatFindShortcut'
 import { SESSION_MESSAGE_SEARCH_KEY } from '@/modules/sessionMessageSearch'
@@ -935,6 +940,7 @@ import {
 } from '@/composables/chat/sessionBootstrapAdmission'
 import { useChatSessionRuntime } from '@/composables/chat/useChatSessionRuntime'
 import { useChatSessionViewCache } from '@/composables/chat/useChatSessionViewCache'
+import { projectInitialCompactionRows } from '@/utils/chat/compactionPresentation'
 import {
   useChatSessionSubscription,
 } from '@/composables/chat/useChatSessionSubscription'
@@ -1037,12 +1043,16 @@ import {
 } from '@/utils/chat/artifacts'
 import {
   artifactFromWorkbenchItem,
+  fixedArtifactTarget,
   createArtifactPreviewWorkbenchItem,
   requestInitialSectionForWorkbenchItem,
 } from '@/workbench/artifactItems'
 import { artifactPayloadFromRevision } from '@/workbench/artifactDocumentProvider'
+import { prepareCurrentDocumentPreview, resolveCurrentDocumentResource } from '@/workbench/currentDocumentOpening'
+import { useArtifactDocumentsStore } from '@/stores/artifactDocuments'
 import {
   artifactPayloadFromWorkbenchResource,
+  canonicalWorkbenchResources,
   createResourceCollectionWorkbenchItem,
   resourceFromPreparedPreview,
   workbenchResourceKey,
@@ -1084,7 +1094,6 @@ import {
   STOPPED_STREAM_TASK_ID,
 } from '@/utils/chat/streamEvents'
 import { copyTextWithFallback, copyImageToClipboard, downloadBlob, shareCopyImageSupported } from '@/utils/browser'
-import { useCopyFeedback } from '@/composables/chat/useCopyFeedback'
 import { recordSessionNavigationDiag } from '@/utils/chat/sessionNavigationDiag'
 import { currentSessionLink } from '@/utils/chat/sessionLinks'
 import {
@@ -1163,7 +1172,7 @@ type Message = ChatMessage
 
 // Both route chat and a workbench child mount this exact implementation. Host
 // differences concern identity/lifetime only, never event folding or rendering.
-const props = defineProps<{
+const props = withDefaults(defineProps<{
   embedded?: boolean
   surfaceVisible?: boolean
   sessionKeyOverride?: string
@@ -1178,7 +1187,7 @@ const props = defineProps<{
   draftIdentity?: string
   inheritedRunMode?: string | null
   expectedWorkspaceId?: string | null
-}>()
+}>(), { surfaceVisible: true })
 const conversationPolicy = computed(() => props.policy ?? MAIN_CONVERSATION_POLICY)
 const surfaceVisible = computed(() => props.surfaceVisible !== false)
 const workbenchOwnerKey = computed(() => props.workbenchOwnerSessionKey || sessionKey.value)
@@ -1334,6 +1343,7 @@ function artifactPreviewItemForExplicitOpen(
 
 const artifactPromptAnnotationsStore = useArtifactPromptAnnotationsStore()
 const workbenchResourcesStore = useWorkbenchResourcesStore()
+const artifactDocumentsStore = useArtifactDocumentsStore()
 const artifactImageLightbox = useArtifactImageLightbox()
 const platform = usePlatform()
 const router = useRouter()
@@ -1342,12 +1352,20 @@ const { pushToast } = useToasts()
 const { confirm } = useConfirm()
 const projectWorkspaces = useProjectWorkspaces()
 const activeProjectWorkspace = useActiveProjectWorkspace()
+watch(() => gatewayAccess.deliveryIdentity && gatewayAccess.canManageProjectWorkspaces ? JSON.stringify([
+  gatewayAccess.deliveryIdentity, gatewayAccess.loadConnectionEndpoint(), gatewayAccess.subscriptionEpoch,
+]) : null, scope => activeProjectWorkspace.setPresentationScope(scope), { immediate: true, flush: 'sync' })
+watch(projectWorkspaces.validationGeneration,
+  () => activeProjectWorkspace.invalidatePhysicalSnapshots(), { flush: 'sync' })
+let workbenchMetadataScope: string | null = null
+let workbenchIdentityRevision = 0
 const draftProjectHydration = createDraftProjectHydrationGuard()
 const {
   pendingWorkspaceId,
   boundWorkspaceId,
   activeWorkspace,
   status: activeWorkspaceStatus,
+  presentationStatus: activeWorkspacePresentationStatus,
   sendBlockedReason: activeWorkspaceSendBlockedReason,
 } = activeProjectWorkspace
 const projectPickerOpen = ref(false)
@@ -1464,6 +1482,7 @@ function annotationAllowed(annotation: Pick<PromptAnnotationSnapshot, 'selection
 const workbenchResourcesEnabled = computed(() => (
   appStore.features.documentWorkbenchResources === true
   || promptAnnotationsEnabled.value
+  || officePromptAnnotationsEnabled.value
 ))
 const attachmentWorkbenchPreviewEnabled = computed(() => (
   workbenchEnabled.value
@@ -1483,6 +1502,7 @@ const sendableAnnotationDraftIds = computed(() =>
 function promptAnnotationBlockedMessage(): string {
   if (!promptAnnotationsEnabled.value && !officePromptAnnotationsEnabled.value) return ''
   const reason = artifactPromptAnnotationsStore.sendBlockedReason(sessionKey.value, annotationAllowed)
+  if (reason === 'stale') return t('workbench.annotationUnified.stale')
   if (reason === 'editing') return t('chat.promptAnnotations.editingBlocked')
   if (reason === 'too-long') return t('chat.promptAnnotations.tooLongBlocked')
   return ''
@@ -1507,7 +1527,7 @@ async function discardPromptAnnotation(annotationId: string) {
 
 async function jumpPromptAnnotation(annotationId: string) {
   const annotation = artifactPromptAnnotationsStore.annotations[annotationId]
-  if (!promptAnnotationsEnabled.value || !annotation || annotation.selection !== undefined) return
+  if (!annotation || !annotationAllowed(annotation)) return
   const activated = await focusArtifactPromptAnnotation({
     annotationId,
     documentId: annotation.documentId,
@@ -2102,6 +2122,7 @@ const chatPendingQueue = useChatPendingQueue({
   pendingQueuePolicy: props.pendingQueuePolicy,
   pendingInputQueue,
   connectionState: gatewayConnectionState,
+  supportsTurnCommand: command => chatSlashCommands.supportsTurnCommand(command),
   deliveryIdentity,
   composerRevision,
   prepareAttachmentsForSend,
@@ -2157,6 +2178,26 @@ const {
   flushDeferredPendingDrain,
   cleanup: cleanupPendingQueue,
 } = chatPendingQueue
+watch([sessionKey, pendingQueue], ([key, items]) => {
+  artifactPromptAnnotationsStore.setQueuedDraftIds(key, items.flatMap(item => item.pageContext ? item.draftIds || [] : []))
+}, { deep: true, immediate: true, flush: 'sync' })
+
+async function restorePendingAnnotations(pendingUiId: string) {
+  try {
+    await chatPendingQueue.restoreQueuedAnnotations(pendingUiId, item => {
+      if (!item.pageContext) throw new Error('Missing annotation context')
+      assertPageContextWithinLimits(item.pageContext)
+      const snapshots = pageAnnotationSnapshots(item.pageContext)
+      if (!snapshots.length) throw new Error('Missing annotation instructions')
+      artifactPromptAnnotationsStore.restoreSnapshots(
+        item.ownerSessionKey || sessionKey.value,
+        snapshots, item.draftIds,
+      )
+    })
+  } catch {
+    pushToast(t('chat.promptAnnotations.updateFailed'), { tone: 'danger' })
+  }
+}
 watch(attachmentWorkBusy, (busy) => {
   if (!busy) flushDeferredPendingDrain()
 })
@@ -2171,11 +2212,13 @@ const {
   getCompactionPlacement,
   setCompactInFlight,
   hideCompactStatus,
-  showCompactStatus,
+  beginManualCompactionRequest,
   showCompactionToast,
   handleStreamGenerationChange: handleCompactionStreamGenerationChange,
   cleanup: cleanupCompaction,
 } = chatCompaction
+const temporaryCompactionRecovery = computed(() => compactStatus.value.durability === 'request_scoped'
+  && ['completed', 'emergency_ephemeral'].includes(compactStatus.value.status))
 isCompactInFlightForCurrentSession = chatCompaction.isCompactInFlightForCurrentSession
 
 function transcriptCompactionState(status: string): ChatMaintenanceEvent['state'] {
@@ -2520,6 +2563,7 @@ onScopeDispose(() => window.removeEventListener(LOCAL_SESSIONS_DELETED_EVENT, in
 const renderSourceMessages = sessionViewCache.messages
 const chatRenderedMessages = useChatRenderedMessages({
   messages: renderSourceMessages,
+  isPreview: sessionViewCache.showingPreview,
   interruptState,
   sessionKey,
   routerSlots,
@@ -2557,7 +2601,15 @@ const findContextRendered = useChatRenderedMessages({
   isSubagentCompletionMessage, timeTranslator: t,
 })
 const findDisplayMessages = computed(() => findContextMessages.value
-  ? findContextRendered.renderedMessages.value : visibleRenderedMessages.value)
+  ? findContextRendered.renderedMessages.value
+  : projectInitialCompactionRows(visibleRenderedMessages.value, {
+    sessionKey: sessionKey.value,
+    historySessionKey: historySessionKey.value,
+    initialHistoryStatus: historyState.value.initialLoadStatus,
+    retrying: historyState.value.retrying,
+    showingPreview: sessionViewCache.showingPreview.value,
+    compactionId: compactStatus.value.compactionId,
+  }))
 
 function shouldRenderRouterStrip(_message: ChatRenderedMessage): boolean {
   // Always surface the router strip — the live ensemble strip is the primary
@@ -2591,7 +2643,7 @@ const chatHistory = useChatHistory({
   canApplyViewportCorrection: () => !historyNavigationScrollLock.locked,
   stripTimePrefix,
   scrollToBottom,
-  onHistoryInstalled: sessionViewCache.historyInstalled,
+  onHistoryInstalled: (key, compactions) => sessionViewCache.historyInstalled(key, true, compactions),
   initialWindowSize: () => sessionViewCache.showingPreview.value ? sessionViewCache.messages.value.length : 0,
   onTerminalTask: outcome => {
     const taskId = outcome.taskId || ''
@@ -2795,13 +2847,21 @@ const {
   cleanup: cleanupSessionArtifacts,
 } = chatSessionArtifacts
 
-const voiceInput = useVoiceInput(injectedAudioTranscription)
+const voiceInput = useVoiceInput(injectedAudioTranscription, async () => {
+  const key = sessionKey.value
+  const epoch = currentEpoch.value
+  if (!key) return {}
+  const resolved = await sessionDirectory.resolve({ key })
+  if (key !== sessionKey.value || epoch !== currentEpoch.value) throw new Error('Recording session changed')
+  return { sessionKey: key, sessionId: resolved.id, sessionEpoch: epoch }
+})
 const {
   voiceBusy,
   voiceRecording,
   toggleVoiceInput,
   cleanup: cleanupVoiceInput,
 } = voiceInput
+watch([sessionKey, currentEpoch], () => voiceInput.cancel(), { flush: 'sync' })
 
 // Gate the composer mic button on real transcription readiness. onboarding.status
 // resolves whether audio is enabled AND an ElevenLabs key is present server-side
@@ -2861,6 +2921,22 @@ async function handleRegenerateMessage(
 
 let applyPendingUserInputSnapshot: (snapshot: SessionReadMetadata) => void = () => {}
 let applyGoalSnapshot: (snapshot: SessionReadMetadata) => void = () => {}
+watch(
+  [sessionKey, deliveryIdentity, currentEpoch, () => gatewayAccess.subscriptionEpoch],
+  (values, previous) => {
+    const [key, identity, epoch, connectionEpoch] = values
+    const [previousKey, previousIdentity, previousEpoch, previousConnectionEpoch] = previous
+    if (previousIdentity !== null && identity !== previousIdentity) workbenchIdentityRevision++
+    // Delivery identity hashing runs alongside startup. Its first Hello-backed
+    // publication belongs to the same read; losing/replacing a proven identity
+    // or changing the connection/session still invalidates retained metadata.
+    const initialProof = previousIdentity === null && identity !== null
+      && key === previousKey && epoch === previousEpoch && connectionEpoch === previousConnectionEpoch
+      && workbenchMetadataScope === JSON.stringify([key, null, connectionEpoch, epoch])
+    workbenchMetadataScope = initialProof ? JSON.stringify([key, identity, connectionEpoch, epoch]) : null
+  },
+  { flush: 'sync' },
+)
 const chatSessionSubscription = useChatSessionSubscription({
   sessionReadLeaseReader: sessionReadLifecycle,
   conversationRuntime,
@@ -2886,6 +2962,13 @@ const chatSessionSubscription = useChatSessionSubscription({
     chatCompaction.handleGatewayRestart()
   },
   onLiveSnapshot: snapshot => restoreLiveTurnSnapshot(snapshot),
+  onReadEpoch: (key, epoch) => {
+    const viewGeneration = sessionViewCache.generation.value
+    sessionViewCache.observeEpoch(key, epoch)
+    if (viewGeneration !== sessionViewCache.generation.value) {
+      scheduleHistorySync()
+    }
+  },
   onReadStarted: () => {
     sessionViewCache.beginLiveRead(sessionKey.value)
     presentationMetadataReady.value = false
@@ -2898,7 +2981,7 @@ const chatSessionSubscription = useChatSessionSubscription({
   },
   onSnapshotInstalled: () => {
     if (!rpcEventHandlers.finishRecovery()) {
-      throw new SessionReadFailure('busy', 'Session recovery buffer overflow; retrying the latest snapshot.', true)
+      throw new SessionReadFailure('busy', 'Session projection could not consume the buffered events; retrying the latest snapshot.', true)
     }
   },
   onAuthoritativeIdle: () => {
@@ -2924,9 +3007,16 @@ const chatSessionSubscription = useChatSessionSubscription({
   },
   beginSessionMetadataResolution: key => {
     if (pendingSessionIntent.value === 'new_chat') return -1
+    const scope = JSON.stringify([
+      key, gatewayAccess.deliveryIdentity, gatewayAccess.subscriptionEpoch, currentEpoch.value,
+    ])
+    const refresh = Boolean(gatewayAccess.deliveryIdentity && workbenchMetadataScope === scope)
+    workbenchMetadataScope = scope
     const preserveCurrent = workbenchMaterializedSessionKey === key
     workbenchMaterializedSessionKey = ''
-    return activeProjectWorkspace.beginSessionResolution(key, preserveCurrent)
+    if (refresh && !preserveCurrent) return activeProjectWorkspace.beginSessionRefresh(key)
+    return preserveCurrent ? activeProjectWorkspace.beginSessionResolution(key, true)
+      : activeProjectWorkspace.beginSessionVisit(key)
   },
   onSessionMetadata: (key, generation, metadata) => {
     if (generation < 0) return
@@ -2934,19 +3024,40 @@ const chatSessionSubscription = useChatSessionSubscription({
       workspaceBindingMismatch.value = (metadata.workspaceId ?? null) !== props.expectedWorkspaceId
     }
     const connectionEpoch = gatewayAccess.subscriptionEpoch
+    const sessionEpoch = metadata.epoch ?? currentEpoch.value
+    const identityRevision = workbenchIdentityRevision
+    const isCurrent = () => !chatViewDisposed && key === sessionKey.value
+      && connectionEpoch === gatewayAccess.subscriptionEpoch && sessionEpoch === currentEpoch.value
+      && identityRevision === workbenchIdentityRevision
     const cached = projectWorkspaces.workspaces.value.find(item => item.id === metadata.workspaceId)
-    void applySessionProjectWorkspaceMetadata({
-      state: activeProjectWorkspace, sessionKey: key, generation,
-      metadata: {
-        workspaceId: metadata.workspaceId ?? undefined,
-        projectWorkspace: projectWorkspaceFromSessionRead(metadata.projectWorkspace),
-        projectWorkspaceDeferred: metadata.projectWorkspaceDeferred,
-      },
-      cachedWorkspace: cached ? activeSnapshot(cached) : null,
-      loadWorkspaces: async () => (await projectWorkspaces.loadWorkspaces({ timeoutMs: 7_000 }))
-        .map(workspace => activeSnapshot(workspace)),
-      isCurrent: () => !chatViewDisposed && key === sessionKey.value
-        && gatewayAccess.subscriptionEpoch === connectionEpoch,
+    // Subscription installs this metadata's epoch in onSnapshot immediately
+    // after this callback. Validate/project after that installation so a cold
+    // session with a nonzero epoch cannot invalidate its own workspace read.
+    void Promise.resolve().then(() => {
+      const registered = projectWorkspaceFromSessionRead(metadata.projectWorkspace)
+      const validated = registered ? projectWorkspaces.getValidatedWorkspace(registered.id, registered.path) : undefined
+      return applySessionProjectWorkspaceMetadata({
+        state: activeProjectWorkspace, sessionKey: key, generation,
+        metadata: {
+          workspaceId: metadata.workspaceId ?? undefined,
+          projectWorkspace: registered,
+          projectWorkspaceDeferred: metadata.projectWorkspaceDeferred,
+          epoch: sessionEpoch,
+        },
+        cachedWorkspace: cached ? activeSnapshot(cached) : null,
+        validatedWorkspace: validated ? validated.workspace ? activeSnapshot(validated.workspace) : null : undefined,
+        loadWorkspaces: async () => (await projectWorkspaces.loadWorkspaces({ timeoutMs: 7_000 }))
+          .map(workspace => activeSnapshot(workspace)),
+        isCurrent,
+      })
+    }).then(() => {
+      // The first snapshot establishes the session epoch after the read began.
+      // Remember the installed context, not the pre-bootstrap unknown epoch.
+      if (isCurrent() && activeWorkspaceStatus.value !== 'resolving' && activeWorkspaceStatus.value !== 'error') {
+        workbenchMetadataScope = JSON.stringify([
+          key, gatewayAccess.deliveryIdentity, connectionEpoch, sessionEpoch,
+        ])
+      }
     })
   },
   onSessionMetadataError: (key, generation) => {
@@ -3148,6 +3259,15 @@ function retryLive(explicit = true) {
   return retryLiveCoordinator(explicit)
 }
 
+async function retrySessionRecoveryNotice() {
+  if (!recoveryNoticeState.value?.startsWith('live-')) return retryHistory()
+  if (!chatSessionBootstrap.liveRecoveryRequiresReload.value) return retryLive()
+  // Flush the current draft watcher before the explicit page reload.
+  await nextTick()
+  await chatAttachments.flushAttachmentDraft()
+  window.location.reload()
+}
+
 function cancelSessionBootstrap(unsubscribe = true) {
   optionalRpcAdmissionGeneration += 1
   cancelSessionBootstrapCoordinator(unsubscribe)
@@ -3207,11 +3327,17 @@ const promptAnnotationSendBlockedReason = computed<string | null>(() =>
 const deliveryBlockedReason = computed<string | null>(() => (
   sessionRoutingSendBlockedReason.value || liveSendBlockedReason.value
 ))
-const effectiveSendBlockedReason = computed<string | null>(() => (
+const baseSendBlockedReason = computed<string | null>(() => (
   (props.ownerBlocked || preparingHostSession.value ? t('chat.liveSendBlockedConnecting') : null)
   || (workspaceBindingMismatch.value ? t('workbench.newPanel.workspaceNotReady') : null)
   || (projectBindingBusy.value || workbenchSessionPreparing.value ? t('workspaces.activeProjectResolving') : null)
-  || deliveryBlockedReason.value || promptAnnotationSendBlockedReason.value
+  || deliveryBlockedReason.value
+))
+const queuedSendBlockedReason = computed<string | null>(() => (
+  baseSendBlockedReason.value || newTaskModelSendBlockedReason.value
+))
+const effectiveSendBlockedReason = computed<string | null>(() => (
+  baseSendBlockedReason.value || promptAnnotationSendBlockedReason.value
   || newTaskModelSendBlockedReason.value
 ))
 const provenSessionDelivery = ref<{
@@ -3361,7 +3487,7 @@ const chatSessionRuntime = useChatSessionRuntime({
   usageModel,
   createSessionKey,
   persistSession,
-  beginSessionResolution: activeProjectWorkspace.beginSessionResolution,
+  beginSessionResolution: activeProjectWorkspace.beginSessionVisit,
   cancelSessionBootstrap: (unsubscribe = true) => {
     // Retire draft-project work on the old socket before the next session's
     // coordinator can start, so its abort/reconnect cannot tear down B.
@@ -3384,10 +3510,10 @@ const chatSessionRuntime = useChatSessionRuntime({
   restoreWidgetState,
   resetStreamLiveTurnState,
   retireAttachments,
+  resetInputHistory: () => resetComposerInputHistory(),
   resetDraftComposer: () => {
     artifactImageLightbox.close()
     inputText.value = ''
-    resetComposerInputHistory()
     autoResizeTextarea()
   },
 })
@@ -3638,6 +3764,7 @@ const sideChatCommand = useSideChatCommand({
   notify: message => pushToast(message, { duration: 6000 }), translate: key => t(key), resized: autoResizeTextarea,
 })
 const chatSlashCommands = useChatSlashCommands({
+  catalogScope: () => JSON.stringify([gatewayAccess.deliveryIdentity, gatewayAccess.subscriptionEpoch]),
   sideChat: sideChatCommand,
   commandAllowed: command => conversationSlashActionAllowed(conversationPolicy.value, command.execution?.action || command.cmd),
   skillCatalog,
@@ -3673,9 +3800,7 @@ const chatSlashCommands = useChatSlashCommands({
     scheduleHistorySync()
     void retryLive()
   },
-  setCompactInFlight,
-  showCompactStatus,
-  showCompactionToast,
+  beginManualCompactionRequest,
   notify: (message: string) => pushToast(message, { duration: 6000 }),
   activatePlanMode: activatePlanComposerMode,
   planModeAvailable: () => planUiAvailable.value,
@@ -3844,6 +3969,7 @@ const chatSend = useChatSend({
   },
   activeSteerCapability,
   inputText,
+  commandText: composerText,
   messages,
   sessionKey,
   pendingQueueOwnerContext,
@@ -3865,6 +3991,7 @@ const chatSend = useChatSend({
   pendingSessionIntent,
   pendingWorkspaceId,
   sendBlockedReason: effectiveSendBlockedReason,
+  queuedSendBlockedReason,
   offlineQueueIdentity,
   deliveryIdentity,
   validateActiveProjectBeforeSend,
@@ -3881,6 +4008,10 @@ const chatSend = useChatSend({
   promptAnnotationSnapshots: ids => artifactPromptAnnotationsStore.snapshotsForIds(
     ids.filter(id => annotationAllowed(artifactPromptAnnotationsStore.annotations[id])),
   ).filter(annotationAllowed),
+  invalidatePromptAnnotations: snapshots => {
+    try { artifactPromptAnnotationsStore.invalidateSnapshots(snapshots) }
+    catch { pushToast(t('chat.promptAnnotations.updateFailed'), { tone: 'warn' }) }
+  },
   acknowledgePromptAnnotations: (snapshots, acceptedSessionKey, requestSessionKey) => {
     let removedIds: string[]
     try {
@@ -3893,6 +4024,7 @@ const chatSend = useChatSend({
       draftIds: removedIds,
       sessionKey: acceptedSessionKey,
       requestSessionKey,
+      documentId: snapshots[0]?.documentId,
     })
   },
   materializeDraftSession: key => {
@@ -3908,7 +4040,10 @@ const chatSend = useChatSend({
     // The provisional draft bootstrap can finish before the Gateway creates
     // the first durable session. Re-register immediately after acceptance so
     // buffered text, tool, and reasoning frames replay into the first turn.
-    const bootstrap = startSessionBootstrap({ includeHistory: false, force: true })
+    // Draft bootstrap skips durable history. Once the route is materialized,
+    // the presentation barrier requires that first canonical history receipt
+    // as well as the live snapshot, even when the session key is unchanged.
+    const bootstrap = startSessionBootstrap({ includeHistory: true, force: true })
     void bootstrap.live.then(outcome => {
       if (outcome.authoritative && sessionKey.value === key) {
         // A provisional snapshot may have completed before the first send
@@ -3970,6 +4105,8 @@ const chatSend = useChatSend({
   classifySlashCommand,
   executeSlashCommand,
   isPlanModeCommand,
+  resolveTurnCommand: chatSlashCommands.resolveTurnCommand,
+  supportsTurnCommand: chatSlashCommands.supportsTurnCommand,
   closeSlashMenu,
   autoResizeTextarea,
   scrollToBottom,
@@ -4443,7 +4580,19 @@ const rpcEventHandlers = useChatRpcEventHandlers({
   clearPendingRouterDecision,
   handleRouterControlReplay,
   resetRouterReplayCursor,
-  showCompactionToast,
+  showCompactionToast: (payload, meta) => {
+    // This callback runs only after the RPC consumer's cursor/owner fences.
+    // Bind the receipt to this read, never to the cached snapshot's old lease.
+    const key = sessionKey.value
+    const authority = sessionReadLifecycle.current()
+    const identity = deliveryIdentity.value
+    return showCompactionToast(payload, {
+      ...meta,
+      onTerminal: receipt => sessionViewCache.reconcileCompactionTerminal(key, receipt, {
+        identity, authority, epoch: typeof payload.epoch === 'number' ? payload.epoch : null,
+      }),
+    })
+  },
   getCompactionPlacement: id => getCompactionPlacement(id) || undefined,
   showWarningToast: message => pushToast(message || t('chat.warning.default'), { tone: 'warn', duration: 5000 }),
   supportsTurnCommitted: () => gatewayAccess.turnCommittedEvents,
@@ -5077,8 +5226,8 @@ const modelImageSendBlockedMessage = computed(() => {
     : ''
 })
 
-const activeProjectStatusMessage = computed(() => {
-  switch (activeWorkspaceStatus.value) {
+function projectStatusMessage(status: string): string {
+  switch (status) {
     case 'resolving':
       return t('workspaces.activeProjectResolving')
     case 'unavailable':
@@ -5091,14 +5240,18 @@ const activeProjectStatusMessage = computed(() => {
     default:
       return ''
   }
-})
+}
+
+const activeProjectStatusMessage = computed(() => projectStatusMessage(activeWorkspacePresentationStatus.value))
 
 const activeProjectComposerBlockMessage = computed(() => {
   switch (activeWorkspaceStatus.value) {
     case 'resolving':
     case 'unavailable':
     case 'removed':
-      return activeProjectStatusMessage.value
+      // The stable presentation can be ready while session metadata is being
+      // checked. Admission must use operation status, never its visible copy.
+      return projectStatusMessage(activeWorkspaceStatus.value)
     default:
       return ''
   }
@@ -5595,9 +5748,8 @@ async function previewAttachmentResource(attachment: DisplayAttachment) {
     const current = await workbenchResourcesStore.openCurrent(key, resource)
     if (!isCurrent()) return
     if (current?.disposition === 'document') {
-      const artifact = artifactPayloadFromRevision(current.revision)
-      artifact.documentId = current.document.documentId
-      artifact.revisionId = current.revision.revisionId
+      const artifact = await prepareCurrentDocumentPreview(current.resource, key, artifactDocumentsStore, isCurrent)
+      if (!artifact || !isCurrent()) return
       openWorkbenchItemExplicit(artifactPreviewItemForExplicitOpen({
         artifact,
         initialSection: 'preview',
@@ -5612,8 +5764,10 @@ async function previewAttachmentResource(attachment: DisplayAttachment) {
       return
     }
     if (!current && resource.resource.type === 'document') {
+      const artifact = await prepareCurrentDocumentPreview(resource, key, artifactDocumentsStore, isCurrent)
+      if (!artifact || !isCurrent()) return
       openWorkbenchItemExplicit(artifactPreviewItemForExplicitOpen({
-        artifact: artifactPayloadFromWorkbenchResource(resource),
+        artifact,
         initialSection: 'preview',
         nativeHtml: Boolean(
           platform.capabilities.hasNativeWorkbenchSurfaces
@@ -5699,7 +5853,8 @@ async function downloadArtifact(artifact: ArtifactPayload) {
   // are separate workbench actions and must not change what this chat card
   // resolves to after later edits.
   try {
-    const result = await artifactWorkbench.content.fetchArtifact(artifact, {
+    const target = artifact.source === 'workspace-preview' ? artifact : fixedArtifactTarget(artifact)
+    const result = await artifactWorkbench.content.fetchArtifact(target, {
       sessionKey: sessionKey.value,
     })
     if (!result.ok) {
@@ -5726,12 +5881,10 @@ const headerDeliverableCount = computed(() => {
   if (!workbenchEnabled.value || !workbenchResourcesEnabled.value) {
     return sessionArtifacts.value.length
   }
-  // Local previews are Documents, not public artifacts. Keep their existing
-  // resource-list entry reachable without creating a delivery just for the UI.
-  return Math.max(
-    sessionArtifacts.value.length,
-    workbenchResourcesStore.navigationResources(sessionKey.value).length,
-  )
+  const snapshot = workbenchResourceSnapshot.value
+  return snapshot.loaded && snapshot.available
+    ? canonicalWorkbenchResources(snapshot.resources).length
+    : sessionArtifacts.value.length
 })
 const attachmentWorkbenchResources = computed<ReadonlyMap<string, WorkbenchResource>>(() => (
   new Map(
@@ -5872,6 +6025,7 @@ function openLegacyArtifactWorkbench(
       && platform.workbench.native,
     ),
     sessionKey: sessionKey.value,
+    ...(artifact.id ? { resourceIdentity: `deliverable:${artifact.id}` } : {}),
   }))
 }
 
@@ -5883,125 +6037,54 @@ async function openDeliverableWorkbenchResource(artifact: ArtifactPayload) {
   const documentId = typeof artifact.documentId === 'string'
     ? artifact.documentId.trim()
     : typeof artifact.document_id === 'string' ? artifact.document_id.trim() : ''
-  if ((!artifactId && !documentId) || !key) {
-    openLegacyArtifactWorkbench(artifact)
-    return
-  }
   try {
-    // Persisted workspace cards can reference an internal historical revision.
-    // Resolve its owning document instead of treating it as a public delivery.
-    if (artifact.source === 'workspace-preview') {
+    const historical = artifact.workbenchOpenIntent === 'history'
+    if (!historical && artifact.source === 'workspace-preview') {
       await openWorkspacePreviewExplicit(
         documentId || { artifactId }, key,
         typeof artifact.previewPagePath === 'string' ? artifact.previewPagePath : undefined,
       )
       return
     }
-    const ref = documentId
-      ? createWorkbenchResourceRef('document', documentId)
-      : createWorkbenchResourceRef('deliverable', artifactId)
-    const resource = await workbenchResourcesStore.resolve(key, ref)
+    if (!artifactId || !key) {
+      openLegacyArtifactWorkbench(artifact)
+      return
+    }
+    const ref = createWorkbenchResourceRef('deliverable', artifactId)
+    const resource = historical
+      ? await workbenchResourcesStore.resolve(key, ref)
+      : await resolveCurrentDocumentResource(
+          (session, resource) => workbenchResourcesStore.resolveFresh(session, resource, isCurrent), key, ref, isCurrent)
     if (!isCurrent()) return
     if (!resource) {
       openLegacyArtifactWorkbench(artifact)
       return
     }
-    const current = await workbenchResourcesStore.openCurrent(key, resource)
-    if (!isCurrent()) return
-    if (current?.disposition === 'document') {
-      const currentArtifact = artifactPayloadFromRevision(current.revision)
-      currentArtifact.documentId = current.document.documentId
-      currentArtifact.revisionId = current.revision.revisionId
-      openWorkbenchItemExplicit(artifactPreviewItemForExplicitOpen({
-        artifact: currentArtifact,
-        initialSection: 'preview',
-        navigationArtifacts: sessionArtifacts.value,
-        nativeHtml: Boolean(
-          platform.capabilities.hasNativeWorkbenchSurfaces
-          && platform.workbench.native,
-        ),
-        previewLeaseEligible: true,
-        resourceIdentity: workbenchResourceKey(current.resource.resource),
-        sessionKey: key,
-      }))
-      return
-    }
-    if (!current && resource.resource.type === 'document') {
-      openLegacyArtifactWorkbench(
-        artifactPayloadFromWorkbenchResource(resource),
-        'preview',
-      )
-      return
-    }
-    if (
-      !current
-      && resource.resource.type !== 'document'
-      && resource.capabilities.edit
-      && resource.sha256
-    ) {
-      const imported = await workbenchResourcesStore.importDocument(
-        key,
-        resource,
-      )
-      if (!isCurrent()) return
-      const importedArtifact = artifactPayloadFromRevision(imported.revision)
-      importedArtifact.documentId = imported.document.documentId
-      importedArtifact.revisionId = imported.revision.revisionId
-      openWorkbenchItemExplicit(artifactPreviewItemForExplicitOpen({
-        artifact: importedArtifact,
-        initialSection: 'preview',
-        navigationArtifacts: sessionArtifacts.value,
-        nativeHtml: Boolean(
-          platform.capabilities.hasNativeWorkbenchSurfaces
-          && platform.workbench.native,
-        ),
-        previewLeaseEligible: true,
-        resourceIdentity: `document:${imported.document.documentId}`,
-        sessionKey: key,
-      }))
-      return
-    }
-    const readonlyResource = current?.resource || resource
-    if (!readonlyResource.capabilities.preview) {
+    if (!resource.capabilities.preview) {
       pushToast(t(workbenchResourceUnavailableReasonKey(
-        current?.reasonCode || workbenchResourceActionReasonCode(
-          readonlyResource.capabilities,
-          'preview',
-        ),
+        workbenchResourceActionReasonCode(resource.capabilities, 'preview'),
       )), { tone: 'warn' })
       return
     }
-    const preview = await workbenchResourcesStore.preview(
-      key,
-      readonlyResource.resource,
-    )
-    if (!isCurrent()) return
-    if (!preview) {
-      openLegacyArtifactWorkbench(artifact)
-      return
-    }
-    const preparedResource = resourceFromPreparedPreview(preview)
+    // Discovery follows existing Document lineage without importing a copy.
+    // Explicit history retains the immutable delivery and its own tab.
+    const previewArtifact = historical ? artifactPayloadFromWorkbenchResource(resource)
+      : await prepareCurrentDocumentPreview(resource, key, artifactDocumentsStore, isCurrent)
+    if (!isCurrent() || !previewArtifact) return
     openWorkbenchItemExplicit(artifactPreviewItemForExplicitOpen({
-      artifact: artifactPayloadFromWorkbenchResource(preparedResource),
+      artifact: previewArtifact,
+      historical,
       navigationArtifacts: sessionArtifacts.value,
-      nativeHtml: false,
-      preparedPreview: preview.preview,
-      previewLeaseEligible: false,
-      resourceIdentity: workbenchResourceKey(readonlyResource.resource),
+      nativeHtml: Boolean(platform.capabilities.hasNativeWorkbenchSurfaces && platform.workbench.native),
+      resourceIdentity: workbenchResourceKey(resource.resource),
       sessionKey: key,
     }))
   } catch (error) {
     if (!isCurrent()) return
-    // METHOD_NOT_FOUND is normalized to a null open result by the provider and
-    // follows the compatibility path above. Any other failure must remain
-    // visible: silently opening the immutable chat artifact would disguise a
-    // failed current-head resolution as a successful edit action.
     const classified = classifyArtifactProductError(error)
     const translated = t(classified.messageKey)
-    pushToast(
-      translated === classified.messageKey ? classified.fallbackMessage : translated,
-      { tone: 'danger', duration: 9000 },
-    )
+    pushToast(translated === classified.messageKey ? classified.fallbackMessage : translated,
+      { tone: 'danger', duration: 9000 })
   }
 }
 
@@ -6019,10 +6102,12 @@ const workspacePreviewOpening = useWorkspacePreviewOpening({
   getArtifact: (key, artifactId) => artifactWorkbench.artifacts.get(key, artifactId),
   resolve: (key, resource) => workbenchResourcesStore.resolve(key, resource),
   openCurrent: (key, resource) => workbenchResourcesStore.openCurrent(key, resource),
+  prepareCurrent: (current, key, isCurrent) => prepareCurrentDocumentPreview(current.resource, key, artifactDocumentsStore, isCurrent),
   show: (current, key, previewPagePath) => {
     const artifact = artifactPayloadFromRevision(current.revision)
     artifact.documentId = current.document.documentId
     artifact.revisionId = current.revision.revisionId
+    artifact.sourcePath = current.resource.sourcePath
     if (previewPagePath) artifact.previewPagePath = previewPagePath
     const item = artifactPreviewItemForExplicitOpen({
       artifact,
@@ -6359,6 +6444,7 @@ const {
   copyIconName: sessionCopyIcon,
   copyLiveText: sessionCopyLiveText,
   onCopyClick: copySessionLink,
+  resetCopyFeedback: resetSessionCopyFeedback,
 } = useCopyFeedback(async () => {
   const key = sessionKey.value
   const epoch = gatewayAccess.subscriptionEpoch
@@ -6376,6 +6462,7 @@ const {
     return false
   }
 })
+watch([sessionKey, () => gatewayAccess.subscriptionEpoch], resetSessionCopyFeedback, { flush: 'sync' })
 
 // App owns the header component. This view registers one stable set of refs and
 // commands; draft materialization only changes those refs and never rebuilds
@@ -6452,8 +6539,13 @@ const chatRouteHeaderRegistration = props.embedded
   sessionDurable: computed(() => !isDraftSurface()),
   // Bootstrap owns whether a history read is needed (materialized drafts skip
   // it). A failed workspace lookup is settled, not an endless loading state.
-  sessionLoading: computed(() => activeWorkspaceStatus.value === 'resolving'
-    || !isDraftSurface() && ['idle', 'loading'].includes(chatSessionBootstrap.historyPhase.value)),
+  sessionLoading: computed(() => !activeProjectWorkspace.refreshing.value
+    && (activeWorkspaceStatus.value === 'resolving'
+      || !isDraftSurface() && ['idle', 'loading'].includes(chatSessionBootstrap.historyPhase.value))),
+  sessionRefreshing: activeProjectWorkspace.refreshing,
+  sessionContext: computed(() => JSON.stringify([
+    sessionKey.value, gatewayAccess.deliveryIdentity, gatewayAccess.subscriptionEpoch, currentEpoch.value,
+  ])),
   sessionPreparable: workbenchSessionPreparation.canPrepare,
   workspaceId: boundWorkspaceId,
   workspaceReady: computed(() => activeWorkspaceStatus.value === 'ready'),
@@ -6566,9 +6658,7 @@ async function onShareCopy() {
   const ok = await copyImageToClipboard(preview.blob)
   // Approved decision: the modal stays open after a copy so the user can copy
   // again or then download; only Download / Cancel / Escape closes it.
-  pushToast(ok ? t('chat.toast.copiedToClipboard') : t('chat.toast.copyNotSupported'), {
-    tone: ok ? undefined : 'danger',
-  })
+  if (!ok) pushToast(t('chat.toast.copyNotSupported'), { tone: 'danger' })
 }
 
 // Re-render the image in the chosen theme, swapping the object URL in place so
@@ -7511,8 +7601,10 @@ async function validateActiveProjectBeforeSend(): Promise<string | null> {
     const workspaces = await projectWorkspaces.loadWorkspaces({
       timeoutMs: Math.max(1, deadlineAt - Date.now()),
       signal: controller.signal,
+      fresh: true,
     })
-    if (sessionKey.value !== key || boundWorkspaceId.value !== workspaceId) {
+    if (controller.signal.aborted || activeProjectValidationController !== controller
+      || sessionKey.value !== key || boundWorkspaceId.value !== workspaceId) {
       return activeWorkspaceSendBlockedReason.value || 'resolving'
     }
     const workspace = workspaces.find(item => item.id === workspaceId) || null
@@ -7527,6 +7619,9 @@ async function validateActiveProjectBeforeSend(): Promise<string | null> {
     ) {
       activeProjectWorkspace.failWorkspaceRefresh()
     }
+    // A cancelled/superseded read must not turn a retained ready presentation
+    // into a successful preflight result for the departed operation.
+    return controller.signal.aborted ? 'resolving' : 'error'
   } finally {
     if (activeProjectValidationController === controller) {
       activeProjectValidationController = null
@@ -8055,6 +8150,9 @@ watch(
 
 watch(projectWorkspaces.workspaces, workspaces => {
   if (!gatewayAccess.canManageProjectWorkspaces) return
+  // A reconnect clears the catalog before its next successful load. That
+  // temporary empty value is not evidence that the bound project was removed.
+  if (!projectWorkspaces.hasLoaded.value) return
   const workspaceId = boundWorkspaceId.value
   if (!workspaceId) return
   const workspace = workspaces.find(item => item.id === workspaceId) || null

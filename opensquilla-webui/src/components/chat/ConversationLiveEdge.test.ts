@@ -54,6 +54,31 @@ async function mountHost(mode: 'main-live' | 'transcript-live') {
 }
 
 describe('ConversationLiveEdge mounted parity', () => {
+  it.each(['main-live', 'transcript-live'] as const)('keeps running compaction visible after collapse (%s)', async mode => {
+    vi.spyOn(Date, 'now').mockReturnValue(4000)
+    const { host, message } = await mountHost(mode)
+    message.statusHistory = [{ action: 'context_compaction', label: '', at: 3500,
+      id: 'compact', category: 'maintenance', state: 'running', activityOrder: 5 }]
+    await flush()
+
+    const toggle = host.querySelector<HTMLButtonElement>('.assistant-activity__live-head')!
+    expect(toggle.getAttribute('aria-expanded')).toBe('true')
+    toggle.click()
+    await flush()
+
+    const hint = host.querySelector('[data-testid="collapsed-compaction-status"]')
+    expect(hint).not.toBeNull()
+    expect(hint!.textContent).toContain(i18n.global.t('chat.compact.compacting'))
+    const body = host.querySelector('.assistant-activity__body')!
+    expect(body.getAttribute('aria-hidden')).toBe('true')
+    expect(body.contains(hint)).toBe(false)
+
+    message.statusHistory = [{ action: 'context_compaction', label: '', at: 3500,
+      id: 'compact', category: 'maintenance', state: 'completed', durability: 'request_scoped', activityOrder: 5 }]
+    await flush()
+    expect(host.querySelector('[data-testid="collapsed-compaction-status"]')).toBeNull()
+  })
+
   it('renders main and transcript live reasoning, tools, provider wait and compaction in the same order', async () => {
     vi.spyOn(Date, 'now').mockReturnValue(4000)
     const main = await mountHost('main-live')

@@ -40,15 +40,24 @@ async function harness(officeEnabled = true, nativeEnabled = false) {
   const workspace = await provider.loadWorkspace(sourceArtifact, 'session-1')
   const artifact = workspace.headArtifact
   const store = useArtifactPromptAnnotationsStore()
+  const annotationActions = {
+    ...store,
+    get: (annotationId: string) => store.annotations[annotationId],
+    list: (sessionKey: string, documentId: string) => store.draftsForSession(sessionKey)
+      .filter(draft => draft.documentId === documentId),
+    update: (annotationId: string, body: string) => store.update(annotationId, body),
+    create: (request: Parameters<typeof store.create>[0]) => store.create(request),
+  }
   const options = { baseOrigin: 'http://localhost', currentSessionId: () => 'session-1',
     platform: { id: 'web', capabilities: {}, files: {} }, artifactContent: {}, artifactPreviews: {},
     confirmRemoteResources: vi.fn(), pushToast: vi.fn(), t: (key: string) => key,
-    officePromptAnnotations: officeEnabled ? store : undefined,
-    promptAnnotations: nativeEnabled ? store : undefined,
+    officePromptAnnotations: officeEnabled ? annotationActions : undefined,
+    promptAnnotations: nativeEnabled ? annotationActions : undefined,
     artifactDocuments: { load: async () => undefined,
       headArtifact: () => artifact, snapshot: () => ({ workspace }) },
   } as unknown as ArtifactWorkbenchProviderOptions
-  const item = createArtifactPreviewWorkbenchItem({ artifact, sessionKey: 'session-1', nativeHtml: false })
+  const item = createArtifactPreviewWorkbenchItem({ artifact, sessionKey: 'session-1', nativeHtml: false,
+    resourceIdentity: 'document:document-1' })
   const renderState: Record<string, unknown> = {}
   const definition = createArtifactWorkbenchDefinitions(options)[0]
   const runtime = await definition.createRuntime!(item, { getRenderState: () => renderState,
@@ -127,6 +136,169 @@ describe('Office preview context', () => {
     await h.runtime.handleComponentEvent!({ type: 'artifact-annotation-fallback-cancel', payload: { annotationId: id } }, h.item)
     expect(h.store.drafts).toEqual([])
     expect(h.renderState.annotationFallback).toBeNull()
+    await h.runtime.dispose?.('closed')
+  })
+
+  it('records card and summary actions as unsent composer drafts', async () => {
+    const h = await harness()
+    await h.select()
+    const id = (h.renderState.annotationFallback as { annotationId: string }).annotationId
+    await h.runtime.handleComponentEvent!({ type: 'artifact-annotation-fallback-submit',
+      payload: { annotationId: id, body: '只记录，不执行' } }, h.item)
+    await h.runtime.handleComponentEvent!({ type: 'artifact-annotation-summary',
+      payload: { type: 'submit' } }, h.item)
+    expect(h.store.annotations[id]).toMatchObject({ body: '只记录，不执行', status: 'draft' })
+    expect(h.store.isQueued(id)).toBe(false)
+    expect(h.store.sendableDraftsForSession('session-1').map(draft => draft.annotationId)).toEqual([id])
+    expect(h.store.sendBlockedReason('session-1')).toBeNull()
+    expect(h.renderState.annotationFallback).toBeNull()
+    await h.runtime.dispose?.('closed')
+  })
+
+  it('restores the original text when canceling an existing draft edit', async () => {
+    const h = await harness()
+    await h.select()
+    const id = (h.renderState.annotationFallback as { annotationId: string }).annotationId
+    await h.runtime.handleComponentEvent!({ type: 'artifact-annotation-fallback-submit',
+      payload: { annotationId: id, body: '原有修改建议' } }, h.item)
+    await h.runtime.handleComponentEvent!({ type: 'artifact-annotation-summary',
+      payload: { type: 'edit', annotationId: id } }, h.item)
+    await h.runtime.handleComponentEvent!({ type: 'artifact-annotation-fallback-update',
+      payload: { annotationId: id, body: '本次临时修改' } }, h.item)
+    expect(h.store.annotations[id].body).toBe('本次临时修改')
+    expect(h.store.sendBlockedReason('session-1')).toBe('editing')
+    // Reopening the same item must not replace its cancel checkpoint.
+    await h.runtime.handleComponentEvent!({ type: 'artifact-annotation-summary',
+      payload: { type: 'edit', annotationId: id } }, h.item)
+    await h.runtime.handleComponentEvent!({ type: 'artifact-annotation-fallback-cancel',
+      payload: { annotationId: id, body: '本次临时修改' } }, h.item)
+    expect(h.store.annotations[id].body).toBe('原有修改建议')
+    expect(h.store.sendBlockedReason('session-1')).toBeNull()
+    expect(h.renderState.annotationFallback).toBeNull()
+    await h.runtime.dispose?.('closed')
+  })
+
+  it('preserves a failed record and prevents closing until the latest body is saved', async () => {
+    const h = await harness()
+    await h.select()
+    const id = (h.renderState.annotationFallback as { annotationId: string }).annotationId
+    const update = vi.spyOn(h.store, 'update').mockRejectedValue(new Error('Storage unavailable'))
+    await h.runtime.handleComponentEvent!({ type: 'artifact-annotation-fallback-submit',
+      payload: { annotationId: id, body: '存储恢复后保留这段正文' } }, h.item)
+    expect(h.renderState.annotationFallback).toMatchObject({ annotationId: id })
+    expect(h.renderState.annotationError).toBeTruthy()
+    expect(h.store.sendBlockedReason('session-1')).toBe('editing')
+    expect(await h.runtime.beforeClose?.()).toBe(false)
+    update.mockRestore()
+    expect(await h.runtime.beforeClose?.()).toBe(true)
+    expect(h.store.annotations[id].body).toBe('存储恢复后保留这段正文')
+    expect(h.store.sendBlockedReason('session-1')).toBeNull()
+    await h.runtime.dispose?.('closed')
+  })
+
+  it('finishes the previous editor before opening another draft and releases both locks', async () => {
+    const h = await harness()
+    const ids: string[] = []
+    for (const body of ['第一条', '第二条']) {
+      await h.select()
+      const id = (h.renderState.annotationFallback as { annotationId: string }).annotationId
+      ids.push(id)
+      await h.runtime.handleComponentEvent!({ type: 'artifact-annotation-fallback-submit',
+        payload: { annotationId: id, body } }, h.item)
+    }
+    await h.runtime.handleComponentEvent!({ type: 'artifact-annotation-summary',
+      payload: { type: 'edit', annotationId: ids[0] } }, h.item)
+    await h.runtime.handleComponentEvent!({ type: 'artifact-annotation-fallback-update',
+      payload: { annotationId: ids[0], body: '已更新第一条' } }, h.item)
+    await h.runtime.handleComponentEvent!({ type: 'artifact-annotation-summary',
+      payload: { type: 'edit', annotationId: ids[1] } }, h.item)
+    expect(h.store.annotations[ids[0]].body).toBe('已更新第一条')
+    expect(h.renderState.annotationFallback).toMatchObject({ annotationId: ids[1] })
+    await h.runtime.handleComponentEvent!({ type: 'artifact-annotation-fallback-cancel',
+      payload: { annotationId: ids[1] } }, h.item)
+    expect(h.store.sendBlockedReason('session-1')).toBeNull()
+    expect(h.store.sendableDraftsForSession('session-1')).toHaveLength(2)
+    await h.runtime.dispose?.('closed')
+  })
+
+  it('saves an Office editor before suspension so a hidden card cannot block composer send', async () => {
+    const h = await harness()
+    await h.select()
+    const id = (h.renderState.annotationFallback as { annotationId: string }).annotationId
+    await h.runtime.handleComponentEvent!({ type: 'artifact-annotation-fallback-update',
+      payload: { annotationId: id, body: '切文件时保留' } }, h.item)
+    await h.runtime.suspend?.(h.item)
+    expect(h.store.annotations[id].body).toBe('切文件时保留')
+    expect(h.store.sendBlockedReason('session-1')).toBeNull()
+    expect(h.renderState.annotationFallback).toBeNull()
+    await h.runtime.dispose?.('closed')
+  })
+
+  it('ignores an acknowledgement from another document or an older draft while editing a new one', async () => {
+    const h = await harness()
+    await h.runtime.handleComponentEvent!({ type: 'office-annotation-mode', payload: { enabled: true } }, h.item)
+    await h.runtime.handleComponentEvent!({ type: 'page-annotations-sent',
+      payload: { documentId: 'other-document', draftIds: [] } }, h.item)
+    expect(h.renderState.annotationMode).toBe(true)
+    await h.select()
+    const id = (h.renderState.annotationFallback as { annotationId: string }).annotationId
+    await h.runtime.handleComponentEvent!({ type: 'artifact-annotation-fallback-update',
+      payload: { annotationId: id, body: '旧回执之后的新正文' } }, h.item)
+    await h.runtime.handleComponentEvent!({ type: 'page-annotations-sent',
+      payload: { documentId: 'document-1', draftIds: ['previously-sent'] } }, h.item)
+    expect(h.renderState.annotationMode).toBe(true)
+    expect(h.renderState.annotationFallback).toMatchObject({ annotationId: id })
+    expect(h.store.annotations[id].body).toBe('旧回执之后的新正文')
+    await h.runtime.dispose?.('closed')
+  })
+
+  it('does not stop an Office selection whose draft creation is pending when an old acknowledgement arrives', async () => {
+    const h = await harness()
+    await h.runtime.handleComponentEvent!({ type: 'office-annotation-mode', payload: { enabled: true } }, h.item)
+    const originalCreate = h.store.create.bind(h.store)
+    let resolveCreate!: () => void
+    const gate = new Promise<void>(resolve => { resolveCreate = resolve })
+    const create = vi.spyOn(h.store, 'create').mockImplementation(async request => {
+      await gate
+      return originalCreate(request)
+    })
+    const selected = h.select()
+    expect(create).toHaveBeenCalledOnce()
+    await h.runtime.handleComponentEvent!({ type: 'page-annotations-sent',
+      payload: { documentId: 'document-1', draftIds: ['previously-sent'] } }, h.item)
+    expect(h.renderState.annotationMode).toBe(true)
+    resolveCreate()
+    await selected
+    expect(h.renderState.annotationFallback).toBeTruthy()
+    create.mockRestore()
+    await h.runtime.dispose?.('closed')
+  })
+
+  it('ignores late locate results for the previous card and accepts only the current request', async () => {
+    const h = await harness()
+    const ids: string[] = []
+    for (const body of ['第一条', '第二条']) {
+      await h.select()
+      const id = (h.renderState.annotationFallback as { annotationId: string }).annotationId
+      ids.push(id)
+      await h.runtime.handleComponentEvent!({ type: 'artifact-annotation-fallback-submit',
+        payload: { annotationId: id, body } }, h.item)
+    }
+    await h.runtime.handleComponentEvent!({ type: 'artifact-annotation-summary',
+      payload: { type: 'edit', annotationId: ids[0] } }, h.item)
+    const oldRequest = h.renderState.officeSelectionToLocate as { requestId: string }
+    await h.runtime.handleComponentEvent!({ type: 'artifact-annotation-summary',
+      payload: { type: 'edit', annotationId: ids[1] } }, h.item)
+    const currentRequest = h.renderState.officeSelectionToLocate as { requestId: string }
+    const anchor = { rect: { left: 30, top: 40, width: 100, height: 20 }, rects: [],
+      viewport: { left: 0, top: 0, width: 800, height: 600 }, visible: true }
+    await h.runtime.handleComponentEvent!({ type: 'office-annotation-located',
+      payload: { status: 'stale', anchor, requestId: oldRequest.requestId } }, h.item)
+    expect(h.renderState.annotationFallback).toMatchObject({ annotationId: ids[1], stale: false })
+    expect(h.renderState.annotationFallback).not.toHaveProperty('anchor')
+    await h.runtime.handleComponentEvent!({ type: 'office-annotation-located',
+      payload: { status: 'exact', anchor, requestId: currentRequest.requestId } }, h.item)
+    expect(h.renderState.annotationFallback).toMatchObject({ annotationId: ids[1], stale: false, anchor })
     await h.runtime.dispose?.('closed')
   })
 

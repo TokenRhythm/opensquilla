@@ -36,7 +36,9 @@ def _invalid(message: str) -> RpcHandlerError:
     return RpcHandlerError("INVALID_REFERENCE", message)
 
 
-def _validated_reference(params: Any) -> tuple[str, dict[str, Any], str, str, int, int]:
+def _validated_reference(
+    params: Any, *, require_line_range: bool = True,
+) -> tuple[str, dict[str, Any], str, str, int, int]:
     if not isinstance(params, dict):
         raise _invalid("A source reference and sessionKey are required.")
     key = params.get("sessionKey")
@@ -83,8 +85,8 @@ def _validated_reference(params: Any) -> tuple[str, dict[str, Any], str, str, in
     revision = state.get("revision")
     if not isinstance(revision, str) or _REVISION.fullmatch(revision) is None:
         raise _invalid("A source revision is required.")
-    start = locator.get("startLine")
-    end = locator.get("endLine")
+    start = locator.get("startLine", None if require_line_range else 1)
+    end = locator.get("endLine", None if require_line_range else start)
     if type(start) is not int or type(end) is not int or start < 1 or end < start:
         raise _invalid("The source line range is invalid.")
     return key, reference, relative, revision, start, end

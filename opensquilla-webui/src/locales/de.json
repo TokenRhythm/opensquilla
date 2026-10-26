@@ -135,6 +135,22 @@
     "openDirectoryFailed": "Projektverzeichnis konnte nicht geöffnet werden. Bitte erneut versuchen.",
     "copyDirectoryFailed": "Projektverzeichnispfad konnte nicht kopiert werden.",
     "projects": "Projekte",
+    "addProject": "Projekt hinzufügen",
+    "projectAction": "Projektaktion",
+    "openExistingProject": "Vorhandenes öffnen",
+    "saveParentDirectory": "Speichern unter",
+    "projectLocation": "Projektordner",
+    "chooseParentDirectory": "Übergeordneten Ordner wählen",
+    "chooseExistingDirectory": "Vorhandenen Ordner wählen",
+    "executionHost": "Computer: {host}",
+    "gatewayHost": "Gateway-Host",
+    "createLocationHint": "An diesem Ort wird ein neuer Projektordner erstellt.",
+    "openLocationHint": "Der gewählte Ordner wird Ihren Projekten hinzugefügt.",
+    "createUnavailable": "Dieses Gateway unterstützt das direkte Erstellen und Registrieren eines Projekts nicht. Sie können weiterhin ein vorhandenes Projekt öffnen oder in der Ordnerauswahl einen neuen Ordner erstellen.",
+    "preparingProject": "Wird vorbereitet…",
+    "projectOpened": "Projekt „{name}“ geöffnet",
+    "createProjectUnconfirmed": "Beim Erstellen des Projekts unter {path} ist ein Problem aufgetreten. Prüfen Sie vor einem erneuten Versuch die Projektliste. {error}",
+    "openProjectFailed": "Projekt konnte nicht geöffnet werden: {error}",
     "createProject": "Projekt erstellen",
     "projectNamePlaceholder": "Projektname",
     "sourceFolders": "Quellordner",
@@ -280,6 +296,31 @@
     "dismiss": "Ausblenden"
   },
   "workbench": {
+    "annotationUnified": {
+      "selectTarget": "Select content to annotate",
+      "start": "Annotate",
+      "stop": "Finish annotating",
+      "placeholder": "Describe a change…",
+      "recordHint": "Enter to record · Shift + Enter for a new line",
+      "record": "Keep annotating",
+      "submit": "Record {count} annotations",
+      "summary": "{count} annotations",
+      "empty": "Select text, an object or a range to describe a change.",
+      "locate": "Locate",
+      "edit": "Edit",
+      "reselect": "Select again",
+      "cancel": "Cancel this edit",
+      "delete": "Delete",
+      "queued": "Waiting to send",
+      "restoreQueued": "Cancel sending and restore annotations",
+      "otherPages": "Other pages",
+      "versionChanged": "Loaded the current working version. Select a target to annotate.",
+      "locationOnly": "Located the page. Select again to change the target.",
+      "stale": "The document changed. Select the target again.",
+      "unavailable": "Annotation is unavailable for this file or client.",
+      "submitFailed": "Could not queue annotations. Your drafts were kept.",
+      "recordToConversation": "Record in conversation"
+    },
     "tabs": {
       "copyLink": "Link kopieren",
       "openWeb": "Webseite öffnen",
@@ -313,7 +354,7 @@
       "hoverElement": "Klicken, um Änderungen anzufordern",
       "hoverRange": "Zellen auswählen und loslassen, um Änderungen zu beschreiben",
       "chooseContent": "Wählen Sie zuerst den zu ändernden Inhalt aus",
-      "selectDocx": "Markieren Sie den zu ändernden Text durch Ziehen. Lassen Sie los, um Ihre Änderungswünsche einzugeben.",
+      "selectDocx": "Klicken Sie auf einen Absatz oder markieren Sie Text durch Ziehen. Geben Sie dann Ihre Änderungswünsche ein.",
       "selectPptx": "Klicken Sie auf das zu ändernde Objekt und geben Sie Ihre Änderungswünsche ein.",
       "selectXlsx": "Wählen Sie eine Zelle aus oder ziehen Sie über einen Bereich. Lassen Sie los, um Ihre Änderungswünsche einzugeben.",
       "cancelSelection": "Auswahl beenden",
@@ -364,6 +405,7 @@
     },
     "resources": {
       "title": "Dateien", "count": "Dateien ({count})", "empty": "Noch keine Dateien oder Links.",
+      "currentWorkingFile": "Aktuelle Arbeitsdatei", "publishedVersion": "Veröffentlichte Version",
       "groups": { "files": "Dateien", "links": "Links", "attachments": "Dateien", "documents": "Dateien", "deliverables": "Dateien", "urls": "Links" },
       "open": "{name} öffnen", "preparing": "Editor wird vorbereitet…", "retry": "Erneut versuchen", "preview": "{name} ansehen", "download": "{name} herunterladen", "edit": "Kopie von {name} bearbeiten", "publish": "{name} veröffentlichen",
       "imported": "{name} kann jetzt bearbeitet werden.", "published": "{name} kann jetzt geteilt werden.",
@@ -450,9 +492,6 @@
       "outputGap": "Terminal output was interrupted",
       "exited": "Terminal exited",
       "state": { "starting": "Starting", "running": "Connected", "exited": "Exited", "error": "Unavailable" }
-    },
-    "nativePreview": {
-      "capacityReached": "Es sind bereits vier interaktive Vorschauen geöffnet. Kehre zu einer vorhandenen Vorschau zurück oder schließe eine, bevor du eine weitere öffnest."
     },
     "artifactAnnotation": {
       "start": "Änderung anfordern",
@@ -548,6 +587,15 @@
       "documentEditingRetired": "Aktualisieren Sie die App und öffnen Sie die Seite erneut, um Anmerkungen als Chatnachricht zu senden."
     },
     "artifactDocument": {
+      "versionHistory": "Versionsverlauf ({count})",
+      "currentVersion": "Aktuell v{generation}",
+      "historicalVersion": "Verlauf",
+      "openLatest": "Neueste öffnen",
+      "viewDeliveredVersion": "Gelieferte Version anzeigen",
+      "viewRevision": "Diese Version anzeigen",
+      "fixedSnapshot": "Gelieferte Version",
+      "fixedSnapshotHint": "Dies ist die im Chat gelieferte Version. Anmerkungen öffnen das aktuelle Arbeitsdokument; die gelieferte Version bleibt erhalten.",
+      "continueEditing": "Weiter bearbeiten",
       "sections": "Bereiche des Artefaktdokuments",
       "preview": "Vorschau",
       "source": "Quelltext",
@@ -3536,6 +3584,45 @@
     "bundleDifferentGateway": "Öffnen Sie die eigene WebUI des verbundenen Gateways, um dessen Support-Paket herunterzuladen."
   },
   "usageLogs": {
+    "capabilities": {
+      "unknown": "Unbekannt",
+      "partialMeter": "{value} · {count} unbekannt",
+      "metrics": {
+        "input_tokens": "Eingabe-Token",
+        "output_tokens": "Ausgabe-Token",
+        "cache_read_tokens": "Cache-Lese-Token",
+        "cache_write_tokens": "Cache-Schreib-Token",
+        "input_images": "Eingabebilder",
+        "input_video_seconds": "Dauer des Eingabevideos",
+        "output_audio_seconds": "Dauer der Audioausgabe",
+        "requested_audio_seconds": "Angeforderte Audiodauer",
+        "requests": "Anfragen",
+        "output_images": "Ausgabebilder",
+        "input_audio_seconds": "Eingabeaudio",
+        "input_characters": "Eingabezeichen",
+        "requested_video_seconds": "Angeforderte Videodauer",
+        "video_seconds": "Erzeugte Videodauer",
+        "search_credits": "Suchguthaben",
+        "scrape_credits": "Extraktionsguthaben",
+        "character_credits": "Zeichenguthaben",
+        "cost_in_usd_ticks": "Kostenpunkte des Anbieters",
+        "input_text_tokens": "Eingabetext-Token",
+        "output_text_tokens": "Ausgabetext-Token",
+        "input_audio_tokens": "Eingabeaudio-Token",
+        "output_audio_tokens": "Ausgabeaudio-Token",
+        "input_image_tokens": "Eingabebild-Token",
+        "output_image_tokens": "Ausgabebild-Token"
+      },
+      "units": {
+        "request": "Anfragen",
+        "image": "Bilder",
+        "second": "Sekunden",
+        "character": "Zeichen",
+        "credit": "Guthabenpunkte",
+        "token": "Token",
+        "usd_tick_1e_10": "USD × 10⁻¹⁰"
+      }
+    },
     "tasks": {
       "unnamed": "Unbenannte Aufgabe"
     },
@@ -3565,10 +3652,6 @@
       "cacheRead": "Cache L",
       "cacheWrite": "Cache S"
     },
-    "costHintTitle": "CNY-Werte verwenden den festen Kurs {rate}. Für buchhalterische Zwecke mit dem aktuellen Wechselkurs abgleichen.",
-    "nativeCostHintTitle": "Die ursprüngliche Anbieterrechnung ist in CNY; USD verwendet den auf dem Beleg gespeicherten festen Normierungskurs.",
-    "nativeMixedCostHintTitle": "Gemischte Währungen oder ausstehende Abrechnungen bleiben in kanonischen USD; bestätigte Originalbelege werden separat angezeigt.",
-    "nativeBillingSubtotals": "Originalbelege: {amounts}",
     "rangeHiddenHint": "{count} undatierte historische Aufgaben ausgeblendet",
     "coverage": {
       "approximate": "Einige historische Werte werden aus Aufgabensummen geschätzt.",
@@ -3626,10 +3709,10 @@
       "cacheRead": "Cache L",
       "cacheWrite": "Cache S",
       "cost": "Kosten",
-      "source": "Quelle",
       "model": "Modell"
     },
     "breakdown": {
+      "callTitle": "Aufrufdetails",
       "title": "Modellaufschlüsselung",
       "modelCount": "{count} Modelle",
       "total": "{tokens} Tokens · {cost}",
@@ -3638,35 +3721,28 @@
     "costSource": {
       "actual": {
         "label": "Tatsächlich",
-        "tooltip": "Tatsächlich — vom Anbieter abgerechnete Kosten",
-        "short": "tatsächlich"
+        "tooltip": "Tatsächlich — vom Anbieter abgerechnete Kosten"
       },
       "estimated": {
         "label": "Geschätzt",
-        "tooltip": "Geschätzt — lokal aus Token-Zahlen abgeleitet",
-        "short": "geschätzt"
+        "tooltip": "Geschätzt — Anbieterangebot oder aufgezeichneter lokaler Preis"
       },
       "mixed": {
         "label": "Gemischt",
-        "tooltip": "Gemischt — teilweise Abrechnungsdaten, Rest geschätzt",
-        "short": "gemischt"
+        "tooltip": "Gemischt — teilweise Abrechnungsdaten, Rest geschätzt"
       },
       "unpriced": {
         "label": "Ohne Preis",
-        "tooltip": "Ohne Preis — kein Eintrag in der Preistabelle für dieses Modell",
-        "short": "ohne Preis"
+        "tooltip": "Ohne Preis — kein Eintrag in der Preistabelle für dieses Modell"
       },
       "none": {
-        "label": "Keine",
-        "tooltip": "Keine Kosten erfasst",
-        "short": "keine"
+        "label": "Keine Kosten erfasst",
+        "tooltip": "Keine Kosten erfasst"
       },
       "ephemeral": {
         "label": "Flüchtig",
-        "tooltip": "Flüchtige Sitzung — Kosten noch nicht persistiert",
-        "short": "flüchtig"
-      },
-      "cacheBlindHint": "Enthält Schätzungen, die zwischengespeicherte Tokens zum vollen Eingabepreis bewerten — als Obergrenze zu verstehen."
+        "tooltip": "Flüchtige Sitzung — Kosten noch nicht persistiert"
+      }
     },
     "relTime": {
       "justNow": "gerade eben",
@@ -3735,6 +3811,7 @@
       "continue": "Continue",
       "commandWithSkills": "Selected skills apply to a chat message. Remove the skill labels before running a command.",
       "commandDescriptions": {
+        "init": "Projektanweisungen aus dem aktuellen Projekt erstellen oder verbessern",
         "new": "Neuen Chat starten",
         "compact": "Aktuellen Kontext kürzen",
         "goal": "Langfristiges Ziel festlegen",
@@ -3896,6 +3973,7 @@
     "liveUnavailable": "Live-Aktualisierungen sind vorübergehend nicht verfügbar",
     "liveUnavailableDescription": "Der Verlauf bleibt verfügbar. Der Versand wird fortgesetzt, sobald die Live-Aktualisierungen wiederhergestellt sind.",
     "liveUnavailableConnectedDescription": "Das Gateway ist verbunden. Live-Aktualisierungen für diese Sitzung sind vorübergehend nicht verfügbar.",
+    "liveRecoveryReloadDescription": "Live-Aktualisierungen konnten nicht wiederhergestellt werden. Sichere ungesendete Eingaben und lade diese Seite neu, um die Verbindung wiederherzustellen.",
     "reconnectLive": "Erneut verbinden",
     "liveSendBlockedConnecting": "Live-Aktualisierungen werden wiederhergestellt. Ihr Entwurf bleibt erhalten.",
     "liveSendBlockedDegraded": "Live-Aktualisierungen sind vorübergehend nicht verfügbar. Ihr Entwurf bleibt erhalten.",
@@ -3993,16 +4071,13 @@
     "subagentPrefix": "Subagent: ",
     "subagentCompletion": "Subagent-Abschluss",
     "turnFailed": "Durchlauf fehlgeschlagen",
-    "copyDiagnosticId": "Diagnose-ID kopieren",
-    "copiedDiagnosticId": "Diagnose-ID kopiert",
-    "copyDiagnosticFailed": "Kopieren fehlgeschlagen. Markieren und kopieren Sie die ID oben manuell.",
     "errorMessage": {
       "unknown": "Diese Anfrage wurde nicht abgeschlossen.",
       "noProvider": "Kein Modell ist verfügbar.",
       "credentials": "Authentifizierung beim Modelldienst fehlgeschlagen.",
       "credits": "Das Guthaben des Modelldienstkontos reicht nicht aus.",
       "modelUnavailable": "Das gewählte Modell ist nicht verfügbar.",
-      "contextLimit": "Die Eingabe überschreitet das Modelllimit.",
+      "contextLimit": "Der Inhalt überschreitet die Modellkapazität. Kürzen Sie die Eingabe oder wählen Sie ein Modell mit größerem Kontextfenster.",
       "unsupported": "Dieses Modell unterstützt die Anfrage nicht.",
       "imageUnsupported": "Dieses Modell unterstützt keine Bilder.",
       "ensembleImageUnsupported": "Dieser Modus unterstützt keine Bilder.",
@@ -4015,7 +4090,7 @@
       "needsConfirmation": "Zum Fortfahren ist eine Bestätigung erforderlich.",
       "toolDenied": "Ein benötigtes Werkzeug ist nicht erlaubt.",
       "toolFailed": "Ein Werkzeug konnte seine Aufgabe nicht abschließen.",
-      "contextUnavailable": "Die aktuelle Unterhaltung konnte nicht verarbeitet werden.",
+      "contextUnavailable": "Die Kontextorganisation wurde nicht abgeschlossen; diese Anfrage konnte nicht fortgesetzt werden. Versuchen Sie es später erneut.",
       "timeout": "Die Aufgabe konnte nicht rechtzeitig abgeschlossen werden.",
       "stopped": "Die Aufgabe wurde gestoppt.",
       "interrupted": "Die Aufgabe wurde unterbrochen.",
@@ -4394,6 +4469,7 @@
       "sendingContinuing": "Antwort wird gesendet · Ausführung wird fortgesetzt…"
     },
     "slashCommands": {
+      "initUnavailable": "Dieses Gateway unterstützt keine Projektinitialisierung. Aktualisieren Sie es und versuchen Sie es erneut. Ihr Entwurf wurde beibehalten.",
       "side": {
         "closed": "Der ursprüngliche Seitenchat wurde geschlossen. Der Entwurf wurde behalten. Bearbeite den Befehl vor dem erneuten Senden, um einen neuen Seitenchat zu starten.",
         "description": "Temporären Seitenchat öffnen · Alias /btw",
@@ -4579,10 +4655,14 @@
       "failureUnavailable": "Das Modell für die Zusammenfassung ist nicht verfügbar",
       "failureProvider": "Das Modell konnte keine verwendbare Zusammenfassung erstellen",
       "failureTimeout": "Die Kontextorganisation hat das Zeitlimit überschritten",
-      "failureRejectedDetail": "Die Zusammenfassung wurde nicht angewendet; der ursprüngliche Kontext bleibt erhalten. Versuchen Sie es erneut oder kopieren Sie bei erneutem Fehler die Diagnose-ID.",
-      "failureUnavailableDetail": "Prüfen Sie die Modellkonfiguration und Verbindung und versuchen Sie es erneut. Sie können die Diagnose-ID zur Fehleranalyse kopieren.",
-      "failureRetryDetail": "Sie können die Kontextorganisation erneut starten. Kopieren Sie bei erneutem Fehler die Diagnose-ID zur Fehleranalyse.",
+      "failureRejectedDetail": "Die Zusammenfassung wurde nicht angewendet. Versuchen Sie es später erneut.",
+      "failureCapacityDetail": "Kürzen Sie die Eingabe oder wählen Sie ein Modell mit größerem Kontextfenster.",
+      "failureUnavailableDetail": "Prüfen Sie die Modelleinstellungen und Netzwerkverbindung oder wählen Sie ein anderes Modell.",
+      "failureRetryDetail": "Starten Sie die Kontextorganisation später erneut oder wählen Sie ein anderes Modell.",
       "compacting": "Kontext wird verdichtet",
+      "recovering": "Status der Kontextverdichtung wird geprüft…",
+      "requestUnconfirmed": "Die Anfrage zur Kontextverdichtung konnte nicht bestätigt werden. Prüfen Sie die Verbindung, bevor Sie es erneut versuchen.",
+      "requestRejected": "Die Anfrage zur Kontextverdichtung wurde abgelehnt.",
       "compacted": "Kontext verdichtet",
       "temporarilyReduced": "Verlauf vorübergehend gekürzt; Verarbeitung wird fortgesetzt",
       "summarySaved": "Zusammenfassung gespeichert",
@@ -4590,12 +4670,12 @@
       "historyIncomplete": "Früherer Kontext zusammengefasst; einige Originalnachrichten sind nicht verfügbar",
       "historySummarized": "Früherer Kontext zusammengefasst",
       "failed": "Verdichtung fehlgeschlagen",
+      "incomplete": "Die Kontextorganisation wurde nicht abgeschlossen",
       "withinBudget": "Kontext innerhalb des Budgets.",
       "noSafeHistory": "Derzeit gibt es keinen Verlauf, der sicher zusammengefasst werden kann",
       "alreadyConcise": "Der aktuelle Kontext ist bereits ausreichend kompakt",
       "skipped": "Die Kontextverdichtung wurde nicht angewendet.",
-      "cancelled": "Verdichtung abgebrochen",
-      "requestScoped": "Nur für diese Anfrage; der Sitzungsverlauf wurde nicht neu geschrieben"
+      "cancelled": "Verdichtung abgebrochen"
     },
     "tool": {
       "genericCall": "Werkzeugaufruf",

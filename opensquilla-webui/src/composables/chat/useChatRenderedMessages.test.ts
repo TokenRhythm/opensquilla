@@ -3059,7 +3059,7 @@ describe('useChatRenderedMessages per-turn usage', () => {
     expect(legacy?.meta?.coverageStatus).toBeUndefined()
   })
 
-  it('does not reinterpret missing cost entries as a presentation state', () => {
+  it('preserves incomplete cost coverage separately from unknown token usage', () => {
     const api = renderedMessagesFor([{
       role: 'assistant',
       text: 'restored cost',
@@ -3078,7 +3078,7 @@ describe('useChatRenderedMessages per-turn usage', () => {
     })
     expect(api.renderedMessages.value[0]?.meta).not.toHaveProperty('costKnown')
     expect(api.renderedMessages.value[0]?.meta).not.toHaveProperty('costIncomplete')
-    expect(api.renderedMessages.value[0]?.meta).not.toHaveProperty('missingCostEntries')
+    expect(api.renderedMessages.value[0]?.meta).toHaveProperty('missingCostEntries', 1)
   })
 })
 

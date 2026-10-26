@@ -70,7 +70,7 @@ async def test_twenty_persisted_window_turns_reopen_and_recover_durable_summary(
     config = GatewayConfig(
         workspace_dir=str(workspace),
         llm={"provider": "openai", "model": model, "api_key": "synthetic-unused",
-             "base_url": "https://example.invalid/v1", "context_window_tokens": 16_000,
+             "base_url": "https://example.invalid/v1", "context_window_tokens": 32_768,
              "max_tokens": 1024, "thinking": "off"},
         compaction={"protected_recent_messages": 0},
         prompt={"mode": "minimal"}, squilla_router={"enabled": False},
@@ -167,10 +167,18 @@ async def test_twenty_persisted_window_turns_reopen_and_recover_durable_summary(
         assert await _rows(case.manager, key) == before
         checkpoint_before = await _checkpoint_rows(case.storage, node)
         assert len(checkpoint_before) == 1
-        for index in range(12):
+        window_sources = [
+            f"HIDDEN_HISTORY_{index:02d}. " + "completed background details " * 240
+            for index in range(12)
+        ]
+        # The raw history alone exceeds the entire 32K window, before fixed
+        # prompt/output costs. Raising this legacy fixture's window must not
+        # remove the real request-window pressure it is intended to exercise.
+        assert token_estimation.estimate_tokens("\n".join(window_sources)) > 32_768
+        for index, source in enumerate(window_sources):
             await case.manager.append_message(
                 key, "user" if index % 2 == 0 else "assistant",
-                f"HIDDEN_HISTORY_{index:02d}. " + "completed background details " * 240,
+                source,
             )
         canonical = await _rows(case.manager, key)
         await _assert_idle(case)
@@ -220,7 +228,13 @@ async def test_twenty_persisted_window_turns_reopen_and_recover_durable_summary(
     assert auxiliary_failures >= 80
     assert auxiliary_failures % 4 == 0
     assert retry_delays == [1, 2, 4] * (auxiliary_failures // 4)
-    assert any("HIDDEN_HISTORY_00" not in request for request in ordinary_requests)
+    # A fitting old user request may remain as a continuity anchor. Assert real
+    # omission in every admitted request, without prescribing which old round
+    # the window must drop. Canonical rows above still contain every source.
+    assert all(
+        any(source not in request for source in window_sources)
+        for request in ordinary_requests
+    )
 
     summary_available = True
     recovery_start = len(summary_requests)

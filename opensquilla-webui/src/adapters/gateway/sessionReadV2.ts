@@ -1,4 +1,5 @@
 import type { TransportCallOptions } from './transportTypes'
+import { acquireSessionReadV2Owner } from './sessionReadV2Owner'
 import {
   projectHistoryMessage,
   projectHistoryCompaction,
@@ -314,11 +315,16 @@ export async function openV2SessionRead(
 ): Promise<SessionReadV2Lease> {
   const params: ReadOpenParams = { key }
   if (!validateSessionsReadOpenV2Params(params)) throw contractError(`${SESSIONS_READ_OPEN_V2_METHOD} params`)
-  const raw = await rpc.request(
-    SESSIONS_READ_OPEN_V2_METHOD,
-    { ...params },
-    callOptions(expectedGeneration, signal),
-  )
+  const owner = await acquireSessionReadV2Owner(rpc, key, expectedGeneration, signal)
+  let raw: unknown
+  try {
+    raw = await owner.request(SESSIONS_READ_OPEN_V2_METHOD, { ...params })
+  } catch (error) {
+    // The caller never received a lease to release. Physical cleanup remains
+    // owned independently, so an unknown wire result must not delay this error.
+    void owner.close().catch(() => {})
+    throw error
+  }
   const open = requireResult<ReadOpenResult>(SESSIONS_READ_OPEN_V2_METHOD, raw, validateSessionsReadOpenV2Result)
   if (rpc.generation !== expectedGeneration) throw new Error('Session read v2 generation changed during open.')
   const state = {
@@ -338,8 +344,8 @@ export async function openV2SessionRead(
     if (state.closed) throw new Error('Session read v2 lease is closed.')
     const params = leaseParams()
     if (!validateSessionsReadStateV2Params(params)) throw contractError(`${SESSIONS_READ_STATE_V2_METHOD} params`)
-    const result = requireResult<ReadStateResult>(SESSIONS_READ_STATE_V2_METHOD, await rpc.request(
-      SESSIONS_READ_STATE_V2_METHOD, params, callOptions(expectedGeneration, signal),
+    const result = requireResult<ReadStateResult>(SESSIONS_READ_STATE_V2_METHOD, await owner.request(
+      SESSIONS_READ_STATE_V2_METHOD, params,
     ), validateSessionsReadStateV2Result)
     if (result.lease_id !== state.leaseId || result.recovery_id !== state.recoveryId) {
       throw new Error('Session read v2 lease identity changed.')
@@ -367,8 +373,8 @@ export async function openV2SessionRead(
       ...(ack === undefined ? {} : { ack_through_seq: ack }),
     })
     if (!validateSessionsReadInstallV2Params(params)) throw contractError(`${SESSIONS_READ_INSTALL_V2_METHOD} params`)
-    const result = requireResult<ReadInstallResult>(SESSIONS_READ_INSTALL_V2_METHOD, await rpc.request(
-      SESSIONS_READ_INSTALL_V2_METHOD, params, callOptions(expectedGeneration, signal),
+    const result = requireResult<ReadInstallResult>(SESSIONS_READ_INSTALL_V2_METHOD, await owner.request(
+      SESSIONS_READ_INSTALL_V2_METHOD, params,
     ), validateSessionsReadInstallV2Result)
     if (result.lease_id !== state.leaseId || result.recovery_id !== state.recoveryId) {
       throw new Error('Session read v2 install identity changed.')
@@ -416,13 +422,12 @@ export async function openV2SessionRead(
       return install({ consumedThroughSeq: target, ackThroughSeq: target })
     },
     async close() {
-      if (state.closed) return null
       state.closed = true
       const params = leaseParams()
       if (!validateSessionsReadCloseV2Params(params)) throw contractError(`${SESSIONS_READ_CLOSE_V2_METHOD} params`)
-      const result = requireResult<ReadCloseResult>(SESSIONS_READ_CLOSE_V2_METHOD, await rpc.request(
-        SESSIONS_READ_CLOSE_V2_METHOD, params, callOptions(expectedGeneration),
-      ), validateSessionsReadCloseV2Result)
+      const raw = await owner.close()
+      if (raw === null) return null
+      const result = requireResult<ReadCloseResult>(SESSIONS_READ_CLOSE_V2_METHOD, raw, validateSessionsReadCloseV2Result)
       if (result.lease_id !== state.leaseId || result.closed !== true) throw new Error('Session read v2 close identity changed.')
       return result
     },

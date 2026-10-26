@@ -6,6 +6,12 @@ import {
 } from '@/contracts/generated/v4/workspacesList'
 import { validateResult as validateWorkspacesListResult } from '@/contracts/generated/v4/workspacesListValidators.mjs'
 import {
+  WORKSPACES_CREATE_METHOD,
+  type Params as WorkspacesCreateParams,
+  type Result as WorkspacesCreateResult,
+} from '@/contracts/generated/v4/workspacesCreate'
+import { validateResult as validateWorkspacesCreateResult } from '@/contracts/generated/v4/workspacesCreateValidators.mjs'
+import {
   WORKSPACES_OPEN_METHOD,
   type Params as WorkspacesOpenParams,
   type Result as WorkspacesOpenResult,
@@ -53,6 +59,7 @@ import {
 } from '@/contracts/generated/v4/sandboxPathPick'
 import type {
   WorkspaceCatalog,
+  WorkspaceCreationDefaults,
   WorkspaceHistoryDeletion,
   WorkspaceItem,
   WorkspacePathListing,
@@ -114,10 +121,11 @@ function normalizeMutation(value: unknown): WorkspaceItem | null {
 }
 
 export function createV4WorkspaceCatalog(transport: WorkspaceTransport): WorkspaceCatalog {
-  const mutate = async <T>(method: string, params: Record<string, unknown>, signal: AbortSignal | undefined, valid: (value: unknown) => boolean): Promise<T> => {
+  let creationDefaults: WorkspaceCreationDefaults | null = null
+  const mutate = async <T>(method: string, params: Record<string, unknown>, signal: AbortSignal | undefined, valid: (value: unknown) => boolean, requestOptions = optionsFor(signal)): Promise<T> => {
     try {
       return requireResult<T>(
-        await transport.request(method, params, optionsFor(signal)),
+        await transport.request(method, params, requestOptions),
         valid,
         method,
       )
@@ -128,14 +136,38 @@ export function createV4WorkspaceCatalog(transport: WorkspaceTransport): Workspa
   }
 
   return {
+    get creationDefaults() { return creationDefaults },
     async list(options): Promise<readonly WorkspaceItem[]> {
       const result = await mutate<WorkspacesListResult>(
         WORKSPACES_LIST_METHOD,
         {},
         options?.signal,
         validateWorkspacesListResult,
+        options?.timeoutMs === undefined ? optionsFor(options?.signal) : {
+          ...optionsFor(options?.signal), timeoutMs: options.timeoutMs,
+          timeoutAction: 'reject', abortAction: 'reject',
+        },
       )
+      const defaults = result.creationDefaults
+      creationDefaults = defaults ? {
+        parentPath: defaults.parentPath,
+        hostName: defaults.hostName,
+        platform: defaults.platform,
+      } : null
       return result.workspaces.map(normalizeWorkspace).filter((item): item is WorkspaceItem => item !== null)
+    },
+
+    async create(parentPath, name, options): Promise<WorkspaceItem | null> {
+      const params: WorkspacesCreateParams = { parentPath, name, trusted: true }
+      const result = await mutate<WorkspacesCreateResult>(
+        WORKSPACES_CREATE_METHOD,
+        params as unknown as Record<string, unknown>,
+        options?.signal,
+        validateWorkspacesCreateResult,
+        { timeoutAction: 'reject', abortAction: 'reject', recoveryClass: 'mutation',
+          ...(options?.signal ? { signal: options.signal } : {}) },
+      )
+      return normalizeMutation(result)
     },
 
     async open(path, options): Promise<WorkspaceItem | null> {

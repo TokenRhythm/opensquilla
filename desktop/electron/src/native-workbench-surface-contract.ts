@@ -208,8 +208,11 @@ export type NativeWorkbenchSurfaceEventType =
   | 'browser-opened'
   | 'browser-closed'
   | 'annotation-selected'
+  | 'annotation-picker-state'
   | 'annotation-draft-change'
   | 'annotation-submit'
+  | 'annotation-record-current'
+  | 'annotation-batch-submit'
   | 'annotation-cancel'
   | 'annotation-overlay-fallback'
 
@@ -251,6 +254,8 @@ export interface NativeWorkbenchSurfaceEvent {
     action?: string
     code?: string
     surfaceInstanceId?: string
+    enabled?: boolean
+    pickerEpoch?: number
     targetUrl?: string
     annotationId?: string
     body?: string

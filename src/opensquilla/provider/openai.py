@@ -77,8 +77,10 @@ from .reasoning_dialects import (
     apply_reasoning_disable,
     apply_reasoning_enable,
 )
+from .recovery_origin import transport_recovery_origin
 from .request_proof import (
     ProviderRequestBudgetExceededError,
+    fit_payload_generation_budget,
     project_final_request_payload,
     protected_tool_result_indexes,
     prove_provider_payload_from_env,
@@ -90,6 +92,7 @@ from .stream_assembly import (
     ToolStreamAccumulator,
     ToolStreamProtocolError,
 )
+from .stream_usage import interrupted_stream_error
 from .text_tool_normalizer import (
     InertDsmlSegment,
     LiteralTextSegment,
@@ -1819,8 +1822,9 @@ def _billing_result(
             if usage.billed_cost_present
             else None
         )
-        # Keep OpenRouter's historical positive-only billed-cost contract.
-        if amount is not None and amount > 0:
+        # A present, valid zero is a confirmed receipt (e.g. a free model).
+        # Missing and malformed cost fields must still remain unconfirmed.
+        if amount is not None and amount >= 0:
             amount_nanos = _money_to_nanos(amount)
             if amount_nanos is None:
                 return 0.0, "none", None
@@ -2288,7 +2292,7 @@ def _text_tool_rejection_error(
     )
 
 
-def _rejected_generation_usage(
+def _observed_generation_usage(
     *,
     usage: _UsageSnapshotAccumulator,
     billing: _ProviderBillingAccumulator,
@@ -2300,6 +2304,11 @@ def _rejected_generation_usage(
     stop_reason: str,
 ) -> DoneEvent | None:
     """Retain observed usage without turning absent counters into zero usage."""
+    if not (
+        usage.token_usage_present or usage.billed_cost_present
+        or billing.tokenrhythm_cost_present or billing.tokenrhythm_pending_present
+    ):
+        return None
     billed_cost, cost_source, receipt = _billing_result(
         provider_kind=provider_kind,
         base_url=base_url,
@@ -3457,6 +3466,7 @@ class OpenAIProvider:
         int | None,
         str | None,
         _ReasoningReplayStats,
+        dict[str, Any],
     ]:
         wire_cfg = _prompt_json_schema_config(cfg, policy=self._compat)
         caps = cfg.model_capabilities
@@ -3702,6 +3712,7 @@ class OpenAIProvider:
             has_tools=bool(tools),
         )
         merge_extra_body(payload, self._extra_body)
+        payload, generation_budget_proof = fit_payload_generation_budget(payload, cfg)
         fallback_reason = (
             "native_is_error_unavailable"
             if any(message.get("role") == "tool" for message in openai_messages)
@@ -3712,6 +3723,7 @@ class OpenAIProvider:
             wire_active_user_index,
             fallback_reason,
             reasoning_replay_stats,
+            generation_budget_proof,
         )
 
     def project_final_request(
@@ -3730,13 +3742,14 @@ class OpenAIProvider:
             wire_active_user_index,
             fallback_reason,
             _reasoning_replay_stats,
+            generation_budget_proof,
         ) = self._build_payload(
             messages,
             tools,
             cfg,
         )
         protected_result_indexes = protected_tool_result_indexes(messages)
-        return project_final_request_payload(
+        projection = project_final_request_payload(
             payload,
             projection_adapter=self._provider_kind,
             proof_budget=provider_request_character_budget(payload, cfg),
@@ -3747,6 +3760,8 @@ class OpenAIProvider:
             message_limit=message_limit,
             protected_tool_result_indexes=protected_result_indexes,
         )
+        projection.proof.update(generation_budget_proof)
+        return projection
 
     def chat(
         self,
@@ -3838,6 +3853,7 @@ class OpenAIProvider:
             wire_active_user_index,
             fallback_reason,
             reasoning_replay_stats,
+            generation_budget_proof,
         ) = self._build_payload(
             messages,
             tools,
@@ -3894,6 +3910,8 @@ class OpenAIProvider:
             active_user_message_index=wire_active_user_index,
             protected_tool_result_indexes=protected_result_indexes,
         )
+        if budget_decision.proof is not None:
+            budget_decision.proof.update(generation_budget_proof)
         if budget_decision.action == "budget_limited":
             proof = budget_decision.proof or {}
             log.warning("provider.request_budget_exhausted", **proof)
@@ -3923,6 +3941,7 @@ class OpenAIProvider:
                 protected_tool_result_indexes=protected_result_indexes,
             )
         except ProviderRequestBudgetExceededError as exc:
+            exc.proof.update(generation_budget_proof)
             log.warning("provider.request_budget_exhausted", **exc.proof)
             yield ErrorEvent(
                 message=json.dumps(exc.proof, ensure_ascii=False, sort_keys=True),
@@ -4048,6 +4067,21 @@ class OpenAIProvider:
         terminal_native_finish_reason: Any = None
         active_choice_seen = False
         response_ids: set[str] = set()
+
+        def stream_error(*, message: str, code: str, **kwargs: Any) -> ErrorEvent:
+            observed = _observed_generation_usage(
+                usage=usage_accumulator, billing=billing_accumulator,
+                provider_kind=self._provider_kind, provider=self.provider_id,
+                base_url=self._base_url, model=self._model, actual_model=actual_model,
+                stop_reason=stop_reason,
+            )
+            if observed is None:
+                return ErrorEvent(message=message, code=code, **kwargs)
+            return replace(interrupted_stream_error(
+                message=message, code=code, recovery_origin="unknown", usage=observed,
+                input_tokens_known=usage_accumulator.input_tokens_present,
+                output_tokens_known=usage_accumulator.output_tokens_present,
+            ), **kwargs)
 
         if os.environ.get("OPENSQUILLA_TRACE_ROUTING"):
             print(
@@ -4236,7 +4270,7 @@ class OpenAIProvider:
                                     "message_limit_proof": proof_fields,
                                 },
                             )
-                            yield ErrorEvent(
+                            yield stream_error(
                                 message=message,
                                 code=str(response.status_code),
                                 http_status=safe_http_status(response.status_code),
@@ -4264,7 +4298,7 @@ class OpenAIProvider:
                             response_body=safe_body_text,
                             metadata={"cache_shape": cache_shape},
                         )
-                        yield ErrorEvent(
+                        yield stream_error(
                             message=message,
                             code=str(response.status_code),
                             http_status=safe_http_status(response.status_code),
@@ -4358,7 +4392,7 @@ class OpenAIProvider:
                             # including malformed empty error envelopes.
                             # Provisional text/tool events already delivered stay
                             # diagnostic only; no deferred End or Done is released.
-                            yield ErrorEvent(
+                            yield stream_error(
                                 message=(
                                     f"{self._compat.display_name} stream error: "
                                     f"{err_message}"
@@ -4381,7 +4415,7 @@ class OpenAIProvider:
                                 message="Provider stream returned an invalid choice batch",
                                 metadata={"phase": "stream", "cache_shape": cache_shape},
                             )
-                            yield ErrorEvent(
+                            yield stream_error(
                                 message=(
                                     f"{self._compat.display_name} stream returned "
                                     "multiple or malformed choices"
@@ -4411,7 +4445,7 @@ class OpenAIProvider:
                                         "cache_shape": cache_shape,
                                     },
                                 )
-                                yield ErrorEvent(
+                                yield stream_error(
                                     message=(
                                         f"{self._compat.display_name} stream mutated "
                                         "state after finish_reason"
@@ -4462,7 +4496,7 @@ class OpenAIProvider:
                                 message="Provider stream returned malformed usage",
                                 metadata={"phase": "stream", "cache_shape": cache_shape},
                             )
-                            yield ErrorEvent(
+                            yield stream_error(
                                 message=(
                                     f"{self._compat.display_name} stream returned "
                                     "malformed usage"
@@ -4501,7 +4535,7 @@ class OpenAIProvider:
 
                         for choice in raw_choices:
                             if not isinstance(choice, Mapping):
-                                yield ErrorEvent(
+                                yield stream_error(
                                     message=(
                                         f"{self._compat.display_name} stream returned "
                                         "a malformed choice"
@@ -4515,7 +4549,7 @@ class OpenAIProvider:
                                 or isinstance(choice_index, bool)
                                 or choice_index != 0
                             ):
-                                yield ErrorEvent(
+                                yield stream_error(
                                     message=(
                                         f"{self._compat.display_name} stream returned "
                                         "an unsupported choice index"
@@ -4528,7 +4562,7 @@ class OpenAIProvider:
                             if finish is not None and (
                                 not isinstance(finish, str) or not finish.strip()
                             ):
-                                yield ErrorEvent(
+                                yield stream_error(
                                     message=(
                                         f"{self._compat.display_name} stream returned "
                                         "an invalid finish reason"
@@ -4542,7 +4576,7 @@ class OpenAIProvider:
 
                             delta = choice.get("delta", {})
                             if not isinstance(delta, Mapping):
-                                yield ErrorEvent(
+                                yield stream_error(
                                     message=(
                                         f"{self._compat.display_name} stream returned "
                                         "a malformed choice delta"
@@ -4565,7 +4599,7 @@ class OpenAIProvider:
                                     reasoning_details, delta, streaming=True
                                 )
                             except ValueError:
-                                yield ErrorEvent(
+                                yield stream_error(
                                     message="Provider returned malformed reasoning_details",
                                     code="invalid_stream_frame",
                                 )
@@ -4990,7 +5024,7 @@ class OpenAIProvider:
                                                 "cache_shape": cache_shape,
                                             },
                                         )
-                                        yield ErrorEvent(
+                                        yield stream_error(
                                             message=(
                                                 f"{self._compat.display_name} returned "
                                                 "an incomplete native tool identity"
@@ -5066,7 +5100,7 @@ class OpenAIProvider:
                                 "malformed_frame_count": malformed_stream_frames,
                             },
                         )
-                        yield ErrorEvent(
+                        yield stream_error(
                             message=(
                                 f"{self._compat.display_name} stream contained "
                                 "a malformed data frame"
@@ -5135,12 +5169,21 @@ class OpenAIProvider:
                             message="Provider stream ended without terminal evidence",
                             metadata={"phase": "stream", "cache_shape": cache_shape},
                         )
-                        yield ErrorEvent(
+                        yield interrupted_stream_error(
                             message=(
                                 f"{self._compat.display_name} stream ended before a "
                                 "finish reason"
                             ),
                             code="incomplete_stream",
+                            recovery_origin="unknown",
+                            usage=_observed_generation_usage(
+                                usage=usage_accumulator, billing=billing_accumulator,
+                                provider_kind=self._provider_kind, provider=self.provider_id,
+                                base_url=self._base_url, model=self._model,
+                                actual_model=actual_model, stop_reason=stop_reason,
+                            ),
+                            input_tokens_known=usage_accumulator.input_tokens_present,
+                            output_tokens_known=usage_accumulator.output_tokens_present,
                         )
                         return
 
@@ -5184,7 +5227,7 @@ class OpenAIProvider:
                             ),
                             metadata={"phase": "stream", "cache_shape": cache_shape},
                         )
-                        yield ErrorEvent(
+                        yield stream_error(
                             message=(
                                 f"{self._compat.display_name} ended a native tool call "
                                 f"with finish reason {stop_reason!r}"
@@ -5295,7 +5338,7 @@ class OpenAIProvider:
                                     calls=tuple(native_argument_rejections),
                                     terminal_reason=terminal_finish_reason,
                                 ),
-                                usage=_rejected_generation_usage(
+                                usage=_observed_generation_usage(
                                     usage=usage_accumulator,
                                     billing=billing_accumulator,
                                     provider_kind=self._provider_kind,
@@ -5307,7 +5350,7 @@ class OpenAIProvider:
                                 ),
                             )
                             return
-                        yield ErrorEvent(
+                        yield stream_error(
                             message=(
                                 f"{self._compat.display_name} returned invalid "
                                 "native tool arguments"
@@ -5338,7 +5381,7 @@ class OpenAIProvider:
                         native_calls=tuple(native_argument_rejections),
                         native_identity_valid=native_identity_valid,
                         usage=(
-                            _rejected_generation_usage(
+                            _observed_generation_usage(
                                 usage=usage_accumulator,
                                 billing=billing_accumulator,
                                 provider_kind=self._provider_kind,
@@ -5646,7 +5689,17 @@ class OpenAIProvider:
                     visible_assistant_text_parts.append(deferred_event.text)
                 yield deferred_event
             deferred_post_native_events.clear()
-            yield ErrorEvent(message=safe_error, code=code)
+            yield interrupted_stream_error(
+                message=safe_error, code=code, recovery_origin=transport_recovery_origin(exc),
+                usage=_observed_generation_usage(
+                    usage=usage_accumulator, billing=billing_accumulator,
+                    provider_kind=self._provider_kind, provider=self.provider_id,
+                    base_url=self._base_url, model=self._model, actual_model=actual_model,
+                    stop_reason=stop_reason,
+                ),
+                input_tokens_known=usage_accumulator.input_tokens_present,
+                output_tokens_known=usage_accumulator.output_tokens_present,
+            )
         except httpx.RequestError as exc:
             code = CONNECTION_FAILED_CODE if is_connection_failure(exc) else "request_error"
             safe_error = redact_upstream_error_text(
@@ -5674,7 +5727,17 @@ class OpenAIProvider:
                     visible_assistant_text_parts.append(deferred_event.text)
                 yield deferred_event
             deferred_post_native_events.clear()
-            yield ErrorEvent(message=safe_error, code=code)
+            yield interrupted_stream_error(
+                message=safe_error, code=code, recovery_origin=transport_recovery_origin(exc),
+                usage=_observed_generation_usage(
+                    usage=usage_accumulator, billing=billing_accumulator,
+                    provider_kind=self._provider_kind, provider=self.provider_id,
+                    base_url=self._base_url, model=self._model, actual_model=actual_model,
+                    stop_reason=stop_reason,
+                ),
+                input_tokens_known=usage_accumulator.input_tokens_present,
+                output_tokens_known=usage_accumulator.output_tokens_present,
+            )
         except CandidateArtifactLimitError as exc:
             message = "Candidate artifact exceeded bounded assembly limits"
             log.warning(
@@ -5700,7 +5763,7 @@ class OpenAIProvider:
             )
             deferred_native_events.clear()
             deferred_post_native_events.clear()
-            yield ErrorEvent(
+            yield stream_error(
                 message=message,
                 code="candidate_artifact_limit_exceeded",
             )
@@ -5732,7 +5795,7 @@ class OpenAIProvider:
                     yield pending_event
             deferred_native_events.clear()
             deferred_post_native_events.clear()
-            yield ErrorEvent(message=message, code="provider_protocol_error")
+            yield stream_error(message=message, code="provider_protocol_error")
         except Exception as exc:  # noqa: BLE001 - chat() contract: ErrorEvent instead of raising
             safe_error = redact_upstream_error_text(
                 f"Provider response handling failed: {str(exc) or repr(exc)}",
@@ -5765,7 +5828,7 @@ class OpenAIProvider:
                     visible_assistant_text_parts.append(deferred_event.text)
                 yield deferred_event
             deferred_post_native_events.clear()
-            yield ErrorEvent(
+            yield stream_error(
                 message=safe_error,
                 code="provider_internal",
             )
@@ -5836,7 +5899,7 @@ class OpenAIProvider:
                     headers=fallback_headers,
                     json=fallback_payload,
                 )
-        except httpx.TimeoutException:
+        except httpx.TimeoutException as exc:
             # The earlier stream may have been accepted; keep compatibility retries finite.
             code = "timeout"
             safe_error = redact_upstream_error_text(
@@ -5855,7 +5918,9 @@ class OpenAIProvider:
                 message=safe_error,
                 metadata={"phase": "non_stream_fallback", "cache_shape": cache_shape},
             )
-            yield ErrorEvent(message=safe_error, code=code)
+            yield ErrorEvent(
+                message=safe_error, code=code, recovery_origin=transport_recovery_origin(exc),
+            )
             return
         except httpx.RequestError as exc:
             code = "request_error"
@@ -5869,7 +5934,9 @@ class OpenAIProvider:
                 message=safe_error,
                 metadata={"phase": "non_stream_fallback", "cache_shape": cache_shape},
             )
-            yield ErrorEvent(message=safe_error, code=code)
+            yield ErrorEvent(
+                message=safe_error, code=code, recovery_origin=transport_recovery_origin(exc),
+            )
             return
 
         response_ids: set[str] = set()
@@ -6420,7 +6487,7 @@ class OpenAIProvider:
                         calls=tuple(native_argument_rejections),
                         terminal_reason=stop_reason,
                     ),
-                    usage=_rejected_generation_usage(
+                    usage=_observed_generation_usage(
                         usage=usage_accumulator,
                         billing=billing_accumulator,
                         provider_kind=self._provider_kind,
@@ -6462,7 +6529,7 @@ class OpenAIProvider:
             native_calls=tuple(native_argument_rejections),
             native_identity_valid=native_identity_valid,
             usage=(
-                _rejected_generation_usage(
+                _observed_generation_usage(
                     usage=usage_accumulator,
                     billing=billing_accumulator,
                     provider_kind=self._provider_kind,

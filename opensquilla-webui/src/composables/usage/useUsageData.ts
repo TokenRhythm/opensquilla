@@ -7,6 +7,7 @@ import { useUsageTotals } from '@/composables/usage/useUsageTotals'
 import { useUsageChartRows } from '@/composables/usage/useUsageChartRows'
 import { useUsageModelCards } from '@/composables/usage/useUsageModelCards'
 import { useUsageSessionRows } from '@/composables/usage/useUsageSessionRows'
+import { usageTaskRows } from '@/composables/usage/usageTaskRows'
 import {
   isUsableTaskName,
   usageTaskDisplayName,
@@ -53,7 +54,6 @@ const TABLE_COLUMN_KEYS: Array<{ key: string; labelKey: string }> = [
   { key: 'cache_read_tokens', labelKey: 'usageLogs.columns.cacheRead' },
   { key: 'cache_write_tokens', labelKey: 'usageLogs.columns.cacheWrite' },
   { key: 'cost_usd', labelKey: 'usageLogs.columns.cost' },
-  { key: 'cost_source', labelKey: 'usageLogs.columns.source' },
   { key: 'model', labelKey: 'usageLogs.columns.model' },
 ]
 
@@ -87,13 +87,13 @@ const usageSnapshot = ref<UsageSnapshot | null>(null)
 const taskTitles = ref<Map<string, string>>(new Map())
 const usageLoading = ref(false)
 const usageError = ref<string | null>(null)
-const sessions = computed<UsageSession[]>(() => usageSnapshot.value?.sessions || [])
+const sessions = computed(() => usageTaskRows(usageSnapshot.value))
 
 let autoRefreshId: ReturnType<typeof setInterval> | null = null
 let loadGeneration = 0
 
 // The rate the ledger normalized CNY receipts with, so every derived CNY
-// figure (totals hint, CSV export, per-row conversions) agrees with
+// figure (totals, CSV export, per-row conversions) agrees with
 // receipt-exact amounts instead of drifting on a hardcoded display rate.
 const cnyRate = computed(() => effectiveCnyPerUsd(usageSnapshot.value) ?? FALLBACK_CNY_RATE)
 
@@ -110,10 +110,6 @@ const sortableCols = computed(() => SORTABLE_COLS)
 // the snapshot, so renderers never re-filter authoritative ledger rows.
 const visibleSessions = computed(() => sessions.value)
 
-const undatedHiddenCount = computed(() => {
-  return 0
-})
-
 const rangeHiddenHint = computed(() => {
   const snapshot = usageSnapshot.value
   if (!snapshot) return ''
@@ -129,7 +125,12 @@ const rangeHiddenHint = computed(() => {
   } else if (snapshot.mode === 'ledger_partial') {
     notices.push(t('usageLogs.coverage.partial'))
   }
-  if (snapshot.coverage.legacyIncludedInTotals) {
+  const legacy = snapshot.coverage.legacyTotals
+  if (snapshot.coverage.legacyIncludedInTotals && legacy && [
+    legacy.cost, legacy.billedCost, legacy.estimatedCost,
+    legacy.input, legacy.output, legacy.totalTokens, legacy.cacheRead, legacy.cacheWrite,
+    legacy.eventCount, legacy.sessions, legacy.estimatedEventCount, legacy.missingCostEntries,
+  ].some(value => value > 0)) {
     notices.push(t('usageLogs.coverage.legacyIncluded'))
   }
   if (snapshot.totals.estimatedEventCount > 0) {
@@ -153,7 +154,14 @@ const rangeHiddenHint = computed(() => {
   return notices.join(' · ')
 })
 
-const serverTotals = computed(() => usageSnapshot.value?.totals || null)
+const serverTotals = computed(() => {
+  const snapshot = usageSnapshot.value
+  if (!snapshot) return null
+  return snapshot.taskGroups === undefined ? snapshot.totals : {
+    ...snapshot.totals,
+    taskCount: snapshot.totals.taskCount ?? snapshot.taskGroups.length,
+  }
+})
 const serverModels = computed(() =>
   usageSnapshot.value?.source === 'usage_ledger' ? usageSnapshot.value.models : null)
 const serverDays = computed(() =>
@@ -169,17 +177,13 @@ const {
   totalTokensDisplay,
   tokensBreakdownParts,
   totalCostDisplay,
-  costHintText,
-  costHintTitle,
   sessionCountDisplay,
   avgCostDisplay,
 } = useUsageTotals({
   visibleSessions,
   serverTotals,
   currency,
-  cnyRate,
   fmtCost,
-  sourceCompositionHint,
 })
 
 const { chartCaption, chartRows } = useUsageChartRows({
@@ -198,7 +202,6 @@ const { modelCards, modelsMeta } = useUsageModelCards({
 
 const { sortedRows, sessionsMeta } = useUsageSessionRows({
   visibleSessions,
-  rangeHiddenHint,
   sortCol,
   sortAsc,
   sessionTimestamp,
@@ -422,8 +425,6 @@ function costSourceClass(source: string): string {
   return 'none'
 }
 
-// A stable source key (independent of locale) used both for labels and for the
-// composition-hint tally; the user-facing strings are looked up from it.
 function costSourceKey(row: CostSourceRow): string {
   const source = costSource(row)
   const ephemeral = 'costEphemeral' in row && Boolean(row.costEphemeral)
@@ -467,35 +468,6 @@ function costSourceTooltipForBreakdown(m: BreakdownRow): string {
   return costSourceTooltip(m)
 }
 
-function costSourceClassesForModelCard(m: ModelCard): Record<string, boolean> {
-  return costSourceClasses(m)
-}
-
-function costSourceLabelForModelCard(m: ModelCard): string {
-  return costSourceLabel(m)
-}
-
-function costSourceTooltipForModelCard(m: ModelCard): string {
-  const base = costSourceTooltip(m)
-  if (m.anyCacheBlind) {
-    return `${base} ${t('usageLogs.costSource.cacheBlindHint')}`
-  }
-  return base
-}
-
-function sourceCompositionHint(rows: UsageSession[]): string {
-  const order = ['actual', 'estimated', 'mixed', 'unpriced', 'ephemeral']
-  const counts: Record<string, number> = { actual: 0, estimated: 0, mixed: 0, unpriced: 0, ephemeral: 0 }
-  rows.forEach(row => {
-    const key = costSourceKey(row)
-    if (counts[key] != null) counts[key] += 1
-  })
-  return order
-    .filter(key => counts[key] > 0)
-    .map(key => `${t(`usageLogs.costSource.${key}.short`)} ${counts[key]}`)
-    .join(' · ')
-}
-
 function modelDisplayLabel(row: UsageSession): string {
   const bd = row.modelBreakdown
   if (Array.isArray(bd) && bd.length > 0) {
@@ -506,10 +478,6 @@ function modelDisplayLabel(row: UsageSession): string {
   return row.model || '—'
 }
 
-function rowKey(row: UsageSession): string {
-  return row.sessionKey || row.session
-}
-
 function rowBreakdown(row: UsageSession): BreakdownRow[] {
   const bd = row.modelBreakdown || []
   const totalCost = bd.reduce((acc, m) => acc + (Number(m.costUsd) || 0), 0)
@@ -517,8 +485,11 @@ function rowBreakdown(row: UsageSession): BreakdownRow[] {
     const tokens = (Number(m.inputTokens) || 0) + (Number(m.outputTokens) || 0)
     const cost = Number(m.costUsd) || 0
     const share = totalCost > 0 ? (cost / totalCost) * 100 : 0
-    const provider = (m.model || '').split('/')[0] || ''
-    const name = (m.model || '').split('/').slice(1).join('/') || m.model || 'unknown'
+    const model = m.model || ''
+    const separator = model.indexOf('/')
+    const provider = m.provider || (separator >= 0 ? model.slice(0, separator) : '')
+    const name = separator >= 0 && model.startsWith(`${provider}/`)
+      ? model.slice(separator + 1) : model || 'unknown'
     return {
       model: m.model || '',
       provider,
@@ -526,6 +497,10 @@ function rowBreakdown(row: UsageSession): BreakdownRow[] {
       tokens,
       cost,
       share,
+      capability: m.capability,
+      meters: m.meters,
+      tokenUnknownItemCount: m.tokenUnknownItemCount,
+      missingCostEntries: m.missingCostEntries,
       costSource: m.costSource,
       costSourceCounts: m.costSourceCounts,
       nativeBilledByCurrency: m.nativeBilledByCurrency,
@@ -592,14 +567,11 @@ function download(filename: string, mime: string, content: string) {
     tableColumns,
     sortableCols,
     visibleSessions,
-    undatedHiddenCount,
     rangeHiddenHint,
     usageTotals,
     totalTokensDisplay,
     tokensBreakdownParts,
     totalCostDisplay,
-    costHintText,
-    costHintTitle,
     sessionCountDisplay,
     avgCostDisplay,
     chartCaption,
@@ -619,20 +591,10 @@ function download(filename: string, mime: string, content: string) {
     fmtNum,
     sessionTimestamp,
     sortVal,
-    costSource,
-    costSourceClass,
-    costSourceLabel,
-    costSourceTooltip,
-    costSourceClasses,
     costSourceClassesForBreakdown,
     costSourceLabelForBreakdown,
     costSourceTooltipForBreakdown,
-    costSourceClassesForModelCard,
-    costSourceLabelForModelCard,
-    costSourceTooltipForModelCard,
-    sourceCompositionHint,
     modelDisplayLabel,
-    rowKey,
     rowBreakdown,
     rowBreakdownTotalTokens,
     rowBreakdownTotalCost,

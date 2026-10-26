@@ -32,6 +32,9 @@ export function usageTaskDisplayName(
   const direct = directCandidates.find(candidate => isUsableTaskName(candidate, key))
   if (typeof direct === 'string') return direct.trim()
 
+  // Parent-task titles already come from the server's exact root generation.
+  if (row.taskGroupId && row.sessionKind === 'root') return fallback
+
   const mapped = taskTitles.get(key)
   return isUsableTaskName(mapped, key) ? mapped.trim() : fallback
 }

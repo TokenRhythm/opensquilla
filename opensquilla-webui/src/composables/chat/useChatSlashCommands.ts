@@ -1,4 +1,5 @@
-import { computed, getCurrentScope, onScopeDispose, ref, type Ref } from 'vue'
+import { computed, getCurrentScope, onScopeDispose, ref, watch, type Ref } from 'vue'
+import type { ProjectInitTurnCommand } from '@/types/turnCommand'
 import type { SkillCatalog } from '@/modules/skillCatalog'
 import type { SkillCandidate } from '@/types/skills'
 import type { SelectedSkillRef } from '@/types/selectedSkills'
@@ -11,6 +12,7 @@ import type {
   UsageReportingRequestOptions,
 } from '@/modules/usageReporting'
 import type { SessionMaintenance } from '@/modules/sessionMaintenance'
+import type { ChatManualCompactionRequest, ChatCompactionRequestNotice } from './useChatCompaction'
 import {
   formatGoalDuration,
   type GoalSnapshot,
@@ -25,6 +27,9 @@ export interface ChatSlashCommand {
   desc: string
   searchDescriptions?: string[]
   aliases: string[]
+  category?: string
+  busy_policy?: string
+  presentation?: string
   execution?: {
     action?: string
   }
@@ -39,6 +44,9 @@ interface SlashCommandPayload extends Record<string, unknown> {
   desc?: string
   usage?: string
   aliases?: unknown
+  category?: string
+  busy_policy?: string
+  presentation?: string
   execution?: {
     action?: string
   }
@@ -61,6 +69,7 @@ const SUPPORTED_WEB_SLASH_ACTIONS = new Set([
   'sessions.reset',
   'usage.status',
   'usage_status',
+  'project.init',
 ])
 
 export interface UseChatSlashCommandsOptions {
@@ -75,6 +84,8 @@ export interface UseChatSlashCommandsOptions {
   onSelectSkill?: (skill: SelectedSkillRef, position: number) => void
   manageSkill?: (name: string) => void
   commandCatalog: CommandCatalog
+  /** Invalidate capability evidence when the Gateway, profile, or socket changes. */
+  catalogScope?: () => string
   usageReporting: Pick<UsageReporting, 'status'>
   sessionMaintenance: SessionMaintenance
   catalogCallOptions?: UsageReportingRequestOptions
@@ -85,13 +96,7 @@ export interface UseChatSlashCommandsOptions {
   autoResizeTextarea: () => void
   newSession: () => void
   resetCurrentSession: () => void
-  setCompactInFlight: (active: boolean, key?: string) => void
-  showCompactStatus: (
-    status: string,
-    message: string,
-    options?: { tone?: string; detail?: string; dismissMs?: number; source?: string },
-  ) => void
-  showCompactionToast: (payload: Record<string, unknown>, meta?: Record<string, unknown>) => void
+  beginManualCompactionRequest: (key: string) => ChatManualCompactionRequest
   notify: (message: string) => void
   activatePlanMode?: () => boolean | Promise<boolean>
   planModeAvailable?: () => boolean
@@ -184,6 +189,9 @@ function isValidSlashCommandPayload(value: unknown): value is SlashCommandPayloa
     ) return false
   }
   const rawAction = command.execution?.action || command.name || command.cmd
+  if (rawAction === 'project.init' && (
+    command.category !== 'turn' || command.busy_policy !== 'next_turn' || command.presentation !== 'turn'
+  )) return false
   return typeof rawAction === 'string'
     && rawAction === rawAction.trim()
     && SUPPORTED_WEB_SLASH_ACTIONS.has(rawAction)
@@ -234,6 +242,29 @@ export function useChatSlashCommands(options: UseChatSlashCommandsOptions) {
   let queryRange: SlashQueryRange | null = null
   let candidatesLoaded = false
   let candidateEpoch = 0
+  let catalogEpoch = 0
+  let catalogLoad: Promise<void> | null = null
+  let compactRequest: ChatManualCompactionRequest | null = null
+  function showCompactRequestNotice(notice: ChatCompactionRequestNotice | null) {
+    if (notice) options.notify(i18n.global.t(notice === 'rejected'
+      ? 'chat.compact.requestRejected' : 'chat.compact.requestUnconfirmed'))
+  }
+  watch([options.sessionKey, () => options.catalogScope?.()], () => {
+    const previous = compactRequest
+    compactRequest = null
+    if (previous) showCompactRequestNotice(previous.retire())
+  }, { flush: 'sync' })
+  if (getCurrentScope()) onScopeDispose(() => {
+    compactRequest?.retire()
+    compactRequest = null
+  })
+  watch(() => options.catalogScope?.(), () => {
+    catalogEpoch += 1
+    catalogLoad = null
+    slashCmds.value = []
+    slashCatalogLoaded.value = false
+    closeSlashMenu()
+  }, { flush: 'sync' })
   const unsubscribe = options.skillCatalog?.subscribeInvalidation?.(invalidateSkillCandidates)
   if (unsubscribe && getCurrentScope()) onScopeDispose(unsubscribe)
 
@@ -292,9 +323,19 @@ export function useChatSlashCommands(options: UseChatSlashCommandsOptions) {
     slashOpen.value = true
   }
 
-  async function loadSlashCommands() {
+  function loadSlashCommands(): Promise<void> {
+    if (catalogLoad) return catalogLoad
+    const epoch = ++catalogEpoch
+    const pending = fetchSlashCommands(epoch)
+    catalogLoad = pending
+    void pending.finally(() => { if (catalogLoad === pending) catalogLoad = null })
+    return pending
+  }
+
+  async function fetchSlashCommands(epoch: number) {
     try {
       const res = await commandCatalog.list('web_chat', options.catalogCallOptions)
+      if (epoch !== catalogEpoch) return
       if (
         !Array.isArray(res?.commands)
         || !res.commands.every(isValidSlashCommandPayload)
@@ -319,6 +360,7 @@ export function useChatSlashCommands(options: UseChatSlashCommandsOptions) {
         handleSlashInput()
       }
     } catch {
+      if (epoch !== catalogEpoch) return
       slashCmds.value = []
       slashCatalogLoaded.value = false
     }
@@ -343,6 +385,7 @@ export function useChatSlashCommands(options: UseChatSlashCommandsOptions) {
       'plans.setMode': 'plan', 'plans.toggleMode': 'plan', '/plan': 'plan',
       reset_session: 'reset', 'sessions.reset': 'reset', '/reset': 'reset',
       usage_status: 'usage', 'usage.status': 'usage', '/usage': 'usage',
+      'project.init': 'init',
     }
     return { ...command, desc: names[action]
       ? i18n.global.t(`chat.skillPalette.commandDescriptions.${names[action]}`)
@@ -356,7 +399,10 @@ export function useChatSlashCommands(options: UseChatSlashCommandsOptions) {
       // Directory edits and mutations in another client have no push event.
       // Revalidate at the next palette opening, never on each search keystroke
       // or during client startup. The epoch also fences an earlier open's RPC.
-      if (!slashOpen.value) resetSkillCandidates()
+      if (!slashOpen.value) {
+        resetSkillCandidates()
+        if (!slashCatalogLoaded.value) void loadSlashCommands()
+      }
       slashIdx.value = 0
       updatePalette()
       void loadSkillCandidates()
@@ -523,6 +569,12 @@ export function useChatSlashCommands(options: UseChatSlashCommandsOptions) {
       return
     }
     const action = cmd?.execution?.action || cmd.cmd || cmd.name
+    if (action === 'project.init') {
+      closeSlashMenu()
+      options.inputText.value = `/init${args ? ` ${args}` : ''}`
+      options.autoResizeTextarea()
+      return
+    }
     if (action === 'workbench.openSideChat') { void options.sideChat?.run(`/side ${args}`); return }
     if (options.selectedSkills?.value.length && !isPlanModeAction(cmd)) {
       options.notify(i18n.global.t('chat.skillPalette.commandWithSkills'))
@@ -582,24 +634,17 @@ export function useChatSlashCommands(options: UseChatSlashCommandsOptions) {
       case 'sessions.contextCompact':
       case '/compact': {
         const compactKey = options.sessionKey.value
-        options.setCompactInFlight(true, compactKey)
-        options.showCompactStatus('started', i18n.global.t('chat.compact.compacting'), {
-          tone: 'info',
-          source: 'manual',
-        })
+        const request = options.beginManualCompactionRequest(compactKey)
+        compactRequest = request
         maintenance.compact({ key: compactKey, wait: false })
           .then((result) => {
-            if (compactKey !== options.sessionKey.value) return
-            options.showCompactionToast({ ...result, key: compactKey, source: 'manual' })
-          })
-          .catch((err: unknown) => {
-            if (compactKey !== options.sessionKey.value) return
-            options.showCompactionToast({
-              key: compactKey,
-              source: 'manual',
-              status: 'failed',
-              detail: err instanceof Error ? err.message : String(err),
-            })
+            if (compactRequest !== request || compactKey !== options.sessionKey.value) return
+            compactRequest = null
+            request.resolve({ ...result })
+          }, (err: unknown) => {
+            if (compactRequest !== request || compactKey !== options.sessionKey.value) return
+            compactRequest = null
+            showCompactRequestNotice(request.reject(err))
           })
         break
       }
@@ -670,25 +715,16 @@ export function useChatSlashCommands(options: UseChatSlashCommandsOptions) {
         }
         if (first === 'clear') {
           Promise.resolve(options.goalClear?.() ?? false)
-            .then(accepted => {
-              if (accepted) options.notify(i18n.global.t('chat.slashCommands.goal.clearOk'))
-            })
             .catch(fail)
           break
         }
         if (first === 'pause') {
           Promise.resolve(options.goalPause?.() ?? false)
-            .then(accepted => {
-              if (accepted) options.notify(i18n.global.t('chat.slashCommands.goal.pauseOk'))
-            })
             .catch(fail)
           break
         }
         if (first === 'resume') {
           Promise.resolve(options.goalResume?.() ?? false)
-            .then(accepted => {
-              if (accepted) options.notify(i18n.global.t('chat.slashCommands.goal.resumeOk'))
-            })
             .catch(fail)
           break
         }
@@ -746,7 +782,8 @@ export function useChatSlashCommands(options: UseChatSlashCommandsOptions) {
     const args = firstWhitespace === -1 ? '' : trimmed.slice(firstWhitespace).trimStart()
     if (classification === 'unavailable') {
       closeSlashMenu()
-      options.notify(i18n.global.t('chat.slashCommands.unknown', { command: cmdText }))
+      options.notify(i18n.global.t(slashCommandKey(cmdText) === '/init'
+        ? 'chat.slashCommands.initUnavailable' : 'chat.slashCommands.unknown', { command: cmdText }))
       return true
     }
     const commandKey = slashCommandKey(cmdText)
@@ -763,6 +800,7 @@ export function useChatSlashCommands(options: UseChatSlashCommandsOptions) {
   }
 
   async function classifySlashCommand(text: string): Promise<SlashCommandClassification> {
+    if (text.trim().startsWith('//')) return 'unknown'
     const local = availableCommands.value.find(command => command.execution?.action === 'workbench.openSideChat'
       && slashCommandKeys(command).includes(slashCommandKey(text)))
     if (local) return allowed(local) ? 'registered' : 'unavailable'
@@ -770,7 +808,20 @@ export function useChatSlashCommands(options: UseChatSlashCommandsOptions) {
     if (!slashCatalogLoaded.value) return 'unavailable'
     const commandKey = slashCommandKey(text)
     const command = availableCommands.value.find(command => slashCommandKeys(command).includes(commandKey))
-    return command ? allowed(command) ? 'registered' : 'unavailable' : 'unknown'
+    return command ? allowed(command) ? 'registered' : 'unavailable'
+      : commandKey === '/init' ? 'unavailable' : 'unknown'
+  }
+
+  function resolveTurnCommand(text: string): ProjectInitTurnCommand | null {
+    const match = /^\/init(?:\s+([\s\S]*))?$/i.exec(text.trim())
+    if (!match || !slashCatalogLoaded.value) return null
+    const command = availableCommands.value.find(command => command.execution?.action === 'project.init')
+    return command && allowed(command) ? { name: 'project.init', args: match[1] || '' } : null
+  }
+
+  async function supportsTurnCommand(command: ProjectInitTurnCommand): Promise<boolean> {
+    if (!slashCatalogLoaded.value) await loadSlashCommands()
+    return command.name === 'project.init' && resolveTurnCommand('/init') !== null
   }
 
   return {
@@ -792,6 +843,8 @@ export function useChatSlashCommands(options: UseChatSlashCommandsOptions) {
     activateSlashCmd,
     selectSlashCmd,
     classifySlashCommand,
+    resolveTurnCommand,
+    supportsTurnCommand,
     executeSlashCommand,
     isPlanModeCommand,
   }

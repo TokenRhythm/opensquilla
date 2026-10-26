@@ -187,6 +187,8 @@ async function pasteSyntheticClipboard(page: Page): Promise<ClipboardPaste> {
 async function copyImage(page: Page, resource: Locator) {
   await resource.getByTestId('copy-image').click()
   await expect(resource.locator('.image-copy-actions')).toHaveAttribute('data-state', 'ok')
+  await expect(resource.getByTestId('copy-image')).toHaveAttribute('aria-label', 'Copy image')
+  await expect(resource.locator('.image-copy-actions [role="status"]')).toHaveText('')
   const pasted = await pasteSyntheticClipboard(page)
   expect(pasted.files).toEqual([{ type: 'image/png', width: 12, height: 8,
     left: [255, 0, 0, 255], right: [0, 0, 0, 0] }])
@@ -242,12 +244,14 @@ test.describe('Image copy through the system clipboard', () => {
     await expect(page.getByRole('menuitem', { name: 'Copy SVG source', exact: true })).toHaveCount(1)
     await page.screenshot({ path: testInfo.outputPath('svg-copy-menu.png') })
     await page.getByRole('menuitem', { name: 'Copy SVG source', exact: true }).click()
-    await expect(page.getByText('SVG source copied', { exact: true })).toBeVisible()
-    const pasted = await pasteSyntheticClipboard(page)
-    // Windows native text paste exposes CRLF line endings.
-    const pastedSource = process.platform === 'win32' ? pasted.text.replace(/\r\n/g, '\n') : pasted.text
-    expect(pastedSource).toBe(SVG_SOURCE)
-    expect(pasted.files).toEqual([])
+    let pasted: Awaited<ReturnType<typeof pasteSyntheticClipboard>> | undefined
+    await expect.poll(async () => {
+      pasted = await pasteSyntheticClipboard(page)
+      // Windows native text paste exposes CRLF line endings.
+      return process.platform === 'win32' ? pasted.text.replace(/\r\n/g, '\n') : pasted.text
+    }).toBe(SVG_SOURCE)
+    expect(pasted!.files).toEqual([])
+    await expect(page.getByText('SVG source copied', { exact: true })).toHaveCount(0)
   })
 
   test('generated SVG with text/plain MIME copies from its file card', async ({ page }) => {

@@ -1,6 +1,7 @@
 """Consumer admission, finite draft replanning and exact source preservation."""
 
 from copy import deepcopy
+from dataclasses import replace
 from unittest.mock import AsyncMock
 
 import pytest
@@ -86,8 +87,12 @@ async def test_revision_with_more_characters_and_fewer_tokens_reaches_consumer(m
         proof = consumer.project_final_request(
             [Message(role="user", content=checkpoint)],
             None,
-            ChatConfig(provider_context_window_tokens=1500, max_tokens=128),
+            ChatConfig(provider_context_window_tokens=32768, max_tokens=4096),
         )
+        # The consumer fixture has an explicit 860-token history allowance.
+        # A high generation cap no longer creates that fixed allowance: normal
+        # provider projection may lower generation to fit the actual request.
+        proof = replace(proof, fits=proof.fits and proof.proof["estimated_tokens"] <= 860)
         proofs.append(proof)
         return proof
 
@@ -119,6 +124,9 @@ async def test_capacity_replan_absorbs_only_new_complete_rounds(monkeypatch, for
         summary="Earlier work is complete.",
         protected_recent_messages=4,
     )
+    # The first retained tail must leave room for a real body goal. The
+    # stricter complete consumer admission, not a zero local G, drives replan.
+    history_budget = sum(estimate_tokens(entry["content"]) for entry in entries)
     seen = []
 
     def admission(checkpoint, kept):
@@ -130,7 +138,7 @@ async def test_capacity_replan_absorbs_only_new_complete_rounds(monkeypatch, for
             session_id="replan",
             entries=entries,
             config=cfg,
-            context_window_tokens=2000,
+            context_window_tokens=history_budget,
             forced_prefix_cut=2 if forced else None,
             consumer_admission=admission,
         )
@@ -171,12 +179,13 @@ async def test_replan_exhaustion_leaves_original_history_and_checkpoint(monkeypa
     entries = history()
     monkeypatch.setattr("opensquilla.session.compaction._find_turn_boundary_cut", lambda *a, **k: 2)
     cfg = synthetic_compaction_config(summary="Prior work completed.", protected_recent_messages=4)
+    history_budget = sum(estimate_tokens(entry["content"]) for entry in entries)
     result = await compact_context(
         CompactionRequest(
             session_id="reject",
             entries=entries,
             config=cfg,
-            context_window_tokens=2000,
+            context_window_tokens=history_budget,
             previous_summary="Previous checkpoint.",
             consumer_admission=lambda *_: False,
         )

@@ -183,12 +183,12 @@ describe('SessionReadLifecycle', () => {
     }
   })
 
-  it('keeps paged history available when the live snapshot exceeds its recovery budget', async () => {
+  it.each(['too-large', 'unresolved'] as const)('keeps paged history available after a terminal %s live failure', async kind => {
     const { adapter, lifecycle } = harness([fixture('alpha', {
-      liveError: new SessionReadFailure('too-large', 'snapshot exceeds budget', false),
+      liveError: new SessionReadFailure(kind, 'live recovery failed', false),
     })])
     const lease = lifecycle.open({ sessionKey: 'alpha' })
-    await expect(lease.live).rejects.toMatchObject({ kind: 'too-large', retryable: false })
+    await expect(lease.live).rejects.toMatchObject({ kind, retryable: false })
     expect(lifecycle.current()).toBe(lease)
     await expect(lease.history.latest()).resolves.toMatchObject({ loadedCount: 1 })
     expect(adapter.activeLeaseCount).toBe(1)

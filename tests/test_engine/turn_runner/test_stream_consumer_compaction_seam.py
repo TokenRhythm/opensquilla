@@ -175,7 +175,7 @@ async def test_in_turn_compaction_after_hook_fires_after_persist_failure(
     yielded, raised = await _drive(runner)
 
     assert raised is None
-    assert any(isinstance(e, DoneEvent) for e in yielded)
+    assert not any(isinstance(e, DoneEvent) for e in yielded)
     in_turn_events = [
         event for event in hook.events if event[1] == "in_turn_stream"
     ]
@@ -184,7 +184,7 @@ async def test_in_turn_compaction_after_hook_fires_after_persist_failure(
         ("after", "in_turn_stream", None, None),
     ]
     assert hook.outcomes[-1]["status"] == "failed"
-    assert hook.outcomes[-1]["reason"] == "persist_failed"
+    assert hook.outcomes[-1]["reason"] == "commit_unconfirmed"
 
 
 # ---------------------------------------------------------------------------
@@ -245,13 +245,13 @@ async def test_persist_failure_emits_failed_lifecycle_without_completed(
     yielded, raised = await _drive(runner)
 
     assert raised is None
-    assert any(isinstance(e, DoneEvent) for e in yielded)
+    assert not any(isinstance(e, DoneEvent) for e in yielded)
     statuses = [payload.get("status") for _, payload in notify_calls]
     assert "completed" not in statuses
     assert "failed" in statuses
     failed_payload = next(payload for _, payload in notify_calls if payload["status"] == "failed")
     assert failed_payload["phase"] == "agent_inline_overflow"
-    assert failed_payload["reason"] == "persist_failed"
+    assert failed_payload["reason"] == "commit_unconfirmed"
 
 
 # ---------------------------------------------------------------------------
@@ -365,10 +365,8 @@ async def test_persist_raises_preserves_recoverable_pre_compaction_state(
     runner = _setup_runner(monkeypatch, case)
     yielded, raised = await _drive(runner)
 
-    # The turn must NOT abort, but runtime state must stay recoverable.
+    # An unknown commit stops the turn; pre-commit runtime state stays recoverable.
     assert raised is None
-    assert any(isinstance(e, DoneEvent) for e in yielded), (
-        "stream aborted after persist failure"
-    )
+    assert not any(isinstance(e, DoneEvent) for e in yielded)
     assert _MAILBOX.refresh_prompt_calls == []
     assert refresh_calls == []

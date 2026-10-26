@@ -115,7 +115,10 @@ from opensquilla.gateway.adapters.plans_contract import (
 from opensquilla.gateway.adapters.session_control_contract import (
     register_session_control_contract,
 )
-from opensquilla.gateway.adapters.session_history_projection import read_chat_history_v4
+from opensquilla.gateway.adapters.session_history_projection import (
+    _project_fork_workspace_previews,
+    read_chat_history_v4,
+)
 from opensquilla.gateway.adapters.session_lifecycle import (
     GatewaySessionLifecycleAdapter,
 )
@@ -295,6 +298,7 @@ from opensquilla.session.terminal_reply import (
     safe_provider_failure_message,
     sanitize_agent_error,
 )
+from opensquilla.turn_outcome_projection import turn_id_from_context
 
 _d = get_dispatcher()
 
@@ -1563,7 +1567,7 @@ def _buffer_session_event(
     session_key: str,
     event_name: str,
     payload: dict[str, Any] | None,
-) -> dict[str, Any]:
+) -> dict[str, Any] | None:
     return buffer_session_event(
         session_key,
         event_name,
@@ -2330,15 +2334,64 @@ def _run_mode_lock_payload(
     }
 
 
+def _handle_task_state_read_failure(
+    event: str,
+    exc: Exception,
+    *,
+    operation: str,
+    started: float,
+    session_key: str | None = None,
+) -> None:
+    """Keep availability failures explicit instead of projecting an empty ledger.
+
+    The compatibility readers can delegate to the same storage and read budget.
+    Retrying them after a busy admission cannot provide an independent fallback.
+    Log only exception type and typed read diagnostics: exception text and
+    tracebacks can contain task details or other private stored values.
+    """
+
+    busy = exc if isinstance(exc, StorageBusyError) else (
+        StorageBusyError(
+            operation,
+            waited_ms=max(0, int((time.monotonic() - started) * 1000)),
+            retry_after_ms=100,
+            stage="deadline",
+            resource="session_task_state",
+        ) if isinstance(exc, TimeoutError) else None
+    )
+    fields: dict[str, Any] = {"exception_type": type(exc).__name__}
+    if session_key is not None:
+        fields["session_key"] = session_key
+    if busy is not None:
+        fields.update(
+            operation=busy.operation,
+            waited_ms=busy.waited_ms,
+            retry_after_ms=busy.retry_after_ms,
+        )
+        if busy.stage is not None:
+            fields["stage"] = busy.stage
+        if busy.resource is not None:
+            fields["resource"] = busy.resource
+    log.warning(event, **fields)
+    if busy is not None:
+        if busy is exc:
+            raise busy
+        raise busy from exc
+
+
 async def _list_task_rows(ctx: RpcContext, storage: Any | None, session_key: str) -> list[Any]:
     if storage is not None:
         recent_storage_list = getattr(storage, "list_recent_agent_tasks", None)
         if callable(recent_storage_list):
+            started = time.monotonic()
             try:
                 return list(await recent_storage_list(session_key))
-            except Exception:
-                log.warning(
+            except Exception as exc:
+                _handle_task_state_read_failure(
                     "sessions.recent_agent_task_storage_state_failed",
+                    exc,
+                    operation="list_recent_agent_tasks",
+                    started=started,
                     session_key=session_key,
                 )
 
@@ -2346,20 +2399,28 @@ async def _list_task_rows(ctx: RpcContext, storage: Any | None, session_key: str
     if task_runtime is not None:
         runtime_list = getattr(task_runtime, "list", None)
         if callable(runtime_list):
+            started = time.monotonic()
             try:
                 return list(await runtime_list(session_key=session_key))
-            except Exception:
-                log.warning("sessions.task_runtime_state_failed", session_key=session_key)
+            except Exception as exc:
+                _handle_task_state_read_failure(
+                    "sessions.task_runtime_state_failed", exc,
+                    operation="task_runtime.list", started=started, session_key=session_key,
+                )
 
     if storage is None:
         return []
     storage_list = getattr(storage, "list_agent_tasks", None)
     if not callable(storage_list):
         return []
+    started = time.monotonic()
     try:
         return list(await storage_list(session_key=session_key))
-    except Exception:
-        log.warning("sessions.agent_task_storage_state_failed", session_key=session_key)
+    except Exception as exc:
+        _handle_task_state_read_failure(
+            "sessions.agent_task_storage_state_failed", exc,
+            operation="list_agent_tasks", started=started, session_key=session_key,
+        )
         return []
 
 
@@ -2375,11 +2436,15 @@ async def _list_task_rows_by_session(
     if storage is not None:
         storage_batch = getattr(storage, "list_agent_tasks_for_sessions", None)
         if callable(storage_batch):
+            started = time.monotonic()
             try:
                 grouped = await storage_batch(keys)
                 return {key: list(grouped.get(key, [])) for key in keys}
-            except Exception:
-                log.warning("sessions.agent_task_storage_batch_state_failed")
+            except Exception as exc:
+                _handle_task_state_read_failure(
+                    "sessions.agent_task_storage_batch_state_failed", exc,
+                    operation="list_agent_tasks_for_sessions", started=started,
+                )
 
     return {key: await _list_task_rows(ctx, storage, key) for key in keys}
 
@@ -3869,7 +3934,7 @@ async def _send_prepared_to_subscribers(
     ctx: RpcContext,
     session_key: str,
     event_name: str,
-    send_payload: dict,
+    send_payload: dict | None,
 ) -> None:
     await send_prepared_to_subscribers(ctx, session_key, event_name, send_payload)
 
@@ -4803,7 +4868,10 @@ async def _handle_sessions_messages_hydrate(params: dict | None, ctx: RpcContext
     # storage coordination inside the same bounded-read contract as history so
     # metadata cannot pin the connection's serialized dispatcher indefinitely.
     with bounded_interactive_storage_reads():
-        return await _hydrate_sessions_messages_metadata(ctx, key)
+        # Registration metadata comes from storage only. Transport recovery
+        # does not invalidate a previously checked physical directory; execution
+        # and workspace operations still validate it at their own boundaries.
+        return await _hydrate_sessions_messages_metadata(ctx, key, include_project_workspace=True)
 
 
 async def _handle_sessions_messages_snapshot(params: dict | None, ctx: RpcContext) -> dict:
@@ -5251,13 +5319,116 @@ async def _handle_sessions_read_close_v2(params: dict | None, ctx: RpcContext) -
 
 
 async def _handle_sessions_history_page_v2(params: dict | None, ctx: RpcContext) -> dict[str, Any]:
+    from opensquilla.application.session_history import HistoryViewOwnerChangedError
+    from opensquilla.gateway.adapters.session_history import SessionHistoryStorageAdapter
+
+    manager = getattr(ctx, "session_manager", None)
+    adapter = SessionHistoryStorageAdapter(manager)
+    if not adapter.supports_committed_view:
+        return await _read_sessions_history_page_v2(params, ctx)
+    key = _require_key(params)
+    assert isinstance(params, dict)
+    view = await adapter.read_view(
+        key, lambda owner: _read_sessions_history_page_v2(params, ctx, pinned_owner=owner),
+    )
+    result = view.value
+    messages = [item["message"] for item in result["items"]]
+    projected = await _project_fork_workspace_previews(
+        messages, session_key=key, manager=manager,
+    )
+    for item, message in zip(result["items"], projected, strict=True):
+        item["message"] = message
+    _bound_projected_history_page(result, params, key=key)
+    try:
+        # This read is outside the captured transaction. Re-reading its owner
+        # inside that transaction would only prove the old snapshot's identity.
+        await adapter.require_current_owner(key, view)
+    except HistoryViewOwnerChangedError as exc:
+        raise RpcHandlerError(
+            "REBASE_REQUIRED", "Session identity changed before history publication",
+            accepted=False,
+        ) from exc
+    return result
+
+
+def _history_page_turn_ids(items: Sequence[Mapping[str, Any]]) -> set[str]:
+    return {
+        turn_id
+        for item in items
+        if (turn_id := turn_id_from_context(item["message"].get("turn_context"))) is not None
+    }
+
+
+def _history_page_outcomes(
+    outcomes: list[dict[str, Any]], *, candidate_turn_ids: set[str], retained_turn_ids: set[str],
+) -> list[dict[str, Any]]:
+    """Exclude only outcomes proved to belong exclusively to omitted messages.
+
+    Legacy tool joining and hidden rows can leave outcomes without a projected
+    message owner. Keep those intact rather than guessing their attribution.
+    """
+    return [
+        outcome for outcome in outcomes
+        if outcome.get("turn_id") not in candidate_turn_ids
+        or outcome.get("turn_id") in retained_turn_ids
+    ]
+
+
+def _bound_projected_history_page(
+    result: dict[str, Any], params: dict, *, key: str,
+) -> None:
+    """Keep optional post-snapshot aliases inside the transport byte budget."""
+
+    target_bytes = min(1_048_576, max(1, int(params.get("target_bytes") or 1_048_576)))
+    direction = "before" if params.get("anchor_message_id") else params["direction"]
+    items = result["items"]
+    candidate_turn_ids = _history_page_turn_ids(items)
+    outcomes = result["turn_outcomes"]
+    while (
+        len(json.dumps(result, ensure_ascii=False, separators=(",", ":")).encode()) > target_bytes
+    ):
+        if len(items) <= 1:
+            raise RpcHandlerError(
+                "RESPONSE_TOO_LARGE", "History metadata exceeds the requested page byte budget",
+                accepted=False,
+            )
+        items.pop(0 if direction == "before" else -1)
+        result["turn_outcomes"] = _history_page_outcomes(
+            outcomes, candidate_turn_ids=candidate_turn_ids,
+            retained_turn_ids=_history_page_turn_ids(items),
+        )
+        message = items[0 if direction == "before" else -1]["message"]
+        boundary = message.get(
+            "historyCursorBefore" if direction == "before" else "historyCursorAfter",
+        )
+        if not isinstance(boundary, str):
+            timestamp, transcript_id = message.get("timestamp"), message.get("transcript_id")
+            if timestamp is None or transcript_id is None:
+                raise RpcHandlerError(
+                    "RESPONSE_TOO_LARGE", "History item has no resumable boundary", accepted=False,
+                )
+            boundary = f"{int(timestamp)}|{int(transcript_id)}"
+        result[f"{direction}_cursor"] = _v2_cursor_encode(
+            key=key, session_id=result["session_id"], session_epoch=result["session_epoch"],
+            direction=direction, cursor=boundary,
+        )
+        result[f"has_more_{direction}"] = True
+        result["complete_for_requested_window"] = False
+
+
+async def _read_sessions_history_page_v2(
+    params: dict | None, ctx: RpcContext,
+    *, pinned_owner: tuple[str | None, int | None] | None = None,
+) -> dict[str, Any]:
     if not isinstance(params, dict):
         raise ValueError("params required: key, direction")
     key = _require_key(params)
     direction = params.get("direction")
     if direction not in {"before", "after"}:
         raise ValueError("params.direction must be before or after")
-    session_id, session_epoch = await _snapshot_session_identity(ctx, key)
+    session_id, session_epoch = (
+        pinned_owner if pinned_owner is not None else await _snapshot_session_identity(ctx, key)
+    )
     if not isinstance(session_id, str) or session_epoch is None:
         raise RpcHandlerError("NOT_FOUND", "Session not found", accepted=False)
     if params.get("session_id") is not None and params["session_id"] != session_id:
@@ -5366,12 +5537,22 @@ async def _handle_sessions_history_page_v2(params: dict | None, ctx: RpcContext)
     # Walk from the requested edge: newest suffix for before, oldest prefix
     # for after. Serialize each item once, including its semantic metadata.
     bounded: list[dict[str, Any]] = []
+    candidate_turn_ids = _history_page_turn_ids(items)
+    retained_turn_ids: set[str] = set()
+    outcomes = result["turn_outcomes"]
+    result["turn_outcomes"] = _history_page_outcomes(
+        outcomes, candidate_turn_ids=candidate_turn_ids, retained_turn_ids=retained_turn_ids,
+    )
     item_bytes = 0
     for item in reversed(items) if direction == "before" else items:
         encoded_size = len(
             json.dumps(item, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
         )
         candidate_count = len(bounded) + 1
+        next_turn_ids = retained_turn_ids | _history_page_turn_ids([item])
+        next_outcomes = _history_page_outcomes(
+            outcomes, candidate_turn_ids=candidate_turn_ids, retained_turn_ids=next_turn_ids,
+        )
         truncated = candidate_count < len(items)
         legacy_edge = boundary(item, direction) if truncated else legacy.get(
             "oldest_cursor" if direction == "before" else "newest_cursor"
@@ -5382,21 +5563,33 @@ async def _handle_sessions_history_page_v2(params: dict | None, ctx: RpcContext)
         )
         result[f"has_more_{direction}"] = bool(legacy.get("has_more")) or truncated
         result["complete_for_requested_window"] = not truncated
-        # result.items remains [] while calculating the fixed page metadata.
+        # Count only outcomes belonging to this candidate page, plus metadata
+        # whose ownership cannot be established from the display projection.
+        # Do not install the candidate's outcomes until its message also fits.
         overhead = len(
-            json.dumps(result, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+            json.dumps(
+                {**result, "turn_outcomes": next_outcomes},
+                ensure_ascii=False, separators=(",", ":"),
+            ).encode("utf-8")
         )
         if overhead + item_bytes + encoded_size + candidate_count - 1 > target_bytes:
             break
         bounded.append(item)
+        retained_turn_ids = next_turn_ids
+        result["turn_outcomes"] = next_outcomes
         item_bytes += encoded_size
     if not bounded and items:
+        metadata_exceeds_budget = overhead > target_bytes
         raise RpcHandlerError(
             "RESPONSE_TOO_LARGE",
-            "A history item exceeds the requested page byte budget",
+            "History metadata exceeds the requested page byte budget"
+            if metadata_exceeds_budget
+            else "A history item and its metadata exceed the requested page byte budget",
             details={
                 "target_bytes": target_bytes,
-                "message_id": items[-1 if direction == "before" else 0]["message_id"],
+                **({} if metadata_exceeds_budget else {
+                    "message_id": items[-1 if direction == "before" else 0]["message_id"],
+                }),
             },
             accepted=False,
         )
@@ -5418,7 +5611,9 @@ async def _handle_sessions_history_page_v2(params: dict | None, ctx: RpcContext)
             raise RpcHandlerError(
                 'HISTORY_STALE', 'Search message changed during navigation', accepted=False,
             )
-        if await _snapshot_session_identity(ctx, key) != (session_id, session_epoch):
+        if pinned_owner is None and await _snapshot_session_identity(ctx, key) != (
+            session_id, session_epoch,
+        ):
             raise RpcHandlerError('REBASE_REQUIRED', 'Session identity changed', accepted=False)
     if (
         len(json.dumps(result, ensure_ascii=False, separators=(",", ":")).encode("utf-8"))
@@ -5475,7 +5670,7 @@ async def _handle_sessions_messages_snapshot_read(params: dict | None, ctx: RpcC
                 snapshots = connection.snapshot_registry()
                 transfer = snapshots.get(key, sync_revision, params["snapshot_id"]) if (
                     params.get("snapshot_id") is not None
-                ) else snapshots.admit(key, sync_revision, lease, is_current=current)
+                ) else connection.admit_snapshot(key, sync_revision, lease, is_current=current)
             if transfer is None or transfer.closed:
                 raise SnapshotTransferError("SNAPSHOT_EXPIRED")
         else:

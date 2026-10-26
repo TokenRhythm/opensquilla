@@ -135,6 +135,22 @@
     "openDirectoryFailed": "プロジェクトのフォルダーを開けませんでした。再試行してください。",
     "copyDirectoryFailed": "プロジェクトのフォルダーパスをコピーできませんでした。",
     "projects": "プロジェクト",
+    "addProject": "プロジェクトを追加",
+    "projectAction": "プロジェクトの操作",
+    "openExistingProject": "既存のプロジェクトを開く",
+    "saveParentDirectory": "保存先",
+    "projectLocation": "プロジェクトのフォルダー",
+    "chooseParentDirectory": "親フォルダーを選択",
+    "chooseExistingDirectory": "既存のフォルダーを選択",
+    "executionHost": "実行ホスト：{host}",
+    "gatewayHost": "Gateway のホスト",
+    "createLocationHint": "この場所に新しいプロジェクトフォルダーを作成します。",
+    "openLocationHint": "選択したフォルダーをプロジェクト一覧に追加します。",
+    "createUnavailable": "この Gateway はプロジェクトの直接作成と登録に対応していません。既存のプロジェクトを開くか、フォルダー選択画面で新しいフォルダーを作成できます。",
+    "preparingProject": "準備中…",
+    "projectOpened": "プロジェクト「{name}」を開きました",
+    "createProjectUnconfirmed": "{path} でのプロジェクト作成中に問題が発生しました。再試行する前にプロジェクト一覧を確認してください。{error}",
+    "openProjectFailed": "プロジェクトを開けませんでした：{error}",
     "createProject": "プロジェクトを作成",
     "projectNamePlaceholder": "プロジェクト名",
     "sourceFolders": "ソースフォルダ",
@@ -280,6 +296,31 @@
     "dismiss": "閉じる"
   },
   "workbench": {
+    "annotationUnified": {
+      "selectTarget": "Select content to annotate",
+      "start": "Annotate",
+      "stop": "Finish annotating",
+      "placeholder": "Describe a change…",
+      "recordHint": "Enter to record · Shift + Enter for a new line",
+      "record": "Keep annotating",
+      "submit": "Record {count} annotations",
+      "summary": "{count} annotations",
+      "empty": "Select text, an object or a range to describe a change.",
+      "locate": "Locate",
+      "edit": "Edit",
+      "reselect": "Select again",
+      "cancel": "Cancel this edit",
+      "delete": "Delete",
+      "queued": "Waiting to send",
+      "restoreQueued": "Cancel sending and restore annotations",
+      "otherPages": "Other pages",
+      "versionChanged": "Loaded the current working version. Select a target to annotate.",
+      "locationOnly": "Located the page. Select again to change the target.",
+      "stale": "The document changed. Select the target again.",
+      "unavailable": "Annotation is unavailable for this file or client.",
+      "submitFailed": "Could not queue annotations. Your drafts were kept.",
+      "recordToConversation": "Record in conversation"
+    },
     "tabs": {
       "copyLink": "リンクをコピー",
       "openWeb": "ウェブページを開く",
@@ -313,7 +354,7 @@
       "hoverElement": "クリックして変更を依頼",
       "hoverRange": "セルや範囲の選択を終えると、変更内容を入力できます",
       "chooseContent": "変更したい内容を先に選択してください",
-      "selectDocx": "変更したいテキストをドラッグで選択してください。選択を終えると、変更内容を入力できます。",
+      "selectDocx": "段落をクリックするか、テキストをドラッグで選択して、変更内容を入力してください。",
       "selectPptx": "変更したいオブジェクトをクリックし、変更内容を入力してください。",
       "selectXlsx": "セルを選択するか範囲をドラッグしてください。選択を終えると、変更内容を入力できます。",
       "cancelSelection": "選択を終了",
@@ -364,6 +405,7 @@
     },
     "resources": {
       "title": "ファイル", "count": "ファイル（{count}）", "empty": "ファイルまたはリンクはまだありません。",
+      "currentWorkingFile": "現在の作業ファイル", "publishedVersion": "公開済みバージョン",
       "groups": { "files": "ファイル", "links": "リンク", "attachments": "ファイル", "documents": "ファイル", "deliverables": "ファイル", "urls": "リンク" },
       "open": "{name} を開く", "preparing": "エディターを準備しています…", "retry": "再試行", "preview": "{name} をプレビュー", "download": "{name} をダウンロード", "edit": "{name} のコピーを編集", "publish": "{name} を公開",
       "imported": "{name} を編集できます。", "published": "{name} を共有できます。",
@@ -450,9 +492,6 @@
       "outputGap": "Terminal output was interrupted",
       "exited": "Terminal exited",
       "state": { "starting": "Starting", "running": "Connected", "exited": "Exited", "error": "Unavailable" }
-    },
-    "nativePreview": {
-      "capacityReached": "すでに 4 つのインタラクティブプレビューが開いています。既存のプレビューに戻るか、1 つ閉じてから新しく開いてください。"
     },
     "artifactAnnotation": {
       "start": "変更を依頼",
@@ -548,6 +587,15 @@
       "documentEditingRetired": "クライアントを更新してページを開き直し、注釈をチャット入力として送信してください。"
     },
     "artifactDocument": {
+      "versionHistory": "バージョン履歴（{count}）",
+      "currentVersion": "現在 v{generation}",
+      "historicalVersion": "履歴",
+      "openLatest": "最新版を開く",
+      "viewDeliveredVersion": "納品時のバージョンを表示",
+      "viewRevision": "このバージョンを表示",
+      "fixedSnapshot": "納品済みの版",
+      "fixedSnapshotHint": "納品時のバージョンです。注釈による修正では現在の作業文書を開き、納品済みの版は保持されます。",
+      "continueEditing": "編集を続ける",
       "sections": "成果物ドキュメントのセクション",
       "preview": "プレビュー",
       "source": "ソース",
@@ -3536,6 +3584,45 @@
     "bundleDifferentGateway": "接続中の Gateway 自身の WebUI を開いて、サポートバンドルをダウンロードしてください。"
   },
   "usageLogs": {
+    "capabilities": {
+      "unknown": "不明",
+      "partialMeter": "{value} · {count} 件不明",
+      "metrics": {
+        "input_tokens": "入力トークン",
+        "output_tokens": "出力トークン",
+        "cache_read_tokens": "キャッシュ読み取りトークン",
+        "cache_write_tokens": "キャッシュ書き込みトークン",
+        "input_images": "入力画像",
+        "input_video_seconds": "入力動画の長さ",
+        "output_audio_seconds": "出力音声の長さ",
+        "requested_audio_seconds": "指定音声の長さ",
+        "requests": "リクエスト",
+        "output_images": "出力画像",
+        "input_audio_seconds": "入力音声",
+        "input_characters": "入力文字",
+        "requested_video_seconds": "要求した動画時間",
+        "video_seconds": "生成した動画時間",
+        "search_credits": "検索クレジット",
+        "scrape_credits": "抽出クレジット",
+        "character_credits": "文字クレジット",
+        "cost_in_usd_ticks": "プロバイダー費用単位",
+        "input_text_tokens": "入力テキストトークン",
+        "output_text_tokens": "出力テキストトークン",
+        "input_audio_tokens": "入力音声トークン",
+        "output_audio_tokens": "出力音声トークン",
+        "input_image_tokens": "入力画像トークン",
+        "output_image_tokens": "出力画像トークン"
+      },
+      "units": {
+        "request": "回",
+        "image": "枚",
+        "second": "秒",
+        "character": "文字",
+        "credit": "クレジット",
+        "token": "トークン",
+        "usd_tick_1e_10": "米ドル × 10⁻¹⁰"
+      }
+    },
     "tasks": {
       "unnamed": "名称未設定のタスク"
     },
@@ -3565,10 +3652,6 @@
       "cacheRead": "キャッシュ読み取り",
       "cacheWrite": "キャッシュ書き込み"
     },
-    "costHintTitle": "CNY の値は固定レート {rate} を使用します。会計用途では現在の為替レートと照合してください。",
-    "nativeCostHintTitle": "プロバイダーの原請求は CNY です。USD は領収書に記録された固定換算レートを使用します。",
-    "nativeMixedCostHintTitle": "複数通貨または精算待ちの請求は標準 USD で集計し、確認済みの原通貨領収情報を別に表示します。",
-    "nativeBillingSubtotals": "原通貨の領収情報: {amounts}",
     "rangeHiddenHint": "日付のない過去のタスク {count} 件を非表示",
     "coverage": {
       "approximate": "一部の過去の使用量はタスク合計から推定しています。",
@@ -3626,10 +3709,10 @@
       "cacheRead": "キャッシュ読み取り",
       "cacheWrite": "キャッシュ書き込み",
       "cost": "コスト",
-      "source": "ソース",
       "model": "モデル"
     },
     "breakdown": {
+      "callTitle": "呼び出しの詳細",
       "title": "モデルの内訳",
       "modelCount": "{count} モデル",
       "total": "{tokens} トークン · {cost}",
@@ -3638,35 +3721,28 @@
     "costSource": {
       "actual": {
         "label": "実績",
-        "tooltip": "実績 — プロバイダーが請求したコスト",
-        "short": "実績"
+        "tooltip": "実績 — プロバイダーが請求したコスト"
       },
       "estimated": {
         "label": "推定",
-        "tooltip": "推定 — トークン数からローカルで算出",
-        "short": "推定"
+        "tooltip": "推定 — プロバイダーの見積もりまたは記録済みのローカル価格"
       },
       "mixed": {
         "label": "混在",
-        "tooltip": "混在 — 一部は請求データ、残りは推定",
-        "short": "混在"
+        "tooltip": "混在 — 一部は請求データ、残りは推定"
       },
       "unpriced": {
         "label": "価格なし",
-        "tooltip": "価格なし — このモデルの価格表エントリがありません",
-        "short": "価格なし"
+        "tooltip": "価格なし — このモデルの価格表エントリがありません"
       },
       "none": {
-        "label": "なし",
-        "tooltip": "記録されたコストはありません",
-        "short": "なし"
+        "label": "費用未記録",
+        "tooltip": "記録されたコストはありません"
       },
       "ephemeral": {
         "label": "一時的",
-        "tooltip": "一時的なセッション — コストはまだ永続化されていません",
-        "short": "一時的"
-      },
-      "cacheBlindHint": "キャッシュされたトークンを通常の入力料金で計算した推定値を含みます — 上限の目安としてご利用ください。"
+        "tooltip": "一時的なセッション — コストはまだ永続化されていません"
+      }
     },
     "relTime": {
       "justNow": "たった今",
@@ -3735,6 +3811,7 @@
       "continue": "Continue",
       "commandWithSkills": "Selected skills apply to a chat message. Remove the skill labels before running a command.",
       "commandDescriptions": {
+        "init": "現在のプロジェクトを調べてガイドを作成・改善する",
         "new": "新しいチャットを開始",
         "compact": "現在の文脈を圧縮",
         "goal": "継続的な目標を設定",
@@ -3896,6 +3973,7 @@
     "liveUnavailable": "リアルタイム更新を一時的に利用できません",
     "liveUnavailableDescription": "履歴は引き続き表示できます。リアルタイム更新の復旧後に送信を再開します。",
     "liveUnavailableConnectedDescription": "Gateway は接続されています。このセッションのリアルタイム更新は一時的に利用できません。",
+    "liveRecoveryReloadDescription": "リアルタイム更新を復元できませんでした。未送信の入力を保存してから、このページを再読み込みして再接続してください。",
     "reconnectLive": "再接続",
     "liveSendBlockedConnecting": "リアルタイム更新は一時的に利用できません。下書きは保持されています。",
     "liveSendBlockedDegraded": "リアルタイム更新は一時的に利用できません。下書きは保持されています。",
@@ -3993,16 +4071,13 @@
     "subagentPrefix": "サブエージェント: ",
     "subagentCompletion": "サブエージェントの完了",
     "turnFailed": "ターンが失敗しました",
-    "copyDiagnosticId": "診断番号をコピー",
-    "copiedDiagnosticId": "診断番号をコピーしました",
-    "copyDiagnosticFailed": "コピーできませんでした。上の番号を選択して手動でコピーしてください。",
     "errorMessage": {
       "unknown": "このリクエストは完了しませんでした。",
       "noProvider": "利用できるモデルがありません。",
       "credentials": "モデルサービスの認証に失敗しました。",
       "credits": "モデルサービスのアカウント残高が不足しています。",
       "modelUnavailable": "選択したモデルは利用できません。",
-      "contextLimit": "入力がモデルの上限を超えています。",
+      "contextLimit": "内容がモデルの容量を超えています。入力を短くするか、コンテキストの大きいモデルを選んでください。",
       "unsupported": "このモデルはこのリクエストに対応していません。",
       "imageUnsupported": "このモデルは画像に対応していません。",
       "ensembleImageUnsupported": "このモードは画像に対応していません。",
@@ -4015,7 +4090,7 @@
       "needsConfirmation": "続行には確認が必要です。",
       "toolDenied": "必要なツールの使用が許可されていません。",
       "toolFailed": "ツールの処理を完了できませんでした。",
-      "contextUnavailable": "現在の会話を処理できませんでした。",
+      "contextUnavailable": "コンテキストの整理が完了せず、このリクエストを続行できませんでした。後で再試行してください。",
       "timeout": "タスクが完了する前にタイムアウトしました。",
       "stopped": "タスクを停止しました。",
       "interrupted": "タスクが中断されました。",
@@ -4394,6 +4469,7 @@
       "sendingContinuing": "返信を送信中 · 実行を継続中…"
     },
     "slashCommands": {
+      "initUnavailable": "この Gateway はプロジェクト初期化に対応していません。更新して再試行してください。下書きは保持されました。",
       "side": {
         "closed": "元のサイドチャットは閉じられました。下書きは保持されています。新しいサイドチャットを開始するには、コマンドを編集して再送信してください。",
         "description": "一時サイドチャットを開く · /btw は別名です",
@@ -4579,10 +4655,14 @@
       "failureUnavailable": "要約用モデルを利用できません",
       "failureProvider": "モデルが使用可能な要約を生成できませんでした",
       "failureTimeout": "コンテキスト整理がタイムアウトしました",
-      "failureRejectedDetail": "要約は適用されず、元のコンテキストは保持されています。再試行し、再び失敗した場合は診断IDをコピーして調査にお使いください。",
-      "failureUnavailableDetail": "モデル設定と接続を確認して再試行してください。調査用に診断IDをコピーできます。",
-      "failureRetryDetail": "コンテキスト整理を再試行できます。再び失敗した場合は診断IDをコピーして調査にお使いください。",
+      "failureRejectedDetail": "要約は適用されませんでした。後で再試行できます。",
+      "failureCapacityDetail": "入力を短くするか、コンテキストウィンドウの大きいモデルを選んでください。",
+      "failureUnavailableDetail": "モデル設定とネットワーク接続を確認するか、別のモデルを選んでください。",
+      "failureRetryDetail": "後でコンテキストの整理を再試行するか、別のモデルを選んでください。",
       "compacting": "コンテキストを圧縮中",
+      "recovering": "コンテキスト圧縮の状態を確認中…",
+      "requestUnconfirmed": "コンテキストの圧縮リクエストの結果を確認できませんでした。接続を確認してから再試行してください。",
+      "requestRejected": "コンテキストの圧縮リクエストが拒否されました。",
       "compacted": "コンテキストを圧縮しました",
       "temporarilyReduced": "履歴を一時的に短縮して処理を続けています",
       "summarySaved": "要約を保存しました",
@@ -4590,12 +4670,12 @@
       "historyIncomplete": "以前のコンテキストを要約しました。一部の元のメッセージは利用できません",
       "historySummarized": "以前のコンテキストを要約しました",
       "failed": "圧縮に失敗しました",
+      "incomplete": "コンテキストの整理が完了しませんでした",
       "withinBudget": "コンテキストは予算内です。",
       "noSafeHistory": "現在、安全に整理できる履歴はありません",
       "alreadyConcise": "現在のコンテキストはすでに十分に簡潔です",
       "skipped": "コンテキストの圧縮は適用されませんでした。",
-      "cancelled": "圧縮をキャンセルしました",
-      "requestScoped": "このリクエストにのみ適用され、セッション履歴は書き換えられていません"
+      "cancelled": "圧縮をキャンセルしました"
     },
     "tool": {
       "genericCall": "ツール呼び出し",

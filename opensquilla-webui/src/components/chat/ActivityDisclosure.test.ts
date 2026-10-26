@@ -5,7 +5,7 @@ import { afterEach, beforeEach, describe, expect, it } from 'vitest'
 
 import ActivityDisclosure from './ActivityDisclosure.vue'
 import activityDisclosureSource from './ActivityDisclosure.vue?raw'
-import { clearAssistantActivityExpansionState } from '@/utils/chat/activityDisclosureState'
+import { clearAssistantActivityExpansionState, writeAssistantActivityExpansion } from '@/utils/chat/activityDisclosureState'
 import enMessages from '@/locales/en.json'
 import zhMessages from '@/locales/zh-Hans.json'
 
@@ -25,6 +25,7 @@ const i18n = createI18n({
         activityElapsed: 'Elapsed {duration}',
         activityDurationSeconds: '{seconds}s',
         activityDurationMinutes: '{minutes}m {seconds}s',
+        compact: { compacting: 'Organizing context…' },
         status: { queued: 'Queued' },
         workedForSeconds: 'Worked for {seconds}s',
         workedForMinutes: 'Worked for {minutes}m {seconds}s',
@@ -265,6 +266,40 @@ describe('ActivityDisclosure lifecycle transitions', () => {
     expect(host.querySelector('button')?.getAttribute('aria-expanded')).toBe('true')
     state.lifecycle = 'settled'
     state.defaultOpen = false
+    await nextTick()
+    expect(host.querySelector('button')?.getAttribute('aria-expanded')).toBe('false')
+  })
+
+  it.each(['working', 'answering'] as const)('does not restore an automatic collapse when a %s turn remounts', async lifecycle => {
+    writeAssistantActivityExpansion('message-previous', false, 'turn-same', false)
+    const host = mountDisclosure({
+      lifecycle, defaultOpen: true, stepCount: 0, failureCount: 0,
+      stateKey: 'message-current', continuityKey: 'turn-same',
+    })
+    await nextTick()
+    expect(host.querySelector('button')?.getAttribute('aria-expanded')).toBe('true')
+  })
+
+  it.each(['working', 'answering'] as const)('does not restore an automatic collapse when %s identity changes', async lifecycle => {
+    writeAssistantActivityExpansion('message-canonical', false, 'turn-next', false)
+    const props = reactive({
+      lifecycle, defaultOpen: true, stepCount: 0, failureCount: 0,
+      stateKey: 'message-current', continuityKey: 'turn-current',
+    })
+    const host = mountDisclosure(props)
+    await nextTick()
+    props.stateKey = 'message-canonical'
+    props.continuityKey = 'turn-next'
+    await nextTick()
+    expect(host.querySelector('button')?.getAttribute('aria-expanded')).toBe('true')
+  })
+
+  it.each(['settled', 'interrupted'] as const)('continues restoring automatic collapse for %s history', async lifecycle => {
+    writeAssistantActivityExpansion('message-previous', false, 'turn-same', false)
+    const host = mountDisclosure({
+      lifecycle, defaultOpen: true, stepCount: 1, failureCount: 0,
+      stateKey: 'message-history', continuityKey: 'turn-same',
+    })
     await nextTick()
     expect(host.querySelector('button')?.getAttribute('aria-expanded')).toBe('false')
   })
@@ -869,6 +904,96 @@ describe('ActivityDisclosure expanded boundary', () => {
     expect(activityDisclosureSource).not.toContain('animation-delay:')
     expect(activityDisclosureSource)
       .not.toContain('.assistant-activity--settled[data-share-expanded="true"]::after')
+  })
+})
+
+describe('ActivityDisclosure running compaction visibility', () => {
+  it('keeps only the collapsed counterpart outside the fold and respects manual expansion', async () => {
+    const props = reactive({
+      lifecycle: 'working' as const,
+      stepCount: 0,
+      failureCount: 0,
+      defaultOpen: true,
+      executing: true,
+      compacting: true,
+      phaseLabel: 'Organizing context…',
+      elapsedLabel: '16s',
+    })
+    const host = mountDisclosure(props)
+    await nextTick()
+    const toggle = host.querySelector<HTMLButtonElement>('.assistant-activity__live-head')!
+    const body = host.querySelector('.assistant-activity__body')!
+    expect(host.querySelector('[data-testid="collapsed-compaction-status"]')).toBeNull()
+
+    toggle.click()
+    await nextTick()
+    const hint = host.querySelector('[data-testid="collapsed-compaction-status"]')!
+    expect(hint.textContent).toBe('Organizing context…')
+    expect(body.contains(hint)).toBe(false)
+    expect(body.getAttribute('aria-hidden')).toBe('true')
+    expect(hint.classList.contains('assistant-activity__compaction--running')).toBe(true)
+    expect(host.querySelectorAll('[role="status"]')).toHaveLength(1)
+    expect(host.querySelector('.activity-motion--active')).toBeNull()
+
+    props.elapsedLabel = '61s'
+    await nextTick()
+    expect(toggle.textContent?.trim()).toBe('Elapsed 1m 1s')
+    expect(toggle.getAttribute('aria-expanded')).toBe('false')
+    expect(host.querySelectorAll('[data-testid="collapsed-compaction-status"]')).toHaveLength(1)
+
+    toggle.click()
+    await nextTick()
+    expect(host.querySelector('[data-testid="collapsed-compaction-status"]')).toBeNull()
+    expect(body.getAttribute('aria-hidden')).toBe('false')
+  })
+
+  it('removes the hint when compaction completes even while the turn continues', async () => {
+    const props = reactive({
+      lifecycle: 'working' as const,
+      stepCount: 0,
+      failureCount: 0,
+      executing: true,
+      compacting: true,
+    })
+    const host = mountDisclosure(props)
+    await nextTick()
+    expect(host.querySelector('[data-testid="collapsed-compaction-status"]')).not.toBeNull()
+    // Both durable completion and request-scoped recovery clear the owner's
+    // running maintenance state; neither is a new persistent badge.
+    props.compacting = false
+    await nextTick()
+    expect(host.querySelector('[data-testid="collapsed-compaction-status"]')).toBeNull()
+    expect(host.querySelector('.assistant-activity__live-head')).not.toBeNull()
+  })
+
+  it.each(['settled', 'failed', 'interrupted'] as const)('does not revive a running hint in %s history', async lifecycle => {
+    const host = mountDisclosure({ lifecycle, stepCount: 1, failureCount: 0, compacting: true })
+    await nextTick()
+    expect(host.querySelector('[data-testid="collapsed-compaction-status"]')).toBeNull()
+  })
+
+  it('keeps a stale or retry-waiting compaction static and hides it for queued work', async () => {
+    const props = reactive({
+      lifecycle: 'working' as const,
+      stepCount: 0,
+      failureCount: 0,
+      executing: true,
+      compacting: true,
+      stale: true,
+      phaseWaiting: false,
+      queued: false,
+    })
+    const host = mountDisclosure(props)
+    await nextTick()
+    expect(host.querySelector('[data-testid="collapsed-compaction-status"]')).not.toBeNull()
+    expect(host.querySelector('.assistant-activity__compaction--running')).toBeNull()
+    props.stale = false
+    props.phaseWaiting = true
+    await nextTick()
+    expect(host.querySelector('.assistant-activity__compaction--running')).toBeNull()
+    props.queued = true
+    await nextTick()
+    expect(host.querySelector('[data-testid="collapsed-compaction-status"]')).toBeNull()
   })
 })
 

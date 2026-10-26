@@ -5,7 +5,7 @@ import { useChatSessionViewCache } from './useChatSessionViewCache'
 
 const row = (id: string, text = id): ChatMessage => ({ role: 'assistant', text, messageId: id, ts: null })
 
-function harness(limits: { maxSessions?: number; maxBytes?: number; maxMessages?: number } = {}) {
+function harness(limits: { maxSessions?: number; maxBytes?: number; maxMessages?: number; currentReadAuthority?: () => unknown } = {}) {
   const scope = effectScope()
   const sessionKey = ref('A')
   const deliveryIdentity = ref<string | null>('gateway-one:owner')
@@ -26,6 +26,69 @@ function harness(limits: { maxSessions?: number; maxBytes?: number; maxMessages?
 }
 
 describe('useChatSessionViewCache', () => {
+  it('preserves the current query, terminal receipt and rendered activity when duplicate outcome graphs exceed the traversal budget', () => {
+    const h = harness()
+    const statusHistory = Array.from({ length: 1_600 }, (_, i) => ({ type: 'status' as const, action: 'ran', at: i, label: `step-${i}` }))
+    const outcome = { turnId: 'turn-a', status: 'succeeded', statusHistory }
+    const rows: ChatMessage[] = [
+      { role: 'user', text: 'Current query', ts: null, messageId: 'query', turnId: 'turn-a', turnOutcome: outcome },
+      { ...row('answer', 'Current answer'), turnId: 'turn-a', turnOutcome: outcome, statusHistory },
+      { role: 'maintenance', text: '', ts: null, messageId: 'compact', maintenance: {
+        kind: 'context_compaction', compactionId: 'cmp-a', source: 'manual', state: 'completed', durability: 'durable',
+      } },
+    ]
+    h.install('A', rows)
+    h.switchTo('B')
+    h.switchTo('A')
+    expect(h.cache.showingPreview.value).toBe(true)
+    expect(h.cache.messages.value.map(message => message.messageId)).toEqual(['query', 'answer', 'compact'])
+    expect(h.cache.messages.value[0]?.text).toBe('Current query')
+    expect(h.cache.messages.value[1]?.turnOutcome?.status).toBe('succeeded')
+    expect(h.cache.messages.value[1]?.statusHistory).toEqual(statusHistory)
+    expect(h.cache.messages.value[2]?.maintenance?.state).toBe('completed')
+    expect(rows[0]?.turnOutcome?.statusHistory).toBe(statusHistory)
+    expect(h.cache.messages.value[1]?.statusHistory).not.toBe(statusHistory)
+    h.scope.stop()
+  })
+
+  it('keeps a matching last-known snapshot when a new bounded capture fails, but never revives one retired by epoch', () => {
+    const h = harness({ maxBytes: 1024 })
+    h.switchTo('B'); h.switchTo('A')
+    h.install('A', [row('new', 'x'.repeat(2_000))])
+    h.switchTo('B'); h.switchTo('A')
+    expect(h.cache.messages.value.map(message => message.messageId)).toEqual(['a'])
+    h.cache.observeEpoch('A', 1)
+    h.install('A', [row('new-epoch', 'x'.repeat(2_000))])
+    h.switchTo('B'); h.switchTo('A')
+    expect(h.cache.showingPreview.value).toBe(false)
+    h.scope.stop()
+  })
+
+  it.each(['identity', 'revoked', 'reset', 'terminal'] as const)('does not rescue a failed capture with a snapshot retired by %s', reason => {
+    const h = harness({ maxBytes: 1024 })
+    h.switchTo('B'); h.switchTo('A')
+    if (reason === 'identity') h.deliveryIdentity.value = 'new-owner'
+    else if (reason === 'revoked') h.deliveryIdentity.value = null
+    else if (reason === 'reset') h.cache.invalidate('A')
+    else h.cache.retirePreview('A')
+    h.install('A', [row('new', 'x'.repeat(2_000))])
+    h.switchTo('B'); h.switchTo('A')
+    expect(h.cache.showingPreview.value).toBe(false)
+    h.scope.stop()
+  })
+
+  it.each([false, true])('preserves confirmed history after a failed refresh only for the same authority (replaced=%s)', replaced => {
+    const authority = ref({ lease: 'original' })
+    const h = harness({ currentReadAuthority: () => authority.value })
+    if (replaced) authority.value = { lease: 'replacement' }
+    h.cache.historyInstalled('A', false)
+    h.switchTo('B')
+    h.switchTo('A')
+    expect(h.cache.showingPreview.value).toBe(!replaced)
+    expect(h.cache.messages.value).toEqual(replaced ? [] : [row('a')])
+    h.scope.stop()
+  })
+
   it('restores A immediately on A/B/A without installing messages or a runtime owner', () => {
     const h = harness()
     h.switchTo('B')
@@ -324,14 +387,37 @@ describe('useChatSessionViewCache first delivery proof', () => {
     h.scope.stop()
   })
 
-  it.each(['history', 'live'] as const)('does not bless a non-authoritative %s receipt when identity arrives', phase => {
+  it('keeps same-lease readable history on first proof without promoting it to a navigation snapshot', () => {
     const h = unprovenIdentityHarness()
-    h.cache.historyInstalled('A', phase !== 'history')
-    h.cache.liveInstalled('A', phase !== 'live')
+    h.cache.historyInstalled('A', false)
+    h.cache.liveInstalled('A')
+    h.deliveryIdentity.value = 'gateway-one:owner'
+    expect(h.cache.ready.value).toBe(true)
+    h.sessionKey.value = 'B'
+    h.messages.value = []
+    h.sessionKey.value = 'A'
+    expect(h.cache.showingPreview.value).toBe(false)
+    expect(h.cache.messages.value).toEqual([])
+    h.scope.stop()
+  })
+
+  it.each([false, true])('rejects readable history from a replaced or missing first-proof lease (missing=%s)', missing => {
+    const h = unprovenIdentityHarness()
+    h.cache.historyInstalled('A', false)
+    h.replaceAuthority(missing ? null : {})
+    h.cache.liveInstalled('A')
     h.deliveryIdentity.value = 'gateway-one:owner'
     expect(h.cache.ready.value).toBe(false)
-    if (phase === 'history') h.cache.historyInstalled('A')
-    else h.cache.liveInstalled('A')
+    h.scope.stop()
+  })
+
+  it('does not bless an unconfirmed live receipt when identity arrives', () => {
+    const h = unprovenIdentityHarness()
+    h.cache.historyInstalled('A')
+    h.cache.liveInstalled('A', false)
+    h.deliveryIdentity.value = 'gateway-one:owner'
+    expect(h.cache.ready.value).toBe(false)
+    h.cache.liveInstalled('A')
     expect(h.cache.ready.value).toBe(true)
     h.scope.stop()
   })
@@ -391,6 +477,155 @@ function liveHarness(limits: { maxBytes?: number; maxSessions?: number } = {}) {
 }
 
 describe('useChatSessionViewCache complete presentation handoff', () => {
+  it('retains a readable degraded view through repeated same-session recovery without caching it for navigation', () => {
+    const h = liveHarness()
+    // Start from an actually unconfirmed cold view, not a failed refresh of
+    // the already-confirmed A history, which must retain its earlier receipt.
+    h.switchTo('C')
+    h.messages.value = [row('c')]
+    h.presentation.value.live.text = 'C is writing'
+    h.cache.historyInstalled('C', false)
+    h.cache.liveInstalled('C')
+    expect(h.cache.ready.value).toBe(true)
+    h.cache.beginLiveRead('C')
+    expect(h.cache.ready.value).toBe(false)
+    expect(h.cache.showingPreview.value).toBe(true)
+    expect(h.cache.presentation.value?.live.text).toBe('C is writing')
+    expect(h.cache.restoredViewport.value).toBeUndefined()
+    h.messages.value = [row('partial')]
+    h.presentation.value.live.text = 'partial replay'
+    h.cache.liveInstalled('C', false)
+    h.cache.beginLiveRead('C')
+    expect(h.cache.messages.value).toEqual([row('c')])
+    expect(h.cache.presentation.value?.live.text).toBe('C is writing')
+    h.switchTo('B')
+    h.switchTo('C')
+    expect(h.cache.showingPreview.value).toBe(false)
+    expect(h.cache.messages.value).toEqual([])
+    expect(h.cache.presentation.value).toBeUndefined()
+    h.scope.stop()
+  })
+
+  it('keeps the confirmed preview while replacement history and its live tail are unconfirmed', () => {
+    const h = liveHarness()
+    h.returnToA()
+    h.messages.value = [row('readable-history')]
+    h.presentation.value.live.text = 'readable live tail'
+    h.cache.historyInstalled('A', false)
+    h.cache.liveInstalled('A')
+    h.cache.beginLiveRead('A')
+    expect(h.cache.ready.value).toBe(false)
+    expect(h.cache.messages.value).toEqual([row('a')])
+    expect(h.cache.presentation.value?.live.text).toBe('A is writing')
+    h.switchTo('B')
+    h.switchTo('A')
+    expect(h.cache.messages.value).toEqual([row('a')])
+    expect(h.cache.presentation.value?.live.text).toBe('A is writing')
+    h.scope.stop()
+  })
+
+  it('releases a same-session degraded preview after confirmed recovery and can cache the repaired view', () => {
+    const h = liveHarness()
+    h.cache.historyInstalled('A', false)
+    h.cache.beginLiveRead('A')
+    h.messages.value = [row('repaired')]
+    h.presentation.value.live.text = 'repaired live'
+    h.cache.historyInstalled('A')
+    expect(h.cache.presentation.value?.live.text).toBe('A is writing')
+    h.cache.liveInstalled('A')
+    expect(h.cache.ready.value).toBe(true)
+    expect(h.cache.showingPreview.value).toBe(false)
+    h.returnToA()
+    expect(h.cache.messages.value).toEqual([row('repaired')])
+    expect(h.cache.presentation.value?.live.text).toBe('repaired live')
+    h.scope.stop()
+  })
+
+  it.each(['epoch', 'identity', 'revoked', 'reset', 'terminal'] as const)(
+    'retires a same-session degraded preview on %s without recapturing it', cause => {
+      const h = liveHarness()
+      h.cache.historyInstalled('A', false)
+      h.cache.beginLiveRead('A')
+      expect(h.cache.showingPreview.value).toBe(true)
+      if (cause === 'epoch') h.cache.observeEpoch('A', 1)
+      else if (cause === 'identity') h.deliveryIdentity.value = 'gateway-two:owner'
+      else if (cause === 'revoked') h.deliveryIdentity.value = null
+      else if (cause === 'terminal') h.cache.retirePreview('A')
+      else h.cache.invalidate('A')
+      expect(h.cache.showingPreview.value).toBe(false)
+      h.cache.beginLiveRead('A')
+      expect(h.cache.showingPreview.value).toBe(false)
+      h.returnToA()
+      expect(h.cache.showingPreview.value).toBe(false)
+      h.scope.stop()
+    },
+  )
+
+  it.each([false, true])(
+    'keeps already readable live output through failed retries without granting navigation authority (history confirmed=%s)',
+    historyConfirmed => {
+      const h = liveHarness()
+      h.switchTo('C')
+      h.messages.value = [row('readable-history')]
+      h.presentation.value.live.text = 'Accepted live output after a degraded read'
+      h.cache.historyInstalled('C', historyConfirmed)
+      h.cache.liveInstalled('C', false)
+      expect(h.cache.ready.value).toBe(true)
+
+      for (let attempt = 0; attempt < 3; attempt++) {
+        h.cache.beginLiveRead('C')
+        expect(h.cache.ready.value).toBe(false)
+        expect(h.cache.showingPreview.value).toBe(true)
+        expect(h.cache.messages.value).toEqual([row('readable-history')])
+        expect(h.cache.presentation.value?.live.text).toBe('Accepted live output after a degraded read')
+        expect(h.cache.restoredViewport.value).toBeUndefined()
+        h.messages.value = [row(`partial-${attempt}`)]
+        h.presentation.value.live.text = `Partial replay ${attempt}`
+        h.cache.liveInstalled('C', false)
+        expect(h.cache.ready.value).toBe(false)
+        expect(h.cache.presentation.value?.live.text).toBe('Accepted live output after a degraded read')
+      }
+
+      h.switchTo('B')
+      h.switchTo('C')
+      expect(h.cache.showingPreview.value).toBe(false)
+      expect(h.cache.messages.value).toEqual([])
+      expect(h.cache.presentation.value).toBeUndefined()
+      h.scope.stop()
+    },
+  )
+
+  it('replaces an unconfirmed readable recovery preview only after confirmed live installation', () => {
+    const h = liveHarness()
+    h.switchTo('C')
+    h.messages.value = [row('readable-history')]
+    h.presentation.value.live.text = 'Accepted live output'
+    h.cache.historyInstalled('C')
+    h.cache.liveInstalled('C', false)
+    h.cache.beginLiveRead('C')
+    h.messages.value = [row('recovered-history')]
+    h.presentation.value.live.text = 'Recovered live output'
+    h.cache.historyInstalled('C')
+    expect(h.cache.presentation.value?.live.text).toBe('Accepted live output')
+    h.cache.liveInstalled('C')
+    expect(h.cache.showingPreview.value).toBe(false)
+    expect(h.cache.ready.value).toBe(true)
+    h.switchTo('B')
+    h.switchTo('C')
+    expect(h.cache.messages.value).toEqual([row('recovered-history')])
+    expect(h.cache.presentation.value?.live.text).toBe('Recovered live output')
+    h.scope.stop()
+  })
+
+  it('bounds the temporary degraded preview with the same byte budget', () => {
+    const h = liveHarness({ maxBytes: 300 })
+    h.cache.historyInstalled('A', false)
+    h.presentation.value.live.text = '字'.repeat(200)
+    h.cache.beginLiveRead('A')
+    expect(h.cache.showingPreview.value).toBe(false)
+    h.scope.stop()
+  })
+
   it('freezes the complete same-session view before recovery and never captures a partial reread', () => {
     const h = liveHarness()
     h.cache.beginLiveRead('A')
@@ -576,7 +811,7 @@ describe('useChatSessionViewCache complete presentation handoff', () => {
   })
 
   it.each(['history', 'live'] as const)(
-    'releases failed history display without overwriting the last complete snapshot (%s first)', first => {
+    'keeps the last complete snapshot when replacement history fails (%s first)', first => {
       const h = liveHarness()
       h.returnToA()
       h.messages.value = [row('incomplete-history')]
@@ -587,9 +822,9 @@ describe('useChatSessionViewCache complete presentation handoff', () => {
       expect(h.cache.showingPreview.value).toBe(true)
       if (first === 'history') h.cache.liveInstalled('A')
       else h.cache.historyInstalled('A', false)
-      expect(h.cache.ready.value).toBe(true)
-      expect(h.cache.showingPreview.value).toBe(false)
-      expect(h.cache.messages.value).toEqual([row('incomplete-history')])
+      expect(h.cache.ready.value).toBe(false)
+      expect(h.cache.showingPreview.value).toBe(true)
+      expect(h.cache.messages.value).toEqual([row('a')])
       // An additional live confirmation cannot promote failed history to a
       // complete cache entry. The next visit still restores the prior view.
       h.cache.liveInstalled('A')

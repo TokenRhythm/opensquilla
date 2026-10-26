@@ -9,7 +9,10 @@ from types import SimpleNamespace
 import pytest
 import pytest_asyncio
 
-from opensquilla.engine.cache_break_monitor import active_compaction_ids
+from opensquilla.engine.cache_break_monitor import (
+    active_compaction_ids,
+    add_compaction_listener,
+)
 from opensquilla.engine.runtime import TurnRunner
 from opensquilla.engine.types import ControlTerminalEvent, ControlTerminalReason, ErrorEvent
 from opensquilla.engine.usage_accounting import (
@@ -60,10 +63,15 @@ async def deadline_turn(tmp_path, monkeypatch):
     runner = TurnRunner(provider_selector=selector, session_manager=manager,
                         config=config, model_catalog=ModelCatalog())
     case = SimpleNamespace(runner=runner, storage=storage, manager=manager, node=node,
-                           workspace=workspace, calls=[], summary_cancelled=False)
+                           workspace=workspace, calls=[], summary_cancelled=False,
+                           compactions=[])
+    remove_listener = add_compaction_listener(
+        lambda key, payload: case.compactions.append(payload) if key == node.session_key else None
+    )
     try:
         yield case
     finally:
+        remove_listener()
         await storage.close()
 
 
@@ -146,12 +154,30 @@ async def test_parent_deadline_cancels_inflight_preflight_without_auxiliary_fail
     deadline_turn, monkeypatch,
 ):
     case = deadline_turn
+    parent_deadline = time.monotonic() + 30
+    parent_timeout: asyncio.Timeout | None = None
+    real_timeout_at = asyncio.timeout_at
+
+    def capture_parent_timeout(deadline):
+        nonlocal parent_timeout
+        timer = real_timeout_at(deadline)
+        if deadline == parent_deadline and parent_timeout is None:
+            parent_timeout = timer
+        return timer
+
+    monkeypatch.setattr("opensquilla.engine.runtime._deadline_from_timeout",
+                        lambda _: parent_deadline)
+    monkeypatch.setattr(asyncio, "timeout_at", capture_parent_timeout)
 
     async def waiting_summary(self, messages, tools=None, config=None):
         summary = config.candidate_output_mode == "inert_artifact"
         case.calls.append(summary)
         assert summary
-        assert config.turn_deadline_at_monotonic is not None
+        assert config.turn_deadline_at_monotonic == parent_deadline
+        assert parent_timeout is not None
+        # Expire the real parent timer only after the summary is in flight.
+        # Cold storage/prompt preparation must not consume a 2s test assumption.
+        parent_timeout.reschedule(asyncio.get_running_loop().time())
         try:
             await asyncio.Event().wait()
         except asyncio.CancelledError:
@@ -160,7 +186,7 @@ async def test_parent_deadline_cancels_inflight_preflight_without_auxiliary_fail
         yield  # pragma: no cover - async stream shape
 
     monkeypatch.setattr(OpenAIProvider, "chat", waiting_summary)
-    async with asyncio.timeout(6):
+    async with asyncio.timeout(35):
         events = await _run(case)
     _assert_deadline(events)
     assert case.calls == [True]
@@ -170,8 +196,9 @@ async def test_parent_deadline_cancels_inflight_preflight_without_auxiliary_fail
 
 
 @pytest.mark.ci_serial
-async def test_parent_deadline_after_sqlite_commit_does_not_rollback_checkpoint(
-    deadline_turn, monkeypatch,
+@pytest.mark.parametrize("installed", [False, True])
+async def test_parent_deadline_after_writer_settles_preserves_actual_commit_outcome(
+    deadline_turn, monkeypatch, installed,
 ):
     case = deadline_turn
     committed = asyncio.Event()
@@ -179,8 +206,8 @@ async def test_parent_deadline_after_sqlite_commit_does_not_rollback_checkpoint(
     rewrite = case.storage.rewrite_compacted_session
 
     async def committed_then_wait(**kwargs):
-        result = await rewrite(**kwargs)
-        assert result
+        result = await rewrite(**kwargs) if installed else False
+        assert result is installed
         committed.set()
         # The owner must settle a started SQLite commit before unwinding a
         # cancellation. Delay its acknowledgement beyond the parent deadline,
@@ -203,9 +230,17 @@ async def test_parent_deadline_after_sqlite_commit_does_not_rollback_checkpoint(
     _assert_deadline(events)
     assert committed.is_set()
     assert case.calls and all(case.calls)
-    assert (await case.manager.get_session(case.node.session_key)).compaction_count == 1
-    assert len(await case.storage.get_all_summaries(case.node.session_id)) == 1
+    node_after = await case.manager.get_session(case.node.session_key)
+    assert node_after.compaction_count == int(installed)
+    assert len(await case.storage.get_all_summaries(case.node.session_id)) == int(installed)
     assert await case.manager.get_canonical_transcript(case.node.session_key) == canonical
+    terminals = [event for event in case.compactions if event["status"] in {
+        "completed", "failed", "cancelled", "timed_out", "skipped",
+    }]
+    assert len(terminals) == 1, case.compactions
+    assert terminals[0]["status"] == ("completed" if installed else "timed_out")
+    assert terminals[0]["applied"] is installed
+    assert terminals[0]["durability"] == ("durable" if installed else "none")
     await _assert_clean(case)
 
 

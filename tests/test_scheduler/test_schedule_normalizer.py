@@ -85,6 +85,18 @@ def test_normalizer_wraps_legacy_expression() -> None:
     assert tz == "America/Los_Angeles"
 
 
+@pytest.mark.parametrize(
+    "params",
+    [
+        {"expression": "50-10/5 * * * *"},
+        {"schedule": {"kind": "cron", "expr": "50-10/5 * * * *"}},
+    ],
+)
+def test_normalizer_rejects_reversed_stepped_ranges(params: dict) -> None:
+    with pytest.raises(ValueError, match="schedule.expr invalid: Range start > end"):
+        coerce_schedule_from_params(params)
+
+
 def test_normalizer_rejects_invalid_tz() -> None:
     with pytest.raises(ValueError, match="schedule.tz invalid"):
         coerce_schedule_from_params(

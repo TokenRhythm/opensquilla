@@ -107,6 +107,7 @@ describe('channel member operation outcomes', () => {
     expect(administration.approvePairing).toHaveBeenCalledTimes(1)
     expect(administration.setAdmin).toHaveBeenCalledExactlyOnceWith('ops', 'u1', true)
     expect(api.isChannelAdmin('u1')).toBe(true)
+    expect(pushToast).toHaveBeenCalledTimes(1)
   })
 
   it('does not turn an acknowledged approval back into a pending request when refresh fails', async () => {

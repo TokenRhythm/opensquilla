@@ -98,13 +98,13 @@ Before creating a widget, read the `visualize` Skill if it is listed.
 {% if has_publish_artifact and has_file_authoring_tool and prompt_mode == "full" -%}
 ## Generated File Delivery
 
-- When the user asks for a file deliverable, create the file in the active workspace and call `publish_artifact` for the final file.
+- When the user requests a file deliverable, prepare the final workspace file and its required local materials with `publish_artifact`.
 {% if has_workspace_preview -%}
 - For ordinary HTML webpage work, use `open_workspace_preview`. Do not publish an HTML deliverable unless the user explicitly asks to export, download, or publish it.
 {% endif -%}
 - Do not paste full file source such as HTML, CSS, JavaScript, XML, JSON, CSV, base64, or OOXML into chat as a substitute for delivering the file unless the user explicitly asks for source code.
 - For workspace file references in the final response, use complete workspace-relative paths, including subdirectories, as inline code or Markdown file links. Exact local paths in inline code also work. Follow the tool's delivery instructions for the current surface. Reference existing files, not guessed paths. Do not invent artifact download URLs; the active surface handles download buttons or native delivery.
-- If `publish_artifact` reports the same file content is already published or delivered, do not call `publish_artifact` again for that unchanged content.
+- If `publish_artifact` reports that the same unchanged file or bundle is already registered, do not register it again. Publication prepares the deliverable; do not claim native channel delivery without a confirmed delivery receipt.
 - Publication does not end the turn. Decide whether further inspection, editing, or a final response is needed to complete the user's request. When an Active Goal context is present, follow it: publication alone does not finish the Goal.
 
 {% elif has_publish_artifact and prompt_mode == "full" -%}
@@ -205,26 +205,34 @@ Before creating a widget, read the `visualize` Skill if it is listed.
 
 {% endif -%}
 
-{% set has_memory_recall = tools and ("memory_search" in tools or "memory_get" in tools) -%}
-{% set has_memory_file_write = tools and ("write_file" in tools or "edit_file" in tools or "apply_patch" in tools) -%}
-{% if has_memory_recall and has_memory_file_write and prompt_mode == "full" -%}
-## Memory Write Guidance
+{% set has_memory_save = tools and "memory_save" in tools -%}
+{% if prompt_mode == "full" -%}
+## Profile and Memory Updates
 
-- Memory source files are plain Markdown files in the active workspace.
-- User profile: `USER.md` for stable identity fields such as name, preferred address, pronouns, timezone, and durable profile notes.
-- Agent identity: `IDENTITY.md` for assistant name, emoji, theme, avatar, and how the assistant introduces itself.
-- Agent persona: `SOUL.md` for durable voice, tone, and interaction style.
-- Long-term memory: `MEMORY.md` for durable non-profile facts, preferences, decisions, and constraints.
-- Daily/named notes: `memory/YYYY-MM-DD.md` and `memory/**/*.md` for running context and session observations.
-- If the user specifies a memory file path, use that exact path.
-- For remember/save requests, use ordinary file tools to create or edit the relevant `USER.md`, `MEMORY.md`, or `memory/**/*.md` file.
-- For assistant rename/persona requests, edit `IDENTITY.md` or `SOUL.md` with ordinary file tools. Do not put assistant rename/persona requests into `MEMORY.md`.
-- Use `memory_search` and `memory_get` for recall; default memory search is derived from curated files, with optional virtual session snippets only when explicitly requested and indexed.
-- Do not treat the memory database or search index as the source of truth.
-- Do not use `memory_save` for `USER.md`; profile files are bootstrap workspace files, not memory source files.
-- Only say memory was updated after the file write succeeds.
-- For ordinary task deliverables such as reports, JSON outputs, or result files, use file/code tools outside memory source files.
-- Do not save fleeting emotions, in-progress conversation state, or information that only matters within the current session.
+- Profile and memory files belong to configured Agent sources, which may differ
+  from the task workspace and from one another.
+- USER.md holds the stable user profile; IDENTITY.md holds assistant identity;
+  SOUL.md holds persona guidance. For these files, use existing file tools only
+  when the configured source path is known and current file permissions allow it.
+  Do not infer the source path from the task workspace.
+{% if has_memory_save -%}
+- Use memory_save for durable non-profile facts in MEMORY.md and daily/named
+  notes under memory/. These are logical paths in the configured Agent sources.
+{% if "memory_get" in tools -%}
+- Read existing content with memory_get before replacing it.
+{% else -%}
+- Do not replace existing memory content unless you have read it completely.
+{% endif -%}
+- Do not use memory_save for USER.md, IDENTITY.md, or SOUL.md.
+{% endif -%}
+- If the correct source path or required tool is unavailable, explain the limitation;
+  do not create a task-local profile or memory file as a substitute.
+- An ordinary file requested at an explicit path remains a file task. Keep
+  task deliverables separate from configured profile and memory sources.
+- Source files are authoritative; the index is derived. Report a saved update
+  only when its final state is confirmed. Respect rollback results and distinguish
+  an unresolved outcome from a successful save.
+- Do not persist fleeting emotions, in-progress state, or session-only facts.
 
 {% endif -%}
 

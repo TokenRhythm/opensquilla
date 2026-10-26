@@ -138,6 +138,32 @@ describe('private Gateway transports', () => {
     expect(workflow.capabilities.providerProbeModes).toBe(true)
   })
 
+  it('exposes local lane owners only for the negotiated current session-flow generation', () => {
+    const handlers = new Map<string, RpcEventHandler>()
+    const rpcSource = {
+      ...source(),
+      on: vi.fn((event: string, handler: RpcEventHandler) => {
+        handlers.set(event, handler)
+        return vi.fn()
+      }),
+      enableConsumptionFlow: vi.fn(),
+      consumeEvent: vi.fn(async () => 'applied' as const),
+      recoverGap: vi.fn(async () => true),
+    }
+    const { rpc } = createPrivateGatewayTransports(rpcSource)
+    expect(rpc.claimLaneOwner?.('alpha', 7)).toBeUndefined()
+    handlers.get('_hello')?.({ policy: { transport_flow: {
+      delivery_epoch: 'current', window_frames: 128, window_bytes: 4 * 1024 * 1024,
+      capability: 'transport.session-flow.v2',
+    } } })
+    expect(rpc.claimLaneOwner?.('alpha', 6)).toBeUndefined()
+    expect(rpc.claimLaneOwner?.('alpha', 7)).toEqual({
+      beginRetirement: expect.any(Function), completeRetirement: expect.any(Function), failRetirement: expect.any(Function),
+    })
+    handlers.get('_state')?.('disconnected')
+    expect(rpc.claimLaneOwner?.('alpha', 7)).toBeUndefined()
+  })
+
   it.each([
     undefined,
     null,

@@ -57,6 +57,7 @@ from opensquilla.provider.credentials import (
     credential_provider_hint,
     endpoint_provider_hint,
 )
+from opensquilla.provider.image_generation_policy import DEFAULT_IMAGE_GENERATION_PRIMARY
 from opensquilla.provider.preset_registry import (
     PREVIOUS_RECOMMENDED_TEXT_MODELS,
     get_preset,
@@ -243,16 +244,20 @@ class AttachmentsConfig(BaseSettings):
 class RateLimitConfig(BaseSettings):
     model_config = SettingsConfigDict(env_prefix="OPENSQUILLA_RATE_")
 
-    enabled: bool = True
+    # Optional deployment policy, not a measure of gateway resource pressure.
+    # Desktop and browser tabs share an IP, and ordinary file/preview activity
+    # can exhaust a fixed request bucket even when the gateway is healthy.
+    # Authentication failure throttling and endpoint resource limits are
+    # independent of this switch and remain enforced.
+    enabled: bool = False
     max_requests: int = 100
     window_seconds: int = 60
     # Content reads are a separate, bounded capability.  A transcript is
     # deliberately read in 1 MiB ranges, so charging those requests to the
     # small control/API bucket makes a normal history or export compete with
-    # startup traffic.  Keep an independent request budget instead of
-    # disabling abuse protection altogether.  The content endpoint enforces
-    # the per-range byte limit; this budget therefore caps the aggregate
-    # amount a client can read in one window as well.
+    # startup traffic. When enabled, keep an independent request budget.
+    # The content endpoint enforces its per-range byte limit regardless of
+    # this optional request-count policy.
     content_max_requests: int = 1200
     content_window_seconds: int = 60
 
@@ -1540,8 +1545,9 @@ def validate_compaction_deployment_write(payload: dict[str, Any]) -> None:
 class SessionNamingConfig(BaseSettings):
     """LLM-generated session titles (auto-naming).
 
-    After the first user message, a one-shot LLM call summarizes it into a short
-    title written to SessionNode.derived_title. Explicit ``model`` and ``tier``
+    After the first user message, a bounded LLM operation summarizes it into a
+    short title written to SessionNode.derived_title. Transient failures can be
+    retried twice within ``timeout_seconds``. Explicit ``model`` and ``tier``
     settings override the selected physical deployment: routed turns reuse the
     chosen model and Ensemble turns reuse their aggregator, through a separate
     naming request. Legacy callers without a selected deployment retain their
@@ -1675,7 +1681,7 @@ class ImageGenerationConfig(BaseSettings):
     # intent. Existing image sections load as ``custom`` so upgrades never
     # silently replace an operator-owned route or re-enable a disabled tool.
     binding: Literal["custom", "follow_llm"] = "custom"
-    primary: str = "openai/gpt-image-1"
+    primary: str = DEFAULT_IMAGE_GENERATION_PRIMARY
     fallbacks: list[str] = Field(default_factory=list)
     size: str = "1024x1024"
     timeout_seconds: float = 180.0

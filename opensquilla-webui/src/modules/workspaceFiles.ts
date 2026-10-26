@@ -1,4 +1,5 @@
 import type { InjectionKey } from 'vue'
+import type { WorkspaceFileReferenceV1 } from '@/types/references'
 
 /** Stable location within one authorized workspace; revision identifies content. */
 export interface WorkspaceFileResource {
@@ -29,6 +30,8 @@ export interface WorkspaceFile {
   nativeActions?: boolean
   revision?: string
   resource?: WorkspaceFileResource
+  documentTarget?: { documentId: string; pagePath?: string }
+  annotationCapability?: { supported: boolean; reasonCode?: string }
 }
 
 export interface WorkspaceFilePage {
@@ -112,6 +115,8 @@ export interface WorkspaceFiles {
   rootApps?(scope: WorkspaceRootScope, signal?: AbortSignal): Promise<WorkspaceAppCatalogue>
   openRoot?(scope: WorkspaceRootScope, root: WorkspaceRoot, appId: string, signal?: AbortSignal): Promise<void>
   resolve(sessionKey: string, paths: string[], signal?: AbortSignal): Promise<WorkspaceFile[]>
+  /** Resolve current file metadata after validating the reference workspace scope. */
+  resolveReference?(sessionKey: string, reference: WorkspaceFileReferenceV1, signal?: AbortSignal): Promise<WorkspaceFile[]>
   read(sessionKey: string, file: WorkspaceFile, signal?: AbortSignal): Promise<Blob>
   readPage?(sessionKey: string, file: WorkspaceFile, startLine: number, endLine: number, signal?: AbortSignal): Promise<WorkspaceFilePage>
   search?(sessionKey: string, file: WorkspaceFile, query: string, signal?: AbortSignal): Promise<WorkspaceFileSearch>

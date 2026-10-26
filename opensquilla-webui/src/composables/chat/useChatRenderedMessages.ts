@@ -99,6 +99,8 @@ export interface UseChatRenderedMessagesOptions {
   /** Next-turn session state; retained for compatibility and never used to classify a turn. */
   modelRoutingMode?: Ref<ModelRoutingMode>
   isStreaming?: Ref<boolean>
+  /** A cached view is readable while current history/live state is being restored. */
+  isPreview?: Readonly<Ref<boolean>>
   currentPlanRevisionId?: Readonly<Ref<string>>
   renderMarkdown: (text: string) => string
   stripGeneratedArtifactMarkers: (text: string) => string
@@ -839,6 +841,7 @@ export function useChatRenderedMessages(options: UseChatRenderedMessagesOptions)
       routerSource: decision.source || 'none',
       routerObserve: decision.routing_applied === false,
       routerStatic: msg.restoredFromHistory === true,
+      routerReplayed: msg.routerReplayed === true || options.isPreview?.value === true,
       routerSettled: msg.routerSettled === true,
       routerPanel: routerPanelDataset(options.routerVisualMode.value),
       routerMode: 'squilla_router',
@@ -954,6 +957,7 @@ export function useChatRenderedMessages(options: UseChatRenderedMessagesOptions)
       routerSource: 'llm_ensemble',
       routerObserve: false,
       routerStatic: msg.restoredFromHistory === true,
+      routerReplayed: msg.routerReplayed === true || options.isPreview?.value === true,
       routerExecutionModel: executionModelFromMessage(msg) || undefined,
       // Live strips stay unsettled (animating) while members stream in; a member
       // list alone no longer forces 'settled'. History strips are frozen instead.
@@ -976,6 +980,33 @@ export function useChatRenderedMessages(options: UseChatRenderedMessagesOptions)
     const cached = numeric(u.cached_tokens ?? u.cachedTokens)
     const reasoning = numeric(u.reasoning_tokens ?? u.reasoningTokens)
     const cost = numeric(u.cost_usd ?? u.costUsd)
+    const costSource = String(u.cost_source ?? u.costSource)
+    const billed = numeric(u.billed_cost ?? u.billedCost
+      ?? (['provider_billed', 'openrouter_usage'].includes(costSource) ? cost : 0))
+    const estimated = numeric(u.estimated_cost_component_usd ?? u.estimatedCostComponentUsd
+      ?? Math.max(0, cost - billed))
+    const rawBreakdown = u.model_usage_breakdown ?? u.modelUsageBreakdown
+    const hasConfirmedBill = Array.isArray(rawBreakdown) && rawBreakdown.some(row => {
+      if (!row || typeof row !== 'object') return false
+      if ((row.has_billed_component ?? row.hasBilledComponent) === true) return true
+      const receipt = row.billing_receipt ?? row.billingReceipt
+      if (receipt && typeof receipt === 'object') {
+        const native = receipt as Record<string, unknown>
+        const usdNanos = native.usd_equivalent_nanos ?? native.usdEquivalentNanos
+          ?? (native.currency === 'USD' ? native.amount_nanos ?? native.amountNanos : undefined)
+        return native.status === 'confirmed' && usdNanos === 0
+      }
+      return ['provider_billed', 'openrouter_usage'].includes(String(row.cost_source ?? row.costSource))
+    })
+    // Mixed also covers a known subtotal plus missing receipts. A zero amount
+    // alone cannot prove that a billed or estimated component exists.
+    const hasBilledComponent = billed > 0 || hasConfirmedBill
+      || (u.has_billed_component ?? u.hasBilledComponent) === true
+      || ['provider_billed', 'openrouter_usage'].includes(costSource)
+    const hasEstimatedComponent = estimated > 0 || costSource === 'opensquilla_estimate'
+      || (u.has_estimated_component ?? u.hasEstimatedComponent) === true
+      || (Array.isArray(rawBreakdown) && rawBreakdown.some(row => row && typeof row === 'object'
+        && (row.has_estimated_component ?? row.hasEstimatedComponent) === true))
     const hasTier = !!(u.routed_tier && u.routing_source && u.routing_source !== 'none')
     const turnSavedPct = typeof u.total_savings_pct === 'number' && u.total_savings_pct > 0 ? u.total_savings_pct : 0
     const hasSaved = hasTier && turnSavedPct > 0 && !u.__savings_ui_suppressed
@@ -1001,7 +1032,7 @@ export function useChatRenderedMessages(options: UseChatRenderedMessagesOptions)
       numeric(u.cache_write_tokens ?? u.cacheWriteTokens ?? u.cache_write),
       numeric(u.billed_cost ?? u.billedCost),
       numeric(u.estimated_cost_component_usd ?? u.estimatedCostComponentUsd),
-    ].some(value => value > 0) || Boolean(ensemble && (
+    ].some(value => value > 0) || hasBilledComponent || hasEstimatedComponent || Boolean(ensemble && (
       ensemble.costUsd > 0
       || ensemble.models.some(member =>
         member.input > 0 || member.output > 0 || member.costUsd > 0,
@@ -1016,6 +1047,10 @@ export function useChatRenderedMessages(options: UseChatRenderedMessagesOptions)
       cachedTokens: cached,
       reasoningTokens: reasoning,
       costUsd: cost,
+      ...(hasBilledComponent ? { billedCostUsd: billed } : {}),
+      ...(hasEstimatedComponent ? { estimatedCostUsd: estimated } : {}),
+      ...(numeric(u.missing_cost_entries ?? u.missingCostEntries) > 0
+        ? { missingCostEntries: Math.floor(numeric(u.missing_cost_entries ?? u.missingCostEntries)) } : {}),
       hasSaved,
       turnSavedPct,
       savedLabel: turnSavedPct > 0 ? `Saved ~${Math.round(turnSavedPct)}%` : 'Cost optimized',
@@ -1658,6 +1693,7 @@ function upsertRouterStrip(
   if (previousIndex >= 0) {
     if (options.settleReplacement !== false) stripItem.routerSettled = true
     const previous = result[previousIndex]
+    if (previous?.routerReplayed) stripItem.routerReplayed = true
     if (options.settlement && !stripItem.routerExecutionModel) {
       stripItem.routerExecutionModel = previous?.routerExecutionModel
     }

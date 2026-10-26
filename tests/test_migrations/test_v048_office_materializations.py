@@ -31,7 +31,9 @@ def test_existing_profile_upgrade_preserves_documents_and_cascades_journal(tmp_p
             "created_at, updated_at) VALUES "
             "('doc', 'key', 'session', 'Deck', 'document', 'rev', 1, 1, 1, 1)"
         )
-    assert apply_pending(str(db_path), MIGRATIONS) == [MIGRATION_ID]
+    applied = apply_pending(str(db_path), MIGRATIONS)
+    assert applied[0] == MIGRATION_ID
+    assert all(item >= MIGRATION_ID for item in applied)
     assert apply_pending(str(db_path), MIGRATIONS) == []
     with sqlite3.connect(db_path) as conn:
         conn.execute("PRAGMA foreign_keys=ON")

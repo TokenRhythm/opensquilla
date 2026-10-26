@@ -13,6 +13,7 @@ export function unknownUsageEventCount(meta: ChatMessageMeta): number {
 export function hasIncompleteUsageCoverage(meta: ChatMessageMeta): boolean {
   const coverageStatus = String(meta.coverageStatus || '').trim().toLowerCase()
   return meta.usageUnknown === true
+    || Number(meta.missingCostEntries || 0) > 0
     || unknownUsageEventCount(meta) > 0
     || Boolean(coverageStatus && coverageStatus !== 'complete')
 }

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -74,6 +75,32 @@ async def test_service_container_closes_scoped_telemetry_after_producers() -> No
     assert container.telemetry_runtime is None
 
 
+async def test_container_shutdown_bounds_a_stalled_daily_usage_worker(monkeypatch):
+    started = asyncio.Event()
+    release = asyncio.Event()
+
+    async def stalled_worker():
+        started.set()
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            await release.wait()
+
+    monkeypatch.setattr(
+        "opensquilla.observability.usage_telemetry.STANDALONE_CLOSE_TIMEOUT_SECONDS", 0.01,
+    )
+    worker = asyncio.create_task(stalled_worker())
+    await started.wait()
+    container = ServiceContainer(config=SimpleNamespace(), daily_usage_telemetry_task=worker)
+    try:
+        await asyncio.wait_for(container.close(), timeout=0.2)
+        assert container.daily_usage_telemetry_task is None
+        assert not worker.done()
+    finally:
+        release.set()
+        await worker
+
+
 def test_turn_runner_receives_only_content_free_sink_methods() -> None:
     reliability_sink = FakeReliabilitySink()
     growth_sink = FakeGrowthSink()
@@ -142,6 +169,13 @@ async def test_service_boot_starts_growth_replay_and_closes_failed_initializatio
         assert calls[0] == "replay_start"
         assert (services.growth_event_sink is None) is start_fails
         assert (services.telemetry_runtime is None) is start_fails
+        usage = services.standalone_usage_telemetry
+        assert usage is not None
+        assert usage._upload_task is None
+        assert usage._flush_worker is None
+        assert usage._upload_on_close is False
+        runner = build_turn_runner_from_services(services)
+        assert runner._turn_finalizer_stage._usage_telemetry is usage
     finally:
         await services.close()
         reset_runtime()

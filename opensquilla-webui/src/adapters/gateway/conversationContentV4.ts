@@ -20,7 +20,8 @@ const STRING_FIELDS = `reason status run_status terminal_message terminal_reason
   recovery tier routed_tier routed_model baseline_model decision_id rollout_phase accepted_routing_mode
   source proposer_label proposer_model proposer_provider detail skip_reason
   compaction_id stage durability intent kind sha256 mime created_at store download_url thumbnail_url
-  input_mode run_kind coverage_status authoritative_text_snapshot authoritative_reasoning_snapshot replay_gap_reason execution_log_handle`.split(/\s+/)
+  input_mode run_kind coverage_status authoritative_text_snapshot authoritative_reasoning_snapshot replay_gap_reason execution_log_handle
+  reset_scope rollback_model_call_id`.split(/\s+/)
 const NUMBER_FIELDS = `epoch stream_seq generation_epoch started_at emitted_at input_tokens output_tokens
   cached_tokens cache_write cost_usd unknown_usage_events old_generation_epoch new_generation_epoch sequence
   retry_attempt retry_limit retry_after_ms finished_at iteration block_index ended_at applied_iteration
@@ -127,15 +128,15 @@ function terminalUsage(source: Record<string, unknown>): ConversationUsage {
     if (source[key] != null && raw[key] == null) raw[key] = source[key]
   }
   const result: Record<string, unknown> = {}
-  for (const key of ['model', 'routed_model', 'routed_tier', 'routing_source', 'coverage_status', 'router_model_call_id', 'decision_id']) {
+  for (const key of ['model', 'routed_model', 'routed_tier', 'routing_source', 'coverage_status', 'router_model_call_id', 'decision_id', 'cost_source']) {
     const value = alias(raw, key)
     if (typeof value === 'string') result[key] = value
   }
-  for (const key of ['input_tokens', 'output_tokens', 'cached_tokens', 'cache_write', 'cache_write_tokens', 'reasoning_tokens', 'cost_usd', 'billed_cost', 'total_tokens', 'estimated_cost_component_usd', 'total_savings_pct', 'total_savings_usd', 'savings_usd', 'savings_pct', 'router_iteration', 'unknown_usage_events']) {
+  for (const key of ['input_tokens', 'output_tokens', 'cached_tokens', 'cache_write', 'cache_write_tokens', 'reasoning_tokens', 'cost_usd', 'billed_cost', 'total_tokens', 'estimated_cost_component_usd', 'total_savings_pct', 'total_savings_usd', 'savings_usd', 'savings_pct', 'router_iteration', 'unknown_usage_events', 'missing_cost_entries']) {
     const value = alias(raw, key)
     if (value != null && Number.isFinite(Number(value))) result[key] = Number(value)
   }
-  for (const key of ['usage_unknown', '__savings_ui_suppressed']) {
+  for (const key of ['usage_unknown', '__savings_ui_suppressed', 'has_billed_component', 'has_estimated_component']) {
     const value = alias(raw, key)
     if (value != null) result[key] = Boolean(value)
   }
@@ -501,6 +502,13 @@ function projectKnownConversationContent(
   }
   if (semanticKind === 'answer-generation-reset') {
     const { kind: _kind, ...data } = projectConversationContent(rawPayload, semanticKind)
+    if (data.reset_scope !== undefined
+      && data.reset_scope !== 'answer' && data.reset_scope !== 'provider_call') {
+      throw new ConversationEventContractError('Invalid answer generation reset scope')
+    }
+    if (data.reset_scope === 'provider_call' && !data.rollback_model_call_id?.trim()) {
+      throw new ConversationEventContractError('Provider call reset requires a model call identity')
+    }
     return { kind: 'known', semanticKind, payload: data }
   }
   if (semanticKind === 'subagent-completed') {

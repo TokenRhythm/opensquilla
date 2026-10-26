@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import os
 import sys
+import time
 from collections.abc import Callable
 from dataclasses import replace
 from pathlib import Path
@@ -673,27 +674,46 @@ def recovery_cleanup_apply(
             )
         # Electron writes the exact user-approved kind/path scope but keeps the
         # pipe open. Reading the complete bounded payload therefore blocks until
-        # parent exit has released Chromium/userData handles and delivered EOF.
+        # parent exit has delivered EOF; Chromium may still finish an exit write.
         approved_scope = _read_parent_cleanup_approval(
             user_data=user_data,
             expected_fingerprint=expected_scope_fingerprint,
         )
-        refreshed = cleanup_inspect(
-            user_data,
-            mode=mode,
-            profile_kind=profile_kind,
-            recovery_id=recovery_id,
-        )
-        if refreshed.outcome != "ready":
-            _cleanup_exit(refreshed, json_output=json_output)
-            return
-        refreshed_scope = frozenset(_cleanup_scope_pair(item) for item in refreshed.items)
-        if not refreshed_scope.issubset(approved_scope):
+        # Parent EOF can precede Chromium's final Preferences/storage writes.
+        # Even an approved kind/path scope can still have a changing manifest.
+        # Require two consecutive matching inventories within the same bounded
+        # window; cleanup_apply still performs its locked CAS before deleting.
+        previous_approved_inventory: tuple[str, int] | None = None
+        for attempt in range(5):
+            if attempt:
+                time.sleep(0.1)
+            refreshed = cleanup_inspect(
+                user_data,
+                mode=mode,
+                profile_kind=profile_kind,
+                recovery_id=recovery_id,
+            )
+            if refreshed.outcome != "ready":
+                _cleanup_exit(refreshed, json_output=json_output)
+                return
+            refreshed_scope = frozenset(_cleanup_scope_pair(item) for item in refreshed.items)
+            if refreshed_scope.issubset(approved_scope):
+                inventory = (refreshed.transaction_id, refreshed.revision)
+                if inventory == previous_approved_inventory:
+                    break
+                previous_approved_inventory = inventory
+            else:
+                previous_approved_inventory = None
+        else:
             _cleanup_exit(
                 replace(
                     refreshed,
                     outcome="blocked",
-                    stable_code="cleanup_scope_changed",
+                    stable_code=(
+                        "cleanup_inventory_stale"
+                        if refreshed_scope.issubset(approved_scope)
+                        else "cleanup_scope_changed"
+                    ),
                 ),
                 json_output=json_output,
             )

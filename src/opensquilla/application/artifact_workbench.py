@@ -3,10 +3,17 @@
 from __future__ import annotations
 
 import re
-from collections.abc import Awaitable, Callable, Mapping, Sequence
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, NotRequired, Protocol, TypedDict
+
+from opensquilla.contracts.content_material import (
+    ContentExportError as ContentExportError,
+)
+from opensquilla.contracts.content_material import (
+    ContentMaterial as ContentMaterial,
+)
 
 _SHA256_RE = re.compile(r"^[a-f0-9]{64}$")
 
@@ -262,15 +269,29 @@ class WorkbenchResourceListQuery:
 @dataclass(frozen=True, slots=True)
 class WorkbenchResourceOpen:
     session_key: str
-    resource: WorkbenchResourceRef
+    resource: WorkbenchResourceRef | None
     idempotency_key: str | None = None
     expected_sha256: str | None = None
     intent: str = "edit-current"
+    workspace_file: Mapping[str, str] | None = None
 
     def __post_init__(self) -> None:
         _identity(self.session_key, "session key")
-        if self.intent != "edit-current":
+        if self.intent not in {"edit-current", "annotate"}:
             raise ValueError("unsupported resource open intent")
+        if (self.resource is None) == (self.workspace_file is None):
+            raise ValueError("resourceRef and workspaceFile are mutually exclusive")
+        if self.workspace_file is not None:
+            if self.intent != "annotate":
+                raise ValueError("workspaceFile requires annotate intent")
+            if set(self.workspace_file) != {"path", "workspaceBinding", "expectedRevision"}:
+                raise ValueError(
+                    "workspaceFile requires path, workspaceBinding and expectedRevision"
+                )
+            for key, value in self.workspace_file.items():
+                _identity(value, key)
+                if len(value) > 4096:
+                    raise ValueError("workspaceFile identity is too long")
         if self.idempotency_key is not None:
             _identity(self.idempotency_key, "idempotency key")
             if len(self.idempotency_key.encode("utf-8")) > 256:
@@ -360,15 +381,6 @@ class ContentNotFoundError(LookupError):
 
 class ContentIntegrityError(RuntimeError):
     """Stored Workbench content failed its integrity check."""
-
-
-class ContentExportError(RuntimeError):
-    """A bounded HTML archive cannot be exported safely."""
-
-    def __init__(self, code: str, status_code: int, message: str) -> None:
-        super().__init__(message)
-        self.code = code
-        self.status_code = status_code
 
 
 class AttachmentClaimError(ValueError):
@@ -483,15 +495,6 @@ class WorkingFileMaterial:
 
 
 @dataclass(frozen=True, slots=True)
-class ContentMaterial:
-    path: Path | None
-    media_type: str
-    filename: str | None = None
-    data: bytes | None = None
-    cleanup: Callable[[], Awaitable[None]] | None = None
-
-
-@dataclass(frozen=True, slots=True)
 class AttachmentStagingPolicy:
     accept_opaque: bool
     opaque_max_bytes: int
@@ -538,6 +541,7 @@ class PreviewLeaseCreate:
     artifact_id: str
     mode: str
     client: str
+    snapshot: bool = False
 
     def __post_init__(self) -> None:
         for value, label in (
@@ -550,6 +554,8 @@ class PreviewLeaseCreate:
             raise ValueError("preview mode must be full or offline")
         if self.client not in {"desktop", "web"}:
             raise ValueError("preview client must be desktop or web")
+        if type(self.snapshot) is not bool:
+            raise ValueError("preview snapshot must be a boolean")
 
 
 @dataclass(frozen=True, slots=True)
@@ -577,6 +583,7 @@ class PreviewLeaseGrant:
     source: Mapping[str, Any]
     expires_at: str
     working_document_id: str | None = None
+    snapshot: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -795,6 +802,8 @@ class ResourceOpenResult(TypedDict, total=False):
     revision: RevisionProjection
     binding: BindingProjection
     receipt: ReceiptProjection
+    baselineUpdated: bool
+    previousRevisionId: str
 
 
 class PreviewCreateResult(TypedDict):

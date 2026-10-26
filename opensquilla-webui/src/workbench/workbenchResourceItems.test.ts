@@ -39,6 +39,16 @@ function resource(
 }
 
 describe('workbench resource items', () => {
+  it('counts repeated resource identities and known delivery lineages once even before the Document is projected', () => {
+    const latest = resource('deliverable', 'art_latest', { documentId: 'doc_one' })
+    const old = resource('deliverable', 'art_old', { documentId: 'doc_one' })
+    const independent = resource('document', 'doc_copy', { documentId: 'doc_copy' })
+    expect(canonicalWorkbenchResources([latest, old, latest, independent, { ...independent }]))
+      .toEqual([latest, independent])
+    const current = resource('document', 'doc_one', { documentId: 'doc_one' })
+    expect(canonicalWorkbenchResources([latest, old, current, independent])).toEqual([current, independent])
+  })
+
   it('preserves parent visibility and child authority when a side inventory refreshes', () => {
     const child = 'agent:main:sidechat:child'
     const before = resource('deliverable', 'art_old')

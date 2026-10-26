@@ -319,14 +319,28 @@ function mermaidErrorCard(message: string, source: string, labels: MermaidRender
     copyButton.type = 'button'
     copyButton.className = 'mermaid-err-copy'
     copyButton.textContent = labels.copyCode
+    copyButton.title = labels.copyCode
+    copyButton.setAttribute('aria-label', labels.copyCode)
+    let copyRequest = 0
+    let copyTimer: number | undefined
     copyButton.addEventListener('click', () => {
+      const request = ++copyRequest
+      window.clearTimeout(copyTimer)
       void copyTextWithFallback(source).then(() => {
+        if (!copyButton.isConnected || request !== copyRequest) return
         copyButton.textContent = '✓'
-        window.setTimeout(() => {
-          if (copyButton.isConnected) copyButton.textContent = labels.copyCode
+        copyButton.title = labels.copyCode
+        copyButton.setAttribute('aria-label', labels.copyCode)
+        copyTimer = window.setTimeout(() => {
+          if (!copyButton.isConnected || request !== copyRequest) return
+          copyButton.textContent = labels.copyCode
+          copyTimer = undefined
         }, 1500)
       }).catch(() => {
+        if (!copyButton.isConnected || request !== copyRequest) return
         copyButton.textContent = labels.copyFailed
+        copyButton.title = labels.copyFailed
+        copyButton.setAttribute('aria-label', labels.copyFailed)
       })
     })
     card.appendChild(copyButton)

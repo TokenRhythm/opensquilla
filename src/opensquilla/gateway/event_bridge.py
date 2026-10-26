@@ -65,7 +65,7 @@ class EventBridge:
                 ``sessions.changed``).
             payload: Event payload dict.
         """
-        if self._subs is None:
+        if self._subs is None or (replay_recorded and payload is None):
             return
 
         try:
@@ -77,7 +77,10 @@ class EventBridge:
                     allow_legacy=False,
                 )
             if event_name.startswith("session.event.") and not replay_recorded:
-                send_payload = get_session_streams().record(session_key, event_name, send_payload)
+                recorded = get_session_streams().record(session_key, event_name, send_payload)
+                if recorded is None:
+                    return
+                send_payload = recorded
 
             subscriber_ids = self._subs.get_message_subscribers(session_key)
             if event_name.startswith("sessions."):

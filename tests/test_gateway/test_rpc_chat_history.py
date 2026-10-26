@@ -1,6 +1,7 @@
 import asyncio
 import hashlib
 import json
+import time
 from types import SimpleNamespace
 
 import pytest
@@ -18,6 +19,7 @@ from opensquilla.gateway.adapters import session_history_projection
 from opensquilla.gateway.rpc import RpcContext, get_dispatcher
 from opensquilla.gateway.rpc_chat import _handle_chat_history
 from opensquilla.history_cursor import HistoryCursorInvalidatedError
+from opensquilla.recovery_read_budget import recovery_read_scope
 from opensquilla.session.manager import SessionManager
 from opensquilla.session.models import (
     AgentTaskRecord,
@@ -1984,7 +1986,7 @@ async def test_chat_history_prefers_bounded_canonical_page_when_available() -> N
 
 
 @pytest.mark.asyncio
-async def test_chat_history_waits_for_same_connection_compaction_rewrite(
+async def test_chat_history_reads_committed_version_during_compaction_rewrite(
     tmp_path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -2030,27 +2032,27 @@ async def test_chat_history_waits_for_same_connection_compaction_rewrite(
     history_task = None
     try:
         await asyncio.wait_for(archive_written.wait(), timeout=2)
-        history_task = asyncio.create_task(
-            _handle_chat_history(
-                {
-                    "sessionKey": session_key,
-                    "limit": 10,
-                    "includeSummaries": False,
-                },
-                RpcContext(
-                    conn_id="test",
-                    principal=SimpleNamespace(role="operator"),
-                    session_manager=manager,
-                    turn_runner=_LockingTurnRunner(),
-                ),
+        with recovery_read_scope(session_key, deadline=time.monotonic() + 5):
+            history_task = asyncio.create_task(
+                _handle_chat_history(
+                    {
+                        "sessionKey": session_key,
+                        "limit": 10,
+                        "includeSummaries": False,
+                    },
+                    RpcContext(
+                        conn_id="test",
+                        principal=SimpleNamespace(role="operator"),
+                        session_manager=manager,
+                        turn_runner=_LockingTurnRunner(),
+                    ),
+                )
             )
-        )
-        await asyncio.wait_for(history_requested_lock.wait(), timeout=2)
-        assert not history_task.done()
-
+        result = await asyncio.wait_for(history_task, timeout=2)
+        assert not history_requested_lock.is_set()
+        assert not compaction_task.done()
         allow_rewrite.set()
         await asyncio.wait_for(compaction_task, timeout=2)
-        result = await asyncio.wait_for(history_task, timeout=2)
     finally:
         allow_rewrite.set()
         pending = [

@@ -162,6 +162,7 @@ export interface PendingSteerAttempt {
 }
 
 export interface ChatPendingItem {
+  turnCommand?: import('./turnCommand').ProjectInitTurnCommand
   /** Stable local identity for keyed rendering and UI actions across peer edits. */
   pendingUiId: string
   text: string
@@ -763,6 +764,8 @@ export interface ChatMessage {
   interrupted?: boolean
   routerState?: string
   routerSettled?: boolean
+  /** Display-only replay provenance; the router may still belong to an active turn. */
+  routerReplayed?: boolean
   // Live-accumulated ensemble members for the in-flight router strip, grown by
   // `session.event.ensemble_progress` deltas before the final `done` arrives.
   ensemble?: ChatEnsembleMeta
@@ -824,6 +827,9 @@ export interface ChatMessageMeta {
   cachedTokens: number
   reasoningTokens: number
   costUsd: number
+  billedCostUsd?: number
+  estimatedCostUsd?: number
+  missingCostEntries?: number
   hasSaved: boolean
   savedLabel: string
   turnSavedPct?: number
@@ -923,6 +929,8 @@ export interface ChatRenderedMessage {
   routerSource?: string
   routerObserve?: boolean
   routerStatic?: boolean
+  /** Freeze an already observed route without claiming that its active call completed. */
+  routerReplayed?: boolean
   routerSettled?: boolean
   routerPanel?: string
   routerMode?: import('./modelRouting').ModelRoutingMode

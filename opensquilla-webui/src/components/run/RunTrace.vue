@@ -1894,8 +1894,8 @@ button.tool-row:hover {
 .tool-timeline--activity .tool-row,
 .tool-timeline--activity .tool-row--running,
 .tool-timeline--activity .tool-row--error {
-  min-height: 1.75rem;
-  padding: 0.25rem 0;
+  min-height: 2rem;
+  padding: 0.375rem 0;
   border-radius: 0;
   background: transparent;
   box-shadow: none;
@@ -2043,6 +2043,10 @@ button.tool-row:hover {
   padding: 0 0 0.125rem;
 }
 
+.tool-timeline--activity :deep(.activity-code-details:not(.activity-code-details--full)) {
+  margin: 0.5rem 0 0.75rem;
+}
+
 .tool-timeline--activity .activity-tool-detail-enter-active {
   transform-origin: top left;
   transition:
@@ -2082,15 +2086,15 @@ button.tool-row:hover {
 }
 
 .tool-timeline--activity .msg-ai-text + .msg-ai-text {
-  margin-top: 0.75rem;
+  margin-top: 1rem;
 }
 
 .tool-timeline--activity .msg-ai-text + .step-card {
-  margin-top: 0.75rem;
+  margin-top: 1rem;
 }
 
 .tool-timeline--activity .step-card + .msg-ai-text {
-  margin-top: 1.25rem;
+  margin-top: 1rem;
 }
 
 .tool-timeline--activity .msg-ai-text :deep(p),
@@ -2104,7 +2108,7 @@ button.tool-row:hover {
 }
 
 .tool-timeline--activity .msg-ai-text :deep(pre) {
-  margin: 0.75rem 0;
+  margin: 1rem 0;
   padding: 0.75rem 0.875rem 0.875rem;
   font-family: var(--font-mono);
   font-size: 0.8125rem;

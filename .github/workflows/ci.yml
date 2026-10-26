@@ -2744,6 +2744,7 @@ jobs:
                 'desktop-quit-interaction:scripts/test-desktop-quit-native-acceptance.mjs'
                 'theme-flow:scripts/test-desktop-theme-flow.mjs'
                 'native-workbench-surface:scripts/test-native-workbench-surface-electron.mjs'
+                'text-context-menu:scripts/test-text-context-menu-electron.mjs'
                 'desktop-zoom-shortcuts:scripts/test-desktop-zoom-shortcuts.mjs'
                 'native-workbench-v2:scripts/test-native-workbench-v2-electron.mjs'
                 'desktop-browser:scripts/test-desktop-browser.mjs'
@@ -2794,6 +2795,7 @@ jobs:
                 'desktop-quit-interaction:scripts/test-desktop-quit-native-acceptance.mjs'
                 'theme-flow:scripts/test-desktop-theme-flow.mjs'
                 'native-workbench-surface:scripts/test-native-workbench-surface-electron.mjs'
+                'text-context-menu:scripts/test-text-context-menu-electron.mjs'
                 'desktop-zoom-shortcuts:scripts/test-desktop-zoom-shortcuts.mjs'
                 'native-workbench-v2:scripts/test-native-workbench-v2-electron.mjs'
                 'desktop-browser:scripts/test-desktop-browser.mjs'
@@ -2805,6 +2807,7 @@ jobs:
             workbench)
               entries=(
                 'native-workbench-surface:scripts/test-native-workbench-surface-electron.mjs'
+                'text-context-menu:scripts/test-text-context-menu-electron.mjs'
                 'desktop-zoom-shortcuts:scripts/test-desktop-zoom-shortcuts.mjs'
                 'native-workbench-v2:scripts/test-native-workbench-v2-electron.mjs'
                 'desktop-browser:scripts/test-desktop-browser.mjs'

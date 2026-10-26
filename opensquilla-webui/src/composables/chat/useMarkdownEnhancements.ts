@@ -39,7 +39,7 @@ export function useMarkdownEnhancements(root: Ref<HTMLElement | null>, options: 
   function labels() {
     return {
       zoomIn: t('chat.mermaid.zoomIn'), zoomOut: t('chat.mermaid.zoomOut'), reset: t('chat.mermaid.reset'),
-      copyCode: t('chat.mermaid.copyCode'), copied: t('chat.copied'), copyFailed: t('chat.toast.copyFailed'),
+      copyCode: t('chat.mermaid.copyCode'), copyFailed: t('chat.toast.copyFailed'),
       exportPng: t('chat.mermaid.exportPng'), exportFailed: t('chat.mermaid.exportFailed'),
       loadFailed: t('chat.mermaid.loadFailed'), tooLarge: t('chat.mermaid.tooLarge'),
       blockedResource: t('chat.mermaid.blockedResource'), viewSource: t('chat.mermaid.viewSource'),
@@ -82,7 +82,7 @@ export function useMarkdownEnhancements(root: Ref<HTMLElement | null>, options: 
   }
 
   function decorateBlock(element: HTMLElement): void {
-    chrome.decorate(element, { copy: t('chat.copy'), copied: t('chat.copied'), copyFailed: t('chat.toast.copyFailed') })
+    chrome.decorate(element, { copy: t('chat.copy'), copyFailed: t('chat.toast.copyFailed') })
     images.decorate(element)
     if (!notes.has(element)) notes.set(element, bindMarkdownFootnotes(element))
     const fences = [...element.querySelectorAll<HTMLPreElement>('pre')]
@@ -153,7 +153,7 @@ export function useMarkdownEnhancements(root: Ref<HTMLElement | null>, options: 
     const element = root.value
     if (!element?.isConnected || disposed) return
     // Rebuild only button chrome; locale changes preserve diagram pan/zoom.
-    chrome.updateLabels({ copy: t('chat.copy'), copied: t('chat.copied'), copyFailed: t('chat.toast.copyFailed') })
+    chrome.updateLabels({ copy: t('chat.copy'), copyFailed: t('chat.toast.copyFailed') })
     updateMermaidLabels(element, labels())
   }, { flush: 'post' })
 

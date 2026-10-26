@@ -230,7 +230,7 @@ async def resolve_page_context(
         WorkbenchResourcePort,
         WorkbenchResourceRef,
     )
-    from opensquilla.artifact_session import ArtifactSessionService
+    from opensquilla.artifact_session import ArtifactConflictError, ArtifactSessionService
     from opensquilla.artifact_session.working_files import checked_path, ensure_working_files
     from opensquilla.artifacts import ArtifactStore
     from opensquilla.gateway.session_services import get_session_storage
@@ -267,6 +267,33 @@ async def resolve_page_context(
             session_id=session_id,
             workspace=workspace,
         )
+        if value.get("annotations") and value.get("revisionId"):
+            from opensquilla.gateway.annotation_preparation import validate_annotation_source
+            from opensquilla.gateway.workspace_files import WorkspaceFiles
+
+            selected_workspace = await WorkspaceFiles(
+                ctx.config, ctx.session_manager,
+            ).workspace(session_key)
+            try:
+                await validate_annotation_source(
+                    service, ArtifactStore(media_root_from_config(ctx.config)),
+                    document_id=binding.document_id, session_key=session_key,
+                    session_id=session_id, revision_id=value["revisionId"],
+                    sha256=value["sha256"], workspace=selected_workspace,
+                )
+            except ArtifactConflictError as exc:
+                from opensquilla.gateway.artifact_product_errors import (
+                    ArtifactProductErrorCode,
+                    artifact_product_error,
+                )
+
+                raise artifact_product_error(
+                    ArtifactProductErrorCode.DOCUMENT_CHANGED,
+                ) from exc
+            result["_annotationSelection"] = {
+                "documentId": binding.document_id,
+                "revisionId": value["revisionId"], "sha256": value["sha256"],
+            }
         result["resourceId"] = f"document:{binding.document_id}"
         from opensquilla.office_format import office_format
 

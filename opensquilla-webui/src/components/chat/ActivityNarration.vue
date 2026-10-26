@@ -38,7 +38,7 @@ useMarkdownEnhancements(root, { version: () => props.item.html })
 
 .activity-narration :deep(pre) {
   max-width: 100%;
-  margin: 0.75rem 0;
+  margin: 1rem 0;
   overflow-x: auto;
   padding: 0.75rem 0.875rem 0.875rem;
   font-family: var(--font-mono);

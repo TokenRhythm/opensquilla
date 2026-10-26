@@ -26,6 +26,18 @@ async function mount() {
 async function tick(ms: number) { await vi.advanceTimersByTimeAsync(ms); await nextTick() }
 
 describe('workbench tab interactions', () => {
+  it('keeps different source files distinguishable from a historical revision', async () => {
+    const f = await mount()
+    f.store.openItem({ ...descriptor('original'), title: 'report.docx', payload: { sourcePath: 'preview-gallery/report.docx' } })
+    f.store.openItem({ ...descriptor('copy'), title: 'report.docx', payload: { sourcePath: 'unregistered/report.docx' } })
+    f.store.openItem({ ...descriptor('history'), title: 'report.docx', payload: { sourcePath: 'unregistered/report.docx', historical: true } })
+    await nextTick()
+    expect([...f.host.querySelectorAll('.workbench-host__tab-source')].map(el => el.textContent))
+      .toEqual(['preview-gallery', 'unregistered', 'unregistered'])
+    expect(f.host.querySelector('[aria-label="report.docx · History · unregistered"]')).not.toBeNull()
+    expect(f.host.querySelectorAll('.workbench-host__tab-version')).toHaveLength(1)
+  })
+
   it('waits 400 ms and only shows cached imagery for inactive tabs, without activating them', async () => {
     const f = await mount(), activate = vi.spyOn(f.store, 'activateItem')
     f.wraps()[0]!.dispatchEvent(new PointerEvent('pointerenter', { pointerType: 'mouse' }))

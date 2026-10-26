@@ -49,7 +49,10 @@ class ContinuingProvider(OpenAIProvider):
                     yield TextDeltaEvent(text="incomplete synthetic summary")
                 yield DoneEvent(stop_reason="stop" if self.failure == "empty" else self.failure)
             else:
-                yield ErrorEvent(message="synthetic summary unavailable", code=self.failure)
+                yield ErrorEvent(
+                    message="synthetic summary unavailable", code=self.failure,
+                    http_status=429 if self.failure == "429" else None,
+                )
         else:
             yield TextDeltaEvent(text=(
                 "Task constraint: retain violet setting. Earlier work is complete."
@@ -89,7 +92,7 @@ async def compaction_retry_delays(monkeypatch):
     return delays
 
 
-@pytest.mark.parametrize("failure", ["503", "timeout", "empty", "length", "tool_calls"])
+@pytest.mark.parametrize("failure", ["429", "503", "timeout", "empty", "length", "tool_calls"])
 async def test_twenty_turns_share_failure_circuit_and_recover_from_canonical_history(
     failure, compaction_retry_delays,
 ):
@@ -118,10 +121,11 @@ async def test_twenty_turns_share_failure_circuit_and_recover_from_canonical_his
     assert runner._compaction_failures[key].count == 3
     # The circuit counts logical summary operations; transient failures
     # consume four physical attempts inside each of those three operations.
-    attempts_per_operation = 4 if failure in {"503", "timeout"} else 1
+    attempts_per_operation = 4 if failure in {"429", "503", "timeout"} else 1
     assert sum(summary for summary, _, _ in provider.calls) == 3 * attempts_per_operation
     assert compaction_retry_delays == (
-        [1.0, 2.0, 4.0] * 3 if attempts_per_operation == 4 else []
+        [10.0, 20.0, 40.0] * 3 if failure == "429"
+        else [1.0, 2.0, 4.0] * 3 if attempts_per_operation == 4 else []
     )
     main = [(messages, proof) for summary, messages, proof in provider.calls if not summary]
     assert len(main) == 20

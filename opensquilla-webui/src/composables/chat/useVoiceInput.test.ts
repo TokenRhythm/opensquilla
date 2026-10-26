@@ -167,6 +167,20 @@ afterEach(() => {
 })
 
 describe('useVoiceInput transcription feedback', () => {
+  it('keeps the recording owner when the active chat changes', async () => {
+    let owner = { sessionKey: 'original-session', sessionId: 'original-id', sessionEpoch: 0 }
+    const transcribe = vi.fn(async () => 'recorded text')
+    const voice = useVoiceInputComposable({ transcribe }, () => owner)
+    const onText = vi.fn()
+    await voice.toggleVoiceInput(onText)
+    owner = { sessionKey: 'next-session', sessionId: 'next-id', sessionEpoch: 1 }
+    await voice.toggleVoiceInput(onText)
+    await waitUntil(() => transcribe.mock.calls.length > 0)
+    expect(transcribe).toHaveBeenCalledWith(expect.objectContaining({
+      sessionKey: 'original-session', sessionId: 'original-id', sessionEpoch: 0,
+    }))
+    voice.cleanup()
+  })
   it('surfaces an "enable in settings" toast when transcription is unavailable (503)', async () => {
     vi.stubGlobal(
       'fetch',

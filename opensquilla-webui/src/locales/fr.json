@@ -135,6 +135,22 @@
     "openDirectoryFailed": "Impossible d’ouvrir le dossier du projet. Réessayez.",
     "copyDirectoryFailed": "Impossible de copier le chemin du dossier du projet.",
     "projects": "Projets",
+    "addProject": "Ajouter un projet",
+    "projectAction": "Action du projet",
+    "openExistingProject": "Ouvrir un projet existant",
+    "saveParentDirectory": "Enregistrer dans",
+    "projectLocation": "Dossier du projet",
+    "chooseParentDirectory": "Choisir le dossier parent",
+    "chooseExistingDirectory": "Choisir un dossier existant",
+    "executionHost": "Ordinateur : {host}",
+    "gatewayHost": "Hôte du Gateway",
+    "createLocationHint": "Un nouveau dossier de projet sera créé à cet emplacement.",
+    "openLocationHint": "Le dossier sélectionné sera ajouté à vos projets.",
+    "createUnavailable": "Ce Gateway ne permet pas de créer et d’enregistrer directement un projet. Vous pouvez ouvrir un projet existant ou créer un dossier depuis le sélecteur de dossiers.",
+    "preparingProject": "Préparation…",
+    "projectOpened": "Projet « {name} » ouvert",
+    "createProjectUnconfirmed": "Un problème est survenu lors de la création du projet dans {path}. Vérifiez la liste des projets avant de réessayer. {error}",
+    "openProjectFailed": "Impossible d’ouvrir le projet : {error}",
     "createProject": "Créer un projet",
     "projectNamePlaceholder": "Nom du projet",
     "sourceFolders": "Dossiers source",
@@ -280,6 +296,31 @@
     "dismiss": "Ignorer"
   },
   "workbench": {
+    "annotationUnified": {
+      "selectTarget": "Select content to annotate",
+      "start": "Annotate",
+      "stop": "Finish annotating",
+      "placeholder": "Describe a change…",
+      "recordHint": "Enter to record · Shift + Enter for a new line",
+      "record": "Keep annotating",
+      "submit": "Record {count} annotations",
+      "summary": "{count} annotations",
+      "empty": "Select text, an object or a range to describe a change.",
+      "locate": "Locate",
+      "edit": "Edit",
+      "reselect": "Select again",
+      "cancel": "Cancel this edit",
+      "delete": "Delete",
+      "queued": "Waiting to send",
+      "restoreQueued": "Cancel sending and restore annotations",
+      "otherPages": "Other pages",
+      "versionChanged": "Loaded the current working version. Select a target to annotate.",
+      "locationOnly": "Located the page. Select again to change the target.",
+      "stale": "The document changed. Select the target again.",
+      "unavailable": "Annotation is unavailable for this file or client.",
+      "submitFailed": "Could not queue annotations. Your drafts were kept.",
+      "recordToConversation": "Record in conversation"
+    },
     "tabs": {
       "copyLink": "Copier le lien",
       "openWeb": "Ouvrir une page web",
@@ -313,7 +354,7 @@
       "hoverElement": "Cliquez pour demander une modification",
       "hoverRange": "Sélectionnez des cellules, puis relâchez pour décrire les modifications",
       "chooseContent": "Sélectionnez d’abord le contenu à modifier",
-      "selectDocx": "Faites glisser le pointeur pour sélectionner le texte à modifier, puis relâchez pour saisir votre demande.",
+      "selectDocx": "Cliquez sur un paragraphe ou faites glisser pour sélectionner du texte précis, puis saisissez votre demande.",
       "selectPptx": "Cliquez sur l’objet à modifier, puis saisissez votre demande.",
       "selectXlsx": "Sélectionnez une cellule ou faites glisser le pointeur sur une plage, puis relâchez pour saisir votre demande.",
       "cancelSelection": "Quitter la sélection",
@@ -364,6 +405,7 @@
     },
     "resources": {
       "title": "Fichiers", "count": "Fichiers ({count})", "empty": "Aucun fichier ni lien pour le moment.",
+      "currentWorkingFile": "Fichier de travail actuel", "publishedVersion": "Version publiée",
       "groups": { "files": "Fichiers", "links": "Liens", "attachments": "Fichiers", "documents": "Fichiers", "deliverables": "Fichiers", "urls": "Liens" },
       "open": "Ouvrir {name}", "preparing": "Préparation de l’éditeur…", "retry": "Réessayer", "preview": "Aperçu de {name}", "download": "Télécharger {name}", "edit": "Modifier une copie de {name}", "publish": "Publier {name}",
       "imported": "{name} peut maintenant être modifié.", "published": "{name} peut maintenant être partagé.",
@@ -450,9 +492,6 @@
       "outputGap": "Terminal output was interrupted",
       "exited": "Terminal exited",
       "state": { "starting": "Starting", "running": "Connected", "exited": "Exited", "error": "Unavailable" }
-    },
-    "nativePreview": {
-      "capacityReached": "Quatre aperçus interactifs sont déjà ouverts. Revenez à un aperçu existant ou fermez-en un avant d’en ouvrir un autre."
     },
     "artifactAnnotation": {
       "start": "Demander une modification",
@@ -548,6 +587,15 @@
       "documentEditingRetired": "Mettez à jour le client et rouvrez la page pour envoyer vos annotations dans la conversation."
     },
     "artifactDocument": {
+      "versionHistory": "Historique des versions ({count})",
+      "currentVersion": "Version actuelle v{generation}",
+      "historicalVersion": "Historique",
+      "openLatest": "Ouvrir la dernière version",
+      "viewDeliveredVersion": "Voir la version livrée",
+      "viewRevision": "Voir cette version",
+      "fixedSnapshot": "Version livrée",
+      "fixedSnapshotHint": "Il s’agit de la version livrée dans le chat. L’annotation ouvre le document de travail actuel et conserve la version livrée.",
+      "continueEditing": "Continuer à modifier",
       "sections": "Sections du document de l’artefact",
       "preview": "Aperçu",
       "source": "Source",
@@ -3536,6 +3584,45 @@
     "bundleDifferentGateway": "Ouvrez la WebUI de la Gateway connectée pour télécharger son dossier de diagnostic."
   },
   "usageLogs": {
+    "capabilities": {
+      "unknown": "Inconnu",
+      "partialMeter": "{value} · {count} inconnus",
+      "metrics": {
+        "input_tokens": "Jetons d’entrée",
+        "output_tokens": "Jetons de sortie",
+        "cache_read_tokens": "Jetons lus en cache",
+        "cache_write_tokens": "Jetons écrits en cache",
+        "input_images": "Images d’entrée",
+        "input_video_seconds": "Durée de la vidéo d’entrée",
+        "output_audio_seconds": "Durée de l’audio de sortie",
+        "requested_audio_seconds": "Durée audio demandée",
+        "requests": "Requêtes",
+        "output_images": "Images produites",
+        "input_audio_seconds": "Audio entrant",
+        "input_characters": "Caractères entrants",
+        "requested_video_seconds": "Durée vidéo demandée",
+        "video_seconds": "Durée vidéo produite",
+        "search_credits": "Crédits de recherche",
+        "scrape_credits": "Crédits d’extraction",
+        "character_credits": "Crédits de caractères",
+        "cost_in_usd_ticks": "Unités de coût du fournisseur",
+        "input_text_tokens": "Jetons de texte entrants",
+        "output_text_tokens": "Jetons de texte sortants",
+        "input_audio_tokens": "Jetons audio entrants",
+        "output_audio_tokens": "Jetons audio sortants",
+        "input_image_tokens": "Jetons d’image entrants",
+        "output_image_tokens": "Jetons d’image sortants"
+      },
+      "units": {
+        "request": "requêtes",
+        "image": "images",
+        "second": "secondes",
+        "character": "caractères",
+        "credit": "crédits",
+        "token": "jetons",
+        "usd_tick_1e_10": "USD × 10⁻¹⁰"
+      }
+    },
     "tasks": {
       "unnamed": "Tâche sans titre"
     },
@@ -3565,10 +3652,6 @@
       "cacheRead": "Lecture cache",
       "cacheWrite": "Écriture cache"
     },
-    "costHintTitle": "Les valeurs en CNY utilisent le taux intégré {rate}. Vérifiez par rapport au taux de change actuel pour un usage comptable.",
-    "nativeCostHintTitle": "La facture d’origine du fournisseur est en CNY ; la valeur USD utilise le taux fixe enregistré sur le reçu.",
-    "nativeMixedCostHintTitle": "La facturation multidevise ou en attente reste en USD canonique ; les reçus d’origine confirmés sont affichés séparément.",
-    "nativeBillingSubtotals": "Reçus d’origine : {amounts}",
     "rangeHiddenHint": "{count} tâches historiques sans date masquées",
     "coverage": {
       "approximate": "Une partie de l’usage historique est estimée à partir des totaux par tâche.",
@@ -3626,10 +3709,10 @@
       "cacheRead": "Lecture cache",
       "cacheWrite": "Écriture cache",
       "cost": "Coût",
-      "source": "Source",
       "model": "Modèle"
     },
     "breakdown": {
+      "callTitle": "Détails des appels",
       "title": "Répartition par modèle",
       "modelCount": "{count} modèles",
       "total": "{tokens} jetons · {cost}",
@@ -3638,35 +3721,28 @@
     "costSource": {
       "actual": {
         "label": "Réel",
-        "tooltip": "Réel — coût facturé par le fournisseur",
-        "short": "réel"
+        "tooltip": "Réel — coût facturé par le fournisseur"
       },
       "estimated": {
         "label": "Estimé",
-        "tooltip": "Estimé — dérivé localement à partir du nombre de jetons",
-        "short": "estimé"
+        "tooltip": "Estimation — devis du fournisseur ou tarif local enregistré"
       },
       "mixed": {
         "label": "Mixte",
-        "tooltip": "Mixte — données de facturation partielles, le reste estimé",
-        "short": "mixte"
+        "tooltip": "Mixte — données de facturation partielles, le reste estimé"
       },
       "unpriced": {
         "label": "Sans tarif",
-        "tooltip": "Sans tarif — aucune entrée de table de tarification pour ce modèle",
-        "short": "sans tarif"
+        "tooltip": "Sans tarif — aucune entrée de table de tarification pour ce modèle"
       },
       "none": {
-        "label": "Aucun",
-        "tooltip": "Aucun coût enregistré",
-        "short": "aucun"
+        "label": "Coût non enregistré",
+        "tooltip": "Aucun coût enregistré"
       },
       "ephemeral": {
         "label": "Éphémère",
-        "tooltip": "Session éphémère — coût pas encore persisté",
-        "short": "éphémère"
-      },
-      "cacheBlindHint": "Inclut des estimations qui tarifient les jetons en cache au tarif d'entrée plein — à considérer comme un plafond."
+        "tooltip": "Session éphémère — coût pas encore persisté"
+      }
     },
     "relTime": {
       "justNow": "à l'instant",
@@ -3735,6 +3811,7 @@
       "continue": "Continue",
       "commandWithSkills": "Selected skills apply to a chat message. Remove the skill labels before running a command.",
       "commandDescriptions": {
+        "init": "Créer ou améliorer les consignes à partir du projet actuel",
         "new": "Démarrer une discussion",
         "compact": "Réduire le contexte actuel",
         "goal": "Définir un objectif durable",
@@ -3896,6 +3973,7 @@
     "liveUnavailable": "Les mises à jour en direct sont temporairement indisponibles",
     "liveUnavailableDescription": "L’historique reste disponible. L’envoi reprendra une fois les mises à jour en direct rétablies.",
     "liveUnavailableConnectedDescription": "La Gateway est connectée. Les mises à jour en direct de cette session sont temporairement indisponibles.",
+    "liveRecoveryReloadDescription": "Les mises à jour en direct n’ont pas pu être rétablies. Enregistrez les messages non envoyés, puis rechargez cette page pour vous reconnecter.",
     "reconnectLive": "Se reconnecter",
     "liveSendBlockedConnecting": "Les mises à jour en direct se reconnectent. Votre brouillon est conservé.",
     "liveSendBlockedDegraded": "Les mises à jour en direct sont temporairement indisponibles. Votre brouillon est conservé.",
@@ -3993,16 +4071,13 @@
     "subagentPrefix": "Sous-agent : ",
     "subagentCompletion": "Achèvement du sous-agent",
     "turnFailed": "Échec du tour",
-    "copyDiagnosticId": "Copier l’identifiant de diagnostic",
-    "copiedDiagnosticId": "Identifiant de diagnostic copié",
-    "copyDiagnosticFailed": "Échec de la copie. Sélectionnez l’identifiant ci-dessus et copiez-le manuellement.",
     "errorMessage": {
       "unknown": "Cette requête n’a pas abouti.",
       "noProvider": "Aucun modèle n’est disponible.",
       "credentials": "L’authentification auprès du service de modèle a échoué.",
       "credits": "Le solde du compte du service de modèle est insuffisant.",
       "modelUnavailable": "Le modèle sélectionné est indisponible.",
-      "contextLimit": "Le contenu dépasse la limite du modèle.",
+      "contextLimit": "Le contenu dépasse la capacité du modèle. Raccourcissez l’entrée ou choisissez un modèle avec un contexte plus grand.",
       "unsupported": "Ce modèle ne prend pas en charge cette demande.",
       "imageUnsupported": "Ce modèle ne prend pas en charge les images.",
       "ensembleImageUnsupported": "Ce mode ne prend pas en charge les images.",
@@ -4015,7 +4090,7 @@
       "needsConfirmation": "Une confirmation est nécessaire pour continuer.",
       "toolDenied": "Un outil nécessaire n’est pas autorisé.",
       "toolFailed": "Un outil n’a pas pu terminer son travail.",
-      "contextUnavailable": "La conversation actuelle n’a pas pu être traitée.",
+      "contextUnavailable": "L’organisation du contexte n’a pas abouti et cette requête n’a pas pu continuer. Réessayez plus tard.",
       "timeout": "La tâche n’a pas pu se terminer dans le délai imparti.",
       "stopped": "La tâche a été arrêtée.",
       "interrupted": "La tâche a été interrompue.",
@@ -4394,6 +4469,7 @@
       "sendingContinuing": "Envoi de la réponse · poursuite de l'exécution…"
     },
     "slashCommands": {
+      "initUnavailable": "Ce Gateway ne prend pas en charge l’initialisation de projets. Mettez-le à jour et réessayez. Votre brouillon a été conservé.",
       "side": {
         "closed": "Le chat latéral d’origine a été fermé. Votre brouillon est conservé. Modifiez la commande avant de la renvoyer pour créer un nouveau chat latéral.",
         "description": "Ouvrir un chat latéral temporaire · alias /btw",
@@ -4579,10 +4655,14 @@
       "failureUnavailable": "Le modèle de résumé est indisponible",
       "failureProvider": "Le modèle n’a pas pu générer de résumé utilisable",
       "failureTimeout": "L’organisation du contexte a dépassé le délai",
-      "failureRejectedDetail": "Le résumé n’a pas été appliqué ; votre contexte initial est conservé. Réessayez ou copiez l’identifiant de diagnostic si l’échec se répète.",
-      "failureUnavailableDetail": "Vérifiez la configuration du modèle et la connexion, puis réessayez. Vous pouvez copier l’identifiant de diagnostic.",
-      "failureRetryDetail": "Vous pouvez relancer l’organisation du contexte. En cas de nouvel échec, copiez l’identifiant de diagnostic.",
+      "failureRejectedDetail": "Le résumé n’a pas été appliqué. Vous pouvez réessayer plus tard.",
+      "failureCapacityDetail": "Raccourcissez l’entrée ou choisissez un modèle avec une fenêtre de contexte plus grande.",
+      "failureUnavailableDetail": "Vérifiez les paramètres du modèle et la connexion réseau, ou choisissez un autre modèle.",
+      "failureRetryDetail": "Relancez l’organisation du contexte plus tard ou choisissez un autre modèle.",
       "compacting": "Compactage du contexte",
+      "recovering": "Vérification de l’état du compactage du contexte…",
+      "requestUnconfirmed": "La demande de compactage du contexte n’a pas pu être confirmée. Vérifiez la connexion avant de réessayer.",
+      "requestRejected": "La demande de compactage du contexte a été refusée.",
       "compacted": "Contexte compacté",
       "temporarilyReduced": "Historique temporairement réduit ; traitement en cours",
       "summarySaved": "Résumé enregistré",
@@ -4590,12 +4670,12 @@
       "historyIncomplete": "Contexte antérieur résumé ; certains messages d’origine ne sont pas disponibles",
       "historySummarized": "Contexte antérieur résumé",
       "failed": "Échec du compactage",
+      "incomplete": "L’organisation du contexte n’a pas abouti",
       "withinBudget": "Contexte dans les limites du budget.",
       "noSafeHistory": "Aucun historique ne peut actuellement être résumé en toute sécurité",
       "alreadyConcise": "Le contexte actuel est déjà suffisamment concis",
       "skipped": "Le compactage du contexte n’a pas été appliqué.",
-      "cancelled": "Compactage annulé",
-      "requestScoped": "Limité à cette requête ; l’historique de session n’a pas été réécrit"
+      "cancelled": "Compactage annulé"
     },
     "tool": {
       "genericCall": "Appel d’outil",

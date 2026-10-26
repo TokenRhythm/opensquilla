@@ -121,12 +121,6 @@ export function chatErrorPresentation(input: ChatErrorPresentationInput): ChatEr
   if (causes.some(value => ['attachment_capacity_unknown', 'attachment_capacity_unavailable'].includes(value))) {
     return presentation('modelUnavailable', 'open-model-settings')
   }
-  if (causes.some(value => [
-    'compaction_refused_empty_summary', 'context_unsalvageable', 'compaction_failed',
-    'compaction_not_smaller', 'compaction_exhausted', 'compaction_deadline_exceeded',
-  ].includes(value))) {
-    return presentation('contextUnavailable')
-  }
   if (causes.some(value => RUN_LIMITS.has(value))) return presentation('runLimit')
   if (causes.some(value => INCOMPLETE_RESPONSES.has(value))) return presentation('responseIncomplete')
   if (kind === 'budgetlimited') return presentation('runLimit')
@@ -139,6 +133,13 @@ export function chatErrorPresentation(input: ChatErrorPresentationInput): ChatEr
     const classified = PROVIDER_PRESENTATIONS.get(value)
       ?? (value.startsWith('provider_') ? PROVIDER_PRESENTATIONS.get(value.slice('provider_'.length)) : undefined)
     if (classified) return { ...classified }
+  }
+  // A generic recovery failure must not hide a known provider cause or its action.
+  if (causes.some(value => [
+    'compaction_refused_empty_summary', 'context_unsalvageable', 'compaction_failed',
+    'compaction_not_smaller', 'compaction_exhausted', 'compaction_deadline_exceeded',
+  ].includes(value))) {
+    return presentation('contextUnavailable')
   }
   return presentation('unknown')
 }

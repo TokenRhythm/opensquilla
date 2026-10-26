@@ -112,3 +112,28 @@ def test_build_diff_summary_uses_readable_unified_diff_headers() -> None:
 
     assert summary.startswith("--- a/src/app.py\n+++ b/src/app.py\n@@")
     assert "\n-b\n+B\n" in summary
+
+
+def test_empty_file_receipt_supports_revision_checked_insertion(tmp_path: Path) -> None:
+    source = tmp_path / "empty.md"
+    source.write_bytes(b"")
+    receipt = build_line_receipt(source, start_line=1, end_line=None, display_path="empty.md")
+    assert receipt["range"] == [0, 0]
+    assert receipt["total_lines"] == 0
+    assert receipt["lines"] == []
+    assert receipt["revision"] == source_revision_for_path(source)
+    assert "reference" not in receipt
+    assert apply_line_edits(
+        "", [{"start_line": 0, "end_line": 0, "replacement": "new\n"}],
+    ) == "new\n"
+
+
+@pytest.mark.parametrize("original,edits", [
+    ("text\n", [{"start_line": 0, "end_line": 0, "replacement": "new"}]),
+    ("", [{"start_line": 1, "end_line": 1, "replacement": "new"}]),
+    ("", [{"start_line": 0, "end_line": 0, "replacement": "new"}] * 2),
+    ("", [{"start_line": False, "end_line": 0, "replacement": "new"}]),
+])
+def test_empty_insertion_does_not_relax_other_ranges(original, edits) -> None:
+    with pytest.raises(SourceEditContractError):
+        apply_line_edits(original, edits)
