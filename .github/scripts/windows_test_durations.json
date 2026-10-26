@@ -1021,6 +1021,7 @@
     "tests/test_release_oss_mirror_workflow.py": 7.527,
     "tests/test_request_proof_levers.py": 0.147,
     "tests/test_root_start_scripts.py": 0.01,
+    "tests/test_router_explicit_provider_save.py": 0.01,
     "tests/test_router_tier_contract.py": 0.423,
     "tests/test_runtime_packs/test_catalog.py": 0.089,
     "tests/test_runtime_packs/test_runtime_pack_manager.py": 6.264,

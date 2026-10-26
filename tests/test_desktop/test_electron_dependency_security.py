@@ -41,8 +41,8 @@ def test_electron_runtime_yaml_parser_includes_empty_merge_source_dos_fix() -> N
     [
         ("js-yaml", (4, 3, 2)),
         ("@xmldom/xmldom", (0, 8, 15)),
-        ("fast-uri", (3, 1, 6)),
-        ("electron", (42, 5, 1)),
+        ("fast-uri", (3, 1, 9)),
+        ("electron", (42, 11, 16)),
         ("http-cache-semantics", (4, 3, 0)),
     ],
 )
@@ -68,9 +68,9 @@ def test_undici_security_floors_preserve_supported_parent_major_versions() -> No
     for version in versions:
         # node-gyp still uses 6.x; forcing it onto 7.x would bypass its contract.
         if version[0] == 6:
-            assert version >= (6, 28, 0)
+            assert version >= (6, 29, 1)
         else:
-            assert version >= (7, 29, 0)
+            assert version >= (7, 30, 1)
 
 
 def test_installer_downloader_removes_unpatched_formatter_dependency() -> None:

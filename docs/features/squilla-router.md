@@ -89,6 +89,17 @@ The reset button replaces the current ladder with that provider's recommendation
 including saved or unsaved custom tiers. Other primary providers do not show this
 shortcut. Restoring tiers keeps the current usage mode.
 
+Saving explicit provider and model selections for executable text tiers enables
+cross-provider routing automatically. Each selected provider uses its own configured
+profile; no additional settings switch is needed. This also applies when saving an
+existing mixed tier table after an upgrade. An explicit `crossProviderTiers: false`
+API option remains authoritative.
+
+Loading saved settings, switching the primary provider, or re-enabling routing
+without submitting tier selections does not enable cross-provider execution.
+Existing primary-switch and legacy-router conflict checks still apply. Dormant
+single-model settings under a static C3 fusion plan do not enable it either.
+
 C3 can optionally use the shared multi-model fusion plan configured under
 `llm_ensemble`. Enabling fusion on C3 makes it use that plan instead of its
 single-model route. If the plan falls back to a single model, it uses the global

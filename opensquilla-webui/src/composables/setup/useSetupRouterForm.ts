@@ -410,7 +410,7 @@ export function useSetupRouterForm() {
     currentEnsembleGloballyEnabled = false,
     currentTierEnsembleStatus?: unknown,
   ) {
-    activeProvider.value = provider.toLowerCase()
+    activeProvider.value = provider.trim().toLowerCase()
     crossProviderTiers.value = router.cross_provider_tiers === true
     tierProviderMismatch.value = router.tier_provider_mismatch === 'veto' ? 'veto' : 'route'
     refreshRuntimeMetadata(providerRoles, currentTierEnsembleStatus)
@@ -494,6 +494,9 @@ export function useSetupRouterForm() {
               : false,
           ensembleSelectionMode: dynamicMember ? tier.ensembleSelectionMode : '',
         },
+      }
+      if (!dynamicMember && (tier.ensembleEnabled === true || tier.ensembleSelectionMode)) {
+        providerRoleContextDirty.value = true
       }
       return
     }
@@ -599,7 +602,18 @@ export function useSetupRouterForm() {
           ? 'recommended'
           : 'custom'
     const body = buildRouterPayload(mode, routerDefaultTier.value, tierValues.value)
-    if (crossProviderTiers.value) {
+    // This payload explicitly saves the tier table. Honor its complete foreign
+    // deployments without requiring a separate, hidden permission. Loading the
+    // form, changing presentation, and primary-provider activation do not submit it.
+    const submittedForeignDeployment = mode !== 'disabled' && Boolean(activeProvider.value)
+      && Object.entries(tierValues.value).some(([name, tier]) => {
+        if (!(TEXT_TIERS as readonly string[]).includes(name)
+          || !routerTierProviderParticipates(name, tier, routerProviderRoles.value)) return false
+        const provider = tier.provider.trim().toLowerCase()
+        const model = tier.model.trim()
+        return Boolean(provider && model && provider !== activeProvider.value)
+      })
+    if (crossProviderTiers.value || submittedForeignDeployment) {
       body.crossProviderTiers = true
       body.tierProviderMismatch = tierProviderMismatch.value
     }

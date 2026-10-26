@@ -2987,6 +2987,7 @@ def test_webui_chat_recovery_runs_the_verified_dist_through_gateway() -> None:
         "topbar-global-controls.spec.ts",
         "topbar-visual.spec.ts",
         "router-physical-model.spec.ts",
+        "router-provider-save.spec.ts",
         "queue-steer.spec.ts",
         "session-created-card.spec.ts",
         "session-chat-reliability.real.spec.ts",

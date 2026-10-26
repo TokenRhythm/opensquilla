@@ -110,6 +110,31 @@ def router_provider_conflicts(config: Any, provider_id: str) -> tuple[str, ...]:
     )
 
 
+def explicitly_selects_cross_provider_tier(
+    candidate: Any,
+    submitted_tiers: Mapping[str, Any] | None,
+) -> bool:
+    """A submitted provider/model pair selects that tier's execution endpoint.
+
+    Only the dedicated tier-authoring mutation uses this intent. Loading a
+    legacy ladder, switching the primary or reactivating saved routes must not
+    infer it from the resulting configuration alone. Dormant fusion drafts and
+    the retired image tier do not select an executable deployment.
+    """
+    submitted = normalize_tier_mapping(submitted_tiers)
+    primary = str(candidate.llm.provider).strip().lower()
+    for tier, provider, _ in executable_router_dependencies(candidate):
+        value = submitted.get(tier)
+        if (
+            provider != primary
+            and isinstance(value, Mapping)
+            and str(value.get("provider") or "").strip().lower() == provider
+            and str(value.get("model") or "").strip()
+        ):
+            return True
+    return False
+
+
 def validate_router_candidate(
     candidate: Any,
     *,

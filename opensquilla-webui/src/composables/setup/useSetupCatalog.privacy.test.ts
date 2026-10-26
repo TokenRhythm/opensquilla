@@ -528,6 +528,137 @@ afterEach(() => {
   document.body.innerHTML = ''
 })
 
+describe('explicit cross-provider Router saves', () => {
+  async function scenario(permission?: boolean, existingForeign = false) {
+    let rejectNextSave = false
+    const result = await primaryTransitionScenario(false, (method, params) => {
+      if (method === 'onboarding.router.configure') {
+        if (rejectNextSave) {
+          rejectNextSave = false
+          throw new SetupWorkflowError('invalid', 'Synthetic deployment rejection', 'router-invalid')
+        }
+        Object.assign(result.saved.squilla_router, {
+          tiers: structuredClone(params?.tiers),
+          default_tier: params?.defaultTier,
+          cross_provider_tiers: params?.crossProviderTiers === true,
+        })
+      }
+      return { changed: true }
+    })
+    if (permission !== undefined) Object.assign(result.saved.squilla_router, { cross_provider_tiers: permission })
+    if (existingForeign) result.saved.squilla_router.tiers.c1 = { provider: 'tokenrhythm', model: 'saved-foreign-model' }
+    await result.api.loadData()
+    rpcCall.mockClear()
+    return { ...result, rejectNextSave: () => { rejectNextSave = true } }
+  }
+
+  it.each([
+    ['new missing permission', undefined, false],
+    ['new disabled permission', false, false],
+    ['upgraded enabled permission', true, true],
+    ['upgraded disabled permission', false, true],
+  ] as const)('saves an explicitly selected foreign deployment for %s', async (_name, permission, existingForeign) => {
+    const { api, app } = await scenario(permission, existingForeign)
+    try {
+      expect(api.sectionDirty('modelStrategy')).toBe(false)
+      expect(rpcCall).not.toHaveBeenCalledWith('onboarding.router.configure', expect.anything())
+      api.updateTierField('c1', 'provider', 'tokenrhythm')
+      api.updateTierField('c1', 'model', 'selected-foreign-model')
+
+      expect(await api.saveModelStrategy()).toBe(true)
+      expect(rpcCall).toHaveBeenCalledWith('onboarding.router.configure', expect.objectContaining({
+        crossProviderTiers: true,
+        tiers: expect.objectContaining({ c1: expect.objectContaining({ provider: 'tokenrhythm', model: 'selected-foreign-model' }) }),
+      }))
+      expect(api.modelStrategyPanel.value.routingSummary?.crossProviderEnabled).toBe(true)
+      expect(api.sectionDirty('modelStrategy')).toBe(false)
+      expect(confirmChoiceAction).not.toHaveBeenCalled()
+    } finally { app.unmount() }
+  })
+
+  it('submits the existing foreign table when saving a changed default tier', async () => {
+    const { api, app } = await scenario(false, true)
+    try {
+      api.setRouterDefaultTier('c0')
+      expect(await api.saveModelStrategy()).toBe(true)
+      expect(rpcCall).toHaveBeenCalledWith('onboarding.router.configure', expect.objectContaining({
+        defaultTier: 'c0', crossProviderTiers: true,
+        tiers: expect.objectContaining({ c1: expect.objectContaining({ provider: 'tokenrhythm', model: 'saved-foreign-model' }) }),
+      }))
+    } finally { app.unmount() }
+  })
+
+  it('does not submit the tier table on load, a clean save, or a visual-only save', async () => {
+    const { api, app } = await scenario(false, true)
+    try {
+      expect(await api.saveModelStrategy()).toBe(true)
+      api.setRouterVisualMode('legacy_grid')
+      expect(await api.saveModelStrategy()).toBe(true)
+
+      expect(rpcCall).not.toHaveBeenCalledWith('onboarding.router.configure', expect.anything())
+      expect(rpcCall).toHaveBeenCalledWith('config.patch.safe', {
+        patches: { 'squilla_router.visual_mode': 'legacy_grid' },
+      })
+      expect(api.modelStrategyPanel.value.routingSummary?.crossProviderEnabled).toBe(false)
+    } finally { app.unmount() }
+  })
+
+  it('retains a rejected foreign deployment for an explicit retry', async () => {
+    const { api, app, rejectNextSave } = await scenario(false)
+    try {
+      api.updateTierField('c1', 'provider', 'tokenrhythm')
+      api.updateTierField('c1', 'model', 'retained-foreign-model')
+      rejectNextSave()
+      expect(await api.saveModelStrategy()).toBe(false)
+      expect(api.sectionDirty('modelStrategy')).toBe(true)
+      expect(api.routerPanel.value.tierRows.find(row => row.name === 'c1')).toMatchObject({
+        provider: 'tokenrhythm', model: 'retained-foreign-model',
+      })
+      expect(rpcCall.mock.calls.filter(([method]) => method === 'onboarding.router.configure')).toHaveLength(1)
+
+      expect(await api.saveModelStrategy()).toBe(true)
+      expect(rpcCall.mock.calls.filter(([method]) => method === 'onboarding.router.configure')).toHaveLength(2)
+      expect(api.sectionDirty('modelStrategy')).toBe(false)
+    } finally { app.unmount() }
+  })
+
+  it('keeps primary activation on the conflict-protected path without submitting tiers', async () => {
+    const { api, app } = await primaryTransitionScenario(false, method => {
+      if (method === 'onboarding.llmProfile.activate') throw routerConflictForPrimary()
+      return { changed: true }
+    })
+    try {
+      await api.activateProvider('tokenrhythm')
+      expect(confirmChoiceAction).toHaveBeenCalledOnce()
+      expect(rpcCall).toHaveBeenCalledWith('onboarding.llmProfile.activate', {
+        providerId: 'tokenrhythm', imageGenerationIntent: 'preserve',
+      })
+      expect(rpcCall).not.toHaveBeenCalledWith('onboarding.router.configure', expect.anything())
+      expect(api.modelStrategyPanel.value.routingSummary?.providerId).toBe('openrouter')
+    } finally { app.unmount() }
+  })
+
+  it('keeps mode-only activation on the conflict-protected path without submitting tiers', async () => {
+    const { api, app, saved } = await scenario(false, true)
+    const originalRpc = rpcCall.getMockImplementation()!
+    rpcCall.mockImplementation(async (method: string, params?: Record<string, unknown>) => {
+      if (method === 'models.routing.set') throw routerConflictForPrimary()
+      return originalRpc(method, params)
+    })
+    try {
+      saved.squilla_router.enabled = false
+      await api.loadData()
+      await api.setModelStrategy('router')
+
+      expect(confirmChoiceAction).toHaveBeenCalledOnce()
+      expect(rpcCall).toHaveBeenCalledWith('models.routing.set', { mode: 'router' })
+      expect(rpcCall).not.toHaveBeenCalledWith('onboarding.router.configure', expect.anything())
+      expect(api.modelStrategyPanel.value.activeStrategy).toBe('single')
+      expect(api.modelStrategyPanel.value.routingSummary?.crossProviderEnabled).toBe(false)
+    } finally { app.unmount() }
+  })
+})
+
 describe('provider readiness indicator', () => {
   function mockReadiness(snapshot: Record<string, unknown>, save?: () => void) {
     rpcCall.mockImplementation(async (method: string) => {

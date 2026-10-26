@@ -157,6 +157,12 @@ class SetupEngine:
                 mode=str(payload.get("mode", "recommended")),
                 default_tier=payload.get("defaultTier"),
                 tiers=payload.get("tiers"),
+                cross_provider_tiers=(
+                    _strict_bool(payload["crossProviderTiers"], field="crossProviderTiers")
+                    if payload.get("crossProviderTiers") is not None
+                    else None
+                ),
+                tier_provider_mismatch=_optional_str(payload.get("tierProviderMismatch")),
             )
         elif normalized in ENSEMBLE_SECTION_ALIASES:
             # Keep-current semantics ride the mutation: keys absent from the

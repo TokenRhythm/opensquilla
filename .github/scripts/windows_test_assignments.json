@@ -199,6 +199,7 @@
       "tests/test_provider_tool_stream_accumulator.py",
       "tests/test_provider_trace_recorder.py",
       "tests/test_redaction.py",
+      "tests/test_router_explicit_provider_save.py",
       "tests/test_safety/test_run_sandboxed_proc_cleanup.py",
       "tests/test_sandbox/test_approval_runtime.py",
       "tests/test_sandbox/test_authority_paths.py",
