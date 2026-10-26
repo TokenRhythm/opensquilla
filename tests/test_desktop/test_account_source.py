@@ -110,6 +110,7 @@ async def test_proxy_transport_preserves_identity_and_rejects_arbitrary_targets(
         )
         assert response.request.url.host == "tokenrhythm.studio"
         assert seen[0].url.host == "127.0.0.1"
+        assert seen[0].headers["host"] == "127.0.0.1:12345"
         assert seen[0].headers["authorization"] == "Bearer " + lease
         for url in [
             "https://evil.invalid/v1/models",
@@ -120,6 +121,72 @@ async def test_proxy_transport_preserves_identity_and_rejects_arbitrary_targets(
             with pytest.raises(httpx.TransportError):
                 await client.get(url)
     assert len(seen) == 1
+
+
+@pytest.mark.asyncio
+async def test_account_provider_streams_through_real_loopback_proxy(monkeypatch):
+    import asyncio
+
+    from opensquilla.provider.openai import OpenAIProvider
+    from opensquilla.provider.types import ChatConfig, ErrorEvent, Message, TextDeltaEvent
+
+    requests = []
+
+    async def handle(reader, writer):
+        try:
+            head = await reader.readuntil(b"\r\n\r\n")
+            lines = head.decode("ascii").split("\r\n")
+            headers = {
+                name.lower(): value
+                for name, value in (line.split(": ", 1) for line in lines[1:] if ": " in line)
+            }
+            body = await reader.readexactly(int(headers["content-length"]))
+            requests.append((lines[0], headers, body))
+            response = (
+                b'data: {"choices":[{"delta":{"content":"OK"},"finish_reason":null}]}\n\n'
+                b'data: {"choices":[{"delta":{},"finish_reason":"stop"}],'
+                b'"usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}}\n\n'
+                b'data: [DONE]\n\n'
+            )
+            writer.write(
+                b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: "
+                + str(len(response)).encode("ascii")
+                + b"\r\nConnection: close\r\n\r\n" + response
+            )
+            await writer.drain()
+        except asyncio.IncompleteReadError:
+            # Before the Host fix, HTTPX connected and rejected its own request.
+            pass
+        finally:
+            writer.close()
+            await writer.wait_closed()
+
+    server = await asyncio.start_server(handle, "127.0.0.1", 0)
+    async with server:
+        port = server.sockets[0].getsockname()[1]
+        lease = signed_in()["credential"]
+        monkeypatch.setitem(bridge._leases, lease, f"http://127.0.0.1:{port}")
+        provider = OpenAIProvider(
+            api_key=lease, model="deepseek-flash", base_url=bridge.OFFICIAL_BASE,
+            provider_kind="tokenrhythm",
+        )
+
+        async def collect():
+            return [event async for event in provider.chat(
+                [Message(role="user", content="hello")], None, ChatConfig(max_tokens=16),
+            )]
+
+        events = await asyncio.wait_for(collect(), timeout=5)
+
+    assert not [event for event in events if isinstance(event, ErrorEvent)]
+    assert "".join(event.text for event in events if isinstance(event, TextDeltaEvent)) == "OK"
+    assert events[-1].kind == "done"
+    assert len(requests) == 1
+    request_line, headers, body = requests[0]
+    assert request_line == "POST /v1/chat/completions HTTP/1.1"
+    assert headers["host"] == f"127.0.0.1:{port}"
+    assert headers["authorization"] == "Bearer " + lease
+    assert b'"hello"' in body
 
 
 def test_account_provider_factory_cannot_fall_back_to_saved_key():

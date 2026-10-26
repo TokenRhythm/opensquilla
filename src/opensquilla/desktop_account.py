@@ -243,11 +243,14 @@ class AccountProxyTransport(httpx.AsyncBaseTransport):
         if not allowed:
             raise httpx.TransportError("Account model route is not supported")
         headers = httpx.Headers(request.headers)
-        headers.pop("host", None)
+        forwarded_url = httpx.URL(self._endpoint + path)
+        # With an explicit stream HTTPX does not generate a Host header.
+        # Replace the upstream authority with the loopback proxy's authority.
+        headers["host"] = forwarded_url.netloc.decode("ascii")
         headers["authorization"] = f"Bearer {self._credential}"
         forwarded = httpx.Request(
             request.method,
-            self._endpoint + path,
+            forwarded_url,
             headers=headers,
             stream=request.stream,
             extensions=request.extensions,
