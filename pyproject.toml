@@ -32,7 +32,7 @@ dependencies = [
     "multidict>=6.9.1",
     "idna>=3.19",
     "urllib3>=2.7.0",
-    "brotli>=1.1",
+    "brotli>=1.2.1",
     "jinja2>=3.1",
     "structlog>=26.1.0",
     # The compact help renderer adapts Typer's private Rich panel hook.
@@ -66,7 +66,7 @@ dependencies = [
     "python-docx>=1.1.0",
     "python-pptx>=1.0.0",
     "openpyxl>=3.1.0",
-    "pypdf>=6.21.1",
+    "pypdf>=6.21.2",
     "reportlab>=4.0.0",
     "lark-oapi>=1.5.5,<1.6",
     "python-telegram-bot>=22.8",
@@ -276,3 +276,10 @@ dev = [
 
 [tool.uv]
 conflicts = [[{ group = "dev" }, { group = "legacy-contract-codegen" }]]
+# Keep optional and build-only transitive dependencies above their security
+# floors without adding them to the base runtime installation.
+constraint-dependencies = [
+    "brotlicffi>=1.2.1.0",
+    "filelock>=4.2.1",
+    "setuptools>=84.1.0",
+]
