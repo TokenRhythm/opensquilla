@@ -163,6 +163,41 @@ async def test_physical_stream_adaptor_rejects_wire_body_without_http_or_unknown
     assert sink.unknown == []
 
 
+async def test_local_character_budget_rejection_is_not_a_provider_usage_gap(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    provider = OpenAIProvider(
+        api_key="synthetic-key",
+        model="synthetic-model",
+        base_url="https://example.test/v1",
+    )
+
+    def unexpected_stream(*args: Any, **kwargs: Any) -> None:
+        del args, kwargs
+        raise AssertionError("local budget rejection must precede HTTP dispatch")
+
+    monkeypatch.setattr(httpx.AsyncClient, "stream", unexpected_stream)
+    sink = _Sink()
+    with bind_usage_accounting_scope(_scope(sink)):
+        events = [
+            event
+            async for event in account_provider_stream(
+                lambda: provider.chat(
+                    [Message(role="user", content="synthetic input")],
+                    config=ChatConfig(provider_request_max_chars=1),
+                ),
+                provider="synthetic-provider",
+                model="synthetic-model",
+            )
+        ]
+
+    assert len(events) == 1
+    assert isinstance(events[0], ErrorEvent)
+    assert events[0]._opensquilla_request_not_dispatched is True
+    assert [call.event_id for call in sink.not_sent] == [sink.started[0].event_id]
+    assert sink.unknown == []
+
+
 async def test_physical_stream_does_not_trust_upstream_budget_prose() -> None:
     sink = _Sink()
 
@@ -255,9 +290,9 @@ async def test_real_http_413_remains_unknown_after_provider_dispatch(
     assert [call.event_id for call, _ in sink.unknown] == [sink.started[0].event_id]
 
 
-def test_wire_rejection_marker_requires_exact_local_proof() -> None:
-    false_proof = dict(_WIRE_PROOF, wire_json_bytes=100)
-    assert local_budget_rejection_event(false_proof)._opensquilla_request_not_dispatched is False
+def test_local_budget_factory_marks_all_pre_dispatch_rejections() -> None:
+    character_proof = {"fits": False, "fits_char_budget": False, "proof_budget": 1}
+    assert local_budget_rejection_event(character_proof)._opensquilla_request_not_dispatched
     assert local_budget_rejection_event(_WIRE_PROOF)._opensquilla_request_not_dispatched is True
     assert replace(
         local_budget_rejection_event(_WIRE_PROOF), generation_epoch=2

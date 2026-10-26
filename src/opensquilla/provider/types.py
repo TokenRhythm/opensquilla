@@ -262,8 +262,8 @@ class ErrorEvent:
     # Trusted transport evidence, distinct from broad retry classifications.
     # Unknown extensions and protocol/consumer failures cannot authorize replay.
     recovery_origin: RecoveryOrigin = "unknown"
-    # Set only by a local adapter after its final wire-body proof rejects the
-    # request before HTTP dispatch. Never inferred from provider response text.
+    # Set only by a local adapter after its final request-budget proof rejects
+    # the request before HTTP dispatch. Never inferred from provider response text.
     _opensquilla_request_not_dispatched: bool = field(default=False, repr=False)
 
 

@@ -153,23 +153,17 @@ ProviderRequestBudgetExceeded = ProviderRequestBudgetExceededError
 
 
 def local_budget_rejection_event(proof: dict[str, Any]) -> ErrorEvent:
-    """Build a budget error with trusted evidence of a rejected wire body."""
+    """Build a budget error for an adapter rejection before HTTP dispatch."""
 
     event = ErrorEvent(
         message=json.dumps(proof, ensure_ascii=False, sort_keys=True),
         code="provider_request_budget_exhausted",
     )
-    used = proof.get("wire_json_bytes")
-    limit = proof.get("wire_body_max_bytes")
-    if (
-        proof.get("wire_byte_budget_exhausted") is True
-        and proof.get("fits_wire_byte_budget") is False
-        and type(used) is int
-        and type(limit) is int
-        and limit > 0
-        and used > limit
-    ):
-        event._opensquilla_request_not_dispatched = True
+    # This factory is called only from an adapter's local budget branches,
+    # before opening the transport. Character and token rejections are just
+    # as unsent as wire-byte rejections. Upstream errors are constructed by
+    # the HTTP handlers and cannot acquire this private dispatch evidence.
+    event._opensquilla_request_not_dispatched = True
     return event
 
 
