@@ -572,9 +572,9 @@ docker build -t opensquilla:local .
 | **省 Token 的路由** | `SquillaRouter`——`recommended` extra 中一个本地的 LightGBM + ONNX 分类器——会按长度、语言、代码、关键词和语义嵌入给每一轮打分，再在四个分级（C0–C3；旧的 T0–T3 命名是其别名）里把它分派给能胜任的最便宜模型。分类在本机上完成；为了做这个判断，你的提示词不会离开本机。 |
 | **自适应推理与提示** | OpenSquilla 仅对路由判定为复杂的轮次请求扩展推理，系统提示也随任务复杂度伸缩——简单轮次用轻量提示，复杂轮次用完整指令。 |
 | **20+ 个 LLM 提供商** | 提供商注册表面向 20 多个 LLM 后端——TokenRhythm、OpenRouter、OpenAI、Anthropic、Ollama、DeepSeek、Gemini、DashScope/Qwen、Moonshot、Mistral、Groq、Zhipu、SiliconFlow、vLLM、LM Studio 等等，并支持主用 + 回退选择；首次 onboarding 会暴露已验证的子集。 |
-| **按需技能与 MCP** | 15 个内置技能(coding、GitHub、cron、pptx/docx/xlsx/pdf、摘要、tmux、天气等)仅在任务需要时加载。OpenSquilla 是 MCP 客户端，也可以作为 MCP 服务端运行——`opensquilla mcp-server run` 需要 `mcp` extra(安装 `opensquilla[recommended,mcp]`)。技能可以从 CLI 编写、安装和发布。 |
+| **按需技能与 MCP** | 15 个内置技能(coding、GitHub、cron、pptx/docx/xlsx/pdf、摘要、tmux、天气等)仅在任务需要时加载。当前源码已内置 MCP 客户端与服务端支持；SDK 2.x 的安装步骤见 [MCP 设置](docs/mcp-server.md#requirements)，随后运行 `opensquilla mcp-server run` 即可把会话工作流暴露给另一个 MCP 客户端。技能可以从 CLI 编写、安装和发布。 |
 | **持久化本地记忆** | 一份精选的 `MEMORY.md` 加上带日期的 Markdown 笔记，通过 SQLite 全文关键词搜索和 `sqlite-vec` 语义召回来检索。嵌入通过内置 ONNX 在设备端运行，也可切换到 OpenAI/Ollama。可选的指数衰减和需主动启用的“做梦(dream)”记忆整合也可用。 |
-| **分层安全沙箱** | 基于权限矩阵的三档策略（Standard / Strict / Locked）。在 Linux 上 Bubblewrap 隔离代码执行；macOS 的 Seatbelt 后端目前只生成 profile（尚未真正执行），Windows 上则还没有沙箱后端。拒绝账本（denial ledger）会在反复拒绝后自动暂停自主运行，清除被拒的输出；技能元数据和工具结果也会做 XML 转义，以防提示注入。 |
+| **分层安全沙箱** | 基于权限矩阵的三档策略（Standard / Strict / Locked）。在 Linux 上 Bubblewrap 隔离代码执行；macOS 通过 Seatbelt（`sandbox-exec`）以生成的 SBPL profile 运行命令；Windows 在就绪检查通过后使用原生 `windows_default` 后端。拒绝账本（denial ledger）会在反复拒绝后自动暂停自主运行，清除被拒的输出；技能元数据和工具结果也会做 XML 转义，以防提示注入。 |
 | **内置工具** | 文件读/写/编辑、shell 与后台进程、git、网络搜索（DuckDuckGo、Bocha、Brave、Tavily 或 Exa），以及带 SSRF 防护的网页抓取、电子表格/PPTX/PDF 创作、图像生成，以及文本转语音。 |
 | **统一网关** | 一个运行在 `127.0.0.1:18791` 上、带 WebSocket RPC 和内嵌控制台(`/control/`)的 Starlette ASGI 服务。Web UI、CLI，以及 Terminal、WebSocket、Slack、Telegram、Discord、Feishu、DingTalk、WeCom、Matrix、QQ 这些渠道，都共用同一个 `TurnRunner`。 |
 | **持久会话、子 Agent 与调度** | 由 SQLite 支撑的会话、转录和回放存储，并带有按 Agent 隔离的工作区。Agent 可以派生深度受限的子 Agent；`SchedulerEngine` 内置了 cron 解析器，会通过 `opensquilla cron` 运行周期性作业。 |
