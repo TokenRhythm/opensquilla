@@ -49,6 +49,31 @@ test('account links resolve against the configured production or UAT origin',asy
   }
  }
 })
+test('UAT OAuth, account APIs and model requests all use the packaged test origin', async t => {
+ const origin = 'https://gpt.tokenrhythm.studio'
+ const f = await fixture(t, { origin, beforeFetch: async url => assert.equal(new URL(url).origin, origin) })
+ await f.login()
+ assert.equal(new URL(f.opened).origin, origin)
+ assert.equal(new URL(f.opened).pathname, '/api/oauth/authorize')
+ const { PassThrough } = await import('node:stream')
+ const seen = []
+ const request = (url, options, callback) => {
+  seen.push(String(url))
+  const stream = new PassThrough(); stream.setTimeout = () => stream; stream.resume()
+  stream.on('finish', () => {
+   const response = new PassThrough(); response.statusCode = 200; response.headers = { 'content-type': 'application/json' }
+   callback(response); response.end(JSON.stringify({ id: 'uat-video-1' }))
+  })
+  return stream
+ }
+ const proxy = new TokenRhythmModelProxy(f.account, request); t.after(() => proxy.close())
+ const env = await proxy.start(), lease = (await f.account.runtimeState()).credential
+ for (const path of ['/v1/chat/completions', '/v1/images/generations', '/v1/videos/generations']) {
+  const response = await fetch(env.OPENSQUILLA_DESKTOP_ACCOUNT_URL + path, { method: 'POST', headers: { Authorization: 'Bearer ' + lease }, body: '{}' })
+  assert.equal(response.status, 200); await response.text()
+ }
+ assert.deepEqual(seen, ['/v1/chat/completions', '/v1/images/generations', '/v1/videos/generations'].map(path => origin + path))
+})
 test('old absolute same-origin links remain compatible and invalid links never open',async t=>{
  const f=await fixture(t,{links:{account:'https://tokenrhythm.studio/account/account',usage:'/account',recharge:'/account/recharge'}});await f.login()
  await f.account.openLink('account');assert.equal(f.opened,'https://tokenrhythm.studio/account/account')

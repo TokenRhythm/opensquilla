@@ -6,22 +6,40 @@ import { fileURLToPath } from 'node:url'
 
 const scriptPath = fileURLToPath(import.meta.url)
 const packageRoot = resolve(dirname(scriptPath), '..')
+const testOutputDirectory = resolve(packageRoot, '../../dist/desktop-electron/test')
+
+export function createLocalTestBuildConfig(now = new Date()) {
+  const parts = new Intl.DateTimeFormat('en-GB', {
+    timeZone: 'Asia/Shanghai', year: 'numeric', month: '2-digit', day: '2-digit',
+    hour: '2-digit', minute: '2-digit', second: '2-digit', hourCycle: 'h23',
+  }).formatToParts(now)
+  const part = type => parts.find(item => item.type === type).value
+  const stamp = `${part('year')}${part('month')}${part('day')}-${part('hour')}${part('minute')}${part('second')}`
+  return {
+    directories: { output: testOutputDirectory },
+    extraMetadata: {
+      version: `0.5.8-test-${stamp}`,
+      opensquillaTokenRhythmOrigin: 'https://gpt.tokenrhythm.studio',
+    },
+  }
+}
 
 export function parseLocalBuildArgs(args) {
   const [mode, ...flags] = args
   if (!['pack', 'dist'].includes(mode)
-    || flags.length > 1
-    || (flags.length === 1 && flags[0] !== '--prepared')) {
-    throw new Error('Usage: node scripts/build-local.mjs pack|dist [--prepared]')
+    || new Set(flags).size !== flags.length
+    || flags.some(flag => !['--prepared', '--test'].includes(flag))) {
+    throw new Error('Usage: node scripts/build-local.mjs pack|dist [--prepared] [--test]')
   }
-  return { mode, prepared: flags.includes('--prepared') }
+  return { mode, prepared: flags.includes('--prepared'), test: flags.includes('--test') }
 }
 
-function runNpmScript(script) {
+function runNpmScript(script, env = process.env) {
   const npmCli = process.env.npm_execpath
   const result = spawnSync(npmCli ? process.execPath : 'npm',
     npmCli ? [npmCli, 'run', script] : ['run', script], {
       cwd: packageRoot,
+      env,
       stdio: 'inherit',
       shell: !npmCli && process.platform === 'win32',
     })
@@ -85,12 +103,12 @@ export async function withLocalMacBuildEnvironment(callback, env = process.env) 
   }
 }
 
-async function buildLocalMac(mode) {
+async function buildLocalMac(mode, overrides = {}) {
   const [{ build, createTargets, Platform }, { signAsync }, signing] = await Promise.all([
     import('electron-builder'), import('@electron/osx-sign'), import('./mac-local-signing.mjs'),
   ])
   await signing.withLocalMacSigning(async (identity) => {
-    const config = createLocalMacBuildConfig(identity, { signAsync, ...signing })
+    const config = { ...createLocalMacBuildConfig(identity, { signAsync, ...signing }), ...overrides }
     const installedElectronDist = join(packageRoot, 'node_modules', 'electron', 'dist')
     if (existsSync(join(installedElectronDist, 'Electron.app'))) {
       config.electronDist = installedElectronDist
@@ -104,21 +122,42 @@ async function buildLocalMac(mode) {
   })
 }
 
-export async function runLocalBuild({ mode, prepared }, {
+async function buildLocalWindowsTest(mode, overrides) {
+  const { build, Platform, Arch } = await import('electron-builder')
+  await withLocalMacBuildEnvironment(() => build({
+    projectDir: packageRoot,
+    targets: Platform.WINDOWS.createTarget(mode === 'pack' ? 'dir' : 'nsis', Arch.x64),
+    publish: 'never',
+    config: { ...overrides, forceCodeSigning: false, win: { signExecutable: false } },
+  }))
+}
+
+export async function runLocalBuild({ mode, prepared, test = false }, {
   platform = process.platform, runScript = runNpmScript, buildMac = buildLocalMac,
+  buildWindowsTest = buildLocalWindowsTest,
 } = {}) {
-  if (platform !== 'darwin') {
+  if (platform !== 'darwin' && !test) {
     await runScript(`${mode}${prepared ? ':prepared' : ''}`)
     return
   }
+  if (platform !== 'darwin' && platform !== 'win32') throw new Error('Local test packaging requires macOS or Windows.')
   if (!prepared) {
     await runScript('build:web')
     await runScript('build:gateway')
   }
   await runScript('build')
   await runScript('verify:prepared')
-  await buildMac(mode)
-  await runScript('verify:package')
+  const overrides = test ? createLocalTestBuildConfig() : {}
+  if (test) console.log(`Local test package: ${overrides.extraMetadata.version}; account/API origin: ${overrides.extraMetadata.opensquillaTokenRhythmOrigin}`)
+  if (platform === 'win32') await buildWindowsTest(mode, overrides)
+  else await buildMac(mode, overrides)
+  await runScript('verify:package', test
+    ? {
+      ...process.env, OPEN_SQUILLA_PACKAGE_OUTPUT: testOutputDirectory,
+      OPENSQUILLA_EXPECT_PACKAGE_VERSION: overrides.extraMetadata.version,
+      OPENSQUILLA_EXPECT_ACCOUNT_ORIGIN: overrides.extraMetadata.opensquillaTokenRhythmOrigin,
+    }
+    : process.env)
 }
 
 if (process.argv[1] && resolve(process.argv[1]) === scriptPath) {

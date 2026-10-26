@@ -31,6 +31,7 @@ function harness(account, { home = '/synthetic-profile', apply = async () => {},
   const calls = []
   const window = { loadFile: async () => {}, isDestroyed: () => false, webContents: { send() {} } }
   const env = {
+    tokenrhythmAccountOrigin: origin,
     AccountError, pauseAccountsForMaintenance, createHash, randomUUID, join,
     AbortSignal: { timeout: () => AbortSignal.timeout(timeoutMs) },
     process: { env: {}, platform: 'darwin' },

@@ -3,6 +3,7 @@ import electronUpdater from 'electron-updater'
 import { parse as parseToml } from 'smol-toml'
 import { TokenRhythmAccount, AccountError, hasSavedModelConnection, pauseAccountsForMaintenance, type AccountMaintenancePause } from './tokenrhythm-account.js'
 import { TokenRhythmModelProxy } from './tokenrhythm-model-proxy.js'
+import { resolveAccountOrigin } from './tokenrhythm-environment.js'
 import type { AccountAction, AccountLink, AccountMediaSource, ModelCredentialSource } from '../../../contracts/desktop/tokenrhythm-account.js'
 import { spawn, spawnSync, type ChildProcess, type ChildProcessWithoutNullStreams } from 'node:child_process'
 import { createHash, randomUUID } from 'node:crypto'
@@ -630,6 +631,10 @@ if (channelUserData !== resolve(app.getPath('userData'))) {
   app.setPath('userData', channelUserData)
 }
 const packageRoot = resolve(__dirname, '..')
+const tokenrhythmAccountOrigin = resolveAccountOrigin(
+  JSON.parse(readFileSync(join(packageRoot, 'package.json'), 'utf8')).opensquillaTokenRhythmOrigin,
+  process.env.OPENSQUILLA_TOKENRHYTHM_ORIGIN,
+)
 const defaultRepoRoot = resolve(packageRoot, '..', '..')
 const repoRoot = process.env.OPENSQUILLA_DESKTOP_REPO_ROOT
   ? resolve(process.env.OPENSQUILLA_DESKTOP_REPO_ROOT)
@@ -1906,7 +1911,7 @@ const LEGACY_TEXT_TIER_ALIASES: Record<string, TextRouterTier> = {
 function canonicalTierKey(name: string): string {
   return LEGACY_TEXT_TIER_ALIASES[name] ?? name
 }
-const TOKENRHYTHM_REGISTER_URL = 'https://tokenrhythm.studio/register'
+const TOKENRHYTHM_REGISTER_URL = new URL('/register', tokenrhythmAccountOrigin).href
 const PROVIDER_CATALOG: ProviderCatalogEntry[] = ([
   {
     id: 'tokenrhythm',
@@ -3500,7 +3505,7 @@ async function loadDesktopSettings(): Promise<DesktopSettingsSnapshot> {
 const desktopAccounts = new Map<string, { account: TokenRhythmAccount; proxy: TokenRhythmModelProxy }>()
 function desktopAccount() {
   const profile = activeDesktopProfile()
-  const origin = process.env.OPENSQUILLA_TOKENRHYTHM_ORIGIN || 'https://tokenrhythm.studio'
+  const origin = tokenrhythmAccountOrigin
   const identity = `${profile.home}\0${origin}`
   const existing = desktopAccounts.get(identity)
   if (existing) return existing

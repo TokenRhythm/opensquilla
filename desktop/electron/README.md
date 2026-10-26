@@ -195,6 +195,23 @@ outside the checkout. Every local bundle must retain the certificate-pinned
 application identity; signing or verification failure stops the build without
 an ad-hoc fallback. Local builds never publish artifacts.
 
+For an internal macOS or Windows UAT installer, run `npm run dist:local:test`. It embeds
+`https://gpt.tokenrhythm.studio` as the account/API origin in the application,
+so OAuth and account model requests use UAT even when launched from Finder.
+The app and installer version is `0.5.8-test-YYYYMMDD-HHMMSS` (Shanghai time).
+Test artifacts are written under `dist/desktop-electron/test/`; test versions
+use a separate `OpenSquilla-test` user data directory. Ordinary packaging keeps
+the source release version and production origin. The explicit runtime
+`OPENSQUILLA_TOKENRHYTHM_ORIGIN` override remains available.
+
+After a matching successful Gateway build, use
+`npm run dist:local:test:prepared` to rebuild only the desktop shell and installer.
+Windows test packaging runs on Windows, targets x64 NSIS and is unsigned.
+The `Windows UAT Test Installer` workflow builds the same package on Windows
+when a `test-windows-*` tag is pushed. It uploads `windows-uat-test-installer`
+without creating a GitHub Release or accessing the release signing environment.
+Manual dispatch is also available once the workflow is on the default branch.
+
 Signing passes the dedicated keychain explicitly, temporarily appends it to the
 existing ordered search list, and restores account preferences after success or
 failure. It does not change the default keychain or certificate trust. Retain

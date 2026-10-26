@@ -1,0 +1,73 @@
+name: Windows UAT Test Installer
+
+# Test tags are separate from the v* tags used by Release Assets.
+on:
+  push:
+    tags:
+      - 'test-windows-*'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build unsigned Windows x64 UAT installer
+    runs-on: windows-2022
+    timeout-minutes: 90
+    defaults:
+      run:
+        shell: pwsh
+    env:
+      PYTHONUTF8: '1'
+      PYTHONUNBUFFERED: '1'
+      CSC_IDENTITY_AUTO_DISCOVERY: 'false'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+          lfs: true
+          persist-credentials: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version-file: opensquilla-webui/.node-version
+          cache: npm
+          cache-dependency-path: |
+            opensquilla-webui/package-lock.json
+            desktop/electron/package-lock.json
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+      - name: Hydrate router assets
+        run: |
+          git lfs pull --include='src/opensquilla/squilla_router/models/v4.2_phase3_inference/**'
+          if ($LASTEXITCODE -ne 0) { throw 'Router LFS fetch failed' }
+      - name: Build and verify full Windows UAT package
+        working-directory: desktop/electron
+        run: |
+          npm ci
+          if ($LASTEXITCODE -ne 0) { throw 'Electron dependency installation failed' }
+          npm run dist:local:test
+          if ($LASTEXITCODE -ne 0) { throw 'Windows UAT packaging or verification failed' }
+      - name: Verify installer size and record checksum
+        run: |
+          python .github/scripts/verify_desktop_slim_size.py --root dist/desktop-electron/test --platform windows
+          if ($LASTEXITCODE -ne 0) { throw 'Windows installer exceeds the existing size budget' }
+          $installers = @(Get-ChildItem dist/desktop-electron/test -Filter 'OpenSquilla-0.5.8-test-*-win-x64.exe' -File)
+          if ($installers.Count -ne 1) { throw 'Expected exactly one Windows UAT test installer' }
+          $installer = $installers[0]
+          $digest = (Get-FileHash -LiteralPath $installer.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
+          "$digest  $($installer.Name)" | Set-Content -LiteralPath "$($installer.FullName).sha256" -Encoding utf8
+          "Windows UAT installer: $($installer.Name); source: $env:GITHUB_SHA; account/API origin: https://gpt.tokenrhythm.studio; unsigned." >> $env:GITHUB_STEP_SUMMARY
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows-uat-test-installer
+          path: |
+            dist/desktop-electron/test/OpenSquilla-0.5.8-test-*-win-x64.exe
+            dist/desktop-electron/test/*.sha256
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 14

@@ -18,7 +18,7 @@
 - `desktop/electron/src/tokenrhythm-account.ts` 独立负责 PKCE S256、动态回环回调、随机 state、稳定 installation_id、串行刷新、账号/钱包/Key 状态、退出及待撤销会话。
 - `tokenrhythm-model-proxy.ts` 仅接受受管 Gateway 的临时授权；固定 HTTPS 上游及方法/路径白名单，拒绝浏览器跨源调用、任意目标、查询参数和上游重定向。上游认证头由主进程设置。
 - 账号令牌和模型 Key 仅存于真实 Electron safeStorage 加密的 `account.enc`；临时文件原子替换。存储不可用时拒绝账号登录。显式 `--use-mock-keychain` / `--password-store=basic` 不允许真实账号登录，启动不再自动添加模拟钥匙串开关。
-- 每个 profile、每个官方环境隔离账号目录。正式域名为 `https://tokenrhythm.studio`；UAT 只能显式设置 `OPENSQUILLA_TOKENRHYTHM_ORIGIN=https://…`（无路径、查询、用户名密码）。后端返回的站点链接也需与该源一致。
+- 每个 profile、每个官方环境隔离账号目录。正式域名为 `https://tokenrhythm.studio`。macOS 本地测试包通过 `npm run dist:local:test` 内置 `https://gpt.tokenrhythm.studio`，版本为 `0.5.8-test-YYYYMMDD-HHMMSS`，并使用独立测试数据目录；也可显式设置 `OPENSQUILLA_TOKENRHYTHM_ORIGIN=https://…`（无路径、查询、用户名密码）覆盖站点。后端返回的站点链接也需与该源一致。
 - `contracts/desktop/tokenrhythm-account.d.ts` 是 renderer 的展示数据边界，无账号令牌、模型 Key 或本机代理凭证。
 - Gateway 启动环境中的 `OPENSQUILLA_DESKTOP_ACCOUNT_URL/TOKEN` 在加载工具和 dotenv 前移除。`src/opensquilla/desktop_account.py` 在私有进程内获取临时模型凭证，不写入 TOML。
 - 已有配置默认 `credential_source=manual`；新增账号专属连接可保存 `credential_source=account`，但真实账号绑定与 Key 均由加密账号模块持有。删除并存的手动连接保留账号模型/路由，并阻止环境 Key 补位。
