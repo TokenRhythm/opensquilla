@@ -346,7 +346,13 @@ export function projectConversationContent(payload: unknown, kind?: Conversation
     result.revision = Number(source.revision)
   }
   if (kind === 'warning') {
-    result.warningVisible = !['provider_reasoning_only_retry', 'provider_request_message_limit_recovery_success', 'context_auto_compaction_start', 'context_auto_compaction_retry'].includes(String(source.code || ''))
+    result.warningVisible = ![
+      'provider_reasoning_only_retry',
+      'provider_request_message_limit_recovery_success',
+      'context_auto_compaction_start',
+      'context_auto_compaction_retry',
+      'reasoning_replay_context_rebuilt',
+    ].includes(String(source.code || ''))
   }
   if (kind === 'turn-completed') {
     result.finalText = terminalText(source)

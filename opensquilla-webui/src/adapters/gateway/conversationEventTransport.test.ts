@@ -268,7 +268,7 @@ describe('conversation event transport adapter', () => {
     { event: 'done', wire: { usage: { input_tokens: '', inputTokens: 12, cost_usd: '', costUsd: 0.25, coverage_status: '', coverageStatus: 'partial', usage_unknown: '', usageUnknown: true } }, expected: { usage: { input_tokens: 0, cost_usd: 0, coverage_status: '', usage_unknown: false } } },
     { event: 'done', wire: { usage: { model_usage_breakdown: false, modelUsageBreakdown: [{ model: 'model-a', cost_usd: 1 }] } }, expected: { usage: { model_usage_breakdown: [{ model: 'model-a', cost_usd: 1 }] } } },
     { event: 'router_decision', wire: { accepted_routing_mode: '', acceptedRoutingMode: 'ensemble', source: '', routing_source: 'ensemble', baseline_model: '', baselineModel: 'baseline' }, expected: { accepted_routing_mode: 'ensemble', source: 'ensemble', baseline_model: 'baseline' } },
-    ...['provider_reasoning_only_retry', 'provider_request_message_limit_recovery_success', 'context_auto_compaction_start', 'context_auto_compaction_retry'].map(code => ({ event: 'warning', wire: { code }, expected: { warningVisible: false } })),
+    ...['provider_reasoning_only_retry', 'provider_request_message_limit_recovery_success', 'context_auto_compaction_start', 'context_auto_compaction_retry', 'reasoning_replay_context_rebuilt'].map(code => ({ event: 'warning', wire: { code }, expected: { warningVisible: false } })),
   ])('preserves the established field selection for $event: $wire', ({ event, wire, expected }) => {
     const { rpc, transport } = harness()
     const observed = vi.fn()
