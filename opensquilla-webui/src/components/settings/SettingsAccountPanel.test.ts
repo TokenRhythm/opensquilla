@@ -33,8 +33,9 @@ describe('account settings and source visibility',()=>{
  it('never invents a zero balance on wallet failure and retains decimal precision',async()=>{
   const el=await mount(SettingsAccountPanel,state({status:'signed_in',profile,keyStatus:'ready',walletStatus:'error'}))
   expect(el.textContent).toContain('暂时无法获取余额');expect(el.textContent).not.toContain('¥0.00')
-  mock.store.state.wallet={currency:'CNY',balances:{available:'-0.00000001',recharge:'10.0000',bonus:'0.0001',debt:'10.00010001',frozen:'0'},asOf:'2026-10-21T01:00:00Z'}
-  mock.store.state.walletStatus='stale';await nextTick();expect(el.textContent).toContain('¥-0.00000001');expect(el.textContent).toContain('2026-10-21T01:00:00Z')
+  const asOf=new Date(2026,9,21,9,0,0,393).toISOString()
+  mock.store.state.wallet={currency:'CNY',balances:{available:'-0.00000001',recharge:'10.0000',bonus:'0.0001',debt:'10.00010001',frozen:'0'},asOf}
+  mock.store.state.walletStatus='stale';await nextTick();expect(el.textContent).toContain('¥-0.00000001');expect(el.textContent).toContain('更新时间 2026-10-21 09:00:00');expect(el.textContent).not.toContain(asOf)
  })
  it('allows logout when an encrypted session is restored offline before profile data',async()=>{
   const el=await mount(SettingsAccountPanel,state({status:'unverified',errorCode:'ACCOUNT_NETWORK_UNAVAILABLE'}))

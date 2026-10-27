@@ -4,11 +4,21 @@ import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { createHash } from 'node:crypto'
-import { TokenRhythmAccount, pauseAccountsForMaintenance } from '../dist/tokenrhythm-account.js'
+import { TokenRhythmAccount, describeAccountDevice, pauseAccountsForMaintenance } from '../dist/tokenrhythm-account.js'
 import { TokenRhythmModelProxy, allowedModelRoute } from '../dist/tokenrhythm-model-proxy.js'
 import { LocalAccountSecrets, LOCAL_ACCOUNT_FILE } from '../dist/local-account-secrets.js'
 const scope = 'profile.read wallet.read managed_key.read managed_key.obtain session.revoke offline_access'
 const until = async fn => { for(let i=0;i<200;i++){if(fn())return;await new Promise(r=>setTimeout(r,5))}throw Error('condition timeout') }
+test('account device labels use the OS product version and distinguish Windows 11', () => {
+ for (const [platform, version, expected] of [
+  ['darwin', '26.0.1', {name:'Mac',os:'macOS 26'}],
+  ['darwin', '10.15.7', {name:'Mac',os:'macOS 10.15'}],
+  ['win32', '10.0.26100', {name:'PC',os:'Windows 11'}],
+  ['win32', '10.0.19045', {name:'PC',os:'Windows 10'}],
+  ['linux', '6.8.0-45-generic', {name:'Linux',os:'Linux 6.8.0-45-generic'}],
+  ['freebsd', '14.0', undefined], ['darwin', '', undefined]
+ ]) assert.deepEqual(describeAccountDevice(platform, version), expected)
+})
 async function browserCallback(f, extra = { code: 'browser-once' }) {
  await f.account.login()
  const authorization = new URL(f.opened)
@@ -70,6 +80,19 @@ test('PKCE/state, display-only boundary, precise decimals, encrypted persistence
  callback.search=new URLSearchParams({state:url.searchParams.get('state'),code:'valid'});await fetch(callback);await until(()=>f.account.snapshot().keyStatus==='ready')
  const verifier=new URLSearchParams(f.calls.find(c=>c.path==='/api/oauth/token').body).get('code_verifier');assert.equal(createHash('sha256').update(verifier).digest('base64url'),url.searchParams.get('code_challenge'))
  const state=JSON.stringify(f.account.snapshot());assert.ok(!/model-secret|access-a|refresh-a/.test(state));assert.equal(f.account.snapshot().wallet.balances.available,'-0.0001');assert.equal(f.account.snapshot().source,'manual');assert.ok(!(await readFile(join(f.directory,'account.enc'),'utf8')).includes('model-secret'))
+})
+test('login and refresh report device metadata without changing the authorization URL', async t => {
+ const f=await fixture(t)
+ f.deps.deviceInfo=describeAccountDevice('darwin','26.0.1')
+ const authorization=await f.login()
+ assert.equal(authorization.searchParams.has('device_name'),false)
+ f.advance(40_000);await f.account.verify(true)
+ const exchanges=f.calls.filter(call=>call.path==='/api/oauth/token')
+ assert.deepEqual(exchanges.map(call=>new URLSearchParams(call.body).get('grant_type')),['authorization_code','refresh_token'])
+ for(const call of exchanges) {
+  assert.equal(call.headers['X-TokenRhythm-Device-Name'],'Mac')
+  assert.equal(call.headers['X-TokenRhythm-Device-OS'],'macOS 26')
+ }
 })
 test('account links resolve against the configured production or UAT origin',async t=>{
  for(const origin of ['https://tokenrhythm.studio','https://gpt.tokenrhythm.studio']) {

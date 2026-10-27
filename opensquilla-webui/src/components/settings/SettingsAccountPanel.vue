@@ -14,6 +14,12 @@ const authorizing = computed(() => ['authorizing', 'verifying'].includes(account
 const failure = computed(() => account.error || account.state?.errorCode)
 const errorText = computed(() => failure.value && te(`account.errors.${failure.value}`) ? t(`account.errors.${failure.value}`) : t('account.errors.generic'))
 const wallet = computed(() => account.state?.wallet)
+const walletUpdatedAt = computed(() => {
+  const date = new Date(wallet.value?.asOf || '')
+  if (Number.isNaN(date.getTime())) return '—'
+  const pad = (value: number) => String(value).padStart(2, '0')
+  return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())} ${pad(date.getHours())}:${pad(date.getMinutes())}:${pad(date.getSeconds())}`
+})
 // Preserve decimal precision; never round a small positive balance to zero.
 function money(value: string | undefined) {
   if (value === undefined) return '—'
@@ -61,7 +67,7 @@ onMounted(() => { void account.init() })
           <div class="account-balance"><span>{{ t('account.frozen') }}</span><span>{{ money(wallet.balances.frozen) }}</span></div>
         </details>
         <p v-if="account.state?.walletStatus === 'error' || account.state?.walletStatus === 'stale'" class="account-error" role="status">{{ t('account.walletUnavailable') }}</p>
-        <p v-if="wallet" class="control-section__desc">{{ t('account.asOf') }} {{ wallet.asOf }}</p>
+        <p v-if="wallet" class="control-section__desc">{{ t('account.asOf') }} {{ walletUpdatedAt }}</p>
         <div class="account-actions">
           <button class="btn btn--ghost" :disabled="account.busy" @click="act('refresh')">{{ t('account.refresh') }}</button>
           <span class="account-spacer" />

@@ -28,11 +28,26 @@ interface SavedAccount {
   pending: LoginTokens[]
 }
 interface LoginAttempt { state: string; verifier: string; redirect: string; url: string; server: Server; timer: NodeJS.Timeout; epoch: number }
+interface AccountDeviceInfo { name: string; os: string }
+export function describeAccountDevice(platform: string, systemVersion: string): AccountDeviceInfo | undefined {
+  if (!/^[A-Za-z0-9][A-Za-z0-9 ._+()-]{0,47}$/.test(systemVersion)) return undefined
+  const [major, minor, build] = systemVersion.split('.')
+  if (platform === 'darwin') return { name: 'Mac', os: `macOS ${major === '10' ? `${major}.${minor}` : major}` }
+  if (platform === 'win32') {
+    const legacyVersions: Record<string, string> = { '1': '7', '2': '8', '3': '8.1' }
+    const version = major === '10' ? (Number(build) >= 22000 ? '11' : '10')
+      : major === '6' ? (legacyVersions[minor!] || systemVersion) : systemVersion
+    return { name: 'PC', os: `Windows ${version}` }
+  }
+  if (platform === 'linux') return { name: 'Linux', os: `Linux ${systemVersion}` }
+  return undefined
+}
 export interface AccountDependencies {
   directory: string
   storageFile?: string
   legacyStorageFile?: string
   origin: string
+  deviceInfo?: AccountDeviceInfo
   assertSecureStorage(): void
   encrypt(value: string): string
   decrypt(value: string): string
@@ -348,7 +363,13 @@ export class TokenRhythmAccount {
     return object(body.data)
   }
   private async exchange(params: Record<string, string>): Promise<LoginTokens> {
-    const raw = await this.json('/api/oauth/token', { method: 'POST', headers: { 'Content-Type': 'application/x-www-form-urlencoded' }, body: new URLSearchParams({ client_id: CLIENT, ...params }).toString() })
+    const headers: Record<string, string> = { 'Content-Type': 'application/x-www-form-urlencoded' }
+    const device = this.deps.deviceInfo ?? describeAccountDevice(process.platform, process.getSystemVersion?.() || '')
+    if (device) {
+      headers['X-TokenRhythm-Device-Name'] = device.name
+      headers['X-TokenRhythm-Device-OS'] = device.os
+    }
+    const raw = await this.json('/api/oauth/token', { method: 'POST', headers, body: new URLSearchParams({ client_id: CLIENT, ...params }).toString() })
     if (raw.token_type !== 'Bearer' || (raw.client_id && raw.client_id !== CLIENT) || typeof raw.expires_in !== 'number' || raw.expires_in <= 0 || raw.expires_in > 86400) throw new AccountError('INVALID_ACCOUNT_RESPONSE')
     const scopes = string(raw.scope).split(' ')
     if (SCOPES.split(' ').some(scope => !scopes.includes(scope))) throw new AccountError('INSUFFICIENT_SCOPE')

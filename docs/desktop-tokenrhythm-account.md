@@ -31,6 +31,15 @@
 
 ## 网站衔接
 
+### 登录设备信息
+
+桌面主进程用 `process.platform` 和 Electron `process.getSystemVersion()` 生成设备类型和系统版本，
+在登录换取令牌及刷新令牌时通过 `X-TokenRhythm-Device-Name`、`X-TokenRhythm-Device-OS` 上报。
+macOS 使用产品版本（如 `Mac / macOS 26`），Windows 根据系统构建号区分 10 和 11。
+这些字段只用于网站显示，不参与安装标识、会话归属或授权判定。旧服务端可忽略这两个请求头。
+配套服务端需先应用 `20261027000100_oauth_session_device_info` 迁移，再发布代码。
+网站以设备信息替代安装 ID；旧会话在新版客户端下一次刷新令牌后补齐，缺少信息时显示“未知设备”。
+
 ### 浏览器登录结果页
 
 桌面接收一次性回调后，将浏览器重定向到不含授权码和 state 的随机本机结果地址。
