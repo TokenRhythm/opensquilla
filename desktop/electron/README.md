@@ -217,7 +217,7 @@ After building, a small Linux job mirrors the installer and its SHA256 file to
 the existing OSS bucket under `releases/test/windows/<run-id>-<attempt>/`
 (respecting `ALIYUN_OSS_PREFIX`). Its job summary includes verified public
 download links. It reuses the release mirror's OSS variables and secrets;
-no CDN or extra server is needed. See `docs/release-oss-mirror.md` for retention.
+no CDN or extra server is needed.
 
 Signing passes the dedicated keychain explicitly, temporarily appends it to the
 existing ordered search list, and restores account preferences after success or
