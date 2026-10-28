@@ -3,6 +3,22 @@
   "targets": [
     {
       "kind": "method",
+      "wireName": "git.status",
+      "roles": [
+        "params",
+        "result"
+      ]
+    },
+    {
+      "kind": "method",
+      "wireName": "git.diff",
+      "roles": [
+        "params",
+        "result"
+      ]
+    },
+    {
+      "kind": "method",
       "wireName": "sessions.messages.search",
       "roles": [
         "params",

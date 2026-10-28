@@ -1,0 +1,20 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://opensquilla.dev/contracts/gateway/v4/git/git-status.schema.json",
+  "title": "OpenSquilla git.status Contract",
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {"request": {"$ref": "#/$defs/RequestFrame"}, "response": {"$ref": "#/$defs/ResponseFrame"}},
+  "x-opensquilla-wire": {"protocol": "opensquilla-websocket-json", "version": 4, "compatibility": "exact-json-tree"},
+  "x-opensquilla-codegen": {"python": {"tool": "datamodel-code-generator", "version": "0.81.0", "target": "pydantic_v2.BaseModel"}, "typescript": {"tool": "json-schema-to-typescript", "version": "16.0.0"}, "runtimeValidation": {"tool": "ajv", "version": "8.20.0", "mode": "standalone-adapter-only"}},
+  "x-opensquilla-method": {"name": "git.status", "kind": "query", "scope": "operator.read", "guestAllowed": false, "idempotency": "read-only", "timeout": {"policy": "transport"}, "capability": {"kind": "method-availability", "name": "git.status"}, "request": "#/$defs/RequestFrame", "params": "#/$defs/Params", "response": "#/$defs/ResponseFrame", "result": "#/$defs/Result", "errors": [{"code": "OWNER_REQUIRED"}, {"code": "INVALID_PARAMS"}, {"code": "GIT_UNAVAILABLE"}, {"code": "INTERNAL_ERROR"}]},
+  "$defs": {
+    "Params": {"type": "object", "additionalProperties": false, "properties": {"workspaceId": {"description": "Project workspace id; null or omitted means the current session default working directory.", "type": ["string", "null"]}}},
+    "ChangedFile": {"type": "object", "additionalProperties": false, "required": ["path", "status", "staged"], "properties": {"path": {"type": "string"}, "status": {"enum": ["modified", "added", "deleted", "renamed", "untracked", "conflicted"]}, "staged": {"type": "boolean"}, "previousPath": {"type": ["string", "null"]}}},
+    "Status": {"type": "object", "additionalProperties": false, "required": ["available", "workspacePath", "branch", "detached", "unborn", "headOid", "ahead", "behind", "clean", "files", "reason"], "properties": {"available": {"description": "Whether the directory is a usable git repository.", "type": "boolean"}, "workspacePath": {"description": "Resolved absolute path of the repository.", "type": ["string", "null"]}, "branch": {"description": "Branch name; null while detached.", "type": ["string", "null"]}, "detached": {"type": "boolean"}, "unborn": {"description": "Branch without any commit yet.", "type": "boolean"}, "headOid": {"description": "Full HEAD commit id.", "type": ["string", "null"]}, "ahead": {"type": "integer", "minimum": 0}, "behind": {"type": "integer", "minimum": 0}, "clean": {"type": "boolean"}, "files": {"type": "array", "items": {"$ref": "#/$defs/ChangedFile"}}, "reason": {"description": "Why the repository is unavailable, such as not_repository or git_unavailable.", "type": ["string", "null"]}}},
+    "Result": {"type": "object", "additionalProperties": false, "required": ["status"], "properties": {"status": {"$ref": "#/$defs/Status"}}},
+    "RpcError": {"type": "object", "additionalProperties": true},
+    "RequestFrame": {"type": "object", "additionalProperties": true, "required": ["type", "id", "method"], "properties": {"type": {"const": "req"}, "id": {"type": "string"}, "method": {"const": "git.status"}, "params": {"$ref": "#/$defs/Params"}}},
+    "ResponseFrame": {"type": "object", "additionalProperties": true, "required": ["type", "id", "ok"], "properties": {"type": {"const": "res"}, "id": {"type": "string"}, "ok": {"type": "boolean"}, "payload": {"$ref": "#/$defs/Result"}, "error": {"$ref": "#/$defs/RpcError"}}}
+  }
+}

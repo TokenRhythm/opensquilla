@@ -493,6 +493,37 @@
       "exited": "Terminal exited",
       "state": { "starting": "Starting", "running": "Connected", "exited": "Exited", "error": "Unavailable" }
     },
+    "gitChanges": {
+      "title": "Quellcodeverwaltung",
+      "subtitle": "Änderungen im Arbeitsverzeichnis dieser Sitzung",
+      "openHint": "Git-Arbeitsbereich: Klicke, um Änderungen zu prüfen ({branch})",
+      "refresh": "Änderungen aktualisieren",
+      "fileCount": "{count} geändert",
+      "ahead": "{count} Commit(s) vor dem Upstream",
+      "behind": "{count} Commit(s) hinter dem Upstream",
+      "staged": "Vorgemerkt",
+      "unstaged": "Nicht vorgemerkt",
+      "untracked": "Nicht nachverfolgt",
+      "clean": "Der Arbeitsbaum enthält keine Änderungen.",
+      "notARepository": "Dieses Arbeitsverzeichnis ist kein Git-Repository.",
+      "gitUnavailable": "Git ist für dieses Arbeitsverzeichnis nicht verfügbar.",
+      "loading": "Änderungen werden geladen…",
+      "retry": "Wiederholen",
+      "binary": "Binärdatei: kein Text-Diff verfügbar.",
+      "truncated": "Dieser Diff ist gekürzt; öffne die Datei, um den Rest zu sehen.",
+      "emptyDiff": "Git hat für diese Datei keine Textänderungen gemeldet.",
+      "additions": "Hinzugefügte Zeilen",
+      "deletions": "Gelöschte Zeilen",
+      "closeDiff": "Diff schließen",
+      "status": {
+        "modified": "Geändert",
+        "added": "Hinzugefügt",
+        "deleted": "Gelöscht",
+        "renamed": "Umbenannt",
+        "untracked": "Nicht nachverfolgt",
+        "conflicted": "Konflikt"
+      }
+    },
     "artifactAnnotation": {
       "start": "Änderung anfordern",
       "stop": "Annotieren beenden",

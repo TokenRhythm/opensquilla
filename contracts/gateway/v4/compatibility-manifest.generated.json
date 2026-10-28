@@ -475,6 +475,18 @@
     },
     {
       "lifecycle": "stable",
+      "name": "git.diff",
+      "schema": "git/git-diff.schema.json",
+      "schemaSha256": "22b89de2e1c98887b2995f7627645448a700d1e0ceb2545a322a3b8368660898"
+    },
+    {
+      "lifecycle": "stable",
+      "name": "git.status",
+      "schema": "git/git-status.schema.json",
+      "schemaSha256": "f60ac943857bde95a57764346a1d926045fa8116aa651acee2e6d5ea8461b2a8"
+    },
+    {
+      "lifecycle": "stable",
       "name": "goals.capabilities",
       "schema": "goals/goals-capabilities.schema.json",
       "schemaSha256": "9bb8d1e2c0e3562294de5930544d304fe8a6c7c9cc8e6c97677262a7b6baec38"
@@ -1452,10 +1464,10 @@
   "protocol": "opensquilla-websocket-json",
   "source": {
     "eventFamilyCount": 10,
-    "generatorSha256": "829c5afc1ad4481e06e232cd30f7746db621efafcc9c29f6dcb01e7eb3b79cad",
-    "methodCount": 213,
-    "schemaCount": 223,
-    "schemaTreeSha256": "80c689d229c795f27e43c797468cd96a83eba981383b7e5e4bf4d7a4c9d0689c",
+    "generatorSha256": "39ff9a0e523eba24c4e87b457ff16caf3832e21db8bfb37b808d805bb8e6d25b",
+    "methodCount": 215,
+    "schemaCount": 225,
+    "schemaTreeSha256": "171a781c2707c1e50b974bcffcd826fadf9f5bf6705619ffe80f2f52082fda25",
     "toolchains": {
       "legacyTypes": {
         "python": {

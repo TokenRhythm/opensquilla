@@ -493,6 +493,37 @@
       "exited": "Terminal exited",
       "state": { "starting": "Starting", "running": "Connected", "exited": "Exited", "error": "Unavailable" }
     },
+    "gitChanges": {
+      "title": "Contrôle de code source",
+      "subtitle": "Modifications dans le répertoire de travail de cette session",
+      "openHint": "Espace de travail Git : cliquez pour examiner les modifications ({branch})",
+      "refresh": "Actualiser les modifications",
+      "fileCount": "{count} modifié(s)",
+      "ahead": "{count} commit(s) en avance sur le dépôt distant",
+      "behind": "{count} commit(s) en retard sur le dépôt distant",
+      "staged": "Indexé",
+      "unstaged": "Non indexé",
+      "untracked": "Non suivi",
+      "clean": "L’arborescence de travail ne présente aucune modification.",
+      "notARepository": "Ce répertoire de travail n’est pas un dépôt Git.",
+      "gitUnavailable": "Git n’est pas disponible pour ce répertoire de travail.",
+      "loading": "Chargement des modifications…",
+      "retry": "Réessayer",
+      "binary": "Fichier binaire : aucune différence de texte disponible.",
+      "truncated": "Cette différence est tronquée ; ouvrez le fichier pour voir la suite.",
+      "emptyDiff": "Git n’a signalé aucune modification de texte pour ce fichier.",
+      "additions": "Lignes ajoutées",
+      "deletions": "Lignes supprimées",
+      "closeDiff": "Fermer la différence",
+      "status": {
+        "modified": "Modifié",
+        "added": "Ajouté",
+        "deleted": "Supprimé",
+        "renamed": "Renommé",
+        "untracked": "Non suivi",
+        "conflicted": "En conflit"
+      }
+    },
     "artifactAnnotation": {
       "start": "Demander une modification",
       "stop": "Arrêter l’annotation",

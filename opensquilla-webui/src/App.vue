@@ -254,6 +254,13 @@
         />
       </div>
       <div class="topbar-right">
+        <GitBranchChip
+          v-if="isChatRoute && gitStatus.branchLabel.value"
+          :label="gitStatus.branchLabel.value"
+          :dirty-count="gitStatus.dirtyCount.value"
+          :loading="gitStatus.loading.value"
+          @open="openGitChanges"
+        />
         <ChatSystemStatus
           :layout="systemHeaderLayout"
           :connection-state="effectiveConnectionState"
@@ -487,6 +494,7 @@ import ProjectWorkspacePickerDialog from './components/ProjectWorkspacePickerDia
 import UpdateBanner from './components/UpdateBanner.vue'
 import SidebarDesktopUpdate from './components/SidebarDesktopUpdate.vue'
 import ChatSystemStatus from './components/chat/ChatSystemStatus.vue'
+import GitBranchChip from './components/chat/GitBranchChip.vue'
 import ChatHeaderActions from './components/chat/ChatHeaderActions.vue'
 import SidebarConversations from './components/SidebarConversations.vue'
 import SidebarResizer from './components/SidebarResizer.vue'
@@ -495,6 +503,9 @@ import ArtifactImageLightbox from './components/chat/ArtifactImageLightbox.vue'
 import AppWorkbench from './components/workbench/AppWorkbench.vue'
 import WorkbenchToggle from './components/workbench/WorkbenchToggle.vue'
 import { useWorkbenchStore } from './workbench/store'
+import type { WorkbenchItem, WorkbenchScope } from './workbench/types'
+import { useGitAccess } from './modules/git'
+import { useGitStatus } from './composables/useGitStatus'
 import { WORKBENCH_SPLIT_MIN_WIDTH, workbenchLayoutMode, workbenchShouldYieldSidebar } from './workbench/layout'
 import { useDesktopUpdate } from './composables/useDesktopUpdate'
 import { useDesktopUpdatePresentation } from './composables/useDesktopUpdatePresentation'
@@ -935,6 +946,37 @@ const currentSessionKey = computed(() => {
 const workbenchSessionKey = computed(() =>
   currentSessionKey.value || chatRouteHeader.model.sessionKey.value,
 )
+// The branch chip reads the current session's working directory. A null
+// workspaceId means "session default", so nothing has to be resolved here.
+const gitAccess = useGitAccess()
+const gitWorkspaceId = computed(() => chatRouteHeader.model.workspaceId.value ?? null)
+const gitStatus = useGitStatus({
+  access: computed(() => gitAccess),
+  workspaceId: gitWorkspaceId,
+  active: computed(() => isChatRoute.value),
+})
+
+// One stable id per session scope: clicking the chip again re-activates the
+// same tab instead of stacking duplicates.
+function openGitChanges() {
+  const sessionKey = workbenchSessionKey.value
+  const scope: WorkbenchScope = sessionKey
+    ? { type: 'session', id: sessionKey }
+    : { type: 'app' }
+  const item: WorkbenchItem = {
+    id: 'git-changes',
+    kind: 'git-changes',
+    title: t('workbench.gitChanges.title'),
+    scope,
+    hostKind: 'dom',
+    retention: 'keep-alive',
+    // The panel renders outside this route, so the repository it reads travels
+    // with the item; null keeps the session-default working directory.
+    payload: { workspaceId: gitWorkspaceId.value },
+  }
+  workbenchStore.openItem(item, { activate: true })
+  workbenchStore.setExpanded(true)
+}
 const sessionTaskAttention = useSessionTaskAttention()
 
 function currentSessionIsVisible(): boolean {

@@ -493,6 +493,37 @@
       "exited": "Terminal exited",
       "state": { "starting": "Starting", "running": "Connected", "exited": "Exited", "error": "Unavailable" }
     },
+    "gitChanges": {
+      "title": "ソース管理",
+      "subtitle": "このセッションの作業ディレクトリの変更",
+      "openHint": "Git ワークベンチ：クリックして変更を確認（{branch}）",
+      "refresh": "変更を更新",
+      "fileCount": "{count} 件の変更",
+      "ahead": "上流より {count} コミット先行",
+      "behind": "上流より {count} コミット遅れ",
+      "staged": "ステージ済み",
+      "unstaged": "未ステージ",
+      "untracked": "未追跡",
+      "clean": "作業ツリーに変更はありません。",
+      "notARepository": "この作業ディレクトリは Git リポジトリではありません。",
+      "gitUnavailable": "この作業ディレクトリでは Git を利用できません。",
+      "loading": "変更を読み込んでいます…",
+      "retry": "再試行",
+      "binary": "バイナリファイルのため、テキストの差分は表示できません。",
+      "truncated": "差分が省略されています。続きはファイルを開いて確認してください。",
+      "emptyDiff": "このファイルについて、Git はテキストの変更を報告していません。",
+      "additions": "追加された行",
+      "deletions": "削除された行",
+      "closeDiff": "差分を閉じる",
+      "status": {
+        "modified": "変更",
+        "added": "追加",
+        "deleted": "削除",
+        "renamed": "名前変更",
+        "untracked": "未追跡",
+        "conflicted": "競合"
+      }
+    },
     "artifactAnnotation": {
       "start": "変更を依頼",
       "stop": "注釈を終了",

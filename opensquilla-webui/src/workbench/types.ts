@@ -22,6 +22,7 @@ export type WorkbenchPanelKind =
   | 'tool-file-history'
   | 'diff'
   | 'terminal'
+  | 'git-changes'
   | 'assistant-chat'
 
 export type WorkbenchRetention = 'dispose-on-suspend' | 'keep-alive'

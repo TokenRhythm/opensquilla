@@ -512,6 +512,37 @@
       "exited": "Terminal exited",
       "state": { "starting": "Starting", "running": "Connected", "exited": "Exited", "error": "Unavailable" }
     },
+    "gitChanges": {
+      "title": "Source control",
+      "subtitle": "Changes in this session's working directory",
+      "openHint": "Git workbench: click to review changes ({branch})",
+      "refresh": "Refresh changes",
+      "fileCount": "{count} changed",
+      "ahead": "Ahead of upstream by {count} commit(s)",
+      "behind": "Behind upstream by {count} commit(s)",
+      "staged": "Staged",
+      "unstaged": "Unstaged",
+      "untracked": "Untracked",
+      "clean": "The working tree has no changes.",
+      "notARepository": "This working directory is not a Git repository.",
+      "gitUnavailable": "Git is not available for this working directory.",
+      "loading": "Loading changes…",
+      "retry": "Retry",
+      "binary": "Binary file: no text diff is available.",
+      "truncated": "This diff is truncated; open the file to see the rest.",
+      "emptyDiff": "Git reported no text changes for this file.",
+      "additions": "Added lines",
+      "deletions": "Deleted lines",
+      "closeDiff": "Close diff",
+      "status": {
+        "modified": "Modified",
+        "added": "Added",
+        "deleted": "Deleted",
+        "renamed": "Renamed",
+        "untracked": "Untracked",
+        "conflicted": "Conflicted"
+      }
+    },
     "artifactAnnotation": {
       "start": "Request changes",
       "stop": "Stop annotating",

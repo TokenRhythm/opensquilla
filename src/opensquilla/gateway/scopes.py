@@ -153,6 +153,8 @@ METHOD_SCOPES: dict[str, str] = {
     "sessions.unsubscribe": READ_SCOPE,
     "workspaces.list": READ_SCOPE,  # OpenSquilla-only; owner-guarded local paths.
     "workspaces.references.read": READ_SCOPE,
+    "git.status": READ_SCOPE,  # OpenSquilla-only; owner-guarded local repository inspection.
+    "git.diff": READ_SCOPE,
     "sessions.messages.snapshot": READ_SCOPE,
     "sessions.messages.snapshot.read": READ_SCOPE,
     "sessions.messages.resume": READ_SCOPE,
