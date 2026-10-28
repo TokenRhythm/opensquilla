@@ -460,12 +460,21 @@ def test_content_tier_includes_turn_calls(tmp_path) -> None:
 
 def test_desktop_logs_are_derived_and_credential_excluded(tmp_path) -> None:
     home, log_dir = _make_home(tmp_path, desktop=True)
+    exit_record = {
+        "event": "gateway_process_exit_observed", "process_instance_id": "synthetic-run",
+        "pid": 123, "code": -1073741819, "signal": None,
+        "windows_status_hex": "0xc0000005", "outcome": "nonzero_exit",
+    }
+    desktop_log = home.parent.parent / "logs" / "desktop.log"
+    with desktop_log.open("a", encoding="utf-8") as stream:
+        stream.write(json.dumps(exit_record) + "\n")
     dest = tmp_path / "bundle.zip"
 
     collect_bundle(dest, home_dir=home, log_dir=log_dir)
 
     entries = _read_zip(dest)
     assert "desktop/desktop.log" in entries
+    assert json.loads(entries["desktop/desktop.log"].splitlines()[-1]) == exit_record
     assert "desktop/desktop.log.1" in entries
     assert "desktop/desktop.log.2" in entries
     assert "desktop/gateway.log" in entries

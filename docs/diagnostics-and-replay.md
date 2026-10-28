@@ -49,6 +49,33 @@ Use diagnostics for:
 Avoid leaving raw diagnostics on longer than needed. Raw captures may contain
 private prompts, tool outputs, local paths, or provider-visible content.
 
+### Compaction pauses and Gateway exits
+
+Normal operational logs include content-free compaction timings.
+`compaction.summary_response_received` marks a valid provider completion event
+before stream cleanup; `compaction.llm_call_completed` follows that cleanup.
+Follow `compaction.phase_started` and `compaction.phase_finished` with the same
+`compaction_id`. The `step_name`
+distinguishes attachment projection, historical reference extraction, retained
+history measurement, summary validation, consumer admission, and durable commit
+work. Finished records include `duration_ms`, `status`, and the exception type
+when work fails, times out, or is cancelled. They contain no summary or history
+text and remain available in diagnostic bundles without content capture.
+
+Use `pid` to correlate those steps with Gateway lifecycle records. Desktop
+records `gateway_process_exit_observed` as soon as its owned child exits,
+including the process instance, exit code or signal, uptime, and any stop or
+termination request. Windows records the exit status in hexadecimal too.
+`gateway_process_stdio_closed` may arrive later if another process still holds
+an output pipe. CLI records `gateway.run_started` and `gateway.run_finished` at
+the server runtime boundary; the latter does not by itself prove OS process exit.
+
+A phase start without a finish identifies the last observed work, but does not
+prove a crash or its cause. A hard kill cannot write its own final Gateway log;
+use the Desktop parent record or the external service manager's exit evidence.
+Collect a [diagnostic bundle](troubleshooting.md#collecting-diagnostics-for-a-bug-report)
+before restarting again when possible.
+
 ## Replay a Recorded Turn
 
 Replay reads a recorded turn from the decision log and prints a human-readable

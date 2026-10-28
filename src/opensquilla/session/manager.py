@@ -49,6 +49,10 @@ from opensquilla.session.compaction import (
     validate_compaction_artifact,
 )
 from opensquilla.session.compaction_deployment import compaction_deployment_fingerprint
+from opensquilla.session.compaction_diagnostics import (
+    compaction_diagnostic_phase,
+    report_compaction_diagnostic,
+)
 from opensquilla.session.compaction_lifecycle import ConsumerAdmissionStaleError, new_compaction_id
 from opensquilla.session.compaction_state import (
     CoverageCheckpoint,
@@ -3928,7 +3932,6 @@ class SessionManager:
 
         if result.removed_count == 0 and not result.replaced_previous_summary:
             return result
-        require_compaction_time(effective_config, phase="validating")
         from opensquilla.session.compaction import (
             compaction_replay_summary,
             consumer_admission_accepts,
@@ -3941,7 +3944,15 @@ class SessionManager:
                 raise exc
             return precommit_unapplied("precommit_read_failed")
 
+        def rejected(reason: str) -> None:
+            report_compaction_diagnostic(
+                "session_compaction.precommit_rejected",
+                compaction_id=persisted_compaction_id, pid=os.getpid(),
+                reason_code=reason, status="rejected",
+            )
+
         def precommit_unapplied(reason: str) -> CompactionResult:
+            rejected(reason)
             return replace(
                 result, summary="", summary_payload=None, kept_entries=raw,
                 removed_count=0, replaced_previous_summary=False, chunks_processed=0,
@@ -3950,38 +3961,48 @@ class SessionManager:
                 remaining_budget_tokens=max(context_window_tokens - result.tokens_before, 0),
             )
 
-        rejection = None
-        if (
-            not isinstance(result.removed_count, int)
-            or isinstance(result.removed_count, bool)
-            or not 0 <= result.removed_count <= len(raw)
-            or result.kept_start_index != result.removed_count
-            or result.kept_entries != raw[result.removed_count:]
+        with compaction_diagnostic_phase(
+            compaction_id=persisted_compaction_id,
+            phase="validating", step="precommit_validation",
         ):
-            rejection = "invalid_source_boundary"
-        elif not result.summary.strip():
-            rejection = "empty_summary"
-        coverage = None
+            require_compaction_time(effective_config, phase="validating")
+            rejection = None
+            if (
+                not isinstance(result.removed_count, int)
+                or isinstance(result.removed_count, bool)
+                or not 0 <= result.removed_count <= len(raw)
+                or result.kept_start_index != result.removed_count
+                or result.kept_entries != raw[result.removed_count:]
+            ):
+                rejection = "invalid_source_boundary"
+            elif not result.summary.strip():
+                rejection = "empty_summary"
+            coverage = None
+            if rejection is None:
+                try:
+                    coverage, rejection = validate_compaction_artifact(
+                        compaction_replay_summary(result),
+                        (),
+                        summary_replay_renderer=_durable_summary_replay,
+                    )
+                except (TypeError, ValueError):
+                    rejection = "invalid_summary"
         if rejection is None:
             try:
-                coverage, rejection = validate_compaction_artifact(
-                    compaction_replay_summary(result),
-                    (),
-                    summary_replay_renderer=_durable_summary_replay,
-                )
-            except (TypeError, ValueError):
-                rejection = "invalid_summary"
-        if rejection is None:
-            try:
-                if not await asyncio.to_thread(
-                    consumer_admission_accepts, consumer_admission,
-                    compaction_replay_summary(result),
-                    result.kept_entries,
+                with compaction_diagnostic_phase(
+                    compaction_id=persisted_compaction_id,
+                    phase="validating", step="precommit_consumer_admission",
                 ):
-                    rejection = "consumer_admission_failed"
+                    if not await asyncio.to_thread(
+                        consumer_admission_accepts, consumer_admission,
+                        compaction_replay_summary(result),
+                        result.kept_entries,
+                    ):
+                        rejection = "consumer_admission_failed"
             except ConsumerAdmissionStaleError:
                 rejection = "consumer_admission_stale"
         if rejection is not None:
+            rejected(rejection)
             return replace(
                 result,
                 summary="",
@@ -4000,11 +4021,15 @@ class SessionManager:
             )
         async with _session_mutation_context(mutation_context):
             try:
-                current_node = await await_compaction_phase(
-                    self._storage.get_session(session_key),
-                    effective_config,
-                    phase="validating",
-                )
+                with compaction_diagnostic_phase(
+                    compaction_id=persisted_compaction_id,
+                    phase="validating", step="precommit_session_read",
+                ):
+                    current_node = await await_compaction_phase(
+                        self._storage.get_session(session_key),
+                        effective_config,
+                        phase="validating",
+                    )
             except sqlite3.OperationalError as exc:
                 return precommit_read_failed(exc)
             if current_node is None:
@@ -4016,14 +4041,19 @@ class SessionManager:
                 operation="compaction commit",
             )
             try:
-                current_entries = await await_compaction_phase(
-                    self._storage.get_transcript(current_node.session_id),
-                    effective_config,
-                    phase="validating",
-                )
+                with compaction_diagnostic_phase(
+                    compaction_id=persisted_compaction_id,
+                    phase="validating", step="precommit_transcript_read",
+                ):
+                    current_entries = await await_compaction_phase(
+                        self._storage.get_transcript(current_node.session_id),
+                        effective_config,
+                        phase="validating",
+                    )
             except sqlite3.OperationalError as exc:
                 return precommit_read_failed(exc)
             if _transcript_preimage(current_entries) != preimage:
+                rejected("stale_preimage")
                 import structlog as _structlog
 
                 _structlog.get_logger(__name__).warning(
@@ -4049,31 +4079,36 @@ class SessionManager:
                 )
 
             try:
-                current_summaries = await await_compaction_phase(
-                    self._storage.get_all_summaries(current_node.session_id),
-                    effective_config,
-                    phase="validating",
-                )
-                current_context_states = await await_compaction_phase(
-                    self._storage.get_context_states(
-                        session_key,
-                        expected_session_id=expected_session_id,
-                        expected_session_epoch=expected_session_epoch,
-                    ),
-                    effective_config,
-                    phase="validating",
-                )
-                _, current_context_fingerprint = await await_compaction_phase(
-                    self.resolve_compaction_context(
-                        session_key, context_states=current_context_states,
-                        summaries=current_summaries,
-                        expected_session_id=current_node.session_id,
-                        expected_session_epoch=current_node.epoch,
-                    ), effective_config, phase="validating",
-                )
+                with compaction_diagnostic_phase(
+                    compaction_id=persisted_compaction_id,
+                    phase="validating", step="precommit_context_read",
+                ):
+                    current_summaries = await await_compaction_phase(
+                        self._storage.get_all_summaries(current_node.session_id),
+                        effective_config,
+                        phase="validating",
+                    )
+                    current_context_states = await await_compaction_phase(
+                        self._storage.get_context_states(
+                            session_key,
+                            expected_session_id=expected_session_id,
+                            expected_session_epoch=expected_session_epoch,
+                        ),
+                        effective_config,
+                        phase="validating",
+                    )
+                    _, current_context_fingerprint = await await_compaction_phase(
+                        self.resolve_compaction_context(
+                            session_key, context_states=current_context_states,
+                            summaries=current_summaries,
+                            expected_session_id=current_node.session_id,
+                            expected_session_epoch=current_node.epoch,
+                        ), effective_config, phase="validating",
+                    )
             except sqlite3.OperationalError as exc:
                 return precommit_read_failed(exc)
             if current_context_fingerprint != previous_context_fingerprint:
+                rejected("stale_context_state")
                 import structlog as _structlog
 
                 _structlog.get_logger(__name__).warning(
@@ -4141,17 +4176,25 @@ class SessionManager:
             # (before the write transaction) so a compacted image can still be
             # rehydrated after the active row is removed.
             try:
-                canonical_entries_for_manifest = (
-                    await self._storage.get_canonical_transcript(current_node.session_id)
-                )
+                with compaction_diagnostic_phase(
+                    compaction_id=persisted_compaction_id,
+                    phase="validating", step="precommit_canonical_read",
+                ):
+                    canonical_entries_for_manifest = (
+                        await self._storage.get_canonical_transcript(current_node.session_id)
+                    )
             except sqlite3.OperationalError as exc:
                 return precommit_read_failed(exc)
-            manifest_state = await asyncio.to_thread(
-                _merge_attachment_manifest_state,
-                node=current_node,
-                entries=canonical_entries_for_manifest,
-                context_states=current_context_states,
-            )
+            with compaction_diagnostic_phase(
+                compaction_id=persisted_compaction_id,
+                phase="validating", step="precommit_attachment_manifest",
+            ):
+                manifest_state = await asyncio.to_thread(
+                    _merge_attachment_manifest_state,
+                    node=current_node,
+                    entries=canonical_entries_for_manifest,
+                    context_states=current_context_states,
+                )
             # Cancellation/deadline wins until this point. Once the atomic
             # SQLite rewrite starts, wait for its real outcome so a committed
             # summary can never be reported as cancelled.
@@ -4163,7 +4206,7 @@ class SessionManager:
 
             _structlog.get_logger(__name__).info(
                 "session_compaction.commit_started",
-                compaction_id=persisted_compaction_id,
+                compaction_id=persisted_compaction_id, pid=os.getpid(),
             )
             boundary = current_entries[-1] if current_entries else None
             commit_task = asyncio.create_task(
@@ -4192,17 +4235,43 @@ class SessionManager:
                 )
             )
             try:
-                installed, cancellation_reconciled = await _await_compaction_commit_barrier(
-                    commit_task
+                with compaction_diagnostic_phase(
+                    compaction_id=persisted_compaction_id,
+                    phase="committing", step="commit_barrier",
+                ):
+                    installed, cancellation_reconciled = await _await_compaction_commit_barrier(
+                        commit_task
+                    )
+            except BaseException as exc:
+                if (
+                    isinstance(exc, StorageBusyError)
+                    and exc.operation == "rewrite_compacted_session"
+                    and exc.stage in {"preflight_read", "begin"}
+                ):
+                    report_compaction_diagnostic(
+                        "session_compaction.commit_rejected",
+                        compaction_id=persisted_compaction_id, pid=os.getpid(),
+                        reason_code="precommit_write_busy", status="rejected",
+                        duration_ms=max(0, int((time.monotonic() - commit_started) * 1000)),
+                    )
+                    return precommit_unapplied("precommit_write_busy")
+                report_compaction_diagnostic(
+                    "session_compaction.commit_failed",
+                    compaction_id=persisted_compaction_id, pid=os.getpid(),
+                    status="cancelled" if isinstance(exc, asyncio.CancelledError) else "failed",
+                    error_type=type(exc).__name__,
+                    duration_ms=max(0, int((time.monotonic() - commit_started) * 1000)),
                 )
-            except StorageBusyError as exc:
-                if exc.operation != "rewrite_compacted_session" or exc.stage not in {
-                    "preflight_read", "begin",
-                }:
-                    raise
-                return precommit_unapplied("precommit_write_busy")
+                raise
             result.cancellation_reconciled = cancellation_reconciled
             if installed is False:
+                report_compaction_diagnostic(
+                    "session_compaction.commit_rejected",
+                    compaction_id=persisted_compaction_id, pid=os.getpid(),
+                    reason_code="stale_preimage", status="rejected",
+                    cancellation_reconciled=cancellation_reconciled,
+                    duration_ms=max(0, int((time.monotonic() - commit_started) * 1000)),
+                )
                 return replace(
                     result,
                     summary="",
@@ -4221,7 +4290,7 @@ class SessionManager:
                 )
             _structlog.get_logger(__name__).info(
                 "session_compaction.commit_completed",
-                compaction_id=persisted_compaction_id,
+                compaction_id=persisted_compaction_id, pid=os.getpid(), status="completed",
                 cancellation_reconciled=cancellation_reconciled,
                 duration_ms=max(0, int((time.monotonic() - commit_started) * 1000)),
             )
@@ -4263,6 +4332,16 @@ class SessionManager:
 
         _log = _structlog.get_logger(__name__)
         persisted_compaction_id = compaction_id or new_compaction_id()
+
+        def refused(reason: str, cancellation_reconciled: bool = False) -> CompactionPersistResult:
+            report_compaction_diagnostic(
+                "persist_compaction.rejected",
+                compaction_id=persisted_compaction_id, pid=os.getpid(),
+                status="rejected", reason_code=reason,
+                cancellation_reconciled=cancellation_reconciled,
+            )
+            return CompactionPersistResult(False, reason, cancellation_reconciled)
+
         deadline_config: CompactionConfig | None = None
         if compaction_deadline_at_monotonic is not None:
             try:
@@ -4278,15 +4357,19 @@ class SessionManager:
 
         node_call = self._storage.get_session(session_key)
         try:
-            node = (
-                await await_compaction_phase(
-                    node_call,
-                    deadline_config,
-                    phase="snapshotting",
+            with compaction_diagnostic_phase(
+                compaction_id=persisted_compaction_id,
+                phase="validating", step="precommit_session_read",
+            ):
+                node = (
+                    await await_compaction_phase(
+                        node_call,
+                        deadline_config,
+                        phase="snapshotting",
+                    )
+                    if deadline_config is not None
+                    else await node_call
                 )
-                if deadline_config is not None
-                else await node_call
-            )
         except sqlite3.OperationalError as exc:
             if not (
                 _is_sqlite_busy(exc) and source_snapshot is not None
@@ -4294,10 +4377,10 @@ class SessionManager:
                 and expected_session_id is not None and expected_session_epoch is not None
             ):
                 raise
-            return CompactionPersistResult(False, "precommit_read_failed")
+            return refused("precommit_read_failed")
         if node is None:
             _log.warning("persist_compaction.session_not_found", session_key=session_key)
-            return CompactionPersistResult(False, "session_not_found")
+            return refused("session_not_found")
         _require_expected_session_owner(
             node,
             expected_session_id=expected_session_id,
@@ -4305,73 +4388,80 @@ class SessionManager:
             operation="inline compaction snapshot",
         )
 
-        expected_source_entries: list[TranscriptEntry] | None = None
-        expected_source_preimage: tuple[tuple[Any, ...], ...] | None = None
-        if source_snapshot is not None:
-            if not source_snapshot.valid:
-                return CompactionPersistResult(False, "invalid_source_boundary")
-            source_entries = source_snapshot.entries
-            source_preimage = source_snapshot.preimage
-            source_context_fingerprint = source_snapshot.context_fingerprint
-            source_boundary_message_id = source_snapshot.boundary_message_id
-            source_boundary_entry_id = source_snapshot.boundary_entry_id
-        if source_entries is not None:
-            expected_source_entries = list(source_entries)
-            expected_source_preimage = tuple(tuple(item) for item in (source_preimage or ()))
-            actual_source_preimage = _transcript_preimage(expected_source_entries)
-            boundary = expected_source_entries[-1] if expected_source_entries else None
-            checkpoint_only = bool(
-                source_snapshot is not None and source_snapshot.valid
-                and source_snapshot.previous_summary and source_context_fingerprint
-                and not expected_source_entries and removed_count == 0
-                and isinstance(summary_payload, dict)
-                and isinstance(summary_payload.get("source_coverage"), dict)
-                and summary_payload["source_coverage"].get("replaces_prior_context") is True
-            )
-            source_is_valid = (
-                (bool(expected_source_entries) or checkpoint_only)
-                and expected_source_preimage == actual_source_preimage
-                and (boundary is not None or checkpoint_only)
-                and (
-                    source_boundary_message_id is None
-                    or (boundary is not None and boundary.message_id == source_boundary_message_id)
+        with compaction_diagnostic_phase(
+            compaction_id=persisted_compaction_id,
+            phase="validating", step="precommit_source_validation",
+        ):
+            expected_source_entries: list[TranscriptEntry] | None = None
+            expected_source_preimage: tuple[tuple[Any, ...], ...] | None = None
+            if source_snapshot is not None:
+                if not source_snapshot.valid:
+                    return refused("invalid_source_boundary")
+                source_entries = source_snapshot.entries
+                source_preimage = source_snapshot.preimage
+                source_context_fingerprint = source_snapshot.context_fingerprint
+                source_boundary_message_id = source_snapshot.boundary_message_id
+                source_boundary_entry_id = source_snapshot.boundary_entry_id
+            if source_entries is not None:
+                expected_source_entries = list(source_entries)
+                expected_source_preimage = tuple(tuple(item) for item in (source_preimage or ()))
+                actual_source_preimage = _transcript_preimage(expected_source_entries)
+                boundary = expected_source_entries[-1] if expected_source_entries else None
+                checkpoint_only = bool(
+                    source_snapshot is not None and source_snapshot.valid
+                    and source_snapshot.previous_summary and source_context_fingerprint
+                    and not expected_source_entries and removed_count == 0
+                    and isinstance(summary_payload, dict)
+                    and isinstance(summary_payload.get("source_coverage"), dict)
+                    and summary_payload["source_coverage"].get("replaces_prior_context") is True
                 )
-                and (
-                    source_boundary_entry_id is None
-                    or (boundary is not None and boundary.id == source_boundary_entry_id)
+                source_is_valid = (
+                    (bool(expected_source_entries) or checkpoint_only)
+                    and expected_source_preimage == actual_source_preimage
+                    and (boundary is not None or checkpoint_only)
+                    and (
+                        source_boundary_message_id is None
+                        or (
+                            boundary is not None
+                            and boundary.message_id == source_boundary_message_id
+                        )
+                    )
+                    and (
+                        source_boundary_entry_id is None
+                        or (boundary is not None and boundary.id == source_boundary_entry_id)
+                    )
+                    and isinstance(removed_count, int)
+                    and not isinstance(removed_count, bool)
+                    and 0 <= removed_count <= len(expected_source_entries)
                 )
-                and isinstance(removed_count, int)
-                and not isinstance(removed_count, bool)
-                and 0 <= removed_count <= len(expected_source_entries)
-            )
-            if not source_is_valid:
-                _log.warning(
-                    "persist_compaction.invalid_source_boundary_skipped",
-                    session_key=session_key,
-                    source_count=len(expected_source_entries),
-                    removed_count=removed_count,
+                if not source_is_valid:
+                    _log.warning(
+                        "persist_compaction.invalid_source_boundary_skipped",
+                        session_key=session_key,
+                        source_count=len(expected_source_entries),
+                        removed_count=removed_count,
+                    )
+                    return refused("invalid_source_boundary")
+                assert isinstance(removed_count, int) and not isinstance(removed_count, bool)
+                exact_removed_count = removed_count
+                removed_entries = expected_source_entries[:exact_removed_count]
+                preserved_entries = expected_source_entries[exact_removed_count:]
+            else:
+                # Compatibility path for older embedders that do not yet carry a
+                # frozen source boundary. Keep its historical behavior, while all
+                # TurnRunner calls use the exact-boundary branch above.
+                entries_call = self._storage.get_transcript(node.session_id)
+                entries = (
+                    await await_compaction_phase(
+                        entries_call,
+                        deadline_config,
+                        phase="snapshotting",
+                    )
+                    if deadline_config is not None
+                    else await entries_call
                 )
-                return CompactionPersistResult(False, "invalid_source_boundary")
-            assert isinstance(removed_count, int) and not isinstance(removed_count, bool)
-            exact_removed_count = removed_count
-            removed_entries = expected_source_entries[:exact_removed_count]
-            preserved_entries = expected_source_entries[exact_removed_count:]
-        else:
-            # Compatibility path for older embedders that do not yet carry a
-            # frozen source boundary. Keep its historical behavior, while all
-            # TurnRunner calls use the exact-boundary branch above.
-            entries_call = self._storage.get_transcript(node.session_id)
-            entries = (
-                await await_compaction_phase(
-                    entries_call,
-                    deadline_config,
-                    phase="snapshotting",
-                )
-                if deadline_config is not None
-                else await entries_call
-            )
-            removed_entries = entries[: max(0, len(entries) - len(kept_entries))]
-            preserved_entries = entries[len(removed_entries) :]
+                removed_entries = entries[: max(0, len(entries) - len(kept_entries))]
+                preserved_entries = entries[len(removed_entries) :]
         if not summary.strip():
             _log.warning(
                 "persist_compaction.empty_summary_not_persisted",
@@ -4379,7 +4469,7 @@ class SessionManager:
                 removed=len(removed_entries),
                 kept=len(kept_entries),
             )
-            return CompactionPersistResult(False, "empty_summary")
+            return refused("empty_summary")
 
         persisted_kept_count = (
             len(preserved_entries)
@@ -4402,22 +4492,28 @@ class SessionManager:
                 and summary_payload["source_coverage"].get("replaces_prior_context") is True
             )
             try:
-                prior_summaries = await self._storage.get_all_summaries(node.session_id)
-                prior_states = await self._storage.get_context_states(
-                    session_key,
-                    expected_session_id=expected_session_id,
-                    expected_session_epoch=expected_session_epoch,
-                )
-                prior_records, expected_context_fingerprint = await self.resolve_compaction_context(
-                    session_key, context_states=prior_states, summaries=prior_summaries,
-                    expected_session_id=node.session_id, expected_session_epoch=node.epoch,
-                )
+                with compaction_diagnostic_phase(
+                    compaction_id=persisted_compaction_id,
+                    phase="validating", step="precommit_context_read",
+                ):
+                    prior_summaries = await self._storage.get_all_summaries(node.session_id)
+                    prior_states = await self._storage.get_context_states(
+                        session_key,
+                        expected_session_id=expected_session_id,
+                        expected_session_epoch=expected_session_epoch,
+                    )
+                    prior_records, expected_context_fingerprint = (
+                        await self.resolve_compaction_context(
+                            session_key, context_states=prior_states, summaries=prior_summaries,
+                            expected_session_id=node.session_id, expected_session_epoch=node.epoch,
+                        )
+                    )
             except sqlite3.OperationalError as exc:
                 if not _is_sqlite_busy(exc) or (
                     expected_source_entries is None or not source_context_fingerprint
                 ):
                     raise
-                return CompactionPersistResult(False, "precommit_read_failed")
+                return refused("precommit_read_failed")
             if (
                 source_context_fingerprint is not None
                 and source_context_fingerprint != expected_context_fingerprint
@@ -4426,26 +4522,30 @@ class SessionManager:
                     "persist_compaction.stale_context_state_skipped",
                     session_key=session_key,
                 )
-                return CompactionPersistResult(False, "stale_context_state")
+                return refused("stale_context_state")
             if replaces_prior_context:
                 previous_covered_through_id = max(
                     (record.covered_through_id for record in prior_records), default=0,
                 )
             try:
-                if summary_format == "structured_v1" and summary_payload is not None:
-                    structured_summary = StructuredCompactionSummary.model_validate(
-                        summary_payload
-                    )
-                else:
-                    structured_summary, _ = build_structured_summary_from_text(
-                        summary,
+                with compaction_diagnostic_phase(
+                    compaction_id=persisted_compaction_id,
+                    phase="validating", step="precommit_validation",
+                ):
+                    if summary_format == "structured_v1" and summary_payload is not None:
+                        structured_summary = StructuredCompactionSummary.model_validate(
+                            summary_payload
+                        )
+                    else:
+                        structured_summary, _ = build_structured_summary_from_text(
+                            summary,
+                            (),
+                        )
+                    coverage, rejection = validate_compaction_artifact(
+                        render_structured_summary(structured_summary.model_dump(mode="json")),
                         (),
+                        summary_replay_renderer=_durable_summary_replay,
                     )
-                coverage, rejection = validate_compaction_artifact(
-                    render_structured_summary(structured_summary.model_dump(mode="json")),
-                    (),
-                    summary_replay_renderer=_durable_summary_replay,
-                )
             except (TypeError, ValueError):
                 rejection = "invalid_summary"
             if rejection is not None:
@@ -4453,7 +4553,7 @@ class SessionManager:
                     "persist_compaction.invalid_summary_not_persisted",
                     session_key=session_key, reason=rejection,
                 )
-                return CompactionPersistResult(False, rejection)
+                return refused(rejection)
 
             covered_through_id = max(
                 previous_covered_through_id,
@@ -4518,63 +4618,79 @@ class SessionManager:
                 )
                 rewritten_entries.append(entry)
 
-        assert summary_record is not None
-        context_state = self._portable_structured_summary_state(node, summary_record)
-        assert context_state is not None
-        # SQLite assigns the new state a later id, including when its timestamp
-        # ties an existing checkpoint. Simulate that ordering without persisting
-        # a synthetic id, then verify the complete post-commit replay set.
-        candidate_state = context_state.model_copy(update={
-            "id": max((state.id or 0 for state in prior_states), default=0) + 1,
-        })
-        candidate_records = build_compaction_context_records(
-            context_states=[*prior_states, candidate_state],
-            summaries=[*prior_summaries, summary_record],
-        )
-        expected_replay = [] if replaces_prior_context else [
-            record.text for record in prior_records
-        ]
-        expected_replay.append(render_structured_summary(context_state.payload))
-        candidate_replay = [record.text for record in candidate_records]
-        # The selector orders structured states before legacy summary fallbacks;
-        # mixed storage therefore need not be an append-only textual order.
-        # Verify every expected body first, then validate the exact wrapper in
-        # that authoritative order. Whitespace/identical duplicates normalize
-        # exactly as replay does; missing or unexpected checkpoints still fail.
-        if (
-            {text.strip() for text in candidate_replay if text.strip()}
-            != {text.strip() for text in expected_replay if text.strip()}
-            or not compaction_replay_is_complete(
-                candidate_replay, format_compaction_summary_context(candidate_replay),
-            )
+        with compaction_diagnostic_phase(
+            compaction_id=persisted_compaction_id,
+            phase="validating", step="precommit_replay_validation",
         ):
-            _log.warning(
-                "persist_compaction.invalid_summary_not_persisted",
-                session_key=session_key, reason="summary_replay_incomplete",
+            assert summary_record is not None
+            context_state = self._portable_structured_summary_state(node, summary_record)
+            assert context_state is not None
+            # SQLite assigns the new state a later id, including when its timestamp
+            # ties an existing checkpoint. Simulate that ordering without persisting
+            # a synthetic id, then verify the complete post-commit replay set.
+            candidate_state = context_state.model_copy(update={
+                "id": max((state.id or 0 for state in prior_states), default=0) + 1,
+            })
+            candidate_records = build_compaction_context_records(
+                context_states=[*prior_states, candidate_state],
+                summaries=[*prior_summaries, summary_record],
             )
-            return CompactionPersistResult(False, "summary_replay_incomplete")
+            expected_replay = [] if replaces_prior_context else [
+                record.text for record in prior_records
+            ]
+            expected_replay.append(render_structured_summary(context_state.payload))
+            candidate_replay = [record.text for record in candidate_records]
+            # The selector orders structured states before legacy summary fallbacks;
+            # mixed storage therefore need not be an append-only textual order.
+            # Verify every expected body first, then validate the exact wrapper in
+            # that authoritative order. Whitespace/identical duplicates normalize
+            # exactly as replay does; missing or unexpected checkpoints still fail.
+            if (
+                {text.strip() for text in candidate_replay if text.strip()}
+                != {text.strip() for text in expected_replay if text.strip()}
+                or not compaction_replay_is_complete(
+                    candidate_replay, format_compaction_summary_context(candidate_replay),
+                )
+            ):
+                _log.warning(
+                    "persist_compaction.invalid_summary_not_persisted",
+                    session_key=session_key, reason="summary_replay_incomplete",
+                )
+                return refused("summary_replay_incomplete")
         try:
-            canonical_entries_for_manifest = (
-                await self._storage.get_canonical_transcript(node.session_id)
-            )
-            existing_states = await self._storage.get_context_states(session_key)
+            with compaction_diagnostic_phase(
+                compaction_id=persisted_compaction_id,
+                phase="validating", step="precommit_canonical_read",
+            ):
+                canonical_entries_for_manifest = (
+                    await self._storage.get_canonical_transcript(node.session_id)
+                )
+                existing_states = await self._storage.get_context_states(session_key)
         except sqlite3.OperationalError as exc:
             if not _is_sqlite_busy(exc) or (
                 expected_source_entries is None or not source_context_fingerprint
             ):
                 raise
-            return CompactionPersistResult(False, "precommit_read_failed")
-        manifest_state = await asyncio.to_thread(
-            _merge_attachment_manifest_state,
-            node=node,
-            entries=canonical_entries_for_manifest,
-            context_states=existing_states,
-        )
+            return refused("precommit_read_failed")
+        with compaction_diagnostic_phase(
+            compaction_id=persisted_compaction_id,
+            phase="validating", step="precommit_attachment_manifest",
+        ):
+            manifest_state = await asyncio.to_thread(
+                _merge_attachment_manifest_state,
+                node=node,
+                entries=canonical_entries_for_manifest,
+                context_states=existing_states,
+            )
         if deadline_config is not None:
             require_compaction_time(deadline_config, phase="committing")
         node.compaction_count = (node.compaction_count or 0) + 1
         node.updated_at = _now_ms()
         commit_started = time.monotonic()
+        report_compaction_diagnostic(
+            "session_compaction.commit_started",
+            compaction_id=persisted_compaction_id, pid=os.getpid(),
+        )
         rewrite_kwargs: dict[str, Any] = {}
         if expected_source_entries is not None:
             rewrite_kwargs = {
@@ -4602,20 +4718,54 @@ class SessionManager:
             )
         )
         try:
-            installed, cancellation_reconciled = await _await_compaction_commit_barrier(commit_task)
-        except StorageBusyError as exc:
-            if exc.operation != "rewrite_compacted_session" or exc.stage not in {
-                "preflight_read", "begin",
-            }:
-                raise
-            return CompactionPersistResult(False, "precommit_write_busy")
+            with compaction_diagnostic_phase(
+                compaction_id=persisted_compaction_id,
+                phase="committing", step="commit_barrier",
+            ):
+                installed, cancellation_reconciled = await _await_compaction_commit_barrier(
+                    commit_task
+                )
+        except BaseException as exc:
+            if (
+                isinstance(exc, StorageBusyError)
+                and exc.operation == "rewrite_compacted_session"
+                and exc.stage in {"preflight_read", "begin"}
+            ):
+                report_compaction_diagnostic(
+                    "session_compaction.commit_rejected",
+                    compaction_id=persisted_compaction_id, pid=os.getpid(),
+                    reason_code="precommit_write_busy", status="rejected",
+                    duration_ms=max(0, int((time.monotonic() - commit_started) * 1000)),
+                )
+                return refused("precommit_write_busy")
+            report_compaction_diagnostic(
+                "session_compaction.commit_failed",
+                compaction_id=persisted_compaction_id, pid=os.getpid(),
+                status="cancelled" if isinstance(exc, asyncio.CancelledError) else "failed",
+                error_type=type(exc).__name__,
+                duration_ms=max(0, int((time.monotonic() - commit_started) * 1000)),
+            )
+            raise
         if installed is False:
+            report_compaction_diagnostic(
+                "session_compaction.commit_rejected",
+                compaction_id=persisted_compaction_id, pid=os.getpid(),
+                reason_code="stale_preimage", status="rejected",
+                cancellation_reconciled=cancellation_reconciled,
+                duration_ms=max(0, int((time.monotonic() - commit_started) * 1000)),
+            )
             _log.warning(
                 "persist_compaction.stale_preimage_skipped",
                 compaction_id=persisted_compaction_id,
                 session_key=session_key,
             )
-            return CompactionPersistResult(False, "stale_preimage", cancellation_reconciled)
+            return refused("stale_preimage", cancellation_reconciled)
+        report_compaction_diagnostic(
+            "session_compaction.commit_completed",
+            compaction_id=persisted_compaction_id, pid=os.getpid(), status="completed",
+            cancellation_reconciled=cancellation_reconciled,
+            duration_ms=max(0, int((time.monotonic() - commit_started) * 1000)),
+        )
         _log.info(
             "persist_compaction.done",
             compaction_id=persisted_compaction_id,

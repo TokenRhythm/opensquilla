@@ -6,6 +6,11 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ## [Unreleased]
 
+### Fixed
+
+- Prevent malformed quotes and long file references in history from stalling
+  compaction. Add local phase timings and Gateway process exit diagnostics.
+
 ## [0.5.7] - 2026-10-23
 
 ### Added

@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict'
+import { EventEmitter } from 'node:events'
 import { readFileSync } from 'node:fs'
 import { createContext, runInContext } from 'node:vm'
 
@@ -6,6 +7,7 @@ import {
   DESKTOP_GATEWAY_STARTUP_TIMEOUT_MS,
   GatewayReadinessTimeoutError,
   lifecycleAllowsProcessSpawn,
+  observeGatewayProcessLifecycle,
   stopAndJoinLifecycleProcesses,
   waitForGatewayReadiness,
 } from '../dist/gateway-lifecycle.js'
@@ -17,6 +19,82 @@ import { WindowsUpdateSecurityError } from '../dist/windows-update-security.js'
 import { WindowsUpdateHandoffError } from '../dist/windows-update-handoff.js'
 import { UpdateChannelError } from '../dist/update-channel.js'
 
+function runProcessExitDiagnosticsCases() {
+  let now = 100
+  const records = []
+  const observe = (child, platform, instanceId) => observeGatewayProcessLifecycle(child, {
+    instanceId, supervisorPid: 99, platform, restartAttempt: 2,
+    now: () => now,
+    report: (event, detail) => records.push({ event, ...detail }),
+  })
+  const child = Object.assign(new EventEmitter(), { pid: 101 })
+  const tracker = observe(child, 'win32', 'instance-first')
+  child.emit('spawn')
+  now = 200
+  child.emit('exit', -1073741819, null)
+  const exit = records.at(-1)
+  assert.equal(exit.event, 'gateway_process_exit_observed')
+  assert.equal(exit.windows_status_hex, '0xc0000005')
+  assert.equal(exit.code, -1073741819, 'retain raw status alongside unsigned Windows spelling')
+  assert.equal(exit.signal, null)
+  assert.equal(exit.outcome, 'nonzero_exit', 'do not infer a crash or external actor')
+  assert.equal(exit.uptime_ms, 100)
+  assert.equal(exit.pid, 101)
+  assert.equal(exit.process_instance_id, 'instance-first')
+  assert.equal(exit.restart_attempt, 2)
+  tracker.requestStop('desktop_stop')
+  tracker.requestTermination('SIGKILL')
+  assert.equal(records.at(-1), exit, 'late cleanup cannot relabel the observed exit')
+  child.emit('exit', 0, null)
+  assert.equal(records.at(-1), exit, 'exit is recorded once before stdio closes')
+  now = 900
+  child.emit('close', -1073741819, null)
+  assert.equal(records.at(-1).exit_to_close_ms, 700)
+  assert.equal(records.at(-1).exit_observed, true)
+  child.emit('close', 0, null)
+  assert.equal(records.filter(row => row.event === 'gateway_process_stdio_closed').length, 1)
+
+  for (const platform of ['win32', 'darwin', 'linux']) {
+    const replacement = Object.assign(new EventEmitter(), { pid: 102 })
+    const next = observe(replacement, platform, `instance-${platform}`)
+    next.requestStop('desktop_quit')
+    next.requestStop('desktop_update')
+    next.requestTermination('SIGTERM')
+    next.requestTermination('SIGTERM')
+    next.requestTermination('SIGKILL')
+    replacement.emit('exit', platform === 'win32' ? 1 : null, platform === 'win32' ? null : 'SIGKILL')
+    const result = records.at(-1)
+    assert.equal(result.stop_reason, 'desktop_quit', 'retain first stop request')
+    assert.equal(result.requested_signal, 'SIGKILL', 'retain escalation independently of exit signal')
+    assert.equal(result.outcome, 'stop_requested')
+    assert.equal(result.process_instance_id, `instance-${platform}`)
+    assert.equal(result.windows_status_hex, platform === 'win32' ? '0x00000001' : null)
+    assert.equal(records.filter(row => row.process_instance_id === `instance-${platform}`
+      && row.event === 'gateway_process_termination_requested').length, 2)
+  }
+  const failed = Object.assign(new EventEmitter(), { pid: undefined })
+  observe(failed, 'win32', 'instance-failed')
+  failed.emit('error', Object.assign(new Error('PRIVATE launch arguments'), { code: 'ENOENT' }))
+  failed.emit('error', Object.assign(new Error('PRIVATE duplicate'), { code: 'EIO' }))
+  failed.emit('close', -2, null)
+  assert.equal(records.at(-1).exit_observed, false, 'spawn failure does not manufacture an exit')
+  assert.equal(records.at(-2).error_code, 'ENOENT')
+  assert.doesNotMatch(JSON.stringify(records), /PRIVATE/)
+
+  const clean = Object.assign(new EventEmitter(), { pid: 103 })
+  observe(clean, 'linux', 'instance-clean')
+  clean.emit('exit', 0, null)
+  assert.equal(records.at(-1).outcome, 'unrequested_clean_exit')
+  const logFailure = Object.assign(new EventEmitter(), { pid: 104 })
+  observeGatewayProcessLifecycle(logFailure, {
+    instanceId: 'instance-no-log', supervisorPid: 99, platform: 'linux', restartAttempt: 0,
+    report: () => { throw new Error('sink unavailable') },
+  }).requestStop('desktop_quit')
+  assert.doesNotThrow(() => logFailure.emit('exit', 0, null))
+}
+
+runProcessExitDiagnosticsCases()
+
 // Run the actual main-process startup wiring with profile inspection held open.
 // Readiness helpers alone do not cover the descriptor seen by the first renderer.
 const main = readFileSync(new URL('../dist/main.js', import.meta.url), 'utf8')
@@ -27,6 +105,100 @@ function mainSection(start, end) {
   assert.notEqual(to, -1, end)
   return main.slice(from, to)
 }
+
+function runProcessDiagnosticsWiringCase() {
+  const child = Object.assign(new EventEmitter(), { pid: 105 })
+  const records = []
+  const context = createContext({
+    child,
+    gatewayProcess: child,
+    gatewayLateReadyObservation: null,
+    gatewayStoppingProcesses: new Set(),
+    updateGatewayShutdownProcess: null,
+    hasGatewayProcessExited: () => false,
+    gatewayProcessDiagnostics: new WeakMap(),
+    observeGatewayProcessLifecycle,
+    gatewayConnectionInstanceId: 'f32ca036-f220-40ee-b3d8-d43570aba9db',
+    randomUUID: () => { throw new Error('diagnostics must reuse the child environment instance ID') },
+    process: { pid: 99, platform: 'win32' },
+    gatewayUnexpectedExitRestartAttempt: 1,
+    desktopLog: (event, detail) => records.push({ event, ...detail }),
+  })
+  runInContext(mainSection(
+    'gatewayProcessDiagnostics.set(child, observeGatewayProcessLifecycle(child, {',
+    '// Keep the Windows packaged startup tail observable',
+  ), context)
+  runInContext(mainSection(
+    'function trackStoppingGatewayProcess(',
+    'function isCurrentGatewayShutdownRequest(',
+  ), context)
+  child.emit('spawn')
+  runInContext("trackStoppingGatewayProcess(child, 'shutdown_endpoint')", context)
+  child.emit('exit', 1, null)
+  assert.equal(records.at(-1).event, 'gateway_process_exit_observed')
+  assert.equal(records.at(-1).stop_reason, 'shutdown_endpoint')
+  assert.equal(records.at(-1).process_instance_id, 'f32ca036-f220-40ee-b3d8-d43570aba9db')
+  assert.equal(records.at(-1).windows_status_hex, '0x00000001')
+  assert.equal(records.some(row => row.event === 'gateway_process_stdio_closed'), false,
+    'actual main wiring retains exit evidence while stdio is still held open')
+}
+
+runProcessDiagnosticsWiringCase()
+
+async function runQuitProcessDiagnosticsWiringCases() {
+  for (const entrypoint of ['quit', 'legacy', 'force', 'update']) {
+    const child = Object.assign(new EventEmitter(), { pid: 107, exitCode: null })
+    const records = []
+    const tracker = observeGatewayProcessLifecycle(child, {
+      instanceId: 'f32ca036-f220-40ee-b3d8-d43570aba9db', supervisorPid: 99,
+      platform: 'win32', restartAttempt: 0,
+      report: (event, detail) => records.push({ event, ...detail }),
+    })
+    const exit = () => { child.exitCode = 0; child.emit('exit', 0, null) }
+    const stopping = new Set()
+    const context = createContext({
+      child, budget: { remainingTotalMs: 1000, elapsedMs: 0 },
+      gatewayProcessDiagnostics: new WeakMap([[child, tracker]]),
+      gatewayStoppingProcesses: stopping,
+      gatewayHardTerminatedProcesses: new WeakSet(),
+      gatewayProcessTreeTerminations: new WeakMap(),
+      quitUnconfirmedProcessTrees: new Set(),
+      process: { platform: 'win32' }, updateApplying: entrypoint === 'update',
+      hasGatewayProcessExited: () => child.exitCode !== null,
+      confirmOwnedGatewayProcessCleanup: async () => true,
+      ownedGatewayRecord: () => ({}),
+      requestVerifiedDesktopGatewayQuit: async () => ({ kind: 'quit_accepted' }),
+      requestOwnedGatewayShutdown: async () => true,
+      waitForGatewayProcessExit: async () => { if (child.exitCode === null) exit(); return true },
+      terminateWindowsProcessTree: async () => { exit(); return true },
+      quitGatewayWithinBudget: async ({ requestQuit }) => { await requestQuit(1000); exit(); return true },
+      desktopLog() {}, setQuitStatus() {}, setAppExitPhase() {},
+      stopAndJoinAllLifecycleOwnedGateways: async callback => { callback(child); return true },
+      stopGateway: () => exit(),
+      updateGatewayShutdownProcess: null, allowGracefulShutdownWhileQuitting: false,
+    })
+    runInContext(mainSection(
+      'async function terminateOwnedGatewayForQuit(', 'function showDesktopQuitFailure(',
+    ), context)
+    runInContext(mainSection(
+      'async function stopOwnedGatewaysForUpdate(', 'async function applyWindowsInstaller(',
+    ), context)
+    const invocation = {
+      quit: 'quitOwnedGateway(child, budget)',
+      legacy: "drainOwnedGatewayForLegacyQuit(child, '', true)",
+      force: 'terminateOwnedGatewayForQuit(child, budget)',
+      update: 'stopOwnedGatewaysForUpdate()',
+    }[entrypoint]
+    assert.equal(await runInContext(invocation, context), true)
+    const observed = records.find(row => row.event === 'gateway_process_exit_observed')
+    assert.equal(observed.stop_reason, entrypoint === 'update' ? 'desktop_update' : 'desktop_quit')
+    assert.equal(observed.outcome, 'stop_requested', entrypoint)
+    if (entrypoint === 'force') assert.equal(observed.requested_signal, 'SIGKILL')
+    assert.equal(stopping.size, 0, 'diagnostic tracking must not change recovery ownership')
+  }
+}
+
+await runQuitProcessDiagnosticsWiringCases()
 
 function runCleanExitRecoveryContractCase() {
   const closeHandler = mainSection("child.once('close', (code, signal) => {", "  // A failed spawn")

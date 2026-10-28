@@ -12,6 +12,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 from urllib.error import URLError
+from uuid import UUID
 
 import httpx
 import pytest
@@ -1921,6 +1922,165 @@ def test_gateway_run_drains_via_http_shutdown_trigger(tmp_path, monkeypatch) -> 
         {key: event[key] for key in ("event", "reason") if key in event}
         for event in logs
     ]
+
+
+@pytest.mark.parametrize("failure", [False, True])
+def test_gateway_run_diagnostics_correlate_return_and_exception_without_content(
+    tmp_path, monkeypatch, failure,
+) -> None:
+    import structlog
+
+    config = tmp_path / "gw.toml"
+    config.write_text('host = "127.0.0.1"\nport = 18791\n', encoding="utf-8")
+    server = _ShutdownProbeServer(fire="api_shutdown", via="http")
+    _install_fake_start(server, {}, monkeypatch)
+    monkeypatch.setattr(gateway_cmd, "_gateway_bind_available", lambda *_args: True)
+    monkeypatch.setattr(gateway_cmd, "_install_shutdown_handlers", lambda *_args: [])
+    if failure:
+        async def failed_start(**_kwargs):
+            raise RuntimeError("PRIVATE runtime detail")
+
+        monkeypatch.setattr(gateway_cmd, "start_gateway_server", failed_start)
+    with structlog.testing.capture_logs() as logs:
+        if failure:
+            with pytest.raises(RuntimeError, match="PRIVATE"):
+                gateway_cmd.run_gateway(
+                    port=None, bind=None, listen="", debug=False, config_path=str(config),
+                )
+        else:
+            gateway_cmd.run_gateway(
+                port=None, bind=None, listen="", debug=False, config_path=str(config),
+            )
+    events = [row for row in logs if row["event"] in {
+        "gateway.run_started", "gateway.run_finished",
+    }]
+    assert len(events) == 2
+    started, finished = events
+    assert started["process_instance_id"] == finished["process_instance_id"]
+    assert started["pid"] == finished["pid"] == os.getpid()
+    assert started["parent_pid"] == os.getppid()
+    assert started["platform"] == sys.platform
+    assert finished["outcome"] == ("exception" if failure else "shutdown_requested")
+    assert finished["error_type"] == ("RuntimeError" if failure else None)
+    assert finished["duration_ms"] >= 0
+    assert "PRIVATE" not in json.dumps(events)
+
+
+@pytest.mark.parametrize("value", [
+    None, "", "PRIVATE invalid instance", "/private/instance", "x" * 64,
+    "f32ca036-f220-40ee-b3d8-d43570aba9db-extra",
+])
+def test_gateway_process_diagnostics_reject_invalid_desktop_instance_id(monkeypatch, value):
+    name = gateway_cmd.DESKTOP_GATEWAY_INSTANCE_ID_ENV
+    if value is None:
+        monkeypatch.delenv(name, raising=False)
+    else:
+        monkeypatch.setenv(name, value)
+    instance_id = gateway_cmd._gateway_process_diagnostic_id()
+    assert str(UUID(instance_id)) == instance_id
+    assert instance_id != value
+    assert gateway_cmd._gateway_process_diagnostic_id() != instance_id
+
+
+def test_gateway_process_diagnostics_join_wrapped_desktop_launch(tmp_path, monkeypatch):
+    import structlog
+
+    shared_instance_id = "f32ca036-f220-40ee-b3d8-d43570aba9db"
+    name = gateway_cmd.DESKTOP_GATEWAY_INSTANCE_ID_ENV
+    monkeypatch.setenv(name, shared_instance_id.upper())
+    monkeypatch.setattr(gateway_cmd.os, "getpid", lambda: 303)
+    monkeypatch.setattr(gateway_cmd.os, "getppid", lambda: 202)
+    config = tmp_path / "gw.toml"
+    config.write_text('host = "127.0.0.1"\nport = 18791\n', encoding="utf-8")
+    server = _ShutdownProbeServer(fire="api_shutdown", via="http")
+    _install_fake_start(server, {}, monkeypatch)
+    original_start = gateway_cmd.start_gateway_server
+
+    async def start_consuming_handoff(**kwargs):
+        # Ownership consumes the existing handoff before worker subprocesses
+        # are admitted. Runtime diagnostics must retain their earlier snapshot.
+        monkeypatch.delenv(name)
+        return await original_start(**kwargs)
+
+    monkeypatch.setattr(gateway_cmd, "start_gateway_server", start_consuming_handoff)
+    monkeypatch.setattr(gateway_cmd, "_gateway_bind_available", lambda *_args: True)
+    monkeypatch.setattr(gateway_cmd, "_install_shutdown_handlers", lambda *_args: [])
+    with structlog.testing.capture_logs() as logs:
+        gateway_cmd.run_gateway(
+            port=None, bind=None, listen="", debug=False, config_path=str(config),
+        )
+    events = [row for row in logs if row["event"] in {
+        "gateway.run_started", "gateway.run_finished",
+    }]
+    assert len(events) == 2
+    assert {row["process_instance_id"] for row in events} == {shared_instance_id}
+    assert all(row["pid"] == 303 and row["parent_pid"] == 202 for row in events)
+    assert name not in os.environ
+
+
+def test_gateway_run_diagnostic_sink_failure_does_not_prevent_shutdown(tmp_path, monkeypatch):
+    config = tmp_path / "gw.toml"
+    config.write_text('host = "127.0.0.1"\nport = 18791\n', encoding="utf-8")
+    server = _ShutdownProbeServer(fire="api_shutdown", via="http")
+    _install_fake_start(server, {}, monkeypatch)
+    monkeypatch.setattr(gateway_cmd, "_gateway_bind_available", lambda *_args: True)
+    monkeypatch.setattr(gateway_cmd, "_install_shutdown_handlers", lambda *_args: [])
+    original_info = gateway_cmd.log.info
+    failed_events = []
+
+    def fail_run_events(event, **fields):
+        if event in {"gateway.run_started", "gateway.run_finished"}:
+            failed_events.append(event)
+            raise OSError("synthetic diagnostic sink failure")
+        return original_info(event, **fields)
+
+    monkeypatch.setattr(gateway_cmd.log, "info", fail_run_events)
+    gateway_cmd.run_gateway(
+        port=None, bind=None, listen="", debug=False, config_path=str(config),
+    )
+    assert failed_events == ["gateway.run_started", "gateway.run_finished"]
+    assert server.closed == ["api_shutdown"]
+
+
+def test_gateway_run_reports_failure_of_heartbeat_cleanup_after_requested_shutdown(
+    tmp_path, monkeypatch,
+):
+    import structlog
+
+    from opensquilla.gateway.stall_watchdog import GatewayStallWatchdog
+
+    config = tmp_path / "gw.toml"
+    config.write_text('host = "127.0.0.1"\nport = 18791\n', encoding="utf-8")
+    server = _ShutdownProbeServer(fire="api_shutdown", via="http")
+    _install_fake_start(server, {}, monkeypatch)
+    monkeypatch.setattr(gateway_cmd, "_gateway_bind_available", lambda *_args: True)
+    monkeypatch.setattr(gateway_cmd, "_install_shutdown_handlers", lambda *_args: [])
+    watchdog = SimpleNamespace(
+        start=lambda: True, stop=lambda: None, heartbeat_failed=lambda _: None,
+    )
+    monkeypatch.setattr(GatewayStallWatchdog, "from_environment", lambda: watchdog)
+    original_create_task = asyncio.create_task
+
+    async def failed_heartbeat():
+        raise RuntimeError("PRIVATE heartbeat failure")
+
+    def create_failed_heartbeat(coroutine, *, name=None, **kwargs):
+        if name == "gateway-stall-heartbeat":
+            coroutine.close()
+            coroutine = failed_heartbeat()
+        return original_create_task(coroutine, name=name, **kwargs)
+
+    monkeypatch.setattr(gateway_cmd.asyncio, "create_task", create_failed_heartbeat)
+    with structlog.testing.capture_logs() as logs, pytest.raises(RuntimeError, match="PRIVATE"):
+        gateway_cmd.run_gateway(
+            port=None, bind=None, listen="", debug=False, config_path=str(config),
+        )
+    finished = [row for row in logs if row["event"] == "gateway.run_finished"]
+    assert len(finished) == 1
+    assert finished[0]["outcome"] == "exception"
+    assert finished[0]["error_type"] == "RuntimeError"
+    assert server.closed == ["api_shutdown"]
+    assert "PRIVATE" not in json.dumps(finished)
 
 
 def test_gateway_run_force_exits_after_incomplete_shutdown(tmp_path, monkeypatch) -> None:
