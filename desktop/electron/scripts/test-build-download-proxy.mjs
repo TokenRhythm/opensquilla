@@ -3,6 +3,7 @@ import { spawn } from 'node:child_process'
 import { createHash } from 'node:crypto'
 import { mkdtemp, rm } from 'node:fs/promises'
 import { createServer } from 'node:http'
+import { createRequire } from 'node:module'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import test from 'node:test'
@@ -13,6 +14,42 @@ function isolatedProxyEnvironment() {
     && !/^global_agent_/i.test(name)
     && !/^roarr_/i.test(name)))
 }
+
+test('installer logger serializer retains URI resolution and schema validation', () => {
+  const require = createRequire(import.meta.url)
+  const builderRequire = createRequire(require.resolve('app-builder-lib/package.json'))
+  const getRequire = createRequire(builderRequire.resolve('@electron/get'))
+  const agentRequire = createRequire(getRequire.resolve('global-agent'))
+  const loggerRequire = createRequire(agentRequire.resolve('roarr'))
+  const serializerRequire = createRequire(loggerRequire.resolve('fast-json-stringify'))
+  assert.equal(serializerRequire('fast-uri/package.json').version, '3.1.9')
+  const uri = serializerRequire('fast-uri')
+  const schemaId = 'https://synthetic.invalid/schemas/event.json'
+  const reference = `${schemaId}#/definitions/ready`
+  assert.equal(uri.resolve(schemaId, '#/definitions/ready'), reference)
+  assert.equal(uri.serialize(uri.parse(reference)), reference)
+  const stringify = loggerRequire('fast-json-stringify')({
+    $id: schemaId,
+    type: 'object',
+    properties: {
+      context: { anyOf: [{ $ref: '#/definitions/ready' }, { $ref: '#/definitions/error' }] },
+    },
+    definitions: {
+      ready: {
+        type: 'object', properties: { ready: { type: 'boolean' } }, required: ['ready'],
+        additionalProperties: false,
+      },
+      error: {
+        type: 'object', properties: { code: { type: 'string' } }, required: ['code'],
+        additionalProperties: false,
+      },
+    },
+  })
+  for (const context of [{ ready: true }, { code: 'ECONNRESET' }]) {
+    assert.deepEqual(JSON.parse(stringify({ context })), { context })
+  }
+  assert.throws(() => stringify({ context: { unknown: true } }))
+})
 
 test('builder artifact downloads retain proxy logging, routing and checksum verification', async () => {
   const directory = await mkdtemp(join(tmpdir(), 'opensquilla-build-proxy-'))

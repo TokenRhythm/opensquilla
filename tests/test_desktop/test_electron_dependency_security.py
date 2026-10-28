@@ -73,17 +73,31 @@ def test_undici_security_floors_preserve_supported_parent_major_versions() -> No
             assert version >= (7, 30, 1)
 
 
-def test_installer_downloader_removes_unpatched_formatter_dependency() -> None:
+def test_installer_downloader_preserves_logger_api_without_vulnerable_dependencies() -> None:
     manifest = json.loads((LOCK_PATH.parent / "package.json").read_text(encoding="utf-8"))
-    assert manifest["overrides"]["global-agent@3.0.0"] == {"roarr": "3.3.0"}
+    logger_override = manifest["overrides"]["global-agent@3.0.0"]["roarr"]
+    # The proxy loader requires the legacy default logger export. Upgrade its
+    # serializer and URI resolver within that supported API boundary.
+    assert logger_override["."] == "3.3.0"
+    assert logger_override["fast-json-stringify"] == "5.16.1"
+    assert manifest["overrides"]["fast-json-stringify@5.16.1"]["fast-uri"] == "3.1.9"
     packages = _packages()
     agents = [package for path, package in packages.items() if path.endswith("/global-agent")]
     loggers = [package for path, package in packages.items() if path.endswith("/roarr")]
+    serializers = [
+        package for path, package in packages.items() if path.endswith("/fast-json-stringify")
+    ]
     assert agents
     assert all(_version_tuple(package["version"]) == (3, 0, 0) for package in agents)
     assert all("roarr" in package["dependencies"] for package in agents)
     assert loggers
-    assert all(_version_tuple(package["version"]) >= (3, 3, 0) for package in loggers)
+    assert all(_version_tuple(package["version"]) == (3, 3, 0) for package in loggers)
+    assert serializers
+    assert all(
+        (5, 16, 1) <= _version_tuple(package["version"]) < (6, 0, 0)
+        for package in serializers
+    )
+    assert not any(path.endswith("/deepmerge") for path in packages)
     assert not any(path.endswith("/sprintf-js") for path in packages)
     download_options = manifest["build"].get("electronDownload", {}).get("downloadOptions", {})
     assert "cache" not in download_options

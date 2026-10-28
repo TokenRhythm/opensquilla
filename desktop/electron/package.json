@@ -121,6 +121,9 @@
         ".": "3.3.0",
         "fast-json-stringify": "5.16.1"
       }
+    },
+    "fast-json-stringify@5.16.1": {
+      "fast-uri": "3.1.9"
     }
   },
   "build": {
