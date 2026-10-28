@@ -2300,7 +2300,7 @@ wheels = [
 
 [[package]]
 name = "opensquilla"
-version = "0.5.8"
+version = "0.5.7"
 source = { editable = "." }
 dependencies = [
     { name = "aiohttp" },

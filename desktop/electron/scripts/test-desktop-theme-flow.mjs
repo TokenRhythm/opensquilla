@@ -226,11 +226,17 @@ try {
   // Exercise the same SPA navigation path as an operator. A hard page.goto()
   // can race a still-settling draft ChatView canonicalization on slower
   // Windows runners and be replaced by /chat/new even though the renderer is
-  // healthy; clicking the permanent settings control also proves the shell is
-  // still interactive before testing the theme panel.
-  const settingsButton = page.locator('button.sidebar-fn-item[data-icon="settings"]')
-  await settingsButton.waitFor({ state: 'visible', timeout: 20_000 })
-  await settingsButton.click()
+  // healthy; opening Settings through the shell also proves it is interactive.
+  // Account-capable clients place Settings inside the account menu; clients
+  // without that capability retain the direct footer entry.
+  const settingsEntry = page.locator(
+    '[data-testid="sidebar-account-trigger"]:visible, '
+    + 'button.sidebar-fn-item[data-icon="settings"]:visible',
+  ).first()
+  await settingsEntry.waitFor({ state: 'visible', timeout: 20_000 })
+  const accountMenu = await settingsEntry.getAttribute('data-testid') === 'sidebar-account-trigger'
+  await settingsEntry.click()
+  if (accountMenu) await page.getByTestId('sidebar-account-settings').click()
   await page.waitForURL(url => url.pathname.includes('/settings'), {
     timeout: 20_000,
   })

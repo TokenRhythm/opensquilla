@@ -138,14 +138,22 @@ describe('logout confirmation', () => {
   return { el, trigger, dialog: document.querySelector<HTMLElement>('[role="dialog"]')! }
  }
 
- it('keeps the settings action available in the simplified menu', async () => {
-  const onSettings = vi.fn()
-  const el = await mount(SidebarAccountMenu, state({ status: 'signed_in', profile }), { onSettings })
-  el.querySelector<HTMLButtonElement>('[aria-haspopup="menu"]')!.click()
+ it.each(['signed_out', 'signed_in', 'unverified'] as const)('hands settings focus back to the menu trigger while %s', async (status) => {
+  let focusAtSettings: Element | null = null
+  const onSettings = vi.fn(() => { focusAtSettings = document.activeElement })
+  const el = await mount(SidebarAccountMenu, state({ status, profile }), { onSettings })
+  mock.store.busy = true
+  const trigger = el.querySelector<HTMLButtonElement>('[aria-haspopup="menu"]')!
+  trigger.click()
   await nextTick()
-  el.querySelector<HTMLButtonElement>('[role="menuitem"]')!.click()
+  const settings = [...el.querySelectorAll<HTMLButtonElement>('[role="menuitem"]')].find(button => button.textContent === '设置')!
+  expect(settings.disabled).toBe(false)
+  settings.focus()
+  settings.click()
   await nextTick()
   expect(onSettings).toHaveBeenCalledOnce()
+  expect(focusAtSettings).toBe(trigger)
+  expect(document.activeElement).toBe(trigger)
   expect(el.querySelector('[role="menu"]')).toBeNull()
   expect(mock.store.action).not.toHaveBeenCalled()
  })
