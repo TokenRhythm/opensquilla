@@ -11,7 +11,10 @@ const account = useAccountStore()
 const { t, te } = useI18n()
 const logoutOpen = ref(false)
 const authorizing = computed(() => ['authorizing', 'verifying'].includes(account.state?.status || ''))
-const failure = computed(() => account.error || account.state?.errorCode)
+const failure = computed(() => {
+  const errorCode = account.error || account.state?.errorCode
+  return errorCode === 'ACCOUNT_LOGIN_CANCELLED' ? null : errorCode
+})
 const recoveryRequired = computed(() => account.state?.status === 'storage_unavailable'
   && ['ACCOUNT_LOCAL_KEY_MISSING', 'ACCOUNT_LOCAL_KEY_INVALID', 'ACCOUNT_LOCAL_DATA_INVALID'].includes(account.state?.errorCode || ''))
 const errorText = computed(() => failure.value && te(`account.errors.${failure.value}`) ? t(`account.errors.${failure.value}`) : t('account.errors.generic'))
