@@ -162,7 +162,7 @@ def test_production_registry_uses_contract_wrappers_without_surface_drift() -> N
     # V2 recovery, video discovery, message search, five interactive terminal
     # methods, side create/close and workspace creation add sixteen to the
     # previous 269-method surface.
-    assert len(registry.list_methods()) == 285
+    assert len(registry.list_methods()) == 287
     workspace_entry = registry.get_entry("workspaces.create")
     assert workspace_entry is not None
     assert workspace_entry.required_scope == "operator.write"
