@@ -13,7 +13,7 @@ import os
 import time
 import uuid
 from collections.abc import Awaitable, Callable, Mapping, Sequence
-from contextlib import nullcontext
+from contextlib import ExitStack, nullcontext
 from copy import deepcopy
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -3403,32 +3403,60 @@ async def call_compaction_provider(
                 )
                 return provider_stream
 
-            accounted_stream = (
-                start_stream() if provider_accounts_physical_usage(deployment.provider)
-                else account_provider_stream(
-                    start_stream, provider=deployment.provider_id, model=deployment.model,
+            with ExitStack() as response_phases:
+                response_received = False
+
+                def observe_provider_event(event: Any) -> None:
+                    nonlocal response_received
+                    if response_received or not (
+                        isinstance(event, DoneEvent) or getattr(event, "kind", "") == "done"
+                    ):
+                        return
+                    response_received = True
+                    report_compaction_diagnostic(
+                        "compaction.summary_response_received",
+                        compaction_id=compaction_id, pid=os.getpid(), chunk_index=chunk_index,
+                        attempt_number=attempt_number,
+                        duration_ms=max(0, int((time.monotonic() - call_started_at) * 1000)),
+                    )
+                    # The raw terminal event precedes ledger finalization and
+                    # iterator exhaustion, both of which can perform local I/O.
+                    # Keep this scope open through the actual transport cleanup.
+                    response_phases.enter_context(compaction_diagnostic_phase(
+                        compaction_id=compaction_id,
+                        phase="summarizing", step="summary_response_processing",
+                    ))
+
+                accounts_usage = provider_accounts_physical_usage(deployment.provider)
+                accounted_stream = (
+                    start_stream() if accounts_usage
+                    else account_provider_stream(
+                        start_stream, provider=deployment.provider_id, model=deployment.model,
+                        on_provider_event=observe_provider_event,
+                    )
                 )
-            )
-            try:
-                async with compaction_progress_timeout(
-                    idle_timeout_seconds=timeout,
-                    deadline_at_monotonic=chat_config.turn_deadline_at_monotonic,
-                ) as progress:
-                    async for event in accounted_stream:
-                        record_provider_retry_after(deployment.provider, event)
-                        progress.observe(event)
-                        if isinstance(event, ErrorEvent):
-                            _report_compaction_credential_failure(deployment, event)
-                        yield event
-            finally:
-                with compaction_diagnostic_phase(
-                    compaction_id=compaction_id,
-                    phase="summarizing", step="summary_attempt_cleanup",
-                ):
-                    if provider_stream is not accounted_stream:
-                        await _close_compaction_provider_stream(provider_stream)
-                    await _close_compaction_provider_stream(accounted_stream)
-                    provider_stream = accounted_stream = None
+                try:
+                    async with compaction_progress_timeout(
+                        idle_timeout_seconds=timeout,
+                        deadline_at_monotonic=chat_config.turn_deadline_at_monotonic,
+                    ) as progress:
+                        async for event in accounted_stream:
+                            if accounts_usage:
+                                observe_provider_event(event)
+                            record_provider_retry_after(deployment.provider, event)
+                            progress.observe(event)
+                            if isinstance(event, ErrorEvent):
+                                _report_compaction_credential_failure(deployment, event)
+                            yield event
+                finally:
+                    with compaction_diagnostic_phase(
+                        compaction_id=compaction_id,
+                        phase="summarizing", step="summary_attempt_cleanup",
+                    ):
+                        if provider_stream is not accounted_stream:
+                            await _close_compaction_provider_stream(provider_stream)
+                        await _close_compaction_provider_stream(accounted_stream)
+                        provider_stream = accounted_stream = None
 
         def enforce_stream_memory(text: str) -> None:
             nonlocal received_bytes
@@ -3484,12 +3512,6 @@ async def call_compaction_provider(
                 # estimates cannot validate a different model's billed
                 # generation, and reasoning is not checkpoint body text.
                 enforce_stream_memory(str(getattr(event, "reasoning_content", "") or ""))
-                report_compaction_diagnostic(
-                    "compaction.summary_response_received",
-                    compaction_id=compaction_id, pid=os.getpid(), chunk_index=chunk_index,
-                    attempt_number=attempt_number,
-                    duration_ms=max(0, int((time.monotonic() - call_started_at) * 1000)),
-                )
                 continue
 
         if not saw_done:

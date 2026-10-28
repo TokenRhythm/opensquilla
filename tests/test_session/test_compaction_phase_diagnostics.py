@@ -13,6 +13,12 @@ from types import SimpleNamespace
 import pytest
 from structlog.testing import capture_logs
 
+from opensquilla.engine.usage_accounting import (
+    UsageAccountingScope,
+    UsageExecutionContext,
+    account_provider_stream,
+    bind_usage_accounting_scope,
+)
 from opensquilla.observability.log_privacy import PrivateLogFormatter, scrub_log_artifact
 from opensquilla.provider.types import DoneEvent, TextDeltaEvent
 from opensquilla.session import compaction
@@ -64,7 +70,9 @@ async def test_summary_completion_precedes_local_phase_pairs_and_terminal():
     ]
     phases = [(i, row) for i, row in enumerate(events)
               if row["event"] in {"compaction.phase_started", "compaction.phase_finished"}
-              and row.get("step_name") != "summary_attempt_cleanup"]
+              and row.get("step_name") not in {
+                  "summary_attempt_cleanup", "summary_response_processing",
+              }]
     assert [row["step_name"] for _, row in phases[::2]] == expected
     for index, step in enumerate(expected):
         (begin_index, begin), (end_index, end) = phases[index * 2:index * 2 + 2]
@@ -143,6 +151,145 @@ async def test_actual_attempt_cleanup_is_visible_after_provider_done(monkeypatch
     assert len(finishes) == 1
     assert finishes[0]["status"] == ("cancelled" if cancel else "completed")
     assert finishes[0]["duration_ms"] >= 0
+
+
+@pytest.mark.parametrize("stage", ["finalization", "iterator_exhaustion", "transport_cleanup"])
+@pytest.mark.parametrize("cancel", [False, True])
+async def test_raw_completion_phase_covers_real_accounting_and_transport_cleanup(stage, cancel):
+    entered, release = asyncio.Event(), asyncio.Event()
+    finalized = []
+    closed = []
+    unknown = []
+
+    class Sink:
+        async def start(self, call):
+            pass
+
+        async def finalize(self, call, result):
+            if stage == "finalization":
+                entered.set()
+                await release.wait()
+            finalized.append(result)
+
+        async def mark_unknown(self, call, reason):
+            unknown.append(reason)
+
+    class Stream:
+        def __init__(self):
+            self.events = iter([
+                TextDeltaEvent(text="Synthetic checkpoint."), DoneEvent(stop_reason="end_turn"),
+            ])
+
+        def __aiter__(self):
+            return self
+
+        async def __anext__(self):
+            try:
+                return next(self.events)
+            except StopIteration:
+                if stage == "iterator_exhaustion":
+                    entered.set()
+                    await release.wait()
+                raise StopAsyncIteration from None
+
+        async def aclose(self):
+            if stage == "transport_cleanup":
+                entered.set()
+                await release.wait()
+            closed.append(True)
+
+    class Provider:
+        def chat(self, *args, **kwargs):
+            return Stream()
+
+    cfg = synthetic_compaction_config()
+    target = replace(cfg.llm_plan.primary, provider=Provider())
+    plan = replace(cfg.llm_plan, candidates=(target,))
+    scope = UsageAccountingScope(Sink(), UsageExecutionContext(
+        execution_id="synthetic-response-timing", agent_run_id="synthetic-run",
+    ))
+    with capture_logs() as events, bind_usage_accounting_scope(scope):
+        task = asyncio.create_task(compaction.call_compaction_provider(
+            "Synthetic source.", "", plan, compaction_id="cmp_accounted_response",
+        ))
+        try:
+            await asyncio.wait_for(entered.wait(), 3)
+            received = [row for row in events
+                        if row["event"] == "compaction.summary_response_received"]
+            phases = [row for row in events
+                      if row.get("step_name") == "summary_response_processing"]
+            assert len(received) == 1
+            assert len(phases) == 1 and phases[0]["status"] == "started"
+            assert not any(row["event"] == "compaction.llm_call_completed" for row in events)
+            assert not closed
+            if stage == "finalization":
+                assert not finalized
+            if cancel:
+                task.cancel()
+                await asyncio.sleep(0)
+                if stage == "finalization":
+                    # The existing ledger cancellation barrier must still settle.
+                    assert not task.done() and not finalized
+                    assert not any(row["event"] == "compaction.phase_finished"
+                                   and row.get("step_name") == "summary_response_processing"
+                                   for row in events)
+            release.set()
+            if cancel:
+                with pytest.raises(asyncio.CancelledError):
+                    await task
+            else:
+                assert await task == "Synthetic checkpoint."
+        finally:
+            release.set()
+            await asyncio.gather(task, return_exceptions=True)
+    finishes = [row for row in events if row.get("step_name") == "summary_response_processing"
+                and row["event"] == "compaction.phase_finished"]
+    assert len(finishes) == 1
+    assert finishes[0]["status"] == ("cancelled" if cancel else "completed")
+    if not cancel:
+        finished_index = events.index(finishes[0])
+        completed_index = next(index for index, row in enumerate(events)
+                               if row["event"] == "compaction.llm_call_completed")
+        assert finished_index < completed_index
+    assert finalized and closed and not unknown
+    assert PRIVATE not in json.dumps(events)
+
+
+@pytest.mark.parametrize("scoped", [False, True])
+async def test_raw_event_observer_failure_preserves_event_identity_and_accounting(scoped):
+    source = [TextDeltaEvent(text="Synthetic checkpoint."), DoneEvent(stop_reason="end_turn")]
+    observed, finalized = [], []
+
+    async def stream():
+        for event in source:
+            yield event
+
+    def broken_observer(event):
+        observed.append(event)
+        raise RuntimeError(PRIVATE)
+
+    class Sink:
+        async def start(self, call):
+            pass
+
+        async def finalize(self, call, result):
+            finalized.append(result)
+
+        async def mark_unknown(self, call, reason):
+            pytest.fail("A completed stream must retain its terminal usage receipt")
+
+    scope = UsageAccountingScope(Sink(), UsageExecutionContext(
+        execution_id="synthetic-observer", agent_run_id="synthetic-observer-run",
+    )) if scoped else None
+    with bind_usage_accounting_scope(scope):
+        delivered = [event async for event in account_provider_stream(
+            stream, provider="synthetic", model="synthetic/model",
+            on_provider_event=broken_observer,
+        )]
+    assert len(delivered) == len(observed) == len(source)
+    assert all(actual is expected for actual, expected in zip(delivered, source, strict=True))
+    assert all(actual is expected for actual, expected in zip(observed, source, strict=True))
+    assert len(finalized) == int(scoped)
 
 
 async def test_admission_replan_records_source_and_attachment_work(monkeypatch):

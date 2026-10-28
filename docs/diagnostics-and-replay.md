@@ -52,14 +52,16 @@ private prompts, tool outputs, local paths, or provider-visible content.
 ### Compaction pauses and Gateway exits
 
 Normal operational logs include content-free compaction timings.
-`compaction.summary_response_received` marks a valid provider completion event
-before stream cleanup; `compaction.llm_call_completed` follows that cleanup.
+`compaction.summary_response_received` marks a raw provider terminal event
+before usage settlement and stream cleanup. It does not mean the summary passed
+validation. The `summary_response_processing` phase spans usage settlement,
+iterator exhaustion, and cleanup; `compaction.llm_call_completed` follows them.
 Follow `compaction.phase_started` and `compaction.phase_finished` with the same
 `compaction_id`. The `step_name`
 distinguishes attachment projection, historical reference extraction, retained
-history measurement, summary validation, consumer admission, and durable commit
-work. Finished records include `duration_ms`, `status`, and the exception type
-when work fails, times out, or is cancelled. They contain no summary or history
+history measurement, summary validation, consumer admission, mutation-lock waits,
+and durable commit work. Finished records include `duration_ms`, `status`, and the
+exception type when work fails, times out, or is cancelled. They contain no summary or history
 text and remain available in diagnostic bundles without content capture.
 
 Use `pid` to correlate those steps with Gateway lifecycle records. Desktop

@@ -517,6 +517,19 @@ def _session_mutation_context(
     return mutation_context() if mutation_context is not None else _null_async_context()
 
 
+@contextlib.asynccontextmanager
+async def _compaction_mutation_context(
+    mutation_context: Callable[[], contextlib.AbstractAsyncContextManager[None]] | None,
+    *, compaction_id: str,
+) -> AsyncIterator[None]:
+    async with contextlib.AsyncExitStack() as stack:
+        with compaction_diagnostic_phase(
+            compaction_id=compaction_id, phase="validating", step="precommit_mutation_wait",
+        ):
+            await stack.enter_async_context(_session_mutation_context(mutation_context))
+        yield
+
+
 def _archive_dir() -> Path:
     return Path(
         os.environ.get(
@@ -4019,7 +4032,9 @@ class SessionManager:
                     0,
                 ),
             )
-        async with _session_mutation_context(mutation_context):
+        async with _compaction_mutation_context(
+            mutation_context, compaction_id=persisted_compaction_id,
+        ):
             try:
                 with compaction_diagnostic_phase(
                     compaction_id=persisted_compaction_id,

@@ -10,7 +10,8 @@ from __future__ import annotations
 import hashlib
 import json
 import re
-from collections.abc import Mapping, Sequence
+from array import array
+from collections.abc import Iterator, Mapping, Sequence
 from dataclasses import dataclass
 from itertools import islice
 from typing import Any
@@ -158,7 +159,7 @@ _ARTIFACT_EXTENSION_RE = re.compile(
 )
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True)
 class _LiteralSpan:
     start: int
     body_start: int
@@ -166,54 +167,59 @@ class _LiteralSpan:
     end: int
 
 
-def _code_spans(text: str) -> list[_LiteralSpan]:
-    runs = list(_BACKTICK_RUN_RE.finditer(text))
+def _code_spans(text: str) -> Iterator[_LiteralSpan]:
+    offset_type = "I" if len(text) <= 0xFFFFFFFF else "Q"
+    starts = array(offset_type)
+    ends = array(offset_type)
+    for run in _BACKTICK_RUN_RE.finditer(text):
+        starts.append(run.start())
+        ends.append(run.end())
     following: dict[int, int] = {}
-    closing: dict[int, int] = {}
-    for index in range(len(runs) - 1, -1, -1):
-        length = runs[index].end() - runs[index].start()
-        if length in following:
-            closing[index] = following[length]
+    closing = array(offset_type, [0]) * len(starts)
+    for index in range(len(starts) - 1, -1, -1):
+        length = ends[index] - starts[index]
+        closing[index] = following.get(length, 0)
         following[length] = index
-    spans: list[_LiteralSpan] = []
     position = 0
-    for index, run in enumerate(runs):
-        if run.start() < position or index not in closing:
+    for index, start in enumerate(starts):
+        if start < position or not closing[index]:
             continue
-        end = runs[closing[index]]
-        spans.append(_LiteralSpan(run.start(), run.end(), end.start(), end.end()))
-        position = end.end()
-    return spans
+        end = closing[index]
+        yield _LiteralSpan(start, ends[index], starts[end], ends[end])
+        position = ends[end]
 
 
-def _quote_spans(text: str) -> list[_LiteralSpan]:
+def _quote_spans(text: str) -> Iterator[_LiteralSpan]:
     # Record available closing quotes once. Retrying a regex at each unmatched
     # opening quote can revisit the same suffix or explore ambiguous escapes.
-    quotes: list[tuple[int, str, bool]] = []
+    offset_type = "I" if len(text) <= 0xFFFFFFFF else "Q"
+    positions = array(offset_type)
+    kinds = bytearray()
+    available = bytearray()
     backslashes = 0
     for index, char in enumerate(text):
         if char in "'\"\n":
-            quotes.append((index, char, backslashes % 2 == 0))
+            positions.append(index)
+            kinds.append(ord(char))
+            available.append(backslashes % 2 == 0)
         backslashes = backslashes + 1 if char == "\\" else 0
-    following: dict[str, int] = {}
-    closing: dict[int, int] = {}
-    for index, char, available in reversed(quotes):
-        if char == "\n":
+    following: dict[int, int] = {}
+    closing = array(offset_type, [0]) * len(positions)
+    for index in range(len(positions) - 1, -1, -1):
+        char_kind = kinds[index]
+        if char_kind == ord("\n"):
             following.clear()
             continue
-        if char in following:
-            closing[index] = following[char]
-        if available:
-            following[char] = index
-    spans: list[_LiteralSpan] = []
+        closing[index] = following.get(char_kind, 0)
+        if available[index]:
+            following[char_kind] = index
     position = 0
-    for index, char, _ in quotes:
-        if char == "\n" or index < position or index not in closing:
+    for index, start in enumerate(positions):
+        if kinds[index] == ord("\n") or start < position or not closing[index]:
             continue
-        end = closing[index]
-        spans.append(_LiteralSpan(index, index + 1, end, end + 1))
+        end = positions[closing[index]]
+        yield _LiteralSpan(start, start + 1, end, end + 1)
         position = end + 1
-    return spans
 
 
 def _artifact_names(text: str) -> list[str]:
@@ -258,8 +264,7 @@ def _clean_obligation_text(
 
 def _command_references(text: str, *, _parse_json_fields: bool = True) -> list[str]:
     code_spans = _code_spans(text)
-    code_by_start = {span.start: span for span in code_spans}
-    code_index = 0
+    code_span = next(code_spans, None)
     json_fields = iter(_JSON_STRING_FIELD_RE.finditer(text)) if _parse_json_fields else iter(())
     field = next(json_fields, None)
     commands: list[str] = []
@@ -280,13 +285,16 @@ def _command_references(text: str, *, _parse_json_fields: bool = True) -> list[s
                 ))
                 position = field.end("value")
             continue
-        while code_index < len(code_spans) and code_spans[code_index].body_end <= match.start():
-            code_index += 1
-        surrounding_code = code_spans[code_index] if code_index < len(code_spans) else None
+        while code_span is not None and code_span.body_end <= match.start():
+            code_span = next(code_spans, None)
+        surrounding_code = code_span
         if surrounding_code is not None and surrounding_code.body_start > match.start():
             surrounding_code = None
         package_prose = _NPM_PACKAGE_PROSE_RE.match(text, match.start())
-        package_span = code_by_start.get(package_prose.end()) if package_prose is not None else None
+        package_span = (
+            code_span if package_prose is not None and code_span is not None
+            and code_span.start == package_prose.end() else None
+        )
         if (surrounding_code is None and package_span is not None
                 and _NPM_PACKAGE_LITERAL_RE.fullmatch(
                     text[package_span.body_start:package_span.body_end],
@@ -306,79 +314,97 @@ def _command_references(text: str, *, _parse_json_fields: bool = True) -> list[s
     return commands
 
 
-def _file_paths(text: str) -> list[str]:
+def _iter_file_paths(text: str) -> Iterator[str]:
     # Each token and suffix is indexed once. In particular, shortening an
     # unquoted candidate must not rescan every following path on the same line.
-    tokens = list(_PATH_TOKENS_RE.finditer(text))
-    count = len(tokens)
-    last_end = [0] * count
-    file_end = [0] * count
-    first_space = [0] * count
+    # Compact offsets avoid retaining a regex Match and several Python integers
+    # per token. Fall back to wider offsets for strings exceeding 4 GiB.
+    offset_type = "I" if len(text) <= 0xFFFFFFFF else "Q"
+    offsets = array(offset_type, [0])
+    kinds = bytearray()
+    kind_numbers = {"word": 0, "space": 1, "separator": 2, "other": 3}
+    for token in _PATH_TOKENS_RE.finditer(text):
+        offsets.append(token.end())
+        assert token.lastgroup is not None
+        kinds.append(kind_numbers[token.lastgroup])
+    count = len(kinds)
+    last_end = array(offset_type, [0]) * count
+    file_end = array(offset_type, [0]) * count
+    first_space = array(offset_type, [0]) * count
     for index in range(count - 1, -1, -1):
-        token = tokens[index]
-        if token.lastgroup != "word":
+        if kinds[index] != 0:
             continue
-        last_end[index] = token.end()
+        token_start, token_end = offsets[index], offsets[index + 1]
+        last_end[index] = token_end
         extends = (
-            index + 2 < count and tokens[index + 2].lastgroup == "word"
-            and (tokens[index + 1].lastgroup == "space"
-                 or (tokens[index + 1].lastgroup == "separator"
-                     and len(tokens[index + 1].group()) == 1))
+            index + 2 < count and kinds[index + 2] == 0
+            and (kinds[index + 1] == 1
+                 or (kinds[index + 1] == 2 and offsets[index + 2] - token_end == 1))
         )
         if extends:
             last_end[index] = last_end[index + 2]
             first_space[index] = (
-                tokens[index + 1].start() if tokens[index + 1].lastgroup == "space"
+                token_end if kinds[index + 1] == 1
                 else first_space[index + 2]
             )
             file_end[index] = file_end[index + 2]
         # An extension has at most 16 characters, so inspect only that suffix
         # instead of trying every starting position in a long extensionless word.
-        suffix_start = max(token.start() + 1, token.end() - 17)
-        if ((not extends or tokens[index + 1].lastgroup == "space")
-                and _PATH_EXTENSION_RE.search(text, suffix_start, token.end()) is not None):
-            file_end[index] = token.end()
-    literal_ends: dict[int, set[int]] = {}
-    for span in [*_code_spans(text), *_quote_spans(text)]:
-        literal_ends.setdefault(span.body_start, set()).add(span.body_end)
-    paths: list[str] = []
+        suffix_start = max(token_start + 1, token_end - 17)
+        if ((not extends or kinds[index + 1] == 1)
+                and _PATH_EXTENSION_RE.search(text, suffix_start, token_end) is not None):
+            file_end[index] = token_end
+    code_spans = _code_spans(text)
+    quote_spans = _quote_spans(text)
+    code_span = next(code_spans, None)
+    quote_span = next(quote_spans, None)
     index = 0
     while index < count:
-        token = tokens[index]
-        start = token.start()
+        start, token_end = offsets[index], offsets[index + 1]
         tail = -1
-        if token.lastgroup == "word":
-            drive = text[token.end() - 1]
+        if kinds[index] == 0:
+            drive = text[token_end - 1]
             if (drive.isascii() and drive.isalpha() and index + 3 < count
-                    and tokens[index + 1].group() == ":"
-                    and tokens[index + 2].group() in {"/", "\\"}):
-                start = token.end() - 1
+                    and text[token_end:offsets[index + 2]] == ":"
+                    and text[offsets[index + 2]:offsets[index + 3]] in {"/", "\\"}):
+                start = token_end - 1
                 tail = index + 3
-            elif index + 2 < count and tokens[index + 1].group() == "/":
+            elif index + 2 < count and text[token_end:offsets[index + 2]] == "/":
                 # The original boundary can admit a suffix after punctuation
                 # inside an otherwise blocked word; visit that word only once.
-                while (start < token.end() and start > 0
+                while (start < token_end and start > 0
                        and _PATH_PREFIX_BLOCK_RE.fullmatch(text[start - 1]) is not None):
                     start += 1
-                if start < token.end():
+                if start < token_end:
                     tail = index + 2
-        elif token.lastgroup == "separator" and token.group().endswith("/"):
-            start = token.end() - 1
+        elif kinds[index] == 2 and text[token_end - 1] == "/":
+            start = token_end - 1
             if start == 0 or text[start - 1] != "<":
                 tail = index + 1
-        if (tail < 0 or tail >= count or tokens[tail].lastgroup != "word"
+        if (tail < 0 or tail >= count or kinds[tail] != 0
                 or (start > 0 and _PATH_PREFIX_BLOCK_RE.fullmatch(text[start - 1]) is not None)):
             index += 1
             continue
         end = last_end[tail]
-        if end not in literal_ends.get(start, ()):
+        while code_span is not None and code_span.body_start < start:
+            code_span = next(code_spans, None)
+        while quote_span is not None and quote_span.body_start < start:
+            quote_span = next(quote_spans, None)
+        is_literal = any(
+            span is not None and span.body_start == start and span.body_end == end
+            for span in (code_span, quote_span)
+        )
+        if not is_literal:
             end = file_end[tail] or first_space[tail] or end
-            paths.append(text[start:end].rstrip("."))
+            yield text[start:end].rstrip(".")
         else:
-            paths.append(text[start:end])
-        while index < count and tokens[index].start() < end:
+            yield text[start:end]
+        while index < count and offsets[index] < end:
             index += 1
-    return paths
+
+
+def _file_paths(text: str) -> list[str]:
+    return list(_iter_file_paths(text))
 
 
 def _after_label(line: str) -> str:
@@ -926,7 +952,7 @@ def extract_compaction_obligations(
                                 source_entry_id=source_entry_id,
                                 max_obligations=max_obligations,
                             )
-                        for file_path in _file_paths(result_text):
+                        for file_path in _iter_file_paths(result_text):
                             _add_obligation(
                                 obligations,
                                 seen,
@@ -960,7 +986,7 @@ def extract_compaction_obligations(
                 source_entry_id=source_entry_id,
                 max_obligations=max_obligations,
             )
-        for file_path in _file_paths(content):
+        for file_path in _iter_file_paths(content):
             _add_obligation(
                 obligations,
                 seen,

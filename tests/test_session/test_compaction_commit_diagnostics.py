@@ -7,6 +7,7 @@ import json
 import logging
 import os
 import sqlite3
+from contextlib import asynccontextmanager
 from types import SimpleNamespace
 
 import pytest
@@ -57,7 +58,7 @@ async def candidate(monkeypatch):
         await storage.close()
 
 
-async def _invoke(candidate, writer):
+async def _invoke(candidate, writer, *, mutation_context=None):
     node = candidate.node
     kwargs = {
         "compaction_id": _COMPACTION_ID,
@@ -66,7 +67,8 @@ async def _invoke(candidate, writer):
     }
     if writer == "manual":
         return await candidate.manager.compact_with_result(
-            node.session_key, 32768, CompactionConfig(), trigger_reason="manual", **kwargs,
+            node.session_key, 32768, CompactionConfig(), trigger_reason="manual",
+            mutation_context=mutation_context, **kwargs,
         )
     candidate.generated = True
     return await candidate.manager.persist_compaction_result(
@@ -97,7 +99,8 @@ async def test_durable_phase_order_and_correlation_survive_private_log_projectio
     starts = _events(logs, "compaction.phase_started")
     finishes = _events(logs, "compaction.phase_finished")
     expected = (
-        ["precommit_validation", "precommit_consumer_admission", "precommit_session_read",
+        ["precommit_validation", "precommit_consumer_admission", "precommit_mutation_wait",
+         "precommit_session_read",
          "precommit_transcript_read", "precommit_context_read"]
         if writer == "manual" else
         ["precommit_session_read", "precommit_source_validation", "precommit_context_read",
@@ -125,6 +128,54 @@ async def test_durable_phase_order_and_correlation_survive_private_log_projectio
         assert f'"step_name": "{step}"' in safe
     assert f'"pid": {os.getpid()}' in safe
     assert '"cancellation_reconciled": false' in safe
+
+
+@pytest.mark.parametrize("cancel", [False, True])
+async def test_precommit_mutation_wait_is_visible_and_remains_cancellable(candidate, cancel):
+    entered, release = asyncio.Event(), asyncio.Event()
+    held = False
+
+    @asynccontextmanager
+    async def mutation_context():
+        nonlocal held
+        if candidate.generated:
+            entered.set()
+            await release.wait()
+        held = True
+        try:
+            yield
+        finally:
+            held = False
+
+    with capture_logs() as logs:
+        task = asyncio.create_task(_invoke(candidate, "manual", mutation_context=mutation_context))
+        try:
+            await asyncio.wait_for(entered.wait(), 2)
+            assert not held
+            starts = _events(logs, "compaction.phase_started")
+            assert starts[-1]["step_name"] == "precommit_mutation_wait"
+            assert not any(row["step_name"] == "precommit_mutation_wait"
+                           for row in _events(logs, "compaction.phase_finished"))
+            assert not _events(logs, "session_compaction.commit_started")
+            if cancel:
+                task.cancel()
+                with pytest.raises(asyncio.CancelledError):
+                    await task
+            else:
+                release.set()
+                result = await task
+                assert result.removed_count == 2
+        finally:
+            release.set()
+            await asyncio.gather(task, return_exceptions=True)
+    finished = [row for row in _events(logs, "compaction.phase_finished")
+                if row["step_name"] == "precommit_mutation_wait"]
+    assert len(finished) == 1
+    assert finished[0]["status"] == ("cancelled" if cancel else "completed")
+    assert not held
+    assert len(await candidate.manager.get_summaries(candidate.node.session_key)) == (
+        0 if cancel else 1
+    )
 
 
 async def test_invalid_candidate_is_rejected_before_the_writer(candidate):

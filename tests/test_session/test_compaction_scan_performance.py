@@ -56,6 +56,40 @@ def test_historical_coverage_scan_finishes_in_isolated_process(case: str) -> Non
     assert json.loads(result.stdout)["case"] == case
 
 
+@pytest.mark.parametrize("case", ["paths", "quotes", "fences"])
+def test_scan_uses_compact_indexes_in_isolated_process(case: str) -> None:
+    # Measure Python allocations rather than platform-specific RSS units or an
+    # inherited high-water mark. Keep enough headroom for allocator differences.
+    script = textwrap.dedent("""
+        import json
+        import sys
+        import tracemalloc
+        from opensquilla.session.compaction_state import _command_references, _iter_file_paths
+
+        case = sys.argv[1]
+        content = {"paths": "a/b " * 100_000,
+                   "quotes": '\" ' * 200_000,
+                   "fences": "` " * 200_000}[case] + "\\nOpen docs/retained.py."
+        tracemalloc.start()
+        count = 0
+        last = None
+        for path in _iter_file_paths(content):
+            count += 1
+            last = path
+        assert count == (100_001 if case == "paths" else 1)
+        assert last == "docs/retained.py"
+        assert _command_references(content) == []
+        _, peak = tracemalloc.get_traced_memory()
+        assert peak < 24 * 1024 * 1024, peak
+        print(json.dumps({"case": case, "peak": peak}))
+    """)
+    result = subprocess.run(
+        [sys.executable, "-c", script, case], capture_output=True, text=True, timeout=45,
+        check=True,
+    )
+    assert json.loads(result.stdout)["case"] == case
+
+
 @pytest.mark.parametrize("path", [
     "docs/My  Report.md", r"C:\Program Files\My  App\report.txt", "/srv/My  Cache",
     "../cache/My\tReport.txt", "src/a+b.py",
