@@ -180,9 +180,9 @@
             :disabled="inputDisabled"
             :aria-label="t('chat.messageToSend')"
             :aria-describedby="sendControlHint ? sendTooltipId : undefined"
-            :aria-controls="paletteOpen ? paletteId || 'chat-slash-options' : undefined"
-            :aria-expanded="paletteOpen"
-            :aria-activedescendant="paletteOpen ? `${paletteId || 'chat-slash'}-option-${paletteActiveIndex}` : undefined"
+            :aria-controls="activePaletteOpen ? activePaletteId : undefined"
+            :aria-expanded="activePaletteOpen"
+            :aria-activedescendant="activePaletteOpen ? `${activePaletteId}-option-${activePaletteIndex}` : undefined"
             @beforeinput="emit('expand'); emit('beforeinput', $event)"
             @input="onTextareaInput"
             @keydown="emit('keydown', $event)"
@@ -530,6 +530,10 @@ const props = withDefaults(defineProps<{
   paletteOpen?: boolean
   paletteId?: string
   paletteActiveIndex?: number
+  /** The `@` mention palette takes over the editor's combobox semantics. */
+  mentionOpen?: boolean
+  mentionPaletteId?: string
+  mentionActiveIndex?: number
   attachments: Attachment[]
   localPaths?: readonly string[]
   chooseAttachments?: () => Promise<boolean>
@@ -670,6 +674,16 @@ const policy = useConversationPolicy()
 const runModeLabel = computed(() => t(
   props.runMode === 'full' ? 'chat.composer.runModeFull' : 'chat.composer.runModeSafe',
 ))
+
+// The slash palette and the mention palette share one combobox editor: whichever
+// is open owns aria-controls / aria-activedescendant, and the mention wins ties.
+const activePaletteOpen = computed(() => Boolean(props.mentionOpen || props.paletteOpen))
+const activePaletteId = computed(() => props.mentionOpen
+  ? (props.mentionPaletteId || 'chat-mention-options')
+  : (props.paletteId || 'chat-slash-options'))
+const activePaletteIndex = computed(() => props.mentionOpen
+  ? (props.mentionActiveIndex ?? 0)
+  : props.paletteActiveIndex)
 
 const showSkillQueueSend = computed(() => props.canStop
   && props.isStreaming
@@ -944,6 +958,7 @@ watch(() => props.collapsed, (collapsed) => {
   if (collapsed) closeAllPopovers()
 })
 watch(() => props.paletteOpen, open => { if (open) closeAllPopovers() })
+watch(() => props.mentionOpen, open => { if (open) closeAllPopovers() })
 watch(() => props.draftKey, closeAllPopovers)
 
 function toggleAddMenu() {

@@ -3946,6 +3946,14 @@
         }
       }
     },
+    "mention": {
+      "groups": {
+        "workspace": "Workspace files",
+        "sessions": "Recent chats"
+      },
+      "unavailable": "Workspace files are unavailable right now.",
+      "hint": "↑↓ to choose · Enter to insert · Esc to close"
+    },
     "sessionCreated": {
       "title": "Chat created",
       "open": "Open chat",

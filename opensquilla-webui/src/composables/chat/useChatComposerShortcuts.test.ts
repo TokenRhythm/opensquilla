@@ -3,6 +3,7 @@ import { ref } from 'vue'
 import { useChatComposerShortcuts } from './useChatComposerShortcuts'
 import { useLocalPathDraft } from './useLocalPathDraft'
 import type { ChatSlashCommand } from './useChatSlashCommands'
+import type { MentionCandidate } from './useChatMentions'
 import type { ChatMessage, ChatPendingItem } from '@/types/chat'
 
 // The composable gates the Alt+Arrow queue chords on caret position via
@@ -53,9 +54,13 @@ function harness(over: {
   composing?: boolean
   cancelMessageEdit?: () => boolean
   handleLongPaste?: (text: string) => boolean
+  mentionOpen?: boolean
+  mentionItems?: MentionCandidate[]
 } = {}) {
   const inputText = over.draft?.inputText ?? ref(over.inputText ?? '')
   const messages = ref<ChatMessage[]>(over.messages ?? [])
+  const mentionIdx = ref(0)
+  const mentionItems = ref<MentionCandidate[]>(over.mentionItems ?? [])
   const spies = {
     popPendingTail: vi.fn(() => true),
     enqueuePendingInput: vi.fn(() => true),
@@ -66,6 +71,9 @@ function harness(over: {
     completeSlashCmd: vi.fn(),
     activateSlashCmd: vi.fn(),
     cancelMessageEdit: vi.fn(over.cancelMessageEdit ?? (() => false)),
+    chooseMention: vi.fn(),
+    closeMention: vi.fn(),
+    handleMentionInput: vi.fn(),
   }
   const api = useChatComposerShortcuts({
     inputText,
@@ -81,11 +89,14 @@ function harness(over: {
     slashIdx: ref(0),
     filteredSlashCmds: ref(over.filteredSlashCmds ?? []),
     isStreaming: ref(over.isStreaming ?? false),
+    mentionOpen: ref(over.mentionOpen ?? false),
+    mentionIdx,
+    mentionItems,
     isSafariWebKit: () => over.safari ?? false,
     handleLongPaste: over.handleLongPaste,
     ...spies,
   })
-  return { api, inputText, messages, spies }
+  return { api, inputText, messages, spies, mentionIdx }
 }
 
 function keydown(opts: {
@@ -115,6 +126,11 @@ function inputEvent(inputType: string, target: unknown): InputEvent {
 }
 
 const QUEUE = [{ id: 'q1', text: 'queued' }] as unknown as ChatPendingItem[]
+
+const MENTIONS: MentionCandidate[] = [
+  { id: 'workspace:src', kind: 'workspace_directory', label: 'src/', detail: 'src', insertion: '@src/' },
+  { id: 'workspace:README.md', kind: 'workspace_file', label: 'README.md', detail: 'README.md', insertion: '@README.md' },
+]
 
 describe('useChatComposerShortcuts', () => {
   it('recalls explicit path chips with Up/Down while retaining full canonical text exactly once', () => {
@@ -634,5 +650,49 @@ describe('Escape and message edits', () => {
 
     expect(spies.closeSlashMenu).toHaveBeenCalledOnce()
     expect(spies.cancelMessageEdit).not.toHaveBeenCalled()
+  })
+
+  it('moves the mention cursor with ArrowDown while the mention palette is open', () => {
+    const { api, mentionIdx, spies } = harness({
+      inputText: '@',
+      mentionOpen: true,
+      mentionItems: MENTIONS,
+    })
+
+    api.onTextareaKeydown(keydown({ key: 'ArrowDown', target: field('@', 'end') }))
+
+    expect(mentionIdx.value).toBe(1)
+    expect(spies.sendCurrentInput).not.toHaveBeenCalled()
+  })
+
+  it('chooses the highlighted mention on Enter instead of sending the draft', () => {
+    const { api, spies } = harness({
+      inputText: '@',
+      mentionOpen: true,
+      mentionItems: MENTIONS,
+    })
+
+    const e = keydown({ key: 'Enter', target: field('@', 'end') })
+    api.onTextareaKeydown(e)
+
+    expect(spies.chooseMention).toHaveBeenCalledWith(MENTIONS[0])
+    expect(spies.sendCurrentInput).not.toHaveBeenCalled()
+    expect(e.preventDefault).toHaveBeenCalledOnce()
+  })
+
+  it('closes the mention palette on Escape without touching the draft', () => {
+    const { api, inputText, spies } = harness({
+      inputText: '@sr',
+      mentionOpen: true,
+      mentionItems: MENTIONS,
+    })
+
+    const e = keydown({ key: 'Escape', target: field('@sr', 'end') })
+    api.onTextareaKeydown(e)
+
+    expect(spies.closeMention).toHaveBeenCalledOnce()
+    expect(spies.cancelMessageEdit).not.toHaveBeenCalled()
+    expect(inputText.value).toBe('@sr')
+    expect(e.preventDefault).toHaveBeenCalledOnce()
   })
 })

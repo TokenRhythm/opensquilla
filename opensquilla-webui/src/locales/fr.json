@@ -3845,6 +3845,14 @@
         }
       }
     },
+    "mention": {
+      "groups": {
+        "workspace": "Fichiers de l’espace de travail",
+        "sessions": "Conversations récentes"
+      },
+      "unavailable": "Les fichiers de l’espace de travail sont indisponibles pour le moment.",
+      "hint": "↑↓ pour choisir · Entrée pour insérer · Échap pour fermer"
+    },
     "sessionCreated": {
       "title": "Discussion créée",
       "open": "Ouvrir la discussion",
