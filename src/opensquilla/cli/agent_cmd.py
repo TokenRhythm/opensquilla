@@ -897,6 +897,9 @@ def _write_json(path: str, payload: dict[str, Any]) -> None:
 
 def _print_no_provider_error() -> None:
     """Print a three-section diagnostic panel when no LLM provider is configured."""
+    from opensquilla.onboarding.config_store import resolve_config_path
+
+    config_path, _ = resolve_config_path(os.environ.get("OPENSQUILLA_GATEWAY_CONFIG_PATH"))
     body = Text.assemble(
         ("Symptom\n", "bold red"),
         "No LLM provider configured.\n\n",
@@ -905,7 +908,7 @@ def _print_no_provider_error() -> None:
             "No API key was found. The following environment variables were all empty:\n"
             "  OPENROUTER_API_KEY, OPENAI_API_KEY, ANTHROPIC_API_KEY,\n"
             "  DEEPSEEK_API_KEY, GEMINI_API_KEY, DASHSCOPE_API_KEY, and others.\n"
-            "The config file ~/.opensquilla/config.toml also has no [llm].api_key set.\n\n"
+            f"The config file {config_path} also has no [llm].api_key set.\n\n"
         ),
         ("Next steps\n", "bold green"),
         (
@@ -915,7 +918,7 @@ def _print_no_provider_error() -> None:
             "  export OPENROUTER_API_KEY=sk-or-...        # POSIX / macOS / Linux\n"
             '  setx OPENROUTER_API_KEY "sk-or-..."  '
             "# Windows cmd: set OPENROUTER_API_KEY=...\n\n"
-            "Option 3 — edit ~/.opensquilla/config.toml and add:\n"
+            f"Option 3 — edit {config_path} and add:\n"
             "  [llm]\n"
             '  api_key = "your-key-here"\n'
         ),
