@@ -13,6 +13,7 @@ import threading
 import time
 from collections.abc import Callable
 from typing import NoReturn
+from uuid import UUID, uuid4
 
 import structlog
 import typer
@@ -47,6 +48,7 @@ from opensquilla.gateway.config import (  # noqa: E402
     resolve_listen_address,
 )
 from opensquilla.gateway.config_migration import ConfigParseError  # noqa: E402
+from opensquilla.gateway.desktop_ownership import DESKTOP_GATEWAY_INSTANCE_ID_ENV  # noqa: E402
 from opensquilla.gateway.shutdown import ShutdownRequest  # noqa: E402
 from opensquilla.paths import default_opensquilla_home  # noqa: E402
 
@@ -57,6 +59,21 @@ _SHUTDOWN_SIGNALS: tuple[signal.Signals, ...] = tuple(
     for sig in (getattr(signal, "SIGINT", None), getattr(signal, "SIGTERM", None))
     if sig is not None
 )
+
+
+def _gateway_process_diagnostic_id() -> str:
+    """Correlate a wrapped Desktop launch without exposing control authority."""
+
+    value = os.environ.get(DESKTOP_GATEWAY_INSTANCE_ID_ENV, "").strip()
+    if len(value) == 36:
+        try:
+            parsed = UUID(value)
+        except ValueError:
+            pass
+        else:
+            if str(parsed) == value.lower():
+                return str(parsed)
+    return str(uuid4())
 
 
 def _flush_shutdown_streams() -> None:
@@ -114,6 +131,7 @@ class _GatewayShutdownWatchdog:
             return
         log.error(
             "gateway.shutdown_watchdog_expired",
+            pid=os.getpid(),
             timeout=self._timeout,
             exit_code=self._exit_code,
         )
@@ -657,15 +675,59 @@ def run_gateway(
         """Run the Gateway and always retire the diagnostic heartbeat task."""
 
         nonlocal stall_heartbeat_task
+        process_instance_id = _gateway_process_diagnostic_id()
+        diagnostic_started_at = time.monotonic()
+        diagnostic = {
+            "process_instance_id": process_instance_id,
+            "pid": os.getpid(),
+            "parent_pid": os.getppid(),
+            "platform": sys.platform,
+        }
+
+        def record_run_boundary(event: str, **fields: object) -> None:
+            try:
+                log.info(event, **diagnostic, **fields)
+            except Exception:
+                # Diagnostic sinks must not prevent startup or mask its failure.
+                pass
+
+        outcome = "exception"
+        error_type: str | None = None
+        record_run_boundary("gateway.run_started")
         try:
-            return await _run_inner()
+            explicit_shutdown = await _run_inner()
+            outcome = "shutdown_requested" if explicit_shutdown else "server_task_finished"
+            return explicit_shutdown
+        except BaseException as exc:
+            # Exception messages and tracebacks can contain user-controlled data.
+            error_type = type(exc).__name__
+            if isinstance(exc, (asyncio.CancelledError, KeyboardInterrupt)):
+                outcome = "interrupted"
+            raise
         finally:
-            task = stall_heartbeat_task
-            stall_heartbeat_task = None
-            if task is not None:
-                task.cancel()
-                with contextlib.suppress(asyncio.CancelledError):
-                    await task
+            try:
+                task = stall_heartbeat_task
+                stall_heartbeat_task = None
+                if task is not None:
+                    task.cancel()
+                    with contextlib.suppress(asyncio.CancelledError):
+                        await task
+            except BaseException as exc:
+                error_type = type(exc).__name__
+                outcome = (
+                    "interrupted"
+                    if isinstance(exc, (asyncio.CancelledError, KeyboardInterrupt)) else "exception"
+                )
+                raise
+            finally:
+                # This is a runtime boundary, not proof that the OS process has
+                # exited. Its parent observes exit separately, including hard kills.
+                record_run_boundary(
+                    "gateway.run_finished",
+                    outcome=outcome,
+                    error_type=error_type,
+                    duration_ms=round((time.monotonic() - diagnostic_started_at) * 1000, 3),
+                )
 
     try:
         try:

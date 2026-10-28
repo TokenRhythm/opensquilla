@@ -10,7 +10,8 @@ from __future__ import annotations
 import hashlib
 import json
 import re
-from collections.abc import Mapping, Sequence
+from array import array
+from collections.abc import Iterator, Mapping, Sequence
 from dataclasses import dataclass
 from itertools import islice
 from typing import Any
@@ -112,19 +113,16 @@ _MAX_COVERAGE_OBLIGATIONS = 64
 _MAX_COVERAGE_MISSING_LABELS = 32
 _EXACT_REFERENCE_KINDS = frozenset({"file_path", "artifact_path_or_name", "important_identifier"})
 _EXACT_REFERENCE_MANIFEST = "exact_reference_manifest"
-_PATH_RE = re.compile(
-    # The slash in a closing markup tag is not an absolute filesystem path.
-    r"(?<![\w.-])(?:[A-Za-z]:[\\/]|\.{1,2}/|(?<!<)/|[A-Za-z0-9_.@()+-]+/)"
-    r"(?:[A-Za-z0-9_.@()+-]+(?:[ \t]+[A-Za-z0-9_.@()+-]+)*[\\/])*"
-    r"[A-Za-z0-9_.@()+-]+(?:[ \t]+[A-Za-z0-9_.@()+-]+)*"
-    r"(?:\.[A-Za-z0-9][A-Za-z0-9_.-]{0,15})?"
+_PATH_TOKENS_RE = re.compile(
+    r"(?P<word>[A-Za-z0-9_.@()+-]+)|(?P<space>[ \t]+)|(?P<separator>[\\/]+)"
+    r"|(?P<other>[^-A-Za-z0-9_.@()+/\\ \t:]+|:)"
 )
+_PATH_PREFIX_BLOCK_RE = re.compile(r"[\w.-]")
+_PATH_EXTENSION_RE = re.compile(r"\.[A-Za-z0-9][A-Za-z0-9_.-]{0,15}$")
+_BACKTICK_RUN_RE = re.compile(r"`+")
 _COMMAND_RE = re.compile(
     r"\b(?:(?:uv run )?(?:pytest|ruff|python|mypy|pyright|npm|pnpm|yarn|git|bash|sh|make|cargo)"
     r"|go test)\b[^\n\r]{0,220}"
-)
-_MARKDOWN_CODE_RE = re.compile(
-    r"(?<!`)(?P<fence>`+)(?!`)(?P<body>.*?)(?<!`)(?P=fence)(?!`)", re.DOTALL,
 )
 _JSON_STRING_TOKEN = r'"(?:[^"\\\x00-\x1f]|\\(?:["\\/bfnrt]|u[0-9a-fA-F]{4}))*"'
 _JSON_STRING_FIELD_RE = re.compile(
@@ -135,8 +133,6 @@ _NPM_PACKAGE_PROSE_RE = re.compile(r"npm[ \t]+全局包[ \t]*")
 _NPM_PACKAGE_LITERAL_RE = re.compile(
     r"(?:@[a-z0-9_.-]+/)?[a-z0-9_.-]+(?:@[a-zA-Z0-9.*+^~<>=|-]+)?",
 )
-_QUOTED_TEXT_RE = re.compile(r"(?P<quote>['\"])(?P<body>(?:\\.|(?!(?P=quote)).)*)(?P=quote)")
-_PATH_FILE_END_RE = re.compile(r"[^\\/ \t]+\.[A-Za-z0-9][A-Za-z0-9_.-]{0,15}(?=[ \t]|$)")
 _ERROR_MARKERS = ("error", "failed", "failure", "traceback", "exit code", "exception")
 _CONSTRAINT_PREFIXES = ("constraint:", "constraints:", "限制:", "要求:")
 _GOAL_PREFIXES = ("goal:", "objective:", "目标:")
@@ -156,11 +152,91 @@ _IDENTIFIER_RE = re.compile(
     r"|\b(?:[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}"
     r"|[0-9a-fA-F]{12,64})\b"
 )
-_ARTIFACT_NAME_RE = re.compile(
-    r"\b[A-Za-z0-9_.@()+-]+(?:[ \t]+[A-Za-z0-9_.@()+-]+)*"
+_ARTIFACT_WORDS_RE = re.compile(r"\b[A-Za-z0-9_.@()+-]+(?:[ \t]+[A-Za-z0-9_.@()+-]+)*")
+_ARTIFACT_EXTENSION_RE = re.compile(
     r"\.(?:pdf|png|jpe?g|gif|csv|json|md|txt|xlsx?|pptx?|docx?|html?|zip)\b",
     re.IGNORECASE,
 )
+
+
+@dataclass(frozen=True, slots=True)
+class _LiteralSpan:
+    start: int
+    body_start: int
+    body_end: int
+    end: int
+
+
+def _code_spans(text: str) -> Iterator[_LiteralSpan]:
+    offset_type = "I" if len(text) <= 0xFFFFFFFF else "Q"
+    starts = array(offset_type)
+    ends = array(offset_type)
+    for run in _BACKTICK_RUN_RE.finditer(text):
+        starts.append(run.start())
+        ends.append(run.end())
+    following: dict[int, int] = {}
+    closing = array(offset_type, [0]) * len(starts)
+    for index in range(len(starts) - 1, -1, -1):
+        length = ends[index] - starts[index]
+        closing[index] = following.get(length, 0)
+        following[length] = index
+    position = 0
+    for index, start in enumerate(starts):
+        if start < position or not closing[index]:
+            continue
+        end = closing[index]
+        yield _LiteralSpan(start, ends[index], starts[end], ends[end])
+        position = ends[end]
+
+
+def _quote_spans(text: str) -> Iterator[_LiteralSpan]:
+    # Record available closing quotes once. Retrying a regex at each unmatched
+    # opening quote can revisit the same suffix or explore ambiguous escapes.
+    offset_type = "I" if len(text) <= 0xFFFFFFFF else "Q"
+    positions = array(offset_type)
+    kinds = bytearray()
+    available = bytearray()
+    backslashes = 0
+    for index, char in enumerate(text):
+        if char in "'\"\n":
+            positions.append(index)
+            kinds.append(ord(char))
+            available.append(backslashes % 2 == 0)
+        backslashes = backslashes + 1 if char == "\\" else 0
+    following: dict[int, int] = {}
+    closing = array(offset_type, [0]) * len(positions)
+    for index in range(len(positions) - 1, -1, -1):
+        char_kind = kinds[index]
+        if char_kind == ord("\n"):
+            following.clear()
+            continue
+        closing[index] = following.get(char_kind, 0)
+        if available[index]:
+            following[char_kind] = index
+    position = 0
+    for index, start in enumerate(positions):
+        if kinds[index] == ord("\n") or start < position or not closing[index]:
+            continue
+        end = positions[closing[index]]
+        yield _LiteralSpan(start, start + 1, end, end + 1)
+        position = end + 1
+
+
+def _artifact_names(text: str) -> list[str]:
+    names: list[str] = []
+    for words in _ARTIFACT_WORDS_RE.finditer(text):
+        extension = None
+        # Include one following character so a Unicode word character cannot
+        # become an artificial word boundary at the end of this ASCII run.
+        for candidate in _ARTIFACT_EXTENSION_RE.finditer(
+            text, words.start(), min(len(text), words.end() + 1),
+        ):
+            if (candidate.end() <= words.end() and candidate.start() > words.start()
+                    and text[candidate.start() - 1] not in " \t"):
+                extension = candidate
+        if extension is not None:
+            names.append(text[words.start():extension.end()])
+    return names
 
 
 def _entry_value(entry: Any, key: str, default: Any = None) -> Any:
@@ -187,7 +263,8 @@ def _clean_obligation_text(
 
 
 def _command_references(text: str, *, _parse_json_fields: bool = True) -> list[str]:
-    code_spans = list(_MARKDOWN_CODE_RE.finditer(text))
+    code_spans = _code_spans(text)
+    code_span = next(code_spans, None)
     json_fields = iter(_JSON_STRING_FIELD_RE.finditer(text)) if _parse_json_fields else iter(())
     field = next(json_fields, None)
     commands: list[str] = []
@@ -208,24 +285,28 @@ def _command_references(text: str, *, _parse_json_fields: bool = True) -> list[s
                 ))
                 position = field.end("value")
             continue
-        surrounding_code = next((
-            span for span in code_spans
-            if span.start("body") <= match.start() < span.end("body")
-        ), None)
+        while code_span is not None and code_span.body_end <= match.start():
+            code_span = next(code_spans, None)
+        surrounding_code = code_span
+        if surrounding_code is not None and surrounding_code.body_start > match.start():
+            surrounding_code = None
         package_prose = _NPM_PACKAGE_PROSE_RE.match(text, match.start())
-        if surrounding_code is None and package_prose is not None and any(
-            span.start() == package_prose.end()
-            and _NPM_PACKAGE_LITERAL_RE.fullmatch(span.group("body")) is not None
-            for span in code_spans
-        ):
+        package_span = (
+            code_span if package_prose is not None and code_span is not None
+            and code_span.start == package_prose.end() else None
+        )
+        if (surrounding_code is None and package_span is not None
+                and _NPM_PACKAGE_LITERAL_RE.fullmatch(
+                    text[package_span.body_start:package_span.body_end],
+                ) is not None):
             # This explicit package description is prose, not "npm <args>".
             # Keep other unquoted/CJK candidates conservative and continue
             # scanning so a later real command is not swallowed with the prose.
-            position = package_prose.end()
+            position = package_span.start
             continue
         end = match.end()
         if surrounding_code is not None:
-            end = min(end, surrounding_code.end("body"))
+            end = min(end, surrounding_code.body_end)
         commands.append(text[match.start():end].rstrip("."))
         # A closing Markdown fence can precede another command on this line.
         # Shell backticks outside such a surrounding span remain command text.
@@ -233,33 +314,97 @@ def _command_references(text: str, *, _parse_json_fields: bool = True) -> list[s
     return commands
 
 
-def _file_paths(text: str) -> list[str]:
-    literal_spans = [
-        *list(_MARKDOWN_CODE_RE.finditer(text)), *list(_QUOTED_TEXT_RE.finditer(text)),
-    ]
-    paths: list[str] = []
-    position = 0
-    while (match := _PATH_RE.search(text, position)) is not None:
-        value = match.group(0)
-        quoted_path = next((
-            span.group("body") for span in literal_spans
-            if span.start("body") == match.start()
-            and _PATH_RE.fullmatch(span.group("body")) is not None
-        ), None)
-        if quoted_path is not None:
-            paths.append(quoted_path)
-            position = match.start() + len(quoted_path)
+def _iter_file_paths(text: str) -> Iterator[str]:
+    # Each token and suffix is indexed once. In particular, shortening an
+    # unquoted candidate must not rescan every following path on the same line.
+    # Compact offsets avoid retaining a regex Match and several Python integers
+    # per token. Fall back to wider offsets for strings exceeding 4 GiB.
+    offset_type = "I" if len(text) <= 0xFFFFFFFF else "Q"
+    offsets = array(offset_type, [0])
+    kinds = bytearray()
+    kind_numbers = {"word": 0, "space": 1, "separator": 2, "other": 3}
+    for token in _PATH_TOKENS_RE.finditer(text):
+        offsets.append(token.end())
+        assert token.lastgroup is not None
+        kinds.append(kind_numbers[token.lastgroup])
+    count = len(kinds)
+    last_end = array(offset_type, [0]) * count
+    file_end = array(offset_type, [0]) * count
+    first_space = array(offset_type, [0]) * count
+    for index in range(count - 1, -1, -1):
+        if kinds[index] != 0:
             continue
-        # An unquoted path can include a spaced filename, but following prose
-        # is not part of that filename. Extensionless directories remain valid.
-        file_end = _PATH_FILE_END_RE.search(value)
-        if file_end is not None:
-            value = value[:file_end.end()]
+        token_start, token_end = offsets[index], offsets[index + 1]
+        last_end[index] = token_end
+        extends = (
+            index + 2 < count and kinds[index + 2] == 0
+            and (kinds[index + 1] == 1
+                 or (kinds[index + 1] == 2 and offsets[index + 2] - token_end == 1))
+        )
+        if extends:
+            last_end[index] = last_end[index + 2]
+            first_space[index] = (
+                token_end if kinds[index + 1] == 1
+                else first_space[index + 2]
+            )
+            file_end[index] = file_end[index + 2]
+        # An extension has at most 16 characters, so inspect only that suffix
+        # instead of trying every starting position in a long extensionless word.
+        suffix_start = max(token_start + 1, token_end - 17)
+        if ((not extends or kinds[index + 1] == 1)
+                and _PATH_EXTENSION_RE.search(text, suffix_start, token_end) is not None):
+            file_end[index] = token_end
+    code_spans = _code_spans(text)
+    quote_spans = _quote_spans(text)
+    code_span = next(code_spans, None)
+    quote_span = next(quote_spans, None)
+    index = 0
+    while index < count:
+        start, token_end = offsets[index], offsets[index + 1]
+        tail = -1
+        if kinds[index] == 0:
+            drive = text[token_end - 1]
+            if (drive.isascii() and drive.isalpha() and index + 3 < count
+                    and text[token_end:offsets[index + 2]] == ":"
+                    and text[offsets[index + 2]:offsets[index + 3]] in {"/", "\\"}):
+                start = token_end - 1
+                tail = index + 3
+            elif index + 2 < count and text[token_end:offsets[index + 2]] == "/":
+                # The original boundary can admit a suffix after punctuation
+                # inside an otherwise blocked word; visit that word only once.
+                while (start < token_end and start > 0
+                       and _PATH_PREFIX_BLOCK_RE.fullmatch(text[start - 1]) is not None):
+                    start += 1
+                if start < token_end:
+                    tail = index + 2
+        elif kinds[index] == 2 and text[token_end - 1] == "/":
+            start = token_end - 1
+            if start == 0 or text[start - 1] != "<":
+                tail = index + 1
+        if (tail < 0 or tail >= count or kinds[tail] != 0
+                or (start > 0 and _PATH_PREFIX_BLOCK_RE.fullmatch(text[start - 1]) is not None)):
+            index += 1
+            continue
+        end = last_end[tail]
+        while code_span is not None and code_span.body_start < start:
+            code_span = next(code_spans, None)
+        while quote_span is not None and quote_span.body_start < start:
+            quote_span = next(quote_spans, None)
+        is_literal = any(
+            span is not None and span.body_start == start and span.body_end == end
+            for span in (code_span, quote_span)
+        )
+        if not is_literal:
+            end = file_end[tail] or first_space[tail] or end
+            yield text[start:end].rstrip(".")
         else:
-            value = re.split(r"[ \t]", value, maxsplit=1)[0]
-        paths.append(value.rstrip("."))
-        position = match.start() + len(value)
-    return paths
+            yield text[start:end]
+        while index < count and offsets[index] < end:
+            index += 1
+
+
+def _file_paths(text: str) -> list[str]:
+    return list(_iter_file_paths(text))
 
 
 def _after_label(line: str) -> str:
@@ -652,14 +797,12 @@ def extract_compaction_obligations(
                     max_obligations=max_obligations,
                 )
             if any(marker in lower for marker in _ARTIFACT_MARKERS):
-                for match in _ARTIFACT_NAME_RE.finditer(line):
-                    if "/" in match.group(0) or "\\" in match.group(0):
-                        continue
+                for artifact_name in _artifact_names(line):
                     _add_obligation(
                         obligations,
                         seen,
                         kind="artifact_path_or_name",
-                        value=match.group(0).rstrip("."),
+                        value=artifact_name.rstrip("."),
                         source_role=role,
                         source_entry_id=source_entry_id,
                         max_obligations=max_obligations,
@@ -809,7 +952,7 @@ def extract_compaction_obligations(
                                 source_entry_id=source_entry_id,
                                 max_obligations=max_obligations,
                             )
-                        for file_path in _file_paths(result_text):
+                        for file_path in _iter_file_paths(result_text):
                             _add_obligation(
                                 obligations,
                                 seen,
@@ -843,7 +986,7 @@ def extract_compaction_obligations(
                 source_entry_id=source_entry_id,
                 max_obligations=max_obligations,
             )
-        for file_path in _file_paths(content):
+        for file_path in _iter_file_paths(content):
             _add_obligation(
                 obligations,
                 seen,

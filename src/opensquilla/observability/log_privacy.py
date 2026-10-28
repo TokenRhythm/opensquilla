@@ -44,6 +44,7 @@ _IDENTIFIERS = frozenset("""
     ts at timestamp prompt_hash system_prompt_hash tool_list_hash message_hash
     cache_base_hash cache_dynamic_hash cache_legacy_hash cache_shadow_final_hash
     runtime_context_hash log_schema filename truncation_cause skipped_reason
+    process_instance_id signal requested_signal windows_status_hex
 """.split())
 _CONTAINERS = frozenset({
     "attrs", "payload", "fields", "entry", "pipeline_steps", "savings",
@@ -52,6 +53,14 @@ _CONTAINERS = frozenset({
 # Retain only producer-owned enum values for fields that could otherwise be
 # mistaken for free-form reason text. These codes are consumed by diagnostics.
 _CLASSIFICATIONS = {
+    "stop_reason": frozenset({
+        "desktop_stop", "desktop_quit", "desktop_update", "shutdown_endpoint",
+        "ownership_verification_failed",
+    }),
+    "outcome": frozenset({
+        "stop_requested", "signal_observed", "unrequested_clean_exit", "nonzero_exit",
+        "unknown_exit", "shutdown_requested", "server_task_finished", "exception", "interrupted",
+    }),
     "image_route_reason": frozenset({"current_turn", "history_context"}),
     "browser_requested_mode": frozenset({"auto", "dom", "invalid"}),
     "journal_mode": frozenset({

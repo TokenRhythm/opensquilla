@@ -78,8 +78,11 @@ import {
   DESKTOP_GATEWAY_STARTUP_TIMEOUT_MS,
   GatewayReadinessTimeoutError,
   lifecycleAllowsProcessSpawn,
+  observeGatewayProcessLifecycle,
   stopAndJoinLifecycleProcesses,
   waitForGatewayReadiness,
+  type GatewayProcessDiagnostics,
+  type GatewayStopReason,
 } from './gateway-lifecycle.js'
 import {
   OnboardingFlowCoordinator,
@@ -707,6 +710,7 @@ let gatewayShutdownRequestInterceptorInstalled = false
 // clears the current slot so a replacement cannot accidentally reuse it. Quit,
 // update, cleanup, and recovery all join this set before Electron may exit.
 const gatewayStoppingProcesses = new Set<ChildProcessWithoutNullStreams>()
+const gatewayProcessDiagnostics = new WeakMap<ChildProcessWithoutNullStreams, GatewayProcessDiagnostics>()
 const gatewayProcessOwnershipContexts = new WeakMap<ChildProcessWithoutNullStreams, {
   nonce: string
   ownershipDir: string
@@ -1636,7 +1640,7 @@ async function proxyDesktopRendererRequest(
   if (isCurrentGatewayShutdownRequest(`${gatewayState.url}${pathAndQuery}`, method)) {
     const child = gatewayProcess
     if (child && gatewayState.owned) {
-      trackStoppingGatewayProcess(child)
+      trackStoppingGatewayProcess(child, 'shutdown_endpoint')
       cancelGatewayUnexpectedExitRestart('Gateway shutdown endpoint requested')
     }
   }
@@ -9360,7 +9364,11 @@ function hasGatewayProcessExited(process: ChildProcessWithoutNullStreams | null)
   return Boolean(process && (process.exitCode !== null || process.signalCode !== null))
 }
 
-function trackStoppingGatewayProcess(child: ChildProcessWithoutNullStreams): void {
+function trackStoppingGatewayProcess(
+  child: ChildProcessWithoutNullStreams,
+  reason: GatewayStopReason = 'desktop_stop',
+): void {
+  gatewayProcessDiagnostics.get(child)?.requestStop(reason)
   if (child === gatewayProcess) gatewayLateReadyObservation = null
   if (hasGatewayProcessExited(child) || gatewayStoppingProcesses.has(child)) return
   gatewayStoppingProcesses.add(child)
@@ -9394,7 +9402,7 @@ function installGatewayShutdownRequestInterceptor(window: BrowserWindow): void {
       if (isCurrentGatewayShutdownRequest(details.url, details.method)) {
         const child = gatewayProcess
         if (child && gatewayState.owned) {
-          trackStoppingGatewayProcess(child)
+          trackStoppingGatewayProcess(child, 'shutdown_endpoint')
           cancelGatewayUnexpectedExitRestart('Gateway shutdown endpoint requested')
         }
       }
@@ -9488,7 +9496,7 @@ async function discardUnverifiedOwnedGatewayChild(
   child: ChildProcessWithoutNullStreams,
 ): Promise<boolean> {
   if (gatewayProcess !== child) return false
-  trackStoppingGatewayProcess(child)
+  trackStoppingGatewayProcess(child, 'ownership_verification_failed')
   gatewayProcess = null
   gatewayState.status = 'stopped'
   gatewayState.error = undefined
@@ -10033,6 +10041,13 @@ async function startGateway(): Promise<GatewayState> {
       windowsHide: true,
     }
   )
+  gatewayProcessDiagnostics.set(child, observeGatewayProcessLifecycle(child, {
+    instanceId: gatewayConnectionInstanceId,
+    supervisorPid: process.pid,
+    platform: process.platform,
+    restartAttempt: gatewayUnexpectedExitRestartAttempt,
+    report: desktopLog,
+  }))
   // Keep the Windows packaged startup tail observable at the process boundary.
   // `ChildProcess.spawn` only proves that CreateProcess returned; the bundled
   // PyInstaller executable and Python imports may still take seconds before
@@ -11287,6 +11302,7 @@ function terminateGatewayProcess(
   child: ChildProcessWithoutNullStreams,
   signal: NodeJS.Signals,
 ): void {
+  gatewayProcessDiagnostics.get(child)?.requestTermination(signal)
   const pid = child.pid
   if (pid && gatewayProcessTreeChildren.has(child)) {
     if (process.platform === 'win32') {
@@ -11327,7 +11343,8 @@ function stopGateway(): void {
   if (!gatewayProcess || !gatewayState.owned) return
   const child = gatewayProcess
   const url = gatewayState.url
-  trackStoppingGatewayProcess(child)
+  trackStoppingGatewayProcess(child, updateApplying ? 'desktop_update'
+    : isQuitting ? 'desktop_quit' : 'desktop_stop')
   gatewayProcess = null
   gatewayState.status = 'stopped'
   gatewayState.error = undefined
@@ -13171,6 +13188,7 @@ function restoreDownloadedUpdateRetryState(
 
 async function stopOwnedGatewaysForUpdate(): Promise<boolean> {
   return await stopAndJoinAllLifecycleOwnedGateways((child) => {
+    gatewayProcessDiagnostics.get(child)?.requestStop('desktop_update')
     updateGatewayShutdownProcess = child
     allowGracefulShutdownWhileQuitting = true
     try {
@@ -16796,12 +16814,14 @@ async function terminateOwnedGatewayForQuit(
 ): Promise<boolean> {
   if (hasGatewayProcessExited(child)) return await confirmOwnedGatewayProcessCleanup(child, budget)
   if (budget.remainingTotalMs <= 0) return false
+  gatewayProcessDiagnostics.get(child)?.requestStop(updateApplying ? 'desktop_update' : 'desktop_quit')
   gatewayHardTerminatedProcesses.add(child)
   let treeStopped = true
   if (process.platform === 'win32' && child.pid) {
     quitUnconfirmedProcessTrees.add(child)
     let termination = gatewayProcessTreeTerminations.get(child)
     if (!termination) {
+      gatewayProcessDiagnostics.get(child)?.requestTermination('SIGKILL')
       termination = terminateWindowsProcessTree({
         pid: child.pid,
         timeoutMs: budget.remainingTotalMs,
@@ -16836,6 +16856,7 @@ async function quitOwnedGateway(
   child: ChildProcessWithoutNullStreams,
   budget: DesktopQuitBudget,
 ): Promise<boolean> {
+  gatewayProcessDiagnostics.get(child)?.requestStop(updateApplying ? 'desktop_update' : 'desktop_quit')
   let legacyDrain = false
   const result = await quitGatewayWithinBudget({
     budget,
@@ -16890,6 +16911,7 @@ async function drainOwnedGatewayForLegacyQuit(
     })
     return true
   }
+  gatewayProcessDiagnostics.get(child)?.requestStop(updateApplying ? 'desktop_update' : 'desktop_quit')
   const accepted = requestShutdown ? await requestOwnedGatewayShutdown(child, url) : null
   if (requireAccepted && accepted !== true) return false
   desktopLog('quit_gateway_shutdown_requested', { accepted, alreadyStopping: !requestShutdown })

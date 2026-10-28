@@ -3287,9 +3287,9 @@ def test_desktop_quit_joins_children_already_stopping_for_other_lifecycles() -> 
     before_quit = _section(main_ts, "app.on('before-quit'", "function shutdownFromSignal")
 
     assert "const gatewayStoppingProcesses = new Set" in main_ts
-    assert stop.index("trackStoppingGatewayProcess(child)") < stop.index(
-        "gatewayProcess = null"
-    )
+    stopping_call = re.search(r"\btrackStoppingGatewayProcess\(\s*child\s*[,)]", stop)
+    assert stopping_call is not None
+    assert stopping_call.start() < stop.index("gatewayProcess = null")
     assert "requestOwnedGatewayShutdown(child, url)" in stop
     assert "requestGatewayShutdown(url)" not in stop
     assert "const children = new Set(gatewayStoppingProcesses)" in main_ts
@@ -3477,6 +3477,13 @@ def test_desktop_e2e_flows_keep_bounded_shutdown_and_fail_closed_log_reads() -> 
     )
     assert "await app.close()" not in profile_import_flow
     assert "app.close().catch(() => {})" not in profile_import_flow
+    for flow in (profile_flow, profile_import_flow):
+        profile_close = _section(flow, "async function closeActiveApp(", "\ntry {")
+        assert (
+            "requestClose: options => requestElectronQuitWithConfirmation(targetApp, {"
+            in profile_close
+        )
+        assert "...options, requireConfirmation: false," in profile_close
     for flow in (window_flow, theme_flow):
         assert "const ELECTRON_SHUTDOWN_TIMEOUT_MS = 15_000" in flow
         assert "closeElectronWithDeadline" in flow
@@ -3484,6 +3491,12 @@ def test_desktop_e2e_flows_keep_bounded_shutdown_and_fail_closed_log_reads() -> 
         assert "canAcceptWindowsElectronShutdownFallback" in flow
         assert "flowSucceeded && shutdownError" in flow
         assert ".close().catch(() => {})" not in flow
+        final_shutdown = flow[flow.rindex("\n} finally {"):]
+        assert (
+            "requestClose: options => requestElectronQuitWithConfirmation(desktopApp, {"
+            in final_shutdown
+        )
+        assert "...options, requireConfirmation: false," in final_shutdown
 
 
 def test_desktop_shutdown_diagnostics_report_file_cleanup_errors_without_masking_exit() -> None:
