@@ -9,9 +9,11 @@ import hashlib
 import inspect
 import json
 import math
+import os
 import time
 import uuid
 from collections.abc import Awaitable, Callable, Mapping, Sequence
+from contextlib import ExitStack, nullcontext
 from copy import deepcopy
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -87,6 +89,10 @@ from opensquilla.session.compaction_deployment import (
     CompactionExecutionPlan,
     CompactionExecutionTarget,
     build_compaction_llm_plan_from_provider,
+)
+from opensquilla.session.compaction_diagnostics import (
+    compaction_diagnostic_phase,
+    report_compaction_diagnostic,
 )
 from opensquilla.session.compaction_lifecycle import (
     CompactionTimeoutError,
@@ -612,27 +618,32 @@ async def await_compaction_phase[T](
     config: CompactionConfig,
     *,
     phase: str,
+    diagnostic_step: str | None = None,
 ) -> T:
     """Await one cancellable phase under the operation's remaining budget."""
 
-    remaining = compaction_remaining_seconds(config)
-    if remaining is None:
-        return await awaitable
-    if remaining <= 0:
-        close = getattr(awaitable, "close", None)
-        if callable(close):
-            close()
-        raise CompactionTimeoutError(phase, float(config.total_timeout_seconds))
-    try:
-        async with asyncio.timeout(remaining):
+    diagnostic = (
+        compaction_diagnostic_phase(
+            compaction_id=config.operation_id, phase=phase, step=diagnostic_step,
+        ) if diagnostic_step is not None else nullcontext()
+    )
+    with diagnostic:
+        remaining = compaction_remaining_seconds(config)
+        if remaining is None:
             return await awaitable
-    except CompactionTimeoutError:
-        # Nested phases already identify the stage that exhausted the shared
-        # deadline; do not relabel validation/commit admission as the caller's
-        # broader summarizing phase.
-        raise
-    except TimeoutError as exc:
-        raise CompactionTimeoutError(phase, float(config.total_timeout_seconds)) from exc
+        if remaining <= 0:
+            close = getattr(awaitable, "close", None)
+            if callable(close):
+                close()
+            raise CompactionTimeoutError(phase, float(config.total_timeout_seconds))
+        try:
+            async with asyncio.timeout(remaining):
+                return await awaitable
+        except CompactionTimeoutError:
+            # Keep the nested phase that exhausted the original deadline.
+            raise
+        except TimeoutError as exc:
+            raise CompactionTimeoutError(phase, float(config.total_timeout_seconds)) from exc
 
 
 def compact_accepts_config(compact_fn: Any) -> bool:
@@ -3314,6 +3325,7 @@ async def call_compaction_provider(
     accounted_stream: Any | None = None
     recovery_stream: Any | None = None
     projection_stats: dict[str, int] = {}
+    call_started_at = time.monotonic()
     log.info(
         "compaction.llm_call_started",
         compaction_id=compaction_id,
@@ -3391,28 +3403,60 @@ async def call_compaction_provider(
                 )
                 return provider_stream
 
-            accounted_stream = (
-                start_stream() if provider_accounts_physical_usage(deployment.provider)
-                else account_provider_stream(
-                    start_stream, provider=deployment.provider_id, model=deployment.model,
+            with ExitStack() as response_phases:
+                response_received = False
+
+                def observe_provider_event(event: Any) -> None:
+                    nonlocal response_received
+                    if response_received or not (
+                        isinstance(event, DoneEvent) or getattr(event, "kind", "") == "done"
+                    ):
+                        return
+                    response_received = True
+                    report_compaction_diagnostic(
+                        "compaction.summary_response_received",
+                        compaction_id=compaction_id, pid=os.getpid(), chunk_index=chunk_index,
+                        attempt_number=attempt_number,
+                        duration_ms=max(0, int((time.monotonic() - call_started_at) * 1000)),
+                    )
+                    # The raw terminal event precedes ledger finalization and
+                    # iterator exhaustion, both of which can perform local I/O.
+                    # Keep this scope open through the actual transport cleanup.
+                    response_phases.enter_context(compaction_diagnostic_phase(
+                        compaction_id=compaction_id,
+                        phase="summarizing", step="summary_response_processing",
+                    ))
+
+                accounts_usage = provider_accounts_physical_usage(deployment.provider)
+                accounted_stream = (
+                    start_stream() if accounts_usage
+                    else account_provider_stream(
+                        start_stream, provider=deployment.provider_id, model=deployment.model,
+                        on_provider_event=observe_provider_event,
+                    )
                 )
-            )
-            try:
-                async with compaction_progress_timeout(
-                    idle_timeout_seconds=timeout,
-                    deadline_at_monotonic=chat_config.turn_deadline_at_monotonic,
-                ) as progress:
-                    async for event in accounted_stream:
-                        record_provider_retry_after(deployment.provider, event)
-                        progress.observe(event)
-                        if isinstance(event, ErrorEvent):
-                            _report_compaction_credential_failure(deployment, event)
-                        yield event
-            finally:
-                if provider_stream is not accounted_stream:
-                    await _close_compaction_provider_stream(provider_stream)
-                await _close_compaction_provider_stream(accounted_stream)
-                provider_stream = accounted_stream = None
+                try:
+                    async with compaction_progress_timeout(
+                        idle_timeout_seconds=timeout,
+                        deadline_at_monotonic=chat_config.turn_deadline_at_monotonic,
+                    ) as progress:
+                        async for event in accounted_stream:
+                            if accounts_usage:
+                                observe_provider_event(event)
+                            record_provider_retry_after(deployment.provider, event)
+                            progress.observe(event)
+                            if isinstance(event, ErrorEvent):
+                                _report_compaction_credential_failure(deployment, event)
+                            yield event
+                finally:
+                    with compaction_diagnostic_phase(
+                        compaction_id=compaction_id,
+                        phase="summarizing", step="summary_attempt_cleanup",
+                    ):
+                        if provider_stream is not accounted_stream:
+                            await _close_compaction_provider_stream(provider_stream)
+                        await _close_compaction_provider_stream(accounted_stream)
+                        provider_stream = accounted_stream = None
 
         def enforce_stream_memory(text: str) -> None:
             nonlocal received_bytes
@@ -3477,6 +3521,7 @@ async def call_compaction_provider(
             raise _CompactionProviderError("empty_summary")
         log.info(
             "compaction.llm_call_completed",
+            duration_ms=max(0, int((time.monotonic() - call_started_at) * 1000)),
             compaction_id=compaction_id,
             chunk_index=chunk_index,
             provider=deployment.provider_id,
@@ -3490,6 +3535,7 @@ async def call_compaction_provider(
     except Exception as exc:  # noqa: BLE001 - preserve the source on any summary failure
         log.warning(
             "compaction.llm_call_failed",
+            duration_ms=max(0, int((time.monotonic() - call_started_at) * 1000)),
             compaction_id=compaction_id,
             chunk_index=chunk_index,
             provider=deployment.provider_id,
@@ -3517,10 +3563,13 @@ async def call_compaction_provider(
     finally:
         # The raw provider iterator owns the transport. Close it first so a
         # cancellation-resistant usage sink cannot keep the HTTP stream alive.
-        if provider_stream is not accounted_stream:
-            await _close_compaction_provider_stream(provider_stream)
-        await _close_compaction_provider_stream(accounted_stream)
-        await _close_compaction_provider_stream(recovery_stream)
+        with compaction_diagnostic_phase(
+            compaction_id=compaction_id, phase="summarizing", step="summary_stream_cleanup",
+        ):
+            if provider_stream is not accounted_stream:
+                await _close_compaction_provider_stream(provider_stream)
+            await _close_compaction_provider_stream(accounted_stream)
+            await _close_compaction_provider_stream(recovery_stream)
 
 
 async def call_compaction_llm(
@@ -4243,6 +4292,7 @@ async def compact_context_new(request: CompactionRequest) -> CompactionResult:
             ),
             cfg,
             phase="validating",
+            diagnostic_step="attachment_projection",
         )
         # These paths come from verified materialization, not prose extraction or
         # envelope fields. Preserve each full path even if the model summary omits it.
@@ -4272,66 +4322,71 @@ async def compact_context_new(request: CompactionRequest) -> CompactionResult:
                         or len(request.canonical_coverage_entries) >= len(to_compact)
                     )
                 ),
-            ), cfg, phase="validating",
+            ), cfg, phase="validating", diagnostic_step="coverage_extraction",
         )
         obligations = obligation_set.obligations
         kept_tokens, kept_chars = await await_compaction_phase(
             asyncio.to_thread(_compaction_source_size, kept, **replay_measure_kwargs),
             cfg,
             phase="validating",
+            diagnostic_step="retained_source_measurement",
         )
         kept_replay_tokens = await await_compaction_phase(
             asyncio.to_thread(_current_replay_tokens, kept, **replay_measure_kwargs),
             cfg,
             phase="validating",
+            diagnostic_step="retained_replay_measurement",
         )
         admission_failure = "consumer_admission_failed"
         admitted = False
         for revision in range(2):
-            structured_summary, coverage = build_structured_summary_from_text(
-                merged,
-                obligations,
-                block_missing_critical=cfg.coverage_blocking,
-                verified_attachment_paths=sorted(retained_paths),
-                exact_reference_manifest=obligation_set.manifest,
-            )
-            structured_summary.source_coverage.update(
-                {
-                    "replaces_prior_context": bool(prev_summary),
-                    "previous_summary_tokens": previous_summary_tokens,
-                    "summary_input_policy": "bounded_history",
-                }
-            )
-            merged = structured_summary.current_status
-            summary_payload = structured_summary.model_dump(mode="json")
-            replay_summary = render_structured_summary(summary_payload)
-            coverage, artifact_error = validate_compaction_artifact(
-                replay_summary,
-                obligations,
-                summary_replay_renderer=request.summary_replay_renderer,
-                exact_reference_manifest=obligation_set.manifest,
-            )
-            coverage = coverage_with_manifest(coverage, obligation_set.manifest)
-            structured_summary.source_coverage.update(
-                {
-                    "status": coverage.status,
-                    "checked_obligations": coverage.checked_obligations,
-                    "covered_obligations": coverage.covered_obligations,
-                }
-            )
-            summary_payload = structured_summary.model_dump(mode="json")
-            try:
-                consumer_replay_summary = (
-                    request.summary_replay_renderer(replay_summary)
-                    if request.summary_replay_renderer is not None
-                    else replay_summary
-                ) or ""
-            except Exception:
-                consumer_replay_summary = ""
-                artifact_error = "summary_replay_incomplete"
-            tokens_after = _estimate_tokens(consumer_replay_summary) + kept_tokens
-            replay_tokens_after = _estimate_tokens(consumer_replay_summary) + kept_replay_tokens
-            chars_after = len(consumer_replay_summary) + kept_chars
+            with compaction_diagnostic_phase(
+                compaction_id=cfg.operation_id, phase="validating", step="summary_validation",
+            ):
+                structured_summary, coverage = build_structured_summary_from_text(
+                    merged,
+                    obligations,
+                    block_missing_critical=cfg.coverage_blocking,
+                    verified_attachment_paths=sorted(retained_paths),
+                    exact_reference_manifest=obligation_set.manifest,
+                )
+                structured_summary.source_coverage.update(
+                    {
+                        "replaces_prior_context": bool(prev_summary),
+                        "previous_summary_tokens": previous_summary_tokens,
+                        "summary_input_policy": "bounded_history",
+                    }
+                )
+                merged = structured_summary.current_status
+                summary_payload = structured_summary.model_dump(mode="json")
+                replay_summary = render_structured_summary(summary_payload)
+                coverage, artifact_error = validate_compaction_artifact(
+                    replay_summary,
+                    obligations,
+                    summary_replay_renderer=request.summary_replay_renderer,
+                    exact_reference_manifest=obligation_set.manifest,
+                )
+                coverage = coverage_with_manifest(coverage, obligation_set.manifest)
+                structured_summary.source_coverage.update(
+                    {
+                        "status": coverage.status,
+                        "checked_obligations": coverage.checked_obligations,
+                        "covered_obligations": coverage.covered_obligations,
+                    }
+                )
+                summary_payload = structured_summary.model_dump(mode="json")
+                try:
+                    consumer_replay_summary = (
+                        request.summary_replay_renderer(replay_summary)
+                        if request.summary_replay_renderer is not None
+                        else replay_summary
+                    ) or ""
+                except Exception:
+                    consumer_replay_summary = ""
+                    artifact_error = "summary_replay_incomplete"
+                tokens_after = _estimate_tokens(consumer_replay_summary) + kept_tokens
+                replay_tokens_after = _estimate_tokens(consumer_replay_summary) + kept_replay_tokens
+                chars_after = len(consumer_replay_summary) + kept_chars
             if artifact_error is None:
                 try:
                     admitted = (
@@ -4344,6 +4399,7 @@ async def compact_context_new(request: CompactionRequest) -> CompactionResult:
                             ),
                             cfg,
                             phase="validating",
+                            diagnostic_step="consumer_admission",
                         )
                         if request.consumer_admission is not None
                         else (
@@ -4387,6 +4443,7 @@ async def compact_context_new(request: CompactionRequest) -> CompactionResult:
                             asyncio.to_thread(cfg.budget.consumer_tail_over_capacity, kept),
                             cfg,
                             phase="validating",
+                            diagnostic_step="consumer_tail_measurement",
                         )
                     except ConsumerAdmissionStaleError:
                         admission_failure = "consumer_admission_stale"
@@ -4425,15 +4482,19 @@ async def compact_context_new(request: CompactionRequest) -> CompactionResult:
             or forced_cut is not None
         ):
             break
-        safe_limit = _retreat_to_api_round_boundary(
-            entries, _apply_protected_tail(entries, len(entries), cfg)
-        )
-        next_boundaries = sorted(
-            boundary for boundary in _api_round_boundaries(entries) if cut < boundary <= safe_limit
-        )
-        if not next_boundaries:
-            break
-        require_compaction_time(cfg, phase="planning")
+        with compaction_diagnostic_phase(
+            compaction_id=cfg.operation_id, phase="planning", step="replan_source_boundaries",
+        ):
+            safe_limit = _retreat_to_api_round_boundary(
+                entries, _apply_protected_tail(entries, len(entries), cfg)
+            )
+            next_boundaries = sorted(
+                boundary for boundary in _api_round_boundaries(entries)
+                if cut < boundary <= safe_limit
+            )
+            if not next_boundaries:
+                break
+            require_compaction_time(cfg, phase="planning")
         checkpoint_tokens = _estimate_tokens(consumer_replay_summary)
         next_cut = await await_compaction_phase(
             asyncio.to_thread(
@@ -4449,15 +4510,20 @@ async def compact_context_new(request: CompactionRequest) -> CompactionResult:
             ),
             cfg,
             phase="planning",
+            diagnostic_step="replan_source_selection",
         )
         next_cut = min(safe_limit, max(next_boundaries[0], next_cut))
         additional_source = entries[cut:next_cut]
         if cfg.attachment_path_resolver is not None:
-            additional_source = _prepare_compaction_image_paths(
-                additional_source,
-                session_id=request.session_id,
-                resolver=cfg.attachment_path_resolver,
-            )
+            with compaction_diagnostic_phase(
+                compaction_id=cfg.operation_id,
+                phase="planning", step="replan_attachment_projection",
+            ):
+                additional_source = _prepare_compaction_image_paths(
+                    additional_source,
+                    session_id=request.session_id,
+                    resolver=cfg.attachment_path_resolver,
+                )
         to_compact = to_compact + additional_source
         cut = next_cut
         kept = entries[cut:]
@@ -4468,6 +4534,7 @@ async def compact_context_new(request: CompactionRequest) -> CompactionResult:
             asyncio.to_thread(_compaction_source_size, kept, **replay_measure_kwargs),
             cfg,
             phase="planning",
+            diagnostic_step="replan_tail_measurement",
         )
         summary_goal = body_goal(next_kept_tokens)
         # A necessary admission replan absorbs only this additional source.

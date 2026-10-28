@@ -429,18 +429,27 @@ async def account_provider_stream(
     provider: str,
     model: str,
     close_timeout: float | None = _PROVIDER_STREAM_CLOSE_TIMEOUT_SECONDS,
+    on_provider_event: Callable[[Any], None] | None = None,
 ) -> AsyncGenerator[Any, None]:
     """Account exactly one physical ``provider.chat`` invocation.
 
     Child tasks inherit the current scope through ``ContextVar``.
-    Without a scope this is a byte-for-byte streaming pass-through.
+    Without a scope this is a byte-for-byte streaming pass-through. An optional
+    observer sees raw events before ledger finalization; observer failures must
+    not change delivery or the accounting cancellation barriers.
     """
+
+    def observe(event: Any) -> None:
+        if on_provider_event is not None:
+            with contextlib.suppress(Exception):
+                on_provider_event(event)
 
     scope = current_usage_accounting_scope()
     if scope is None:
         unaccounted_stream = stream_factory()
         try:
             async for event in unaccounted_stream:
+                observe(event)
                 yield event
         finally:
             await _close_accounted_provider_stream(
@@ -457,6 +466,7 @@ async def account_provider_stream(
     try:
         stream = stream_factory()
         async for event in stream:
+            observe(event)
             kind = str(getattr(event, "kind", "") or "")
             if kind == "done" and not terminal:
                 # Preserve the physical deployment for compatibility rollups

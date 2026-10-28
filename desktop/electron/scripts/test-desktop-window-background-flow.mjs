@@ -11,6 +11,7 @@ import {
   closeElectronWithDeadline,
   closeHttpServerWithDeadline,
   desktopShutdownEvidenceSince,
+  requestElectronQuitWithConfirmation,
   trackHttpServerConnections,
 } from './e2e-shutdown-helpers.mjs'
 
@@ -916,7 +917,7 @@ try {
   let preserveEvidence = !flowSucceeded
   if (desktopApp) {
     // Capture ownership while Playwright's dispatcher still exists. The public
-    // process() accessor is no longer usable after a successful app.close().
+    // process() accessor may be unavailable after the owned process exits.
     const ownedChild = desktopApp.process()
     const desktopLogPath = join(userDataDir, 'logs', 'desktop.log')
     const desktopLogCheckpoint = await readFile(desktopLogPath, 'utf8').catch(() => null)
@@ -926,6 +927,9 @@ try {
       app: desktopApp,
       phase: 'window-background-final-shutdown',
       timeoutMs: ELECTRON_SHUTDOWN_TIMEOUT_MS,
+      requestClose: options => requestElectronQuitWithConfirmation(desktopApp, {
+        ...options, requireConfirmation: false,
+      }),
       // The helper bounds this callback to 3 seconds. Do not use Electron IPC
       // here: the very process being diagnosed may no longer answer it.
       diagnostics: async () => {

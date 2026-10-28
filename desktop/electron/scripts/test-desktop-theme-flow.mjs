@@ -9,6 +9,7 @@ import {
   canAcceptWindowsElectronShutdownFallback,
   closeElectronWithDeadline,
   desktopShutdownEvidenceSince,
+  requestElectronQuitWithConfirmation,
 } from './e2e-shutdown-helpers.mjs'
 
 const scriptDir = dirname(fileURLToPath(import.meta.url))
@@ -285,9 +286,8 @@ try {
   })
 
   // The native renderer can finish these local theme checks while its owned
-  // Gateway is still starting. Wait for the verified connection before the
-  // ordinary idle app.close(); otherwise Quit correctly asks about unknown
-  // activity after Playwright has already disposed its main-process channel.
+  // Gateway is still starting. Wait for the verified connection before cleanup;
+  // a later unavailable activity probe still follows the normal quit dialog.
   await waitFor(async () => {
     const connection = await page.evaluate(() => window.opensquillaDesktop?.getGatewayConnection?.())
     return connection?.status === 'ready' && /^[0-9a-f]{64}$/.test(connection.authToken ?? '')
@@ -335,6 +335,9 @@ try {
       app: desktopApp,
       phase: 'theme-final-shutdown',
       timeoutMs: ELECTRON_SHUTDOWN_TIMEOUT_MS,
+      requestClose: options => requestElectronQuitWithConfirmation(desktopApp, {
+        ...options, requireConfirmation: false,
+      }),
       diagnostics: async () => {
         const log = await readFile(desktopLogPath, 'utf8').catch(() => null)
         if (log === null) return { logReadFailed: true }

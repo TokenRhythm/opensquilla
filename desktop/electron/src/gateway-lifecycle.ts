@@ -1,4 +1,91 @@
+import type { ChildProcess } from 'node:child_process'
 import { performance } from 'node:perf_hooks'
+
+export type GatewayStopReason =
+  | 'desktop_stop'
+  | 'desktop_quit'
+  | 'desktop_update'
+  | 'shutdown_endpoint'
+  | 'ownership_verification_failed'
+
+export interface GatewayProcessDiagnostics {
+  requestStop(reason: GatewayStopReason): void
+  requestTermination(signal: NodeJS.Signals): void
+}
+
+/** Observe the owned child independently of its stdio and recovery lifecycle. */
+export function observeGatewayProcessLifecycle(
+  child: Pick<ChildProcess, 'on' | 'once' | 'pid'>,
+  options: {
+    instanceId: string
+    supervisorPid: number
+    platform: NodeJS.Platform
+    restartAttempt: number
+    report: (event: string, detail: Record<string, unknown>) => void
+    now?: () => number
+  },
+): GatewayProcessDiagnostics {
+  const now = options.now ?? (() => performance.now())
+  const startedAt = now()
+  let stopReason: GatewayStopReason | null = null
+  let requestedSignal: NodeJS.Signals | null = null
+  let exitAt: number | null = null
+  let errorObserved = false
+  const report = (event: string, detail: Record<string, unknown> = {}): void => {
+    try {
+      options.report(event, {
+        process_instance_id: options.instanceId,
+        supervisor_pid: options.supervisorPid,
+        pid: child.pid ?? null,
+        platform: options.platform,
+        restart_attempt: options.restartAttempt,
+        uptime_ms: Math.max(0, now() - startedAt),
+        stop_reason: stopReason,
+        requested_signal: requestedSignal,
+        ...detail,
+      })
+    } catch { /* diagnostic failure must not change process ownership */ }
+  }
+  child.once('spawn', () => report('gateway_process_started'))
+  child.on('error', (error: NodeJS.ErrnoException) => {
+    if (errorObserved) return
+    errorObserved = true
+    // Error messages can contain launch arguments or machine-specific paths.
+    report('gateway_process_error_observed', { error_code: error.code ?? null })
+  })
+  child.once('exit', (code: number | null, signal: NodeJS.Signals | null) => {
+    exitAt = now()
+    report('gateway_process_exit_observed', {
+      code,
+      signal,
+      // Windows may report a signed or unsigned NTSTATUS and no POSIX signal.
+      windows_status_hex: options.platform === 'win32' && code !== null
+        ? `0x${(code >>> 0).toString(16).padStart(8, '0')}` : null,
+      outcome: stopReason !== null ? 'stop_requested'
+        : signal !== null ? 'signal_observed'
+          : code === 0 ? 'unrequested_clean_exit'
+            : code !== null ? 'nonzero_exit' : 'unknown_exit',
+    })
+  })
+  child.once('close', () => {
+    report('gateway_process_stdio_closed', {
+      exit_observed: exitAt !== null,
+      exit_to_close_ms: exitAt === null ? null : Math.max(0, now() - exitAt),
+    })
+  })
+  return {
+    requestStop(reason) {
+      if (exitAt !== null || stopReason !== null) return
+      stopReason = reason
+      report('gateway_process_stop_requested')
+    },
+    requestTermination(signal) {
+      if (exitAt !== null || signal === requestedSignal) return
+      requestedSignal = signal
+      report('gateway_process_termination_requested')
+    },
+  }
+}
 
 export interface LifecycleProcessDrainOptions<T> {
   currentProcess: () => T | null
