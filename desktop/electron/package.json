@@ -117,7 +117,10 @@
   },
   "overrides": {
     "global-agent@3.0.0": {
-      "roarr": "3.3.0"
+      "roarr": {
+        ".": "3.3.0",
+        "fast-json-stringify": "5.16.1"
+      }
     }
   },
   "build": {

@@ -14,7 +14,7 @@ function isolatedProxyEnvironment() {
     && !/^roarr_/i.test(name)))
 }
 
-test('builder artifact downloads retain proxy routing and checksum verification', async () => {
+test('builder artifact downloads retain proxy logging, routing and checksum verification', async () => {
   const directory = await mkdtemp(join(tmpdir(), 'opensquilla-build-proxy-'))
   const body = Buffer.from('Synthetic verified build artifact')
   const digest = createHash('sha256').update(body).digest('hex')
@@ -32,6 +32,8 @@ test('builder artifact downloads retain proxy routing and checksum verification'
       const { createRequire } = require('node:module');
       const builderRequire = createRequire(require.resolve('app-builder-lib/package.json'));
       const downloader = builderRequire('@electron/get');
+      const proxyLogs = [];
+      globalThis.ROARR.write = line => proxyLogs.push(JSON.parse(line));
       const destination = process.env.OPENSQUILLA_SYNTHETIC_DOWNLOAD_CACHE;
       const options = {
         version: '9.9.9', artifactName: 'fixture.txt', isGeneric: true,
@@ -48,6 +50,16 @@ test('builder artifact downloads retain proxy routing and checksum verification'
         assert.equal(await readFile(cached, 'utf8'), 'Synthetic verified build artifact');
         await assert.rejects(downloader.downloadArtifact({ ...options,
           checksums: { 'fixture.txt': '0'.repeat(64) } }), /checksum|hash/i);
+        const requests = proxyLogs.filter(row => row.message === 'proxying request');
+        assert.equal(requests.length, 2);
+        assert.ok(requests.every(row => row.context.package === 'global-agent'
+          && row.context.namespace === 'Agent' && row.context.logLevel === 10
+          && Number.isInteger(row.context.requestId)
+          && row.context.destination === 'http://artifact.invalid/fixture.txt'));
+        const responses = proxyLogs.filter(row => row.message === 'proxying response');
+        assert.equal(responses.length, 2);
+        assert.ok(responses.every(row => row.context.statusCode === 200
+          && row.context.headers['content-type'] === 'application/octet-stream'));
       })().catch(error => { console.error(error); process.exitCode = 1; });
     `
     const child = spawn(process.execPath, ['-e', script], {

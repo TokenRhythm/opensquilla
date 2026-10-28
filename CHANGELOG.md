@@ -10,6 +10,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 - Prevent malformed quotes and long file references in history from stalling
   compaction. Add local phase timings and Gateway process exit diagnostics.
+- Remove a vulnerable transitive dependency from Desktop's download proxy tooling.
 
 ## [0.5.7] - 2026-10-23
 
