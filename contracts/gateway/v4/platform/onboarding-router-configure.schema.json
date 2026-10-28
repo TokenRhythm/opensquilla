@@ -97,10 +97,9 @@
         },
         "crossProviderTiers": {
           "type": [
-            "object",
+            "boolean",
             "null"
-          ],
-          "additionalProperties": true
+          ]
         },
         "tierProviderMismatch": {
           "type": [

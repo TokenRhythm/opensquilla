@@ -24,6 +24,24 @@ test('sessions.list verification still exposes all four real validators', async 
   assert.equal(validators.validateSessionsListResult({ sessions: [] }), false)
 })
 
+test('router configure accepts only an optional nullable boolean cross-provider flag', async () => {
+  const validators = await loadContractValidators('onboarding.router.configure')
+  for (const params of [{}, { crossProviderTiers: null }, { crossProviderTiers: true }, { crossProviderTiers: false }]) {
+    const wire = { type: 'req', id: 'synthetic', method: 'onboarding.router.configure', params }
+    const original = structuredClone(wire)
+    assert.equal(validators.validateOnboardingRouterConfigureParams(params), true)
+    assert.equal(validators.validateOnboardingRouterConfigureRequestFrame(wire), true)
+    assert.deepEqual(wire, original)
+  }
+  for (const crossProviderTiers of [{}, [], 'true', 'false', 0, 1]) {
+    const params = { crossProviderTiers }
+    assert.equal(validators.validateOnboardingRouterConfigureParams(params), false)
+    assert.equal(validators.validateOnboardingRouterConfigureRequestFrame({
+      type: 'req', id: 'synthetic', method: 'onboarding.router.configure', params,
+    }), false)
+  }
+})
+
 test('execution log fixtures validate frames and their params or results', async () => {
   const validators = await loadContractValidators('sessions.executionLog.read')
   for (const [file, frame, body, field] of [

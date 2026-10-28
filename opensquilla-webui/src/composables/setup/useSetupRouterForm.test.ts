@@ -480,7 +480,7 @@ describe('useSetupRouterForm - model strategy semantics', () => {
     expect(f.payload().mode).toBe('custom')
   })
 
-  it('does not authorize cross-provider execution merely because tier providers differ', () => {
+  it('submits complete foreign deployments without making a loaded form dirty', () => {
     const f = useSetupRouterForm()
     f.initFromConfig({
       enabled: true,
@@ -494,7 +494,8 @@ describe('useSetupRouterForm - model strategy semantics', () => {
     }, {}, 'openai')
 
     expect(f.hasMixedTierProviders.value).toBe(true)
-    expect(f.payload()).not.toHaveProperty('crossProviderTiers')
+    expect(f.isDirty.value).toBe(false)
+    expect(f.payload()).toHaveProperty('crossProviderTiers', true)
     expect(f.tierTemplateState.value).toBe('custom')
     expect(f.payload()).toMatchObject({
       mode: 'custom',
@@ -547,9 +548,7 @@ describe('useSetupRouterForm - model strategy semantics', () => {
 
     expect(f.routerProviderRoles.value).toEqual({})
     expect(f.hasMixedTierProviders.value).toBe(true)
-    expect(f.payload()).not.toHaveProperty('crossProviderTiers')
-    expect(f.payload()).toMatchObject({
-    })
+    expect(f.payload()).toHaveProperty('crossProviderTiers', true)
     expect(f.tierEnsembleStatus.value).toBeNull()
   })
 
@@ -620,7 +619,7 @@ describe('useSetupRouterForm - model strategy semantics', () => {
 
     expect(f.routerProviderRoles.value).toEqual({ c3: 'dynamic_member' })
     expect(f.hasMixedTierProviders.value).toBe(true)
-    expect(f.payload()).not.toHaveProperty('crossProviderTiers')
+    expect(f.payload()).toHaveProperty('crossProviderTiers', true)
     expect(makePanel(f, true).value.routerProviderRoles).toEqual({ c3: 'dynamic_member' })
   })
 
@@ -651,9 +650,7 @@ describe('useSetupRouterForm - model strategy semantics', () => {
       c3: 'direct',
     })
     expect(f.hasMixedTierProviders.value).toBe(true)
-    expect(f.payload()).not.toHaveProperty('crossProviderTiers')
-    expect(f.payload()).toMatchObject({
-    })
+    expect(f.payload()).toHaveProperty('crossProviderTiers', true)
   })
 
   it('keeps authoritative server roles when the local ensemble context did not change', () => {
@@ -688,7 +685,7 @@ describe('useSetupRouterForm - model strategy semantics', () => {
     }, 'custom_b5', false)
 
     expect(f.hasMixedTierProviders.value).toBe(true)
-    expect(f.payload()).not.toHaveProperty('crossProviderTiers')
+    expect(f.payload()).toHaveProperty('crossProviderTiers', true)
 
     f.updateTierField('c3', 'ensembleEnabled', true)
     f.updateTierField('c3', 'ensembleSelectionMode', '')
@@ -813,7 +810,7 @@ describe('useSetupRouterForm - model strategy semantics', () => {
       c3: 'direct',
     })
     expect(f.hasMixedTierProviders.value).toBe(true)
-    expect(f.payload()).not.toHaveProperty('crossProviderTiers')
+    expect(f.payload()).toHaveProperty('crossProviderTiers', true)
     expect(f.payload()).toMatchObject({
       tiers: {
         c3: {
@@ -856,10 +853,8 @@ describe('useSetupRouterForm - model strategy semantics', () => {
     }, {}, 'openrouter')
 
     expect(f.hasMixedTierProviders.value).toBe(true)
-    expect(f.payload()).not.toHaveProperty('crossProviderTiers')
+    expect(f.payload()).toHaveProperty('crossProviderTiers', true)
     expect(makePanel(f, true).value.hasMixedTierProviders).toBe(true)
-    expect(f.payload()).toMatchObject({
-    })
   })
 
   it('atomically clears provider-scoped model and ensemble when provider changes', () => {
@@ -911,5 +906,75 @@ describe('saved cross-provider permission', () => {
     } }, {}, 'openai')
     form.updateTierField('c0', 'model', 'edited')
     expect(form.payload()).toMatchObject({ crossProviderTiers: true, tierProviderMismatch: 'route' })
+  })
+})
+
+describe('explicit tier-table saves', () => {
+  it.each([undefined, false, true])('saves a selected foreign deployment with stored permission %s', permission => {
+    const form = useSetupRouterForm()
+    form.initFromConfig({
+      enabled: true,
+      ...(permission === undefined ? {} : { cross_provider_tiers: permission }),
+      tiers: { c3: { provider: 'tokenrhythm', model: 'original-quality-model' } },
+    }, {}, 'tokenrhythm')
+
+    expect(form.isDirty.value).toBe(false)
+    form.updateTierField('c3', 'provider', ' OpenRouter ')
+    form.updateTierField('c3', 'model', 'moonshotai/kimi-k3.1-pro')
+
+    expect(form.payload()).toMatchObject({
+      mode: 'custom',
+      crossProviderTiers: true,
+      tiers: { c3: { provider: 'openrouter', model: 'moonshotai/kimi-k3.1-pro' } },
+    })
+  })
+
+  it('honors the complete legacy table when saving a changed default tier', () => {
+    const form = useSetupRouterForm()
+    form.initFromConfig({
+      enabled: true,
+      cross_provider_tiers: false,
+      tiers: { c3: { provider: 'openrouter', model: 'saved-quality-model' } },
+    }, {}, 'tokenrhythm')
+    form.setRouterDefaultTier('c3')
+
+    expect(form.payload()).toMatchObject({
+      defaultTier: 'c3', crossProviderTiers: true,
+      tiers: { c3: { provider: 'openrouter', model: 'saved-quality-model' } },
+    })
+  })
+
+  it('recomputes a dormant C3 after an entry change replaces fusion with one model', () => {
+    const form = useSetupRouterForm()
+    form.initFromConfig({
+      enabled: true,
+      cross_provider_tiers: false,
+      tiers: { c3: { provider: 'tokenrhythm', model: 'old-draft', ensemble_enabled: true } },
+    }, {}, 'tokenrhythm', 'custom', { c3: 'dormant_draft' }, 'custom_b5', false)
+    form.updateTierField('c3', 'provider', 'openrouter')
+    form.updateTierField('c3', 'model', 'moonshotai/kimi-k3.1-pro')
+
+    expect(form.routerProviderRoles.value.c3).toBe('direct')
+    expect(form.payload()).toMatchObject({
+      crossProviderTiers: true,
+      tiers: { c3: { provider: 'openrouter', model: 'moonshotai/kimi-k3.1-pro', ensembleEnabled: false } },
+    })
+  })
+
+  it.each([
+    ['incomplete model', true, 'openrouter', '', 'direct'],
+    ['same primary', true, 'tokenrhythm', 'new-model', 'direct'],
+    ['disabled Router', false, 'openrouter', 'new-model', 'direct'],
+    ['dormant C3', true, 'openrouter', 'new-model', 'dormant_draft'],
+    ['blocked C3', true, 'openrouter', 'new-model', 'blocked'],
+  ] as const)('does not enable cross-provider execution for %s', (_label, enabled, provider, model, role) => {
+    const form = useSetupRouterForm()
+    form.initFromConfig({
+      enabled,
+      cross_provider_tiers: false,
+      tiers: { c3: { provider, model } },
+    }, {}, 'tokenrhythm', 'custom', { c3: role })
+
+    expect(form.payload()).not.toHaveProperty('crossProviderTiers')
   })
 })

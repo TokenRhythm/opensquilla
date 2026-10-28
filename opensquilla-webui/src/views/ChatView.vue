@@ -3511,6 +3511,7 @@ const chatSessionRuntime = useChatSessionRuntime({
   resetStreamLiveTurnState,
   retireAttachments,
   resetInputHistory: () => resetComposerInputHistory(),
+  resetSessionHistory: chatHistory.resetForSession,
   resetDraftComposer: () => {
     artifactImageLightbox.close()
     inputText.value = ''

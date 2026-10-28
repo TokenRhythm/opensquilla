@@ -2816,6 +2816,58 @@ describe('useChatRpcEventHandlers durable out-of-band messages', () => {
     }
   })
 
+  it.each(['warning', 'session.event.warning'])('silences reasoning-history recovery from %s while preserving warning sequencing', (eventName) => {
+    const { api, showWarningToast, messages, lastStreamSeq, stop } = createHarness()
+    try {
+      api.handlers.onWireEventFixture(eventName, {
+        key: 'agent:main:test',
+        stream_seq: 1,
+        code: 'reasoning_replay_context_rebuilt',
+        message: 'Preparing compatible history.',
+      }, { replayed: false })
+
+      expect(showWarningToast).not.toHaveBeenCalled()
+      expect(lastStreamSeq.value).toBe(1)
+
+      api.handlers.onWireEventFixture(eventName, {
+        key: 'agent:main:test',
+        stream_seq: 1,
+        code: 'synthetic_unknown_warning',
+        message: 'Replayed visible warning.',
+      }, { replayed: true })
+      api.handlers.onWireEventFixture(eventName, {
+        key: 'agent:main:test',
+        stream_seq: 2,
+        code: 'reasoning_replay_context_rebuilt',
+        message: 'Preparing compatible history again.',
+      }, { replayed: true })
+
+      expect(showWarningToast).not.toHaveBeenCalled()
+      expect(lastStreamSeq.value).toBe(2)
+
+      api.handlers.onWireEventFixture(eventName, {
+        key: 'agent:main:test',
+        stream_seq: 3,
+        code: 'synthetic_unknown_warning',
+        message: 'Provider is degraded.',
+      }, { replayed: false })
+      api.handlers.onWireEventFixture(eventName, {
+        key: 'agent:main:test',
+        stream_seq: 4,
+        message: 'Warning without a code.',
+      }, { replayed: false })
+
+      expect(showWarningToast.mock.calls).toEqual([
+        ['Provider is degraded.'],
+        ['Warning without a code.'],
+      ])
+      expect(lastStreamSeq.value).toBe(4)
+      expect(messages.value).toHaveLength(0)
+    } finally {
+      stop()
+    }
+  })
+
   it('toasts warnings for five-second host handling while consuming silent warning sequences', () => {
     const { api, showWarningToast, messages, lastStreamSeq, stop } = createHarness()
     try {

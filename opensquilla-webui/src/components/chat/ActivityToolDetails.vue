@@ -515,7 +515,7 @@ const detailActionLabel = computed(() => {
 .activity-tool-details__log-status button { margin-inline-start: 0.5rem; padding: 0; border: 0; border-radius: var(--radius-sm); background: transparent; color: var(--text); font: inherit; text-decoration: underline; cursor: pointer; }
 .activity-tool-details__log-status button:focus-visible { outline: none; box-shadow: var(--focus-ring); }
 .activity-tool-details--bounded { position: relative; display: flex; flex-direction: column; max-width: 100%; max-height: min(20rem, 45vh); padding: 0; border: 1px solid var(--border); border-radius: var(--radius-md); background: var(--bg); overflow: hidden; }
-.activity-tool-details__window { min-height: 0; padding: 0.875rem 2.75rem 0.875rem 0.875rem; overflow: auto; overscroll-behavior: contain; scrollbar-gutter: stable; }
+.activity-tool-details__window { min-height: 0; padding: 0.875rem 2.75rem 0.875rem 0.875rem; overflow: auto; overscroll-behavior: auto; scrollbar-gutter: stable; }
 .activity-tool-details__truncated { flex: 0 0 auto; margin: 0; padding: 0.375rem 0.875rem; color: var(--text-muted); font-size: 0.75rem; }
 .activity-tool-details__window:focus-visible { outline: none; box-shadow: var(--focus-ring-inset); }
 .activity-tool-details__section { margin: 0; padding: 0; border: 0; background: transparent; }

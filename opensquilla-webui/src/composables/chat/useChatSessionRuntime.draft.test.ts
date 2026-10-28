@@ -9,10 +9,11 @@ import { useLocalPathDraft } from './useLocalPathDraft'
 import type { ChatMessage } from '@/types/chat'
 
 describe('useChatSessionRuntime project drafts', () => {
-  it('clears composer state when an explicit new task replaces an empty draft', () => {
+  it('clears composer state when an explicit new task replaces an empty draft', async () => {
     const sessionKey = ref('agent:main:webchat:project-a-draft')
     const resetDraftComposer = vi.fn()
     const resetInputHistory = vi.fn()
+    const resetSessionHistory = vi.fn()
     const taskOwnership = useChatTaskOwnership()
     taskOwnership.noteRunning('task-project-a')
     const activeStreamTaskId = ref('task-project-a')
@@ -67,14 +68,16 @@ describe('useChatSessionRuntime project drafts', () => {
       restoreWidgetState: vi.fn(),
       resetStreamLiveTurnState: vi.fn(),
       resetInputHistory,
+      resetSessionHistory,
       resetDraftComposer,
     })
 
-    runtime.startDraftSession('main')
+    await runtime.startDraftSession('main')
 
     expect(sessionKey.value).toBe('agent:main:webchat:project-b-draft')
     expect(resetDraftComposer).toHaveBeenCalledOnce()
     expect(resetInputHistory).toHaveBeenCalledOnce()
+    expect(resetSessionHistory).toHaveBeenCalledExactlyOnceWith('agent:main:webchat:project-b-draft')
     expect(taskOwnership.runningTaskId.value).toBe('')
     expect(taskOwnership.queuedTaskIds.value.size).toBe(0)
     expect(taskOwnership.hydrationResolved.value).toBe(true)

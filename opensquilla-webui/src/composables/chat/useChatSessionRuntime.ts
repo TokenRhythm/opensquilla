@@ -82,6 +82,8 @@ export interface UseChatSessionRuntimeOptions {
   /** Clear session-local navigation state without changing the restored draft. */
   resetInputHistory?: () => void
   resetDraftComposer?: () => void
+  /** Reset history state when a fresh provisional session replaces a deleted one. */
+  resetSessionHistory?: (key: string) => void
 }
 
 const EMPTY_USAGE: ChatUsageAccumulator = {
@@ -330,6 +332,10 @@ export function useChatSessionRuntime(options: UseChatSessionRuntimeOptions) {
     options.retireAttachments?.()
     resetCompactState()
     options.sessionKey.value = key
+    // Draft bootstraps intentionally skip durable history. Clear the previous
+    // session's terminal state explicitly so a deleted session cannot leave
+    // the composer disabled on the fresh-task surface.
+    options.resetSessionHistory?.(key)
     resetSessionRuntimeState()
     // A brand-new provisional key cannot own a durable Gateway task yet. Its
     // first send must not wait for optional draft bootstrap metadata.

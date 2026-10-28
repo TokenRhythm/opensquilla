@@ -1073,6 +1073,7 @@ export function useChatHistory(options: UseChatHistoryOptions) {
   return {
     historySessionKey,
     historyState,
+    resetForSession,
     loadHistory,
     reconcileHistory,
     reconcileHydratedContent,
