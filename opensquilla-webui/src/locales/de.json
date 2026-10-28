@@ -5092,6 +5092,8 @@
     }
   },
   "account": {
+    "recoveryLogin": "Anmeldung zurücksetzen und erneut autorisieren",
+    "recoveryRequired": "Lokale Anmeldedaten können nicht wiederhergestellt werden",
     "title": "Konto und Guthaben",
     "description": "Melden Sie sich auf der TokenRhythm-Website an, um Konto und Guthaben hier zu verwalten.",
     "loginSettings": "Anmelden / Einstellungen",
@@ -5145,11 +5147,15 @@
       "signed_in": "Bei TokenRhythm angemeldet",
       "unverified": "Überprüfung nicht möglich; neue Kontoaufrufe pausiert",
       "reauth_required": "Sitzung abgelaufen. Erneut anmelden.",
-      "storage_unavailable": "Sicherer Systemspeicher nicht verfügbar"
+      "storage_unavailable": "Der lokale Kontospeicher ist nicht verfügbar. Prüfen Sie Ordnerberechtigungen und freien Speicherplatz."
     },
     "errors": {
       "generic": "Verbindung fehlgeschlagen. Konto aktualisieren und erneut versuchen.",
-      "ACCOUNT_STORAGE_UNAVAILABLE": "Lokaler Kontospeicher nicht verfügbar",
+      "ACCOUNT_STORAGE_UNAVAILABLE": "Der lokale Kontospeicher ist nicht verfügbar. Prüfen Sie Ordnerberechtigungen und freien Speicherplatz.",
+      "ACCOUNT_LOCAL_KEY_MISSING": "Der lokale Anmeldeschlüssel fehlt. Setzen Sie die Anmeldung zurück und autorisieren Sie erneut.",
+      "ACCOUNT_LOCAL_KEY_INVALID": "Der lokale Anmeldeschlüssel ist beschädigt. Setzen Sie die Anmeldung zurück und autorisieren Sie erneut.",
+      "ACCOUNT_LOCAL_DATA_INVALID": "Die lokalen Anmeldedaten sind beschädigt. Setzen Sie die Anmeldung zurück und autorisieren Sie erneut.",
+      "ACCOUNT_RECOVERY_FAILED": "Anmeldedaten konnten nicht gesichert oder zurückgesetzt werden. Prüfen Sie Berechtigungen und freien Speicherplatz und versuchen Sie es erneut.",
       "ACCOUNT_NETWORK_UNAVAILABLE": "Überprüfung nicht möglich; neue Kontoaufrufe pausiert",
       "MANAGED_KEY_DISABLED": "Der Modellzugang des Kontos ist deaktiviert. Prüfen Sie Ihr Konto auf der Website.",
       "ACCOUNT_LOGIN_TIMEOUT": "Die Browserautorisierung ist abgelaufen. Melden Sie sich erneut an.",

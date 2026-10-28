@@ -5092,6 +5092,8 @@
     }
   },
   "account": {
+    "recoveryLogin": "ログインをリセットして再認証",
+    "recoveryRequired": "ローカルのログイン情報を復元できません",
     "title": "アカウントと残高",
     "description": "TokenRhythm のウェブサイトでログインし、アカウントと残高を管理します。",
     "loginSettings": "ログイン / 設定",
@@ -5145,11 +5147,15 @@
       "signed_in": "TokenRhythm にログイン済み",
       "unverified": "確認できないため、新しい呼び出しを停止しています",
       "reauth_required": "セッションが無効です。再度ログインしてください。",
-      "storage_unavailable": "システムの安全なストレージを利用できません"
+      "storage_unavailable": "ローカルのアカウント保存先を利用できません。フォルダーの権限と空き容量を確認してください。"
     },
     "errors": {
       "generic": "接続に失敗しました。アカウントを更新して再試行してください。",
-      "ACCOUNT_STORAGE_UNAVAILABLE": "ローカルのアカウントストレージを利用できません",
+      "ACCOUNT_STORAGE_UNAVAILABLE": "ローカルのアカウント保存先を利用できません。フォルダーの権限と空き容量を確認してください。",
+      "ACCOUNT_LOCAL_KEY_MISSING": "ローカルのログインキーがありません。ログインをリセットして再認証してください。",
+      "ACCOUNT_LOCAL_KEY_INVALID": "ローカルのログインキーが破損しています。ログインをリセットして再認証してください。",
+      "ACCOUNT_LOCAL_DATA_INVALID": "ローカルのログイン情報が破損しています。ログインをリセットして再認証してください。",
+      "ACCOUNT_RECOVERY_FAILED": "ログイン情報をバックアップまたはリセットできません。保存先の権限と空き容量を確認して再試行してください。",
       "ACCOUNT_NETWORK_UNAVAILABLE": "確認できないため、新しい呼び出しを停止しています",
       "MANAGED_KEY_DISABLED": "アカウントのモデル認証情報は無効です。ウェブサイトでアカウントを確認してください。",
       "ACCOUNT_LOGIN_TIMEOUT": "ブラウザーでの認証がタイムアウトしました。再度ログインしてください。",

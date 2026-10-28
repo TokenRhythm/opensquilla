@@ -12,6 +12,8 @@ const { t, te } = useI18n()
 const logoutOpen = ref(false)
 const authorizing = computed(() => ['authorizing', 'verifying'].includes(account.state?.status || ''))
 const failure = computed(() => account.error || account.state?.errorCode)
+const recoveryRequired = computed(() => account.state?.status === 'storage_unavailable'
+  && ['ACCOUNT_LOCAL_KEY_MISSING', 'ACCOUNT_LOCAL_KEY_INVALID', 'ACCOUNT_LOCAL_DATA_INVALID'].includes(account.state?.errorCode || ''))
 const errorText = computed(() => failure.value && te(`account.errors.${failure.value}`) ? t(`account.errors.${failure.value}`) : t('account.errors.generic'))
 const wallet = computed(() => account.state?.wallet)
 const walletUpdatedAt = computed(() => {
@@ -20,11 +22,16 @@ const walletUpdatedAt = computed(() => {
   const pad = (value: number) => String(value).padStart(2, '0')
   return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())} ${pad(date.getHours())}:${pad(date.getMinutes())}:${pad(date.getSeconds())}`
 })
-// Preserve decimal precision; never round a small positive balance to zero.
+// Match TokenRhythm's two-decimal ceiling display without losing source precision.
 function money(value: string | undefined) {
   if (value === undefined) return '—'
-  const [whole, fraction = ''] = value.split('.')
-  return `${wallet.value?.currency === 'CNY' ? '¥' : (wallet.value?.currency || '') + ' '}${whole}.${fraction.replace(/0+$/, '').padEnd(2, '0')}`
+  const negative = value.startsWith('-')
+  const [whole, fraction = ''] = (negative ? value.slice(1) : value).split('.')
+  let cents = BigInt(whole) * 100n + BigInt(fraction.padEnd(2, '0').slice(0, 2))
+  if (!negative && /[1-9]/.test(fraction.slice(2))) cents += 1n
+  const amount = `${cents / 100n}.${String(cents % 100n).padStart(2, '0')}`
+  const currency = wallet.value?.currency === 'CNY' ? '¥' : (wallet.value?.currency || '') + ' '
+  return `${negative && cents > 0n ? '-' : ''}${currency}${amount}`
 }
 async function act(value: AccountAction) { await account.action(value).catch(() => {}) }
 onMounted(() => { void account.init() })
@@ -41,13 +48,13 @@ onMounted(() => { void account.init() })
       <div class="account-identity__copy">
         <strong>{{ account.loggedIn ? account.name : t('account.loginTitle') }}</strong>
         <p v-if="account.state?.profile?.maskedPhone">{{ account.state.profile.maskedPhone }}</p>
-        <p role="status">{{ t(`account.status.${account.state?.status || 'signed_out'}`) }}</p>
+        <p role="status">{{ recoveryRequired ? t('account.recoveryRequired') : t(`account.status.${account.state?.status || 'signed_out'}`) }}</p>
       </div>
       <div v-if="account.loggedIn" class="account-identity__actions">
         <button class="btn btn--ghost" @click="account.openLink('account')">{{ t('account.moreInfo') }} <Icon name="externalLink" :size="14" /></button>
         <button class="btn" :disabled="account.busy" @click="logoutOpen = true">{{ t('account.logout') }}</button>
       </div>
-      <button v-else-if="!authorizing" class="btn btn--primary" :disabled="account.busy" @click="act('login')">{{ t('account.login') }}</button>
+      <button v-else-if="!authorizing" class="btn btn--primary" :disabled="account.busy" @click="act('login')">{{ t(recoveryRequired ? 'account.recoveryLogin' : 'account.login') }}</button>
       <div v-else class="account-actions">
         <button class="btn" :disabled="account.busy" @click="act('reopen')">{{ t('account.reopen') }}</button>
         <button class="btn btn--ghost" :disabled="account.busy" @click="act('cancel')">{{ t('common.cancel') }}</button>

@@ -5194,6 +5194,8 @@
     }
   },
   "account": {
+    "recoveryLogin": "重置本机登录并重新授权",
+    "recoveryRequired": "本地登录信息无法恢复",
     "title": "账号与余额",
     "description": "通过 TokenRhythm 网站登录，在这里管理账号和余额。",
     "loginSettings": "登录 / 设置",
@@ -5247,11 +5249,15 @@
       "signed_in": "已登录 TokenRhythm",
       "unverified": "暂时无法验证，新的账号调用已暂停",
       "reauth_required": "会话已失效，请重新登录",
-      "storage_unavailable": "系统安全存储不可用，无法登录"
+      "storage_unavailable": "本地账号存储不可用，请检查目录权限和磁盘空间。"
     },
     "errors": {
       "generic": "连接验证失败，请刷新账号后重试。",
-      "ACCOUNT_STORAGE_UNAVAILABLE": "本地账号存储不可用，无法登录",
+      "ACCOUNT_STORAGE_UNAVAILABLE": "本地账号存储不可用，请检查目录权限和磁盘空间。",
+      "ACCOUNT_LOCAL_KEY_MISSING": "本地登录密钥丢失，请重置本机登录并重新授权。",
+      "ACCOUNT_LOCAL_KEY_INVALID": "本地登录密钥损坏，请重置本机登录并重新授权。",
+      "ACCOUNT_LOCAL_DATA_INVALID": "本地登录信息损坏，请重置本机登录并重新授权。",
+      "ACCOUNT_RECOVERY_FAILED": "无法备份或重置本机登录，请检查存储权限和磁盘空间后重试。",
       "ACCOUNT_NETWORK_UNAVAILABLE": "暂时无法验证，新的账号调用已暂停",
       "MANAGED_KEY_DISABLED": "账号模型凭证已被停用，请前往网站检查账号状态。",
       "ACCOUNT_LOGIN_TIMEOUT": "等待浏览器授权超时，请重新登录。",

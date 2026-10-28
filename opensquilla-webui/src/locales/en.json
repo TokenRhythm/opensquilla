@@ -5195,6 +5195,8 @@
     }
   },
   "account": {
+    "recoveryLogin": "Reset sign-in and authorize again",
+    "recoveryRequired": "Local sign-in information cannot be restored",
     "title": "Account & balance",
     "description": "Sign in on the TokenRhythm website to manage your account and balance here.",
     "loginSettings": "Sign in / Settings",
@@ -5248,11 +5250,15 @@
       "signed_in": "Signed in to TokenRhythm",
       "unverified": "Unable to verify; new account calls are paused",
       "reauth_required": "Session expired. Sign in again.",
-      "storage_unavailable": "System secure storage is unavailable"
+      "storage_unavailable": "Local account storage is unavailable. Check folder permissions and available disk space."
     },
     "errors": {
       "generic": "Connection failed. Refresh your account and retry.",
-      "ACCOUNT_STORAGE_UNAVAILABLE": "Local account storage is unavailable",
+      "ACCOUNT_STORAGE_UNAVAILABLE": "Local account storage is unavailable. Check folder permissions and available disk space.",
+      "ACCOUNT_LOCAL_KEY_MISSING": "The local sign-in key is missing. Reset sign-in and authorize again.",
+      "ACCOUNT_LOCAL_KEY_INVALID": "The local sign-in key is damaged. Reset sign-in and authorize again.",
+      "ACCOUNT_LOCAL_DATA_INVALID": "Local sign-in information is damaged. Reset sign-in and authorize again.",
+      "ACCOUNT_RECOVERY_FAILED": "Could not back up or reset local sign-in. Check storage permissions and available disk space, then retry.",
       "ACCOUNT_NETWORK_UNAVAILABLE": "Unable to verify; new account calls are paused",
       "MANAGED_KEY_DISABLED": "The account model credential is disabled. Check your account on the website.",
       "ACCOUNT_LOGIN_TIMEOUT": "Browser authorization timed out. Sign in again.",

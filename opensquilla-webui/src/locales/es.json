@@ -5092,6 +5092,8 @@
     }
   },
   "account": {
+    "recoveryLogin": "Restablecer el inicio de sesión y volver a autorizar",
+    "recoveryRequired": "No se puede restaurar el inicio de sesión local",
     "title": "Cuenta y saldo",
     "description": "Inicia sesión en el sitio de TokenRhythm para gestionar aquí tu cuenta y saldo.",
     "loginSettings": "Iniciar sesión / Ajustes",
@@ -5145,11 +5147,15 @@
       "signed_in": "Sesión iniciada en TokenRhythm",
       "unverified": "No se puede verificar; nuevas llamadas pausadas",
       "reauth_required": "Sesión caducada. Inicia sesión otra vez.",
-      "storage_unavailable": "Almacenamiento seguro del sistema no disponible"
+      "storage_unavailable": "El almacenamiento local de la cuenta no está disponible. Comprueba los permisos de la carpeta y el espacio en disco."
     },
     "errors": {
       "generic": "Error de conexión. Actualiza la cuenta y reintenta.",
-      "ACCOUNT_STORAGE_UNAVAILABLE": "Almacenamiento local de la cuenta no disponible",
+      "ACCOUNT_STORAGE_UNAVAILABLE": "El almacenamiento local de la cuenta no está disponible. Comprueba los permisos de la carpeta y el espacio en disco.",
+      "ACCOUNT_LOCAL_KEY_MISSING": "Falta la clave de inicio de sesión local. Restablece el inicio de sesión y vuelve a autorizar.",
+      "ACCOUNT_LOCAL_KEY_INVALID": "La clave de inicio de sesión local está dañada. Restablece el inicio de sesión y vuelve a autorizar.",
+      "ACCOUNT_LOCAL_DATA_INVALID": "Los datos de inicio de sesión locales están dañados. Restablece el inicio de sesión y vuelve a autorizar.",
+      "ACCOUNT_RECOVERY_FAILED": "No se pudo respaldar o restablecer el inicio de sesión. Comprueba los permisos y el espacio en disco e inténtalo de nuevo.",
       "ACCOUNT_NETWORK_UNAVAILABLE": "No se puede verificar; nuevas llamadas pausadas",
       "MANAGED_KEY_DISABLED": "La credencial del modelo de la cuenta está desactivada. Revisa tu cuenta en el sitio web.",
       "ACCOUNT_LOGIN_TIMEOUT": "La autorización del navegador ha caducado. Inicia sesión de nuevo.",

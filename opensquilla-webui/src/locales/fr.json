@@ -5092,6 +5092,8 @@
     }
   },
   "account": {
+    "recoveryLogin": "Réinitialiser la connexion et autoriser à nouveau",
+    "recoveryRequired": "Impossible de restaurer la connexion locale",
     "title": "Compte et solde",
     "description": "Connectez-vous sur le site TokenRhythm pour gérer votre compte et votre solde ici.",
     "loginSettings": "Connexion / Paramètres",
@@ -5145,11 +5147,15 @@
       "signed_in": "Connecté à TokenRhythm",
       "unverified": "Vérification impossible ; nouveaux appels suspendus",
       "reauth_required": "Session expirée. Reconnectez-vous.",
-      "storage_unavailable": "Stockage sécurisé du système indisponible"
+      "storage_unavailable": "Le stockage local du compte est indisponible. Vérifiez les autorisations du dossier et l’espace disque."
     },
     "errors": {
       "generic": "Échec de connexion. Actualisez le compte et réessayez.",
-      "ACCOUNT_STORAGE_UNAVAILABLE": "Stockage local du compte indisponible",
+      "ACCOUNT_STORAGE_UNAVAILABLE": "Le stockage local du compte est indisponible. Vérifiez les autorisations du dossier et l’espace disque.",
+      "ACCOUNT_LOCAL_KEY_MISSING": "La clé de connexion locale est manquante. Réinitialisez la connexion et autorisez à nouveau.",
+      "ACCOUNT_LOCAL_KEY_INVALID": "La clé de connexion locale est endommagée. Réinitialisez la connexion et autorisez à nouveau.",
+      "ACCOUNT_LOCAL_DATA_INVALID": "Les informations de connexion locales sont endommagées. Réinitialisez la connexion et autorisez à nouveau.",
+      "ACCOUNT_RECOVERY_FAILED": "Impossible de sauvegarder ou de réinitialiser la connexion. Vérifiez les autorisations et l’espace disque, puis réessayez.",
       "ACCOUNT_NETWORK_UNAVAILABLE": "Vérification impossible ; nouveaux appels suspendus",
       "MANAGED_KEY_DISABLED": "Les identifiants de modèle du compte sont désactivés. Vérifiez votre compte sur le site.",
       "ACCOUNT_LOGIN_TIMEOUT": "Le délai d’autorisation du navigateur a expiré. Reconnectez-vous.",

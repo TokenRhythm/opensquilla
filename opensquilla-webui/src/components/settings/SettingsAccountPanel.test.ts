@@ -30,12 +30,29 @@ describe('account settings and source visibility',()=>{
   expect(el.textContent).toContain('等待浏览器授权');expect(el.textContent).toContain('重新打开浏览器')
   const cancel=[...el.querySelectorAll('button')].find(b=>b.textContent==='取消')!;cancel.click();await nextTick();expect(mock.store.action).toHaveBeenCalledWith('cancel')
  })
- it('never invents a zero balance on wallet failure and retains decimal precision',async()=>{
+ it('never invents a zero balance on wallet failure and formats stale balances to two decimals',async()=>{
   const el=await mount(SettingsAccountPanel,state({status:'signed_in',profile,keyStatus:'ready',walletStatus:'error'}))
   expect(el.textContent).toContain('暂时无法获取余额');expect(el.textContent).not.toContain('¥0.00')
   const asOf=new Date(2026,9,21,9,0,0,393).toISOString()
-  mock.store.state.wallet={currency:'CNY',balances:{available:'-0.00000001',recharge:'10.0000',bonus:'0.0001',debt:'10.00010001',frozen:'0'},asOf}
-  mock.store.state.walletStatus='stale';await nextTick();expect(el.textContent).toContain('¥-0.00000001');expect(el.textContent).toContain('更新时间 2026-10-21 09:00:00');expect(el.textContent).not.toContain(asOf)
+  mock.store.state.wallet={currency:'CNY',balances:{available:'27.98408236',recharge:'0.00',bonus:'27.98408236',debt:'10.00010001',frozen:'0'},asOf}
+  mock.store.state.walletStatus='stale';await nextTick()
+  expect([...el.querySelectorAll('.account-balance')].map(row=>row.lastElementChild?.textContent)).toEqual(['¥27.99','¥0.00','¥27.99','¥10.01','¥0.00'])
+  expect(mock.store.state.wallet.balances.available).toBe('27.98408236')
+  expect(el.textContent).toContain('更新时间 2026-10-21 09:00:00');expect(el.textContent).not.toContain(asOf)
+ })
+ it.each(['ACCOUNT_LOCAL_KEY_MISSING','ACCOUNT_LOCAL_KEY_INVALID','ACCOUNT_LOCAL_DATA_INVALID'])('offers explicit recovery for %s without starting it automatically',async(errorCode)=>{
+  const el=await mount(SettingsAccountPanel,state({status:'storage_unavailable',errorCode}))
+  expect(el.textContent).toContain('本地登录信息无法恢复')
+  expect(el.textContent).not.toContain('系统安全存储不可用')
+  expect(mock.store.action).not.toHaveBeenCalled()
+  const recover=[...el.querySelectorAll<HTMLButtonElement>('button')].find(button=>button.textContent==='重置本机登录并重新授权')!
+  expect(recover).toBeTruthy();recover.click();await nextTick()
+  expect(mock.store.action).toHaveBeenCalledExactlyOnceWith('login')
+ })
+ it('describes storage permission failures without offering credential reset',async()=>{
+  const el=await mount(SettingsAccountPanel,state({status:'storage_unavailable',errorCode:'ACCOUNT_STORAGE_UNAVAILABLE'}))
+  expect(el.textContent).toContain('请检查目录权限和磁盘空间')
+  expect(el.textContent).not.toContain('重置本机登录并重新授权')
  })
  it('allows logout when an encrypted session is restored offline before profile data',async()=>{
   const el=await mount(SettingsAccountPanel,state({status:'unverified',errorCode:'ACCOUNT_NETWORK_UNAVAILABLE'}))

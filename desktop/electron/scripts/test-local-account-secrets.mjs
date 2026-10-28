@@ -61,4 +61,18 @@ test('nonprivate keys and symbolic links are refused', { skip: process.platform 
   await writeFile(outside, Buffer.alloc(32), { mode: 0o600 })
   await symlink(outside, path)
   assert.throws(() => secrets.encrypt('replacement'), /Invalid local account/)
+  assert.throws(() => secrets.recover('replacement'), /Invalid local account/)
+})
+
+test('a failed backup leaves the active credentials and missing key unchanged', { skip: process.platform === 'win32' }, async t => {
+  const { directory, secrets } = await fixture(t)
+  const ciphertext = secrets.encrypt('synthetic-secret')
+  await writeFile(join(directory, LOCAL_ACCOUNT_FILE), ciphertext)
+  await rm(join(directory, 'account.local.key'))
+  await chmod(directory, 0o500)
+  try {
+    assert.throws(() => secrets.recover('replacement'))
+    assert.equal(await readFile(join(directory, LOCAL_ACCOUNT_FILE), 'utf8'), ciphertext)
+    await assert.rejects(() => readFile(join(directory, 'account.local.key')), error => error.code === 'ENOENT')
+  } finally { await chmod(directory, 0o700) }
 })

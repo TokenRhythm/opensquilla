@@ -5,6 +5,7 @@ import { TokenRhythmAccount, AccountError, hasSavedModelConnection, pauseAccount
 import { TokenRhythmModelProxy } from './tokenrhythm-model-proxy.js'
 import { resolveAccountOrigin } from './tokenrhythm-environment.js'
 import { LocalAccountSecrets, LOCAL_ACCOUNT_FILE } from './local-account-secrets.js'
+import { requestAccountLogin } from './account-login-recovery.js'
 import type { AccountAction, AccountLink, AccountMediaSource, ModelCredentialSource } from '../../../contracts/desktop/tokenrhythm-account.js'
 import { spawn, spawnSync, type ChildProcess, type ChildProcessWithoutNullStreams } from 'node:child_process'
 import { createHash, randomUUID } from 'node:crypto'
@@ -3525,6 +3526,7 @@ function desktopAccount() {
     assertSecureStorage: () => secrets.assertAvailable(),
     encrypt: value => secrets.encrypt(value),
     decrypt: value => secrets.decrypt(value),
+    recoverStorage: value => secrets.recover(value),
     openExternal: url => shell.openExternal(url),
     openAppViaProtocol: app.isPackaged,
     onOpenDesktop: async () => {
@@ -3559,6 +3561,20 @@ function requireAccountSender(event: Electron.IpcMainInvokeEvent): void {
   if (updateApplying || isQuitting || desktopCleanupBusy || desktopMigrationBusy) throw new AccountError('ACCOUNT_CLOSING')
 }
 
+async function confirmAccountRecovery(event: Electron.IpcMainInvokeEvent, account: TokenRhythmAccount): Promise<boolean> {
+  const options: Electron.MessageBoxOptions = {
+    type: 'warning', title: desktopT('account.recoveryTitle'),
+    message: desktopT('account.recoveryMessage'), detail: desktopT('account.recoveryDetail'),
+    buttons: [desktopT('common.cancel'), desktopT('account.recoveryConfirm')],
+    defaultId: 0, cancelId: 0, noLink: true,
+  }
+  const window = BrowserWindow.fromWebContents(event.sender)
+  const result = window ? await dialog.showMessageBox(window, options) : await dialog.showMessageBox(options)
+  requireAccountSender(event)
+  if (desktopAccount().account !== account) throw new AccountError('ACCOUNT_CLOSING')
+  return result.response === 1
+}
+
 ipcMain.handle('desktop:account:get', async event => {
   requireAccountSender(event)
   const { account } = desktopAccount()
@@ -3570,7 +3586,7 @@ ipcMain.handle('desktop:account:action', async (event, action: AccountAction) =>
   const { account } = desktopAccount()
   await account.initialize()
   switch (action) {
-    case 'login': return account.login()
+    case 'login': return requestAccountLogin(account, () => confirmAccountRecovery(event, account))
     case 'cancel': return account.cancel()
     case 'reopen': return account.reopen()
     case 'refresh': await account.verify(true); return account.snapshot()
@@ -3926,6 +3942,16 @@ function applyDesktopLocaleChoice(raw: unknown): void {
 
 const DESKTOP_MESSAGES: Record<DesktopLocale, Record<string, string>> = {
   en: {
+    'common.cancel': 'Cancel',
+    "account.recoveryTitle": "Reset local sign-in?",
+    "account.recoveryMessage": "Local sign-in information cannot be restored.",
+    "account.recoveryDetail": "The current credentials will be backed up before resetting sign-in and opening the browser for authorization. Your conversations, model settings and website account balance will be kept.",
+    "account.recoveryConfirm": "Back up and authorize again",
+    "onboarding.account.recoveryLogin": "Reset sign-in and authorize again",
+    "onboarding.account.ACCOUNT_LOCAL_KEY_MISSING": "The local sign-in key is missing. Reset sign-in and authorize again.",
+    "onboarding.account.ACCOUNT_LOCAL_KEY_INVALID": "The local sign-in key is damaged. Reset sign-in and authorize again.",
+    "onboarding.account.ACCOUNT_LOCAL_DATA_INVALID": "Local sign-in information is damaged. Reset sign-in and authorize again.",
+    "onboarding.account.ACCOUNT_RECOVERY_FAILED": "Could not back up or reset local sign-in. Check storage permissions and available disk space, then retry.",
     'menu.edit': 'Edit',
     'menu.view': 'View',
     'menu.reload': 'Reload',
@@ -4063,7 +4089,7 @@ const DESKTOP_MESSAGES: Record<DesktopLocale, Record<string, string>> = {
     "onboarding.account.signed_in": "Signed in to TokenRhythm",
     "onboarding.account.unverified": "Unable to verify; new account calls are paused",
     "onboarding.account.reauth_required": "Session expired. Sign in again.",
-    "onboarding.account.storage_unavailable": "System secure storage is unavailable",
+    "onboarding.account.storage_unavailable": "Local account storage is unavailable. Check folder permissions and available disk space.",
     'onboarding.step2.tokenrhythmTitle': 'TokenRhythm limited-time offer',
     'onboarding.step2.tokenrhythmValue': 'TokenRhythm API calls are free for a limited time.',
     'onboarding.step2.tokenrhythmCta': 'Limited-time offer',
@@ -4096,6 +4122,16 @@ const DESKTOP_MESSAGES: Record<DesktopLocale, Record<string, string>> = {
     'onboarding.step5.finish': "Save and enter",
   },
   'zh-Hans': {
+    'common.cancel': '取消',
+    "account.recoveryTitle": "重置本机登录？",
+    "account.recoveryMessage": "本地登录信息无法恢复。",
+    "account.recoveryDetail": "将先备份当前凭据，再重置本机登录并打开浏览器重新授权。你的对话、模型配置和网站账号余额都会保留。",
+    "account.recoveryConfirm": "备份并重新授权",
+    "onboarding.account.recoveryLogin": "重置本机登录并重新授权",
+    "onboarding.account.ACCOUNT_LOCAL_KEY_MISSING": "本地登录密钥丢失，请重置本机登录并重新授权。",
+    "onboarding.account.ACCOUNT_LOCAL_KEY_INVALID": "本地登录密钥损坏，请重置本机登录并重新授权。",
+    "onboarding.account.ACCOUNT_LOCAL_DATA_INVALID": "本地登录信息损坏，请重置本机登录并重新授权。",
+    "onboarding.account.ACCOUNT_RECOVERY_FAILED": "无法备份或重置本机登录，请检查存储权限和磁盘空间后重试。",
     'menu.edit': '编辑',
     'menu.view': '视图',
     'menu.reload': '重新加载',
@@ -4233,7 +4269,7 @@ const DESKTOP_MESSAGES: Record<DesktopLocale, Record<string, string>> = {
     "onboarding.account.signed_in": "已登录 TokenRhythm",
     "onboarding.account.unverified": "暂时无法验证，新的账号调用已暂停",
     "onboarding.account.reauth_required": "会话已失效，请重新登录",
-    "onboarding.account.storage_unavailable": "系统安全存储不可用，无法登录",
+    "onboarding.account.storage_unavailable": "本地账号存储不可用，请检查目录权限和磁盘空间。",
     'onboarding.step2.tokenrhythmTitle': 'TokenRhythm 限时福利',
     'onboarding.step2.tokenrhythmValue': 'TokenRhythm API 调用限时免费。',
     'onboarding.step2.tokenrhythmCta': '限时福利',
@@ -4266,6 +4302,16 @@ const DESKTOP_MESSAGES: Record<DesktopLocale, Record<string, string>> = {
     'onboarding.step5.finish': "保存并进入",
   },
   ja: {
+    'common.cancel': 'キャンセル',
+    "account.recoveryTitle": "ローカルのログインをリセットしますか？",
+    "account.recoveryMessage": "ローカルのログイン情報を復元できません。",
+    "account.recoveryDetail": "現在の認証情報をバックアップしてからログインをリセットし、ブラウザーで再認証します。会話、モデル設定、ウェブサイトのアカウント残高は保持されます。",
+    "account.recoveryConfirm": "バックアップして再認証",
+    "onboarding.account.recoveryLogin": "ログインをリセットして再認証",
+    "onboarding.account.ACCOUNT_LOCAL_KEY_MISSING": "ローカルのログインキーがありません。ログインをリセットして再認証してください。",
+    "onboarding.account.ACCOUNT_LOCAL_KEY_INVALID": "ローカルのログインキーが破損しています。ログインをリセットして再認証してください。",
+    "onboarding.account.ACCOUNT_LOCAL_DATA_INVALID": "ローカルのログイン情報が破損しています。ログインをリセットして再認証してください。",
+    "onboarding.account.ACCOUNT_RECOVERY_FAILED": "ログイン情報をバックアップまたはリセットできません。保存先の権限と空き容量を確認して再試行してください。",
     'menu.edit': '編集',
     'menu.view': '表示',
     'menu.reload': '再読み込み',
@@ -4385,7 +4431,7 @@ const DESKTOP_MESSAGES: Record<DesktopLocale, Record<string, string>> = {
     "onboarding.account.signed_in": "TokenRhythm にログイン済み",
     "onboarding.account.unverified": "確認できないため、新しい呼び出しを停止しています",
     "onboarding.account.reauth_required": "セッションが無効です。再度ログインしてください。",
-    "onboarding.account.storage_unavailable": "システムの安全なストレージを利用できません",
+    "onboarding.account.storage_unavailable": "ローカルのアカウント保存先を利用できません。フォルダーの権限と空き容量を確認してください。",
     'onboarding.step2.tokenrhythmTitle': 'TokenRhythm 期間限定特典',
     'onboarding.step2.tokenrhythmValue': 'TokenRhythm API は期間限定で無料です。',
     'onboarding.step2.tokenrhythmCta': '期間限定特典',
@@ -4420,6 +4466,16 @@ const DESKTOP_MESSAGES: Record<DesktopLocale, Record<string, string>> = {
     'onboarding.step5.finish': "保存して続ける",
   },
   fr: {
+    'common.cancel': 'Annuler',
+    "account.recoveryTitle": "Réinitialiser la connexion locale ?",
+    "account.recoveryMessage": "Impossible de restaurer la connexion locale.",
+    "account.recoveryDetail": "Les identifiants actuels seront sauvegardés avant la réinitialisation et l’ouverture du navigateur pour autorisation. Vos conversations, paramètres de modèles et solde du compte sur le site seront conservés.",
+    "account.recoveryConfirm": "Sauvegarder et autoriser à nouveau",
+    "onboarding.account.recoveryLogin": "Réinitialiser la connexion et autoriser à nouveau",
+    "onboarding.account.ACCOUNT_LOCAL_KEY_MISSING": "La clé de connexion locale est manquante. Réinitialisez la connexion et autorisez à nouveau.",
+    "onboarding.account.ACCOUNT_LOCAL_KEY_INVALID": "La clé de connexion locale est endommagée. Réinitialisez la connexion et autorisez à nouveau.",
+    "onboarding.account.ACCOUNT_LOCAL_DATA_INVALID": "Les informations de connexion locales sont endommagées. Réinitialisez la connexion et autorisez à nouveau.",
+    "onboarding.account.ACCOUNT_RECOVERY_FAILED": "Impossible de sauvegarder ou de réinitialiser la connexion. Vérifiez les autorisations et l’espace disque, puis réessayez.",
     'menu.edit': 'Édition',
     'menu.view': 'Affichage',
     'menu.reload': 'Recharger',
@@ -4539,7 +4595,7 @@ const DESKTOP_MESSAGES: Record<DesktopLocale, Record<string, string>> = {
     "onboarding.account.signed_in": "Connecté à TokenRhythm",
     "onboarding.account.unverified": "Vérification impossible ; nouveaux appels suspendus",
     "onboarding.account.reauth_required": "Session expirée. Reconnectez-vous.",
-    "onboarding.account.storage_unavailable": "Stockage sécurisé du système indisponible",
+    "onboarding.account.storage_unavailable": "Le stockage local du compte est indisponible. Vérifiez les autorisations du dossier et l’espace disque.",
     'onboarding.step2.tokenrhythmTitle': 'Offre limitée TokenRhythm',
     'onboarding.step2.tokenrhythmValue': 'Les appels à l’API TokenRhythm sont gratuits pendant une durée limitée.',
     'onboarding.step2.tokenrhythmCta': 'Offre limitée',
@@ -4574,6 +4630,16 @@ const DESKTOP_MESSAGES: Record<DesktopLocale, Record<string, string>> = {
     'onboarding.step5.finish': "Enregistrer et continuer",
   },
   de: {
+    'common.cancel': 'Abbrechen',
+    "account.recoveryTitle": "Lokale Anmeldung zurücksetzen?",
+    "account.recoveryMessage": "Die lokalen Anmeldedaten können nicht wiederhergestellt werden.",
+    "account.recoveryDetail": "Die aktuellen Zugangsdaten werden gesichert, bevor die Anmeldung zurückgesetzt und der Browser zur Autorisierung geöffnet wird. Gespräche, Modelleinstellungen und das Kontoguthaben auf der Website bleiben erhalten.",
+    "account.recoveryConfirm": "Sichern und erneut autorisieren",
+    "onboarding.account.recoveryLogin": "Anmeldung zurücksetzen und erneut autorisieren",
+    "onboarding.account.ACCOUNT_LOCAL_KEY_MISSING": "Der lokale Anmeldeschlüssel fehlt. Setzen Sie die Anmeldung zurück und autorisieren Sie erneut.",
+    "onboarding.account.ACCOUNT_LOCAL_KEY_INVALID": "Der lokale Anmeldeschlüssel ist beschädigt. Setzen Sie die Anmeldung zurück und autorisieren Sie erneut.",
+    "onboarding.account.ACCOUNT_LOCAL_DATA_INVALID": "Die lokalen Anmeldedaten sind beschädigt. Setzen Sie die Anmeldung zurück und autorisieren Sie erneut.",
+    "onboarding.account.ACCOUNT_RECOVERY_FAILED": "Anmeldedaten konnten nicht gesichert oder zurückgesetzt werden. Prüfen Sie Berechtigungen und freien Speicherplatz und versuchen Sie es erneut.",
     'menu.edit': 'Bearbeiten',
     'menu.view': 'Ansicht',
     'menu.reload': 'Neu laden',
@@ -4693,7 +4759,7 @@ const DESKTOP_MESSAGES: Record<DesktopLocale, Record<string, string>> = {
     "onboarding.account.signed_in": "Bei TokenRhythm angemeldet",
     "onboarding.account.unverified": "Überprüfung nicht möglich; neue Kontoaufrufe pausiert",
     "onboarding.account.reauth_required": "Sitzung abgelaufen. Erneut anmelden.",
-    "onboarding.account.storage_unavailable": "Sicherer Systemspeicher nicht verfügbar",
+    "onboarding.account.storage_unavailable": "Der lokale Kontospeicher ist nicht verfügbar. Prüfen Sie Ordnerberechtigungen und freien Speicherplatz.",
     'onboarding.step2.tokenrhythmTitle': 'TokenRhythm-Aktion',
     'onboarding.step2.tokenrhythmValue': 'TokenRhythm-API-Aufrufe sind für kurze Zeit kostenlos.',
     'onboarding.step2.tokenrhythmCta': 'Zeitlich begrenztes Angebot',
@@ -4728,6 +4794,16 @@ const DESKTOP_MESSAGES: Record<DesktopLocale, Record<string, string>> = {
     'onboarding.step5.finish': "Speichern und öffnen",
   },
   es: {
+    'common.cancel': 'Cancelar',
+    "account.recoveryTitle": "¿Restablecer el inicio de sesión local?",
+    "account.recoveryMessage": "No se puede restaurar el inicio de sesión local.",
+    "account.recoveryDetail": "Se respaldarán las credenciales actuales antes de restablecer el inicio de sesión y abrir el navegador para autorizar. Se conservarán las conversaciones, la configuración de modelos y el saldo de la cuenta en el sitio web.",
+    "account.recoveryConfirm": "Respaldar y volver a autorizar",
+    "onboarding.account.recoveryLogin": "Restablecer el inicio de sesión y volver a autorizar",
+    "onboarding.account.ACCOUNT_LOCAL_KEY_MISSING": "Falta la clave de inicio de sesión local. Restablece el inicio de sesión y vuelve a autorizar.",
+    "onboarding.account.ACCOUNT_LOCAL_KEY_INVALID": "La clave de inicio de sesión local está dañada. Restablece el inicio de sesión y vuelve a autorizar.",
+    "onboarding.account.ACCOUNT_LOCAL_DATA_INVALID": "Los datos de inicio de sesión locales están dañados. Restablece el inicio de sesión y vuelve a autorizar.",
+    "onboarding.account.ACCOUNT_RECOVERY_FAILED": "No se pudo respaldar o restablecer el inicio de sesión. Comprueba los permisos y el espacio en disco e inténtalo de nuevo.",
     'menu.edit': 'Edición',
     'menu.view': 'Ver',
     'menu.reload': 'Recargar',
@@ -4847,7 +4923,7 @@ const DESKTOP_MESSAGES: Record<DesktopLocale, Record<string, string>> = {
     "onboarding.account.signed_in": "Sesión iniciada en TokenRhythm",
     "onboarding.account.unverified": "No se puede verificar; nuevas llamadas pausadas",
     "onboarding.account.reauth_required": "Sesión caducada. Inicia sesión otra vez.",
-    "onboarding.account.storage_unavailable": "Almacenamiento seguro del sistema no disponible",
+    "onboarding.account.storage_unavailable": "El almacenamiento local de la cuenta no está disponible. Comprueba los permisos de la carpeta y el espacio en disco.",
     'onboarding.step2.tokenrhythmTitle': 'Oferta limitada de TokenRhythm',
     'onboarding.step2.tokenrhythmValue': 'Las llamadas a la API de TokenRhythm son gratis por tiempo limitado.',
     'onboarding.step2.tokenrhythmCta': 'Oferta limitada',
@@ -7007,18 +7083,27 @@ function onboardingHtml(
     const accountMessages = ${inlineScriptJson(Object.fromEntries(DESKTOP_LOCALES.map(locale => [locale, Object.fromEntries(['signed_out','authorizing','verifying','signed_in','unverified','reauth_required','storage_unavailable'].map(status => [status, DESKTOP_MESSAGES[locale]['onboarding.account.' + status]]))])))};
     function renderAccount(state) {
       accountSnapshot = state;
+      const recoverable = state.status === 'storage_unavailable' && ['ACCOUNT_LOCAL_KEY_MISSING', 'ACCOUNT_LOCAL_KEY_INVALID', 'ACCOUNT_LOCAL_DATA_INVALID'].includes(state.errorCode);
+      accountLogin.textContent = desktopMessage(document.documentElement.lang, recoverable ? 'onboarding.account.recoveryLogin' : 'onboarding.account.login');
       const waiting = state.status === 'authorizing' || state.status === 'verifying';
       accountCancel.hidden = !waiting;
       accountLogin.disabled = state.status === 'verifying';
       accountContinue.hidden = state.status !== 'signed_in' || state.keyStatus !== 'ready';
       accountStatus.textContent = (accountMessages[document.documentElement.lang] || accountMessages.en)[state.status] || '';
+      if (recoverable) accountStatus.textContent = desktopMessage(document.documentElement.lang, 'onboarding.account.' + state.errorCode);
       if (state.profile && state.profile.displayName) accountStatus.textContent += ' · ' + state.profile.displayName;
     }
     window.opensquillaDesktop.onAccountState(renderAccount);
     window.opensquillaDesktop.getAccountState().then(renderAccount).catch(() => {});
     accountLogin.addEventListener('click', async () => {
       try { renderAccount(await window.opensquillaDesktop.accountAction(accountSnapshot && accountSnapshot.status === 'authorizing' ? 'reopen' : accountSnapshot && accountSnapshot.profile ? 'retry-key' : 'login')); }
-      catch { accountStatus.textContent = (accountMessages[document.documentElement.lang] || accountMessages.en).unverified; }
+      catch (error) {
+        const storageFailure = accountSnapshot && accountSnapshot.status === 'storage_unavailable';
+        accountStatus.textContent = String(error && error.message).includes('ACCOUNT_RECOVERY_FAILED')
+          ? desktopMessage(document.documentElement.lang, 'onboarding.account.ACCOUNT_RECOVERY_FAILED')
+          : storageFailure ? desktopMessage(document.documentElement.lang, 'onboarding.account.' + (['ACCOUNT_LOCAL_KEY_MISSING', 'ACCOUNT_LOCAL_KEY_INVALID', 'ACCOUNT_LOCAL_DATA_INVALID'].includes(accountSnapshot.errorCode) ? accountSnapshot.errorCode : 'storage_unavailable'))
+          : (accountMessages[document.documentElement.lang] || accountMessages.en).unverified;
+      }
     });
     accountCancel.addEventListener('click', () => window.opensquillaDesktop.accountAction('cancel').then(renderAccount));
     accountContinue.addEventListener('click', async () => {

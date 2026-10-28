@@ -1,12 +1,13 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
-import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
+import { chmod, mkdir, mkdtemp, readFile, readdir, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { createHash } from 'node:crypto'
 import { TokenRhythmAccount, describeAccountDevice, pauseAccountsForMaintenance } from '../dist/tokenrhythm-account.js'
 import { TokenRhythmModelProxy, allowedModelRoute } from '../dist/tokenrhythm-model-proxy.js'
 import { LocalAccountSecrets, LOCAL_ACCOUNT_FILE } from '../dist/local-account-secrets.js'
+import { requestAccountLogin } from '../dist/account-login-recovery.js'
 const scope = 'profile.read wallet.read managed_key.read managed_key.obtain session.revoke offline_access'
 const until = async fn => { for(let i=0;i<200;i++){if(fn())return;await new Promise(r=>setTimeout(r,5))}throw Error('condition timeout') }
 test('account device labels use the OS product version and distinguish Windows 11', () => {
@@ -41,7 +42,7 @@ async function fixture(t, options={}) {
   if(path.includes('/managed-key'))return env.keyFailure?Response.json({code:'MANAGED_KEY_DISABLED'},{status:403}):json({account_id:id,app_id:'opensquilla',status:'active',key_id:'key-'+id,generation:1,secret:'model-secret-'+id})
   if(path.endsWith('/session'))return new Response(null,{status:204});throw Error('unhandled route')
  }}
- if(options.local){const secrets=new LocalAccountSecrets(directory);Object.assign(deps,{storageFile:LOCAL_ACCOUNT_FILE,legacyStorageFile:'account.enc',assertSecureStorage:()=>secrets.assertAvailable(),encrypt:v=>secrets.encrypt(v),decrypt:v=>secrets.decrypt(v)})}
+ if(options.local){const secrets=new LocalAccountSecrets(directory);Object.assign(deps,{storageFile:LOCAL_ACCOUNT_FILE,legacyStorageFile:'account.enc',assertSecureStorage:()=>secrets.assertAvailable(),encrypt:v=>secrets.encrypt(v),decrypt:v=>secrets.decrypt(v),recoverStorage:v=>secrets.recover(v)})}
  const account=new TokenRhythmAccount(deps);t.after(async()=>{await account.close();await rm(directory,{recursive:true,force:true})})
  async function login(){await account.login();const url=new URL(opened),callback=new URL(url.searchParams.get('redirect_uri'));callback.search=new URLSearchParams({state:url.searchParams.get('state'),code:'one-use-code'});await fetch(callback);await until(()=>!['authorizing','verifying'].includes(account.snapshot().status));await account.verify();return url}
  return {account,env,calls,login,deps,directory,get opened(){return opened},get refreshes(){return refreshes},setIdentity(v){id=v},advance(ms){now+=ms}}
@@ -72,7 +73,63 @@ test('a missing local key cannot silently reset a saved login or generate a repl
  await rm(join(f.directory,'account.local.key'))
  const restored=new TokenRhythmAccount(f.deps);t.after(()=>restored.close());await restored.initialize()
  assert.equal(restored.snapshot().status,'storage_unavailable');await assert.rejects(()=>restored.login())
+ assert.equal(restored.snapshot().errorCode,'ACCOUNT_LOCAL_KEY_MISSING')
  await assert.rejects(()=>readFile(join(f.directory,'account.local.key')),error=>error.code==='ENOENT')
+})
+for (const damage of ['missing-key', 'invalid-key', 'wrong-key', 'invalid-record', 'invalid-json']) {
+ test(`confirmed recovery backs up ${damage}, preserves other files, and restores account use after restart`, async t => {
+  const f=await fixture(t,{local:true});const firstLogin=await f.login();await f.account.close()
+  const keyPath=join(f.directory,'account.local.key'), recordPath=join(f.directory,LOCAL_ACCOUNT_FILE)
+  if(damage==='missing-key')await rm(keyPath)
+  if(damage==='invalid-key')await writeFile(keyPath,'damaged')
+  if(damage==='wrong-key')await writeFile(keyPath,Buffer.alloc(32,9))
+  if(damage==='invalid-record')await writeFile(recordPath,'damaged')
+  if(damage==='invalid-json')await writeFile(recordPath,f.deps.encrypt('{invalid'))
+  const original=await readFile(recordPath), oldKey=await readFile(keyPath).catch(()=>null)
+  for(const [name,text] of [['config.toml','saved model settings'],['chat.db','saved conversations'],['account.enc','legacy record']])await writeFile(join(f.directory,name),text)
+  const account=new TokenRhythmAccount(f.deps);t.after(()=>account.close());await account.initialize()
+  assert.equal(account.snapshot().status,'storage_unavailable')
+  let confirmations=0
+  await requestAccountLogin(account,async()=>{confirmations++;return false})
+  assert.equal(confirmations,1);assert.deepEqual(await readFile(recordPath),original)
+  assert.equal((await readdir(f.directory)).filter(name=>name.startsWith('recovery-')).length,0)
+  const authorizing=await requestAccountLogin(account,async()=>true)
+  assert.equal(authorizing.status,'authorizing');assert.equal(authorizing.source,'account')
+  const authorization=new URL(f.opened)
+  assert.equal(authorization.searchParams.get('installation_id'),firstLogin.searchParams.get('installation_id'))
+  const backup=join(f.directory,(await readdir(f.directory)).find(name=>name.startsWith('recovery-')))
+  assert.deepEqual(await readFile(join(backup,LOCAL_ACCOUNT_FILE)),original)
+  assert.deepEqual(await readFile(join(backup,'account.local.key')).catch(()=>null),oldKey)
+  for(const [name,text] of [['config.toml','saved model settings'],['chat.db','saved conversations'],['account.enc','legacy record']])assert.equal(await readFile(join(f.directory,name),'utf8'),text)
+  const callback=new URL(authorization.searchParams.get('redirect_uri'));callback.search=new URLSearchParams({state:authorization.searchParams.get('state'),code:'recovered-code'})
+  await fetch(callback);await until(()=>account.snapshot().keyStatus==='ready');await account.close()
+  const restored=new TokenRhythmAccount(f.deps);t.after(()=>restored.close());await restored.initialize();await restored.verify(true)
+  assert.equal(restored.snapshot().status,'signed_in');assert.equal(restored.snapshot().walletStatus,'ready')
+  assert.equal((await restored.runtimeState()).selectedAccountId,'a')
+  assert.equal(await restored.modelCredential((await restored.runtimeState()).credential),'model-secret-a')
+ })
+}
+test('concurrent recovery entrances share one confirmation and backup, and remain recoverable after backup failure', async t=>{
+ const f=await fixture(t,{local:true});await f.login();await f.account.close();await rm(join(f.directory,'account.local.key'))
+ const account=new TokenRhythmAccount(f.deps);t.after(()=>account.close());await account.initialize()
+ const original=await readFile(join(f.directory,LOCAL_ACCOUNT_FILE));const recover=f.deps.recoverStorage
+ f.deps.recoverStorage=()=>{throw new Error('disk full')}
+ await assert.rejects(()=>requestAccountLogin(account,async()=>true),/ACCOUNT_RECOVERY_FAILED/)
+ assert.equal(account.snapshot().errorCode,'ACCOUNT_LOCAL_KEY_MISSING');assert.deepEqual(await readFile(join(f.directory,LOCAL_ACCOUNT_FILE)),original)
+ f.deps.recoverStorage=recover
+ let release;let confirmations=0
+ const confirm=()=>{confirmations++;return new Promise(resolve=>{release=resolve})}
+ const first=requestAccountLogin(account,confirm),second=requestAccountLogin(account,confirm)
+ assert.equal(first,second);await until(()=>confirmations===1);release(true);await first
+ assert.equal((await readdir(f.directory)).filter(name=>name.startsWith('recovery-')).length,1)
+})
+test('unsafe storage permissions cannot be reset through recovery', {skip:process.platform==='win32'}, async t=>{
+ const f=await fixture(t,{local:true});await f.login();await f.account.close();const path=join(f.directory,'account.local.key');await chmod(path,0o644)
+ const account=new TokenRhythmAccount(f.deps);t.after(()=>account.close());await account.initialize()
+ assert.equal(account.snapshot().errorCode,'ACCOUNT_STORAGE_UNAVAILABLE')
+ await assert.rejects(()=>requestAccountLogin(account,async()=>{assert.fail('must not offer reset for a permission failure')}),/ACCOUNT_STORAGE_UNAVAILABLE/)
+ await assert.rejects(()=>account.recoverLogin(),/ACCOUNT_RECOVERY_UNAVAILABLE/)
+ assert.equal((await readdir(f.directory)).filter(name=>name.startsWith('recovery-')).length,0)
 })
 test('PKCE/state, display-only boundary, precise decimals, encrypted persistence',async t=>{
  const f=await fixture(t);await f.account.login();const url=new URL(f.opened);assert.equal(url.pathname,'/api/oauth/authorize');assert.equal(url.searchParams.get('code_challenge_method'),'S256');assert.match(url.searchParams.get('installation_id'),/^[a-f0-9-]{36}$/)

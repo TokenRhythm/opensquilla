@@ -4,6 +4,7 @@ import { mkdir, readFile, writeFile, rename, rm } from 'node:fs/promises'
 import { join } from 'node:path'
 import type { AddressInfo } from 'node:net'
 import { TokenRhythmLoginResult } from './tokenrhythm-login-result.js'
+import { LocalAccountStorageError, canRecoverAccountStorage } from './local-account-secrets.js'
 import type { AccountLink, AccountMediaSource, AccountProfile, AccountWallet, ModelCredentialSource, TokenRhythmAccountState } from '../../../contracts/desktop/tokenrhythm-account.js'
 
 const SCOPES = 'profile.read wallet.read managed_key.read managed_key.obtain session.revoke offline_access'
@@ -18,6 +19,7 @@ interface LoginTokens { accessToken: string; refreshToken: string; expiresAt: nu
 interface ModelKey { secret: string; keyId: string; generation: number; accountId: string }
 interface SavedAccount {
   version: 1
+  recoveryPending?: boolean
   tokens: LoginTokens | null
   key: ModelKey | null
   source: ModelCredentialSource
@@ -26,6 +28,9 @@ interface SavedAccount {
   mediaAccountIds: { image: string | null; video: string | null }
   videoJobs: Record<string, string>
   pending: LoginTokens[]
+}
+function emptySavedAccount(): SavedAccount {
+  return { version: 1, tokens: null, key: null, source: 'account', selectedAccountId: null, mediaSources: { image: 'inherit', video: 'inherit' }, mediaAccountIds: { image: null, video: null }, videoJobs: {}, pending: [] }
 }
 interface LoginAttempt { state: string; verifier: string; redirect: string; url: string; server: Server; timer: NodeJS.Timeout; epoch: number }
 interface AccountDeviceInfo { name: string; os: string }
@@ -51,6 +56,7 @@ export interface AccountDependencies {
   assertSecureStorage(): void
   encrypt(value: string): string
   decrypt(value: string): string
+  recoverStorage?(value: string): void
   openExternal(url: string): Promise<unknown>
   onState?(state: TokenRhythmAccountState): void
   onInvalidate?(): void
@@ -124,6 +130,7 @@ export class TokenRhythmAccount {
   private verifyPromise: Promise<void> | null = null
   private initialized: Promise<void> | null = null
   private loginStartPromise: Promise<TokenRhythmAccountState> | null = null
+  private recoveryPromise: Promise<TokenRhythmAccountState> | null = null
   private loginCompletionPromise: Promise<void> | null = null
   private logoutPromise: Promise<TokenRhythmAccountState> | null = null
   private closePromise: Promise<void> | null = null
@@ -220,12 +227,19 @@ export class TokenRhythmAccount {
         this.publish({ status: 'reauth_required', errorCode: 'ACCOUNT_LOGIN_REQUIRED' })
       } else if ((error as NodeJS.ErrnoException).code !== 'ENOENT') {
         // Never silently replace a record we could not decrypt.
-        this.saved.source = 'account'
-        this.publish({ status: 'storage_unavailable', errorCode: 'ACCOUNT_STORAGE_UNAVAILABLE' })
+        this.saved = emptySavedAccount()
+        this.invalidate()
+        const errorCode = error instanceof LocalAccountStorageError ? error.code
+          : error instanceof SyntaxError || (error instanceof AccountError && ['ACCOUNT_STORAGE_INVALID', 'INVALID_ACCOUNT_RESPONSE'].includes(error.code))
+            ? 'ACCOUNT_LOCAL_DATA_INVALID' : 'ACCOUNT_STORAGE_UNAVAILABLE'
+        this.publish({ status: 'storage_unavailable', errorCode, profile: null, wallet: null, walletStatus: 'idle', keyStatus: 'missing' })
         return
       }
     }
-    if (!this.closing) {
+    this.startPolling()
+  }
+  private startPolling(): void {
+    if (!this.closing && !this.poll) {
       this.poll = setInterval(() => { void this.verify().catch(() => {}) }, 60_000)
       this.poll.unref()
       void this.verify().catch(() => {})
@@ -251,11 +265,38 @@ export class TokenRhythmAccount {
     this.loginStartPromise = this.startLogin().finally(() => { this.loginStartPromise = null })
     return this.loginStartPromise
   }
+  /** Explicit recovery only; ordinary login must never replace unreadable credentials. */
+  recoverLogin(): Promise<TokenRhythmAccountState> {
+    if (this.recoveryPromise) return this.recoveryPromise
+    this.recoveryPromise = this.recoverAndLogin().finally(() => { this.recoveryPromise = null })
+    return this.recoveryPromise
+  }
+  private async recoverAndLogin(): Promise<TokenRhythmAccountState> {
+    await this.initialize()
+    await this.writes
+    this.assertOpen()
+    if (this.state.status !== 'storage_unavailable' || !canRecoverAccountStorage(this.state.errorCode) || !this.deps.recoverStorage) throw new AccountError('ACCOUNT_RECOVERY_UNAVAILABLE')
+    const next = emptySavedAccount()
+    next.recoveryPending = true
+    try {
+      this.deps.assertSecureStorage()
+      this.deps.recoverStorage(JSON.stringify(next))
+    } catch { throw new AccountError('ACCOUNT_RECOVERY_FAILED') }
+    this.saved = next
+    this.epoch++
+    this.invalidate()
+    this.links = {}
+    this.logoutPersistencePending = false
+    this.revocationPersistencePending = false
+    this.publish({ status: 'signed_out', errorCode: null, profile: null, wallet: null, walletStatus: 'idle', keyStatus: 'missing', walletErrorCode: null, loginExpiresAt: null })
+    this.startPolling()
+    return this.login()
+  }
   private async startLogin(): Promise<TokenRhythmAccountState> {
     await this.initialize()
     this.assertOpen()
-    this.deps.assertSecureStorage()
     if (this.state.status === 'storage_unavailable') throw new AccountError('ACCOUNT_STORAGE_UNAVAILABLE')
+    try { this.deps.assertSecureStorage() } catch { throw new AccountError('ACCOUNT_STORAGE_UNAVAILABLE') }
     if (this.attempt) return this.snapshot()
     // A cancelled exchange can still replace the backend session for this
     // installation. Finish its cleanup before accepting a new authorization.
@@ -452,6 +493,19 @@ export class TokenRhythmAccount {
         this.verifiedAt = this.now()
         this.publish({ status: 'signed_in', profile, errorCode: null })
         await Promise.all([this.refreshWallet(epoch), this.ensureKey(epoch)])
+        if (epoch === this.epoch && !this.admissionClosed && this.saved.recoveryPending && this.state.keyStatus === 'ready') {
+          // The old binding was encrypted with the lost key. Explicit recovery
+          // binds only the newly verified account so existing account-backed
+          // model configuration can resume without changing config.toml.
+          this.saved.selectedAccountId = profile.accountId
+          this.saved.recoveryPending = false
+          try { await this.persist() } catch {
+            this.saved.selectedAccountId = null
+            this.saved.recoveryPending = true
+            throw new AccountError('ACCOUNT_STORAGE_UNAVAILABLE')
+          }
+          this.publish()
+        }
       } catch (error) {
         if (epoch !== this.epoch || this.admissionClosed) return
         this.invalidate()
@@ -674,7 +728,7 @@ export class TokenRhythmAccount {
   }
   private async drainOperations(): Promise<void> {
     await Promise.allSettled([
-      this.initialized, this.loginStartPromise, this.loginCompletionPromise,
+      this.initialized, this.loginStartPromise, this.loginCompletionPromise, this.recoveryPromise,
       this.verifyPromise, this.refreshPromise, this.keyPromise,
       this.logoutPromise, this.revokePromise,
     ])
