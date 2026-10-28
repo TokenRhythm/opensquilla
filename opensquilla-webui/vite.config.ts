@@ -23,6 +23,10 @@ export default defineConfig({
   },
   server: {
     proxy: {
+      '/api/local-account': {
+        target: process.env.OPENSQUILLA_WEB_ACCOUNT_URL || 'http://127.0.0.1:18892',
+        changeOrigin: true,
+      },
       // REST endpoints (approvals, artifacts under /api/v1, file upload, audio, …).
       // Strip the browser's Origin header on the way through: the gateway's
       // same-origin guard on state-changing routes would otherwise reject

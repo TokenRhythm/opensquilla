@@ -1,12 +1,12 @@
 <template>
   <Teleport to="body">
-    <div class="settings-overlay" @click.self="requestClose($event)">
+    <div class="settings-overlay" :class="{ 'settings-overlay--account': section === 'account' }" @click.self="requestClose($event)">
       <Transition name="settings-pop" appear @after-leave="onLeaveComplete">
       <section
         v-if="visible"
         ref="modalRef"
         class="settings-modal"
-        :class="{ 'settings-modal--categories': showCategories }"
+        :class="{ 'settings-modal--categories': showCategories, 'settings-modal--account': section === 'account' }"
         role="dialog"
         aria-modal="true"
         aria-labelledby="settings-modal-title"
@@ -92,7 +92,7 @@
           >
           <!-- Gateway remains available even when config readiness cannot load,
                because this is where users recover the connection/runtime. -->
-          <SettingsAccountPanel v-if="section === 'account' && isDesktop" />
+          <SettingsAccountPanel v-if="section === 'account' && accountSupported" />
           <SettingsGatewayPanel
             v-else-if="section === 'gateway'"
             :is-desktop="isDesktop"
@@ -297,7 +297,8 @@ const { confirmChoice, confirmState } = useConfirm()
 // The catalog retains the desktopOnly capability for future destinations. The
 // consolidated rail currently shares all ten destinations across surfaces.
 const isDesktop = usePlatform().capabilities.isDesktop
-const visibleSections = computed(() => SETTINGS_SECTIONS.filter(s => !s.desktopOnly || isDesktop))
+const accountSupported = Boolean(usePlatform().account)
+const visibleSections = computed(() => SETTINGS_SECTIONS.filter(s => !s.desktopOnly || isDesktop || (s.id === 'account' && accountSupported)))
 
 const {
   section,
@@ -1131,6 +1132,17 @@ onUnmounted(() => {
   height: min(85vh, 100%);
   overflow: hidden;
   width: min(1200px, 100%);
+}
+
+/* The account overview uses the tall settings sheet shown in its reference. */
+@media (min-width: 769px) {
+  .settings-overlay--account {
+    padding: 8px 18px;
+  }
+
+  .settings-modal--account {
+    height: min(97vh, 100%);
+  }
 }
 
 /* Symmetric modal motion: slides up + fades in on open, slides down + fades out

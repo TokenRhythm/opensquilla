@@ -11,6 +11,7 @@
   "main": "dist/main.js",
   "scripts": {
     "build": "node scripts/build.mjs",
+    "preview:web-account": "npm run build && node scripts/preview-web-account.mjs",
     "build:gateway": "node scripts/build-gateway.mjs",
     "fetch:runtimes": "node scripts/fetch-bundled-runtimes.mjs",
     "build:web": "cd ../../opensquilla-webui && npm ci && npm run build",

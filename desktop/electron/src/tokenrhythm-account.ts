@@ -58,6 +58,7 @@ export interface AccountDependencies {
   decrypt(value: string): string
   recoverStorage?(value: string): void
   openExternal(url: string): Promise<unknown>
+  returnToWebUI?: string
   onState?(state: TokenRhythmAccountState): void
   onInvalidate?(): void
   onSignedIn?(): Promise<void>
@@ -334,7 +335,7 @@ export class TokenRhythmAccount {
           this.assertOpen()
           if (!this.deps.onOpenDesktop) throw new AccountError('ACCOUNT_BROWSER_UNAVAILABLE')
           await this.deps.onOpenDesktop()
-        })
+        }, 300_000, this.deps.returnToWebUI)
       result = receipt
       this.loginResult = receipt
       // Remove the authorization code and state from the visible result URL.

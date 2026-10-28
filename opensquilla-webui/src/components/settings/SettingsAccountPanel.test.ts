@@ -36,7 +36,8 @@ describe('account settings and source visibility',()=>{
   const asOf=new Date(2026,9,21,9,0,0,393).toISOString()
   mock.store.state.wallet={currency:'CNY',balances:{available:'27.98408236',recharge:'0.00',bonus:'27.98408236',debt:'10.00010001',frozen:'0'},asOf}
   mock.store.state.walletStatus='stale';await nextTick()
-  expect([...el.querySelectorAll('.account-balance')].map(row=>row.lastElementChild?.textContent)).toEqual(['¥27.99','¥0.00','¥27.99','¥10.01','¥0.00'])
+  expect([...el.querySelectorAll('.account-balance')].map(row=>row.lastElementChild?.textContent)).toEqual(['¥27.99','¥0.00','¥27.99'])
+  expect(el.querySelector('details')).toBeNull()
   expect(mock.store.state.wallet.balances.available).toBe('27.98408236')
   expect(el.textContent).toContain('更新时间 2026-10-21 09:00:00');expect(el.textContent).not.toContain(asOf)
  })

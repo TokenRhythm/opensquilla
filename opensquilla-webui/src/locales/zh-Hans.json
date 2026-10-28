@@ -5197,7 +5197,7 @@
     "recoveryLogin": "重置本机登录并重新授权",
     "recoveryRequired": "本地登录信息无法恢复",
     "title": "账号与余额",
-    "description": "通过 TokenRhythm 网站登录，在这里管理账号和余额。",
+    "description": "通过 TokenRhythm 网站登录，在这里管理账号和余额",
     "loginSettings": "登录 / 设置",
     "loginTitle": "登录 TokenRhythm 账号",
     "login": "登录 TokenRhythm",

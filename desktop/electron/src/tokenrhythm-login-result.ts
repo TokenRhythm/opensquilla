@@ -5,6 +5,7 @@ export type LoginResultStatus = 'pending' | 'success' | 'cancelled' | 'error'
 
 const resultScript = `(() => {
   const useProtocol = document.currentScript.dataset.protocol === 'true';
+  const webReturn = document.currentScript.dataset.webReturn || '';
   const path = location.pathname;
   const title = document.getElementById('result-title');
   const description = document.getElementById('result-description');
@@ -13,6 +14,7 @@ const resultScript = `(() => {
   let opening = false;
   async function openDesktop() {
     if (opening) return;
+    if (webReturn) { location.assign(webReturn); return; }
     if (useProtocol) {
       try { location.assign('opensquilla://open'); } catch {}
       return;
@@ -37,21 +39,22 @@ const resultScript = `(() => {
       if (status === 'pending') { setTimeout(check, 350); return; }
       if (status === 'success') {
         title.textContent = '登录成功';
-        description.textContent = '你可以关闭此页面，返回桌面端继续工作。';
+        description.textContent = webReturn ? '正在返回 OpenSquilla 网页界面。' : '你可以关闭此页面，返回桌面端继续工作。';
+        if (webReturn) open.textContent = '返回 WebUI';
         open.hidden = false;
         hint.textContent = '如未自动打开，请点击上方按钮。';
         document.title = '登录成功 · OpenSquilla';
         void openDesktop();
       } else if (status === 'cancelled') {
         title.textContent = '已取消登录';
-        description.textContent = '你可以关闭此页面，返回 OpenSquilla 重新登录。';
+        description.textContent = webReturn ? '请返回 OpenSquilla 网页界面重新登录。' : '你可以关闭此页面，返回 OpenSquilla 重新登录。';
       } else if (status === 'error') {
         title.textContent = '登录未完成';
-        description.textContent = '请返回 OpenSquilla 查看账号状态并重试。';
+        description.textContent = webReturn ? '请返回 OpenSquilla 网页界面查看账号状态并重试。' : '请返回 OpenSquilla 查看账号状态并重试。';
       } else { throw Error(); }
     } catch {
       title.textContent = '请返回 OpenSquilla';
-      description.textContent = '此页面已失去连接，请在桌面端查看登录结果。';
+      description.textContent = webReturn ? '此页面已失去连接，请在 OpenSquilla 网页界面查看登录结果。' : '此页面已失去连接，请在桌面端查看登录结果。';
     }
   }
   void check();
@@ -78,7 +81,7 @@ h1 { margin: 0; font-size: 19px; line-height: 28px; font-weight: 500; }
 @media (max-height: 600px) { main { padding-top: 64px; } .brand { margin-bottom: 40px; } .actions { margin-top: 40px; } }
 `
 
-function resultPage(nonce: string, useProtocol: boolean): string {
+function resultPage(nonce: string, useProtocol: boolean, webReturnUrl: string): string {
   // Same brand mark as the website consent page; no network assets or credentials.
   return `<!doctype html>
 <html lang="zh-CN"><head>
@@ -99,7 +102,7 @@ function resultPage(nonce: string, useProtocol: boolean): string {
     <p class="hint" id="open-hint" role="status"></p>
   </div>
   <noscript><p class="description">请返回 OpenSquilla 查看登录结果。</p></noscript>
-</main><script nonce="${nonce}" data-protocol="${useProtocol}">${resultScript}</script></body></html>`
+</main><script nonce="${nonce}" data-protocol="${useProtocol}" data-web-return="${webReturnUrl}">${resultScript}</script></body></html>`
 }
 
 /** Short-lived browser receipt, isolated from the account and model API. */
@@ -114,7 +117,14 @@ export class TokenRhythmLoginResult {
     private readonly useProtocol: boolean,
     private readonly openDesktop: () => Promise<void>,
     lifetimeMs = 300_000,
+    private readonly webReturnUrl = '',
   ) {
+    if (webReturnUrl) {
+      const target = new URL(webReturnUrl)
+      if (target.protocol !== 'http:' || target.hostname !== '127.0.0.1' || target.username || target.password || target.hash || target.search || !/^\/control\/settings\/account\/?$/.test(target.pathname)) {
+        throw new Error('Invalid local WebUI return URL')
+      }
+    }
     this.timer = setTimeout(() => this.close(), lifetimeMs)
     this.timer.unref()
     server.unref()
@@ -137,7 +147,7 @@ export class TokenRhythmLoginResult {
     if (req.method === 'GET' && url.pathname === this.path) {
       const nonce = randomBytes(24).toString('base64url')
       res.setHeader('Content-Security-Policy', `default-src 'none'; style-src 'nonce-${nonce}'; script-src 'nonce-${nonce}'; connect-src 'self'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'`)
-      res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' }).end(resultPage(nonce, this.useProtocol))
+      res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' }).end(resultPage(nonce, this.useProtocol, this.webReturnUrl))
     } else if (req.method === 'GET' && url.pathname === `${this.path}/status`) {
       res.writeHead(200, { 'Content-Type': 'application/json' }).end(JSON.stringify({ status: this.status }))
     } else if (req.method === 'POST' && url.pathname === `${this.path}/open` && !this.useProtocol

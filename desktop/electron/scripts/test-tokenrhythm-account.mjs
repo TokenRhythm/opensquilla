@@ -728,3 +728,24 @@ test('browser receipt expires and closes its loopback listener', async () => {
   await assert.rejects(() => fetch(origin + receipt.path))
  } finally { receipt.close() }
 })
+
+test('local WebUI receipt returns to the browser without exposing the authorization code', async () => {
+ const { createServer } = await import('node:http')
+ const { once } = await import('node:events')
+ const { TokenRhythmLoginResult } = await import('../dist/tokenrhythm-login-result.js')
+ let receipt
+ const server = createServer((req, res) => { if (!receipt.handle(req, res)) res.writeHead(404).end() })
+ server.listen(0, '127.0.0.1')
+ await once(server, 'listening')
+ const origin = `http://127.0.0.1:${server.address().port}`
+ const returnUrl = 'http://127.0.0.1:5174/control/settings/account'
+ receipt = new TokenRhythmLoginResult(server, origin, false, async () => {}, 1000, returnUrl)
+ try {
+  const response = await fetch(origin + receipt.path)
+  const html = await response.text()
+  assert.equal(response.status, 200)
+  assert.match(html, /data-web-return="http:\/\/127\.0\.0\.1:5174\/control\/settings\/account"/)
+  assert.doesNotMatch(html, /one-use-code|code_verifier|refresh_token/)
+  assert.throws(() => new TokenRhythmLoginResult(server, origin, false, async () => {}, 1000, 'https://example.com/control/settings/account'))
+ } finally { receipt.close() }
+})
