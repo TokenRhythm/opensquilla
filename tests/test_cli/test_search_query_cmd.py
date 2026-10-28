@@ -77,6 +77,8 @@ def test_search_query_web_search_options_use_local_search(monkeypatch):
 
 
 def test_search_query_web_search_text_output_renders_results(monkeypatch):
+    # Wide terminal so content assertions are not split by wrapping.
+    monkeypatch.setenv("COLUMNS", "300")
     async def fake_run_canonical_web_search(
         options: SearchOptions,
         **kwargs: object,

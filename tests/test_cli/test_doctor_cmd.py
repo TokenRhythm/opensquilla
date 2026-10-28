@@ -668,6 +668,8 @@ def test_doctor_config_mismatch_keeps_running_findings_scoped_to_running_config(
 
 
 def test_doctor_table_prints_fix_steps(monkeypatch) -> None:
+    # Wide terminal so content assertions are not split by wrapping.
+    monkeypatch.setenv("COLUMNS", "300")
     _FakeGatewayClient.calls = []
     monkeypatch.setattr("opensquilla.cli.gateway_client.GatewayClient", _FakeGatewayClient)
 
@@ -679,6 +681,8 @@ def test_doctor_table_prints_fix_steps(monkeypatch) -> None:
 
 
 def test_doctor_degraded_table_exits_zero(monkeypatch) -> None:
+    # Wide terminal so content assertions are not split by wrapping.
+    monkeypatch.setenv("COLUMNS", "300")
     _FakeGatewayClient.calls = []
     original_payload = _FakeGatewayClient.payload
     _FakeGatewayClient.payload = {
@@ -721,6 +725,8 @@ def test_doctor_degraded_table_exits_zero(monkeypatch) -> None:
 
 
 def test_doctor_table_explains_non_blocking_error_impact(monkeypatch) -> None:
+    # Wide terminal so content assertions are not split by wrapping.
+    monkeypatch.setenv("COLUMNS", "300")
     _FakeGatewayClient.calls = []
     original_payload = _FakeGatewayClient.payload
     _FakeGatewayClient.payload = {
@@ -760,6 +766,8 @@ def test_doctor_table_explains_non_blocking_error_impact(monkeypatch) -> None:
 
 
 def test_doctor_table_uses_readiness_impact_to_select_action_findings(monkeypatch) -> None:
+    # Wide terminal so content assertions are not split by wrapping.
+    monkeypatch.setenv("COLUMNS", "300")
     _FakeGatewayClient.calls = []
     original_payload = _FakeGatewayClient.payload
     _FakeGatewayClient.payload = {
@@ -821,6 +829,8 @@ def test_doctor_table_uses_readiness_impact_to_select_action_findings(monkeypatc
 
 
 def test_doctor_table_uses_readiness_impact_to_label_optional_steps(monkeypatch) -> None:
+    # Wide terminal so content assertions are not split by wrapping.
+    monkeypatch.setenv("COLUMNS", "300")
     _FakeGatewayClient.calls = []
     original_payload = _FakeGatewayClient.payload
     _FakeGatewayClient.payload = {
@@ -860,6 +870,8 @@ def test_doctor_table_uses_readiness_impact_to_label_optional_steps(monkeypatch)
 
 
 def test_doctor_table_hides_non_actionable_findings_when_attention_is_needed(monkeypatch) -> None:
+    # Wide terminal so content assertions are not split by wrapping.
+    monkeypatch.setenv("COLUMNS", "300")
     _FakeGatewayClient.calls = []
     original_payload = _FakeGatewayClient.payload
     _FakeGatewayClient.payload = {
@@ -910,6 +922,8 @@ def test_doctor_table_hides_non_actionable_findings_when_attention_is_needed(mon
 
 
 def test_doctor_table_labels_info_only_steps_as_optional(monkeypatch) -> None:
+    # Wide terminal so content assertions are not split by wrapping.
+    monkeypatch.setenv("COLUMNS", "300")
     _FakeGatewayClient.calls = []
     original_payload = _FakeGatewayClient.payload
     _FakeGatewayClient.payload = {
@@ -1294,6 +1308,8 @@ def test_refresh_report_readiness_labels_operator_action_items() -> None:
 
 
 def test_doctor_appends_local_tui_finding_when_opentui_unavailable(monkeypatch) -> None:
+    # Wide terminal so content assertions are not split by wrapping.
+    monkeypatch.setenv("COLUMNS", "300")
     from opensquilla.cli.tui.renderers.selection import (
         ChatUiFallback,
         ChatUiSelection,

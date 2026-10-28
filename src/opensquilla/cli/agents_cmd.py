@@ -62,13 +62,13 @@ def agents_list(
         _print_json(agents)
         return
 
-    console = Console(width=200, force_terminal=False)
+    console = Console(force_terminal=False)
     table = Table(title=f"Agents in {target}")
-    table.add_column("id", no_wrap=True)
-    table.add_column("name", no_wrap=True)
-    table.add_column("type", no_wrap=True)
-    table.add_column("enabled", no_wrap=True)
-    table.add_column("model", no_wrap=True)
+    table.add_column("id")
+    table.add_column("name")
+    table.add_column("type")
+    table.add_column("enabled")
+    table.add_column("model")
     table.add_column("workspace")
     for agent in agents:
         table.add_row(

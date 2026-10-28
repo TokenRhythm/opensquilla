@@ -65,12 +65,12 @@ def search_list(
         print_json(search_provider_catalog_payload())
         return
 
-    console = Console(width=160, force_terminal=False)
+    console = Console(force_terminal=False)
     table = Table(title="Search providers")
-    table.add_column("provider", no_wrap=True)
-    table.add_column("label", no_wrap=True)
-    table.add_column("runtime", no_wrap=True)
-    table.add_column("requires key", no_wrap=True)
+    table.add_column("provider")
+    table.add_column("label")
+    table.add_column("runtime")
+    table.add_column("requires key")
     table.add_column("env key")
     for spec in list_search_provider_setup_specs():
         table.add_row(
@@ -102,13 +102,13 @@ def search_status(
         print_json(payload)
         return
 
-    console = Console(width=140, force_terminal=False)
+    console = Console(force_terminal=False)
     table = Table(title="Search status")
-    table.add_column("provider", no_wrap=True)
-    table.add_column("active", no_wrap=True)
-    table.add_column("configured", no_wrap=True)
-    table.add_column("buildable", no_wrap=True)
-    table.add_column("network", no_wrap=True)
+    table.add_column("provider")
+    table.add_column("active")
+    table.add_column("configured")
+    table.add_column("buildable")
+    table.add_column("network")
     table.add_column("fallback")
     table.add_column("error")
     network_blocked = str(payload.get("networkBlockedReason") or "")
@@ -218,7 +218,7 @@ def search_query(
         typer.secho(f"Search failed: {message}", fg=typer.colors.RED, err=True)
         raise typer.Exit(1)
 
-    console = Console(width=160, force_terminal=False)
+    console = Console(force_terminal=False)
     table = Table(title=f"Search: {query}")
     table.add_column("Title")
     table.add_column("URL")
@@ -288,13 +288,13 @@ def _emit_invalid_request(message: str, *, json_output: bool) -> NoReturn:
 
 
 def _print_research_results(query: str, payload: dict[str, Any]) -> None:
-    console = Console(width=180, force_terminal=False)
+    console = Console(force_terminal=False)
     table = Table(title=f"Research search: {query}")
-    table.add_column("Rank", no_wrap=True)
+    table.add_column("Rank")
     table.add_column("Title")
-    table.add_column("Domain", no_wrap=True)
-    table.add_column("Provider", no_wrap=True)
-    table.add_column("Fetched", no_wrap=True)
+    table.add_column("Domain")
+    table.add_column("Provider")
+    table.add_column("Fetched")
     table.add_column("URL")
     table.add_column("Excerpt")
     for index, row in enumerate(payload.get("results", []), start=1):
@@ -335,7 +335,7 @@ def search_benchmark(
         print_json(payload)
         return
 
-    console = Console(width=160, force_terminal=False)
+    console = Console(force_terminal=False)
     table = Table(title=f"Search benchmark: {profile}")
     table.add_column("Metric")
     table.add_column("v1", justify="right")
@@ -465,7 +465,7 @@ def search_configure(
     )
     typer.echo(f"Search provider configured: {provider}")
     typer.echo(f"Config: {persist.path}")
-    warning_console = Console(file=sys.stdout, width=160, force_terminal=False)
+    warning_console = Console(file=sys.stdout, force_terminal=False)
     for warning in env_reference_warnings(result.config):
         warning_console.print(warning_panel(warning))
     if persist.backup_path:

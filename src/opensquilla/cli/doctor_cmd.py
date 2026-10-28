@@ -672,7 +672,7 @@ def _report_context(report: dict[str, Any]) -> str:
 
 
 def _render_report(report: dict[str, Any]) -> None:
-    console = Console(width=180, force_terminal=False)
+    console = Console(force_terminal=False)
     console.print(f"[bold]OpenSquilla Doctor[/bold] - {report.get('summary', '')}")
     if context := _report_context(report):
         console.print(context)
@@ -683,9 +683,9 @@ def _render_report(report: dict[str, Any]) -> None:
         return
     step_column = _step_column(visible_findings)
     table = Table(show_header=True)
-    table.add_column("Severity", no_wrap=True)
-    table.add_column("Impact", no_wrap=True)
-    table.add_column("Surface", no_wrap=True)
+    table.add_column("Severity")
+    table.add_column("Impact")
+    table.add_column("Surface")
     table.add_column("Finding")
     table.add_column(step_column)
     for finding in visible_findings:

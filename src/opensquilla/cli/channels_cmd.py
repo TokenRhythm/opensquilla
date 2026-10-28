@@ -70,12 +70,12 @@ def _render_channels_table(entries: list[dict[str, Any]], *, title: str) -> None
     if not entries:
         typer.echo("0 channels configured.")
         return
-    console = Console(width=200, force_terminal=False)
+    console = Console(force_terminal=False)
     table = Table(title=title)
-    table.add_column("name", no_wrap=True)
-    table.add_column("type", no_wrap=True)
-    table.add_column("enabled", no_wrap=True)
-    table.add_column("agent_id", no_wrap=True)
+    table.add_column("name")
+    table.add_column("type")
+    table.add_column("enabled")
+    table.add_column("agent_id")
     table.add_column("details")
     for e in entries:
         details = ", ".join(
@@ -129,7 +129,7 @@ def _render_status_table(payload: dict[str, Any], *, name: str | None = None) ->
             str(row.get("restart_attempts") or 0),
             _status_diagnostic_text(row),
         )
-    Console(width=180, force_terminal=False).print(table)
+    Console(force_terminal=False).print(table)
 
 
 def _filter_status_rows(payload: dict[str, Any], name: str | None) -> list[dict[str, Any]]:
@@ -400,18 +400,18 @@ def channels_types(
         ])
         return
     table = Table(title="Supported channel types")
-    table.add_column("type", no_wrap=True)
+    table.add_column("type")
     table.add_column("label")
-    table.add_column("transport", no_wrap=True)
-    table.add_column("public URL", no_wrap=True)
-    table.add_column("extras", no_wrap=True)
+    table.add_column("transport")
+    table.add_column("public URL")
+    table.add_column("extras")
     for s in specs:
         table.add_row(
             s.type, s.label, s.transport,
             "yes" if s.requires_public_url else "no",
             s.dependency_extra or "—",
         )
-    Console(width=140, force_terminal=False).print(table)
+    Console(force_terminal=False).print(table)
 
 
 @channels_app.command("describe")
@@ -448,7 +448,7 @@ def channels_describe(
         })
         return
 
-    console = Console(width=160, force_terminal=False)
+    console = Console(force_terminal=False)
     typer.echo(f"{spec.label} ({spec.type})")
     typer.echo(spec.description)
     typer.echo(
@@ -458,10 +458,10 @@ def channels_describe(
         f"docs={spec.docs_hint}"
     )
     table = Table(title="Fields")
-    table.add_column("name", no_wrap=True)
-    table.add_column("type", no_wrap=True)
-    table.add_column("required", no_wrap=True)
-    table.add_column("secret", no_wrap=True)
+    table.add_column("name")
+    table.add_column("type")
+    table.add_column("required")
+    table.add_column("secret")
     table.add_column("default")
     table.add_column("choices")
     for f in spec.fields:
@@ -567,7 +567,7 @@ def channels_certify(
                 f"{row.get('latencyMs', 0)} ms",
                 detail,
             )
-        Console(width=180, force_terminal=False).print(table)
+        Console(force_terminal=False).print(table)
 
     if not evidence_passed(evidence):
         raise typer.Exit(code=1)
@@ -593,7 +593,7 @@ def _render_pairings_table(records: list[dict[str, Any]], *, channel: str) -> No
             str(record.get("createdAt") or ""),
             str(record.get("approvedAt") or ""),
         )
-    Console(width=140, force_terminal=False).print(table)
+    Console(force_terminal=False).print(table)
     if not records:
         typer.echo("No pairing requests.")
 

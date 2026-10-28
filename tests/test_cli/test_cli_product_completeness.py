@@ -1461,6 +1461,8 @@ def test_channels_status_and_logout_use_existing_rpcs(monkeypatch):
 
 
 def test_channels_status_table_shows_channel_diagnostic(monkeypatch):
+    # Wide terminal so content assertions are not split by wrapping.
+    monkeypatch.setenv("COLUMNS", "300")
     fake = _install_fake_gateway(monkeypatch)
     fake.rpc_payloads = {
         "channels.status": {

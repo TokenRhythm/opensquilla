@@ -33,13 +33,13 @@ def providers_list(
         print_json(provider_catalog_payload())
         return
 
-    console = Console(width=200, force_terminal=False)
+    console = Console(force_terminal=False)
     table = Table(title="Providers")
-    table.add_column("provider", no_wrap=True)
-    table.add_column("label", no_wrap=True)
-    table.add_column("runtime", no_wrap=True)
-    table.add_column("requires key", no_wrap=True)
-    table.add_column("requires base url", no_wrap=True)
+    table.add_column("provider")
+    table.add_column("label")
+    table.add_column("runtime")
+    table.add_column("requires key")
+    table.add_column("requires base url")
     table.add_column("default base url")
     for s in list_provider_setup_specs():
         table.add_row(
@@ -77,12 +77,12 @@ def providers_status(
         print_json(payload)
         return
 
-    console = Console(width=180, force_terminal=False)
+    console = Console(force_terminal=False)
     table = Table(title="Provider status")
-    table.add_column("provider", no_wrap=True)
-    table.add_column("active", no_wrap=True)
-    table.add_column("configured", no_wrap=True)
-    table.add_column("buildable", no_wrap=True)
+    table.add_column("provider")
+    table.add_column("active")
+    table.add_column("configured")
+    table.add_column("buildable")
     table.add_column("model")
     table.add_column("error")
     if probe_models:
