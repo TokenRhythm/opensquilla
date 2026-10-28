@@ -320,15 +320,21 @@ async def _complete_job(
 
 async def refresh_tokenrhythm_video_billing(*, base_url: str, api_key: str, job_id: str) -> None:
     """Refresh a delivered job's delayed bill with one status GET, never a submission."""
-    api_root = _api_root(base_url)
+    from opensquilla.desktop_account import (
+        OFFICIAL_BASE,
+        account_http_client,
+        is_account_credential,
+    )
+
+    api_root = _api_root(OFFICIAL_BASE if is_account_credential(api_key) else base_url)
     secret = clean_header_secret(api_key, label="TokenRhythm video API key")
     safe_job_id = _safe_task_id(job_id)
     if not secret or not await video_job_needs_settlement(
         "tokenrhythm", api_root, safe_job_id, api_key=secret
     ):
         return
-    async with httpx.AsyncClient(
-        timeout=None, trust_env=trust_env(), follow_redirects=False
+    async with account_http_client(
+        secret, timeout=None, trust_env=trust_env(), follow_redirects=False
     ) as client:
         payload = await _get_job(
             client,
