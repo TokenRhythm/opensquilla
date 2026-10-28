@@ -12,6 +12,7 @@ import {
   closeElectronWithDeadline,
   closeHttpServerWithDeadline,
   desktopShutdownEvidenceSince,
+  requestElectronQuitWithConfirmation,
   trackHttpServerConnections,
 } from './e2e-shutdown-helpers.mjs'
 import {
@@ -383,6 +384,9 @@ async function closeActiveApp(phase, { failOnError = true } = {}) {
     app: targetApp,
     phase,
     timeoutMs: ELECTRON_SHUTDOWN_TIMEOUT_MS,
+    requestClose: options => requestElectronQuitWithConfirmation(targetApp, {
+      ...options, requireConfirmation: false,
+    }),
     diagnostics: async () => {
       const currentLog = await readFile(desktopLogPath, 'utf8').catch(() => null)
       const appended = typeof desktopLogCheckpoint === 'string'

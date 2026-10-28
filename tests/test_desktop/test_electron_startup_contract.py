@@ -3477,6 +3477,13 @@ def test_desktop_e2e_flows_keep_bounded_shutdown_and_fail_closed_log_reads() -> 
     )
     assert "await app.close()" not in profile_import_flow
     assert "app.close().catch(() => {})" not in profile_import_flow
+    for flow in (profile_flow, profile_import_flow):
+        profile_close = _section(flow, "async function closeActiveApp(", "\ntry {")
+        assert (
+            "requestClose: options => requestElectronQuitWithConfirmation(targetApp, {"
+            in profile_close
+        )
+        assert "...options, requireConfirmation: false," in profile_close
     for flow in (window_flow, theme_flow):
         assert "const ELECTRON_SHUTDOWN_TIMEOUT_MS = 15_000" in flow
         assert "closeElectronWithDeadline" in flow
