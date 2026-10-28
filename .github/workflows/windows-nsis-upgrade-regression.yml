@@ -335,6 +335,8 @@ jobs:
                   if ($LASTEXITCODE -ne 0) { throw 'Frozen dependency audit failed' }
                 }
                 'gateway-smoke' {
+                  # Preserve probe diagnostics in the always-uploaded execution proof.
+                  $env:CI_REPORT_DIR = $proofRoot
                   # Select the disposable runner's real user profile; the child validates its SID.
                   $env:OPENSQUILLA_SMOKE_SANDBOX_PROFILE_ROOT = Join-Path ([Environment]::GetFolderPath('UserProfile')) '.opensquilla'
                   Push-Location desktop/electron
