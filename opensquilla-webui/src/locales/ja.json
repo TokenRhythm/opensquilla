@@ -3845,6 +3845,14 @@
         }
       }
     },
+    "mention": {
+      "groups": {
+        "workspace": "ワークスペースのファイル",
+        "sessions": "最近のチャット"
+      },
+      "unavailable": "ワークスペースのファイルを読み込めません。",
+      "hint": "↑↓ で選択 · Enter で挿入 · Esc で閉じる"
+    },
     "sessionCreated": {
       "title": "チャットを作成しました",
       "open": "チャットを開く",

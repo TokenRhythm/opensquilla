@@ -3945,6 +3945,14 @@
         }
       }
     },
+    "mention": {
+      "groups": {
+        "workspace": "工作区文件",
+        "sessions": "最近会话"
+      },
+      "unavailable": "当前无法读取工作区文件。",
+      "hint": "↑↓ 选择 · Enter 插入 · Esc 关闭"
+    },
     "sessionCreated": {
       "title": "聊天已创建",
       "open": "打开聊天",
