@@ -49,6 +49,24 @@ def test_wizard_registry_advances_and_applies_schema_defaults() -> None:
     }
 
 
+def test_onboard_agent_default_model_offers_current_anthropic_models() -> None:
+    registry = WizardRegistry()
+    wizard_id, _ = registry.start("onboard_agent")
+    registry.advance(wizard_id, {"agent_name": "cora"})
+    defaults = registry.advance(wizard_id, {"system_prompt": "Help with release work"})
+
+    assert defaults.next_step is not None
+    default_model = next(f for f in defaults.next_step.fields if f.name == "default_model")
+
+    assert "anthropic/claude-sonnet-4-6" in default_model.choices
+    assert "anthropic/claude-haiku-4-5-20251001" in default_model.choices
+    assert not any("claude-3" in choice for choice in default_model.choices)
+
+    final = registry.advance(wizard_id, {"default_model": "anthropic/claude-sonnet-4-6"})
+    assert final.completed is True
+    assert final.result["answers"]["default_model"] == "anthropic/claude-sonnet-4-6"
+
+
 def test_wizard_registry_rejects_blank_required_answers() -> None:
     registry = WizardRegistry()
     wizard_id, _first_step = registry.start("onboard_agent")
