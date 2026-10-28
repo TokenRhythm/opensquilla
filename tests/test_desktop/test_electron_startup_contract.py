@@ -3491,6 +3491,12 @@ def test_desktop_e2e_flows_keep_bounded_shutdown_and_fail_closed_log_reads() -> 
         assert "canAcceptWindowsElectronShutdownFallback" in flow
         assert "flowSucceeded && shutdownError" in flow
         assert ".close().catch(() => {})" not in flow
+        final_shutdown = flow[flow.rindex("\n} finally {"):]
+        assert (
+            "requestClose: options => requestElectronQuitWithConfirmation(desktopApp, {"
+            in final_shutdown
+        )
+        assert "...options, requireConfirmation: false," in final_shutdown
 
 
 def test_desktop_shutdown_diagnostics_report_file_cleanup_errors_without_masking_exit() -> None:
