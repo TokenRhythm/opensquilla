@@ -3287,9 +3287,9 @@ def test_desktop_quit_joins_children_already_stopping_for_other_lifecycles() -> 
     before_quit = _section(main_ts, "app.on('before-quit'", "function shutdownFromSignal")
 
     assert "const gatewayStoppingProcesses = new Set" in main_ts
-    assert stop.index("trackStoppingGatewayProcess(child)") < stop.index(
-        "gatewayProcess = null"
-    )
+    stopping_call = re.search(r"\btrackStoppingGatewayProcess\(\s*child\s*[,)]", stop)
+    assert stopping_call is not None
+    assert stopping_call.start() < stop.index("gatewayProcess = null")
     assert "requestOwnedGatewayShutdown(child, url)" in stop
     assert "requestGatewayShutdown(url)" not in stop
     assert "const children = new Set(gatewayStoppingProcesses)" in main_ts

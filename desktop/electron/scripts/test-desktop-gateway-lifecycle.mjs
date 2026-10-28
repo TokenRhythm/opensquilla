@@ -1,6 +1,8 @@
 import assert from 'node:assert/strict'
+import { spawn } from 'node:child_process'
 import { EventEmitter } from 'node:events'
 import { readFileSync } from 'node:fs'
+import { createServer } from 'node:net'
 import { createContext, runInContext } from 'node:vm'
 
 import {
@@ -94,6 +96,91 @@ function runProcessExitDiagnosticsCases() {
 }
 
 runProcessExitDiagnosticsCases()
+
+async function runRealProcessExitBeforeStdioCloseCase() {
+  const records = []
+  const sockets = new Set()
+  let cleaningUp = false
+  let connected
+  const holderConnected = new Promise(resolve => { connected = resolve })
+  const server = createServer(socket => {
+    if (cleaningUp) { socket.destroy(); return }
+    sockets.add(socket)
+    socket.once('close', () => sockets.delete(socket))
+    socket.once('error', () => {})
+    socket.once('data', connected)
+  })
+  const bounded = async (promise, label) => {
+    let timer
+    try {
+      return await Promise.race([
+        promise,
+        new Promise((_, reject) => {
+          timer = setTimeout(() => reject(new Error(`${label} timed out`)), 10_000)
+        }),
+      ])
+    } finally { clearTimeout(timer) }
+  }
+  let child
+  let closed
+  try {
+    await new Promise((resolve, reject) => {
+      server.once('error', reject)
+      server.listen(0, '127.0.0.1', resolve)
+    })
+    // The descendant's lifetime is leased by this socket, so finally can stop
+    // it even after its launcher exits. No process enumeration or PID kill is
+    // needed, and the same handshake works on Windows, macOS, and Linux.
+    const holderSource = `
+      const socket = require('node:net').connect({ host: '127.0.0.1', port: Number(process.argv[1]) });
+      socket.once('connect', () => socket.write('ready'));
+      socket.once('end', () => process.exit(0));
+      socket.once('close', () => process.exit(0));
+      socket.once('error', () => process.exit(1));
+    `
+    const launcherSource = `
+      const holder = require('node:child_process').spawn(process.execPath,
+        ['-e', ${JSON.stringify(holderSource)}, process.argv[1]],
+        { stdio: ['ignore', 'inherit', 'inherit'], windowsHide: true });
+      const cleanup = () => { holder.kill(); process.exit(0); };
+      holder.once('error', () => process.exit(1));
+      process.once('disconnect', cleanup);
+      process.once('SIGTERM', cleanup);
+      process.once('message', message => { if (message === 'exit') process.exit(23); });
+    `
+    child = spawn(process.execPath, ['-e', launcherSource, String(server.address().port)], {
+      stdio: ['ignore', 'pipe', 'pipe', 'ipc'], windowsHide: true,
+    })
+    observeGatewayProcessLifecycle(child, {
+      instanceId: 'synthetic-inherited-stdio', supervisorPid: process.pid,
+      platform: process.platform, restartAttempt: 0,
+      report: (event, detail) => records.push({ event, ...detail }),
+    })
+    const exited = new Promise(resolve => child.once('exit', (code, signal) => resolve({ code, signal })))
+    closed = new Promise(resolve => child.once('close', resolve))
+    await bounded(holderConnected, 'descendant pipe-holder handshake')
+    child.send('exit')
+    assert.deepEqual(await bounded(exited, 'launcher exit'), { code: 23, signal: null })
+    assert.equal(records.at(-1).event, 'gateway_process_exit_observed')
+    assert.equal(records.at(-1).outcome, 'nonzero_exit')
+    assert.equal(records.some(row => row.event === 'gateway_process_stdio_closed'), false,
+      'real child exit must be observed while its descendant still owns stdout/stderr')
+    for (const socket of sockets) socket.destroy()
+    await bounded(closed, 'inherited stdio close')
+    assert.equal(records.at(-1).event, 'gateway_process_stdio_closed')
+    assert.equal(records.at(-1).exit_observed, true)
+    assert.ok(records.at(-1).exit_to_close_ms >= 0)
+  } finally {
+    cleaningUp = true
+    const serverClosed = new Promise(resolve => server.close(resolve))
+    for (const socket of sockets) socket.destroy()
+    if (child && child.exitCode === null && child.signalCode === null) child.kill()
+    if (closed) await bounded(closed, 'launcher cleanup')
+    await bounded(serverClosed, 'pipe-holder lease cleanup')
+  }
+}
+
+await runRealProcessExitBeforeStdioCloseCase()
 
 // Run the actual main-process startup wiring with profile inspection held open.
 // Readiness helpers alone do not cover the descriptor seen by the first renderer.
