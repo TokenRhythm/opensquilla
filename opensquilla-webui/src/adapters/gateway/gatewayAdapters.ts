@@ -40,6 +40,8 @@ import type { WorkspaceFiles } from '@/modules/workspaceFiles'
 import { createV4WorkspaceFiles } from './workspaceFilesV4'
 import type { TerminalAccess } from '@/modules/terminal'
 import { createV4TerminalAccess } from './terminalV4'
+import type { GitAccess } from '@/modules/git'
+import { createGitAccess } from './gitV4'
 import type { SandboxRuntime } from '@/modules/sandboxRuntime'
 import { createV4SandboxRuntime } from './sandboxRuntimeV4'
 import type { UsageReporting } from '@/modules/usageReporting'
@@ -111,6 +113,7 @@ export interface GatewayAdapters {
   readonly workspaceReferences: WorkspaceReferences
   readonly workspaceFiles: WorkspaceFiles
   readonly terminal: TerminalAccess
+  readonly git: GitAccess
   readonly sandboxRuntime: SandboxRuntime
   readonly usageReporting: UsageReporting
   readonly commandCatalog: CommandCatalog
@@ -194,6 +197,7 @@ export function createGatewayAdapters(
     workspaceReferences: createV4WorkspaceReferences(transports.rpc),
     workspaceFiles: createV4WorkspaceFiles(http),
     terminal: createV4TerminalAccess(transports.rpc, transports.events),
+    git: createGitAccess(transports.rpc),
     sandboxRuntime: createV4SandboxRuntime(transports.rpc, transports.events),
     usageReporting: createV4UsageReporting(transports.rpc),
     commandCatalog: createV4CommandCatalog(transports.rpc),

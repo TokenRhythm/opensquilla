@@ -493,6 +493,37 @@
       "exited": "Terminal exited",
       "state": { "starting": "Starting", "running": "Connected", "exited": "Exited", "error": "Unavailable" }
     },
+    "gitChanges": {
+      "title": "Control de código fuente",
+      "subtitle": "Cambios en el directorio de trabajo de esta sesión",
+      "openHint": "Área de trabajo de Git: haz clic para revisar los cambios ({branch})",
+      "refresh": "Actualizar cambios",
+      "fileCount": "{count} modificado(s)",
+      "ahead": "{count} confirmación(es) por delante del remoto",
+      "behind": "{count} confirmación(es) por detrás del remoto",
+      "staged": "Preparado",
+      "unstaged": "Sin preparar",
+      "untracked": "Sin seguimiento",
+      "clean": "El árbol de trabajo no tiene cambios.",
+      "notARepository": "Este directorio de trabajo no es un repositorio de Git.",
+      "gitUnavailable": "Git no está disponible para este directorio de trabajo.",
+      "loading": "Cargando cambios…",
+      "retry": "Reintentar",
+      "binary": "Archivo binario: no hay diferencias de texto disponibles.",
+      "truncated": "Esta diferencia está truncada; abre el archivo para ver el resto.",
+      "emptyDiff": "Git no informó de cambios de texto en este archivo.",
+      "additions": "Líneas añadidas",
+      "deletions": "Líneas eliminadas",
+      "closeDiff": "Cerrar diferencias",
+      "status": {
+        "modified": "Modificado",
+        "added": "Añadido",
+        "deleted": "Eliminado",
+        "renamed": "Renombrado",
+        "untracked": "Sin seguimiento",
+        "conflicted": "En conflicto"
+      }
+    },
     "artifactAnnotation": {
       "start": "Solicitar cambios",
       "stop": "Dejar de anotar",

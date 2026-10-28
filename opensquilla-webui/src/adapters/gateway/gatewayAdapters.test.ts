@@ -65,6 +65,7 @@ describe('Gateway Adapter composition', () => {
       'workspaceReferences',
       'workspaceFiles',
       'terminal',
+      'git',
       'sandboxRuntime',
       'usageReporting',
       'commandCatalog',

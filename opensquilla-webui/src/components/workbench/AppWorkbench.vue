@@ -411,6 +411,7 @@ import { createWorkbenchResourceCollectionDefinition } from './workbenchResource
 import { WORKSPACE_REFERENCES_KEY } from '@/modules/workspaceReferences'
 import { WORKSPACE_FILES_KEY } from '@/modules/workspaceFiles'
 import { TERMINAL_ACCESS_KEY } from '@/modules/terminal'
+import { useGitAccess } from '@/modules/git'
 import { GATEWAY_ACCESS_KEY } from '@/modules/gatewayAccess'
 import { SESSION_LIFECYCLE_KEY } from '@/modules/sessionLifecycle'
 import { SESSION_READ_LIFECYCLE_FACTORY_KEY } from '@/modules/sessionReadLifecycle'
@@ -419,6 +420,7 @@ import { CONVERSATION_EVENTS_KEY } from '@/modules/conversationEvents'
 import { createWorkspaceFileDefinition } from './workspaceFileProvider'
 import { createWorkspaceFilesWorkbenchDefinition } from './workspaceFilesWorkbenchProvider'
 import { createTerminalWorkbenchDefinition } from './terminalWorkbenchProvider'
+import { createGitChangesWorkbenchDefinition } from './gitChangesWorkbenchProvider'
 import { createAssistantChatWorkbenchDefinition } from './assistantChatWorkbenchProvider'
 import { createToolHistoryFileDefinition } from './toolHistoryFileProvider'
 import WorkbenchHost from './WorkbenchHost.vue'
@@ -488,6 +490,9 @@ const releaseSideChatLauncher = sideChatLauncher?.register(launchSideChatCommand
 const workspaceReferences = inject(WORKSPACE_REFERENCES_KEY, null)
 const workspaceFiles = inject(WORKSPACE_FILES_KEY, null)
 const terminal = inject(TERMINAL_ACCESS_KEY, null)
+// Git is a read-only owner published by main.ts; the module helper returns null
+// outside the app shell (tests, isolated stories) instead of throwing.
+const gitAccess = useGitAccess()
 const referenceGateway = inject(GATEWAY_ACCESS_KEY, null)
 const gateway = referenceGateway
 const assistantSessionLifecycle = inject(SESSION_LIFECYCLE_KEY, null)
@@ -1317,6 +1322,10 @@ if (terminal) {
     key => String(t(key)),
   ), { replace: true })
 }
+workbenchPanelRegistry.register(createGitChangesWorkbenchDefinition(
+  gitAccess,
+  key => String(t(key)),
+), { replace: true })
 if (assistantPortsAvailable) {
   workbenchPanelRegistry.register(createAssistantChatWorkbenchDefinition(
     key => String(t(key)),

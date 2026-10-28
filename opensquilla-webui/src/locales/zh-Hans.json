@@ -511,6 +511,37 @@
       "exited": "终端已退出",
       "state": { "starting": "启动中", "running": "已连接", "exited": "已退出", "error": "不可用" }
     },
+    "gitChanges": {
+      "title": "源代码管理",
+      "subtitle": "当前会话工作目录的改动",
+      "openHint": "Git 工作台：点击查看改动（{branch}）",
+      "refresh": "刷新改动",
+      "fileCount": "{count} 项改动",
+      "ahead": "领先上游 {count} 个提交",
+      "behind": "落后上游 {count} 个提交",
+      "staged": "已暂存",
+      "unstaged": "未暂存",
+      "untracked": "未跟踪",
+      "clean": "工作区没有改动。",
+      "notARepository": "当前工作目录不是 Git 仓库。",
+      "gitUnavailable": "当前工作目录无法使用 Git。",
+      "loading": "正在加载改动…",
+      "retry": "重试",
+      "binary": "二进制文件，没有可显示的文本差异。",
+      "truncated": "差异内容已截断，打开文件可查看其余部分。",
+      "emptyDiff": "Git 未报告该文件的文本改动。",
+      "additions": "新增行数",
+      "deletions": "删除行数",
+      "closeDiff": "关闭差异",
+      "status": {
+        "modified": "已修改",
+        "added": "已新增",
+        "deleted": "已删除",
+        "renamed": "已重命名",
+        "untracked": "未跟踪",
+        "conflicted": "有冲突"
+      }
+    },
     "artifactAnnotation": {
       "start": "请求修改",
       "stop": "退出批注模式",
