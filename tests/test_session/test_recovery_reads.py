@@ -765,6 +765,7 @@ async def test_cancelled_native_initialization_holds_reader_until_settled(
     assert not pool._idle
 
 
+@pytest.mark.ci_serial
 async def test_concurrent_close_is_serial_and_cancellation_keeps_physical_ownership(
     storage: SessionStorage, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
