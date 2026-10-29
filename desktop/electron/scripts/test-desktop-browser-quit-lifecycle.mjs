@@ -52,6 +52,7 @@ function quitHarness(platform = process.platform, { tabCount = 1, activeCount = 
     quitConfirmationWantsExit: false,
     desktopQuitConfirmation: new DesktopQuitConfirmation(), DesktopQuitBudget,
     gatewayProcessCleanupContexts: new Map(), gatewayProcessCleanupOperations: new WeakMap(),
+    gatewayProcessTreeTerminations: new Map(),
     quitUnconfirmedProcessTrees: new Set(),
     desktopWriters: new DesktopWriterAdmission(),
     desktopUpdateCheckScheduler: { stop() {} },

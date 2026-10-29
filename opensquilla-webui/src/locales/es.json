@@ -1,4 +1,11 @@
 {
+  "desktopRuntime": {
+    "starting": "Iniciando OpenSquilla…",
+    "startFailed": "No se pudo iniciar OpenSquilla.",
+    "sandboxUpgradeIncomplete": "La actualización de la configuración del entorno aislado no se completó. Puede seguir usando la aplicación. Revise el registro y vuelva a intentarlo después de reiniciar.",
+    "retry": "Reintentar",
+    "showLog": "Ver registro"
+  },
   "visualize": {
     "runtimeError": "Este lienzo no pudo ejecutarse",
     "runtimeErrorHint": "Su código encontró un error. Puedes pedir a la IA que lo repare o volver a ejecutar esta versión.",
@@ -130,6 +137,7 @@
     "unavailable": "El archivo fuente no está disponible. Las vistas previas y descargas existentes no cambian.", "failed": "La operación de archivo falló."
   },
   "workspaces": {
+    "catalogUnavailable": "La lista de proyectos no está disponible.",
     "openDirectory": "Abrir en el explorador de archivos",
     "copyDirectoryPath": "Copiar ruta del directorio del proyecto",
     "openDirectoryFailed": "No se pudo abrir el directorio del proyecto. Inténtalo de nuevo.",

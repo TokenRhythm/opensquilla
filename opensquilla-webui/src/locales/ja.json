@@ -1,4 +1,11 @@
 {
+  "desktopRuntime": {
+    "starting": "OpenSquilla を起動中…",
+    "startFailed": "OpenSquilla を起動できませんでした。",
+    "sandboxUpgradeIncomplete": "サンドボックス設定の更新が完了していません。引き続き利用できます。ログを確認し、再起動後に再試行してください。",
+    "retry": "再試行",
+    "showLog": "ログを表示"
+  },
   "visualize": {
     "runtimeError": "キャンバスの実行中にエラーが発生しました",
     "runtimeErrorHint": "コードに問題が発生しました。AI に修復を依頼するか、このバージョンを再実行できます。",
@@ -130,6 +137,7 @@
     "unavailable": "現在のソースファイルを利用できません。既存のプレビューとダウンロードは変更されません。", "failed": "ファイル操作に失敗しました。"
   },
   "workspaces": {
+    "catalogUnavailable": "プロジェクト一覧を利用できません。",
     "openDirectory": "ファイルマネージャーで開く",
     "copyDirectoryPath": "プロジェクトのフォルダーパスをコピー",
     "openDirectoryFailed": "プロジェクトのフォルダーを開けませんでした。再試行してください。",

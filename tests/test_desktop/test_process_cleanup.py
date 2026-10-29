@@ -100,6 +100,77 @@ def test_incomplete_owner_receipt_cannot_be_overwritten_by_racing_success(tmp_pa
     assert not _cleanup(control)
 
 
+@pytest.mark.parametrize("receipt_kind", [
+    "incomplete", "unknown-status", "malformed-json", "non-object", "missing-field",
+    "invalid-field-type", "invalid-field-value", "mismatched-owner",
+])
+def test_unconfirmed_receipt_does_not_block_other_pending_cleanup(
+    tmp_path, monkeypatch, receipt_kind,
+):
+    control, state = _configure(tmp_path)
+    scope = process_tree._current_task_process_scope()
+    assert scope is not None
+    bad, good = [
+        process_tree._insert_owner_record(
+            scope, owner_id=owner_id, platform=process_tree._platform_kind(),
+            controller_pid=os.getpid(),
+        )
+        for owner_id in ("a" * 32, "b" * 32)
+    ]
+    database = process_tree._owner_database_path(state)
+    with process_tree._connect_owner_database(database) as connection:
+        row = connection.execute(
+            "SELECT record_json FROM desktop_process_launch_owners WHERE owner_id = ?",
+            (bad.record.owner_id,),
+        ).fetchone()
+        record_json = row["record_json"]
+        record = json.loads(record_json)
+        status = "pending"
+        if receipt_kind in {"incomplete", "unknown-status"}:
+            status = receipt_kind
+        elif receipt_kind == "malformed-json":
+            record_json = "{"
+        elif receipt_kind == "non-object":
+            record_json = "[]"
+        else:
+            if receipt_kind == "missing-field":
+                del record["controller_pid"]
+            elif receipt_kind == "invalid-field-type":
+                record["controller_pid"] = "invalid"
+            elif receipt_kind == "invalid-field-value":
+                record["controller_pid"] = 0
+            else:
+                record["owner_id"] = "c" * 32
+            record_json = json.dumps(record)
+        connection.execute(
+            "UPDATE desktop_process_launch_owners SET record_json = ?, status = ? "
+            "WHERE owner_id = ?", (record_json, status, bad.record.owner_id),
+        )
+    attempted = []
+
+    def finish(reference):
+        attempted.append(reference.record.owner_id)
+        process_tree._delete_owner_record(reference, cleanup_complete=True)
+        return True
+
+    monkeypatch.setattr(process_tree, "_terminate_persisted_posix_owner_sync", finish)
+    assert not _cleanup(control)
+    assert attempted == [good.record.owner_id]
+    with process_tree._connect_owner_database(database) as connection:
+        receipts = {
+            row["owner_id"]: (row["record_json"], row["status"])
+            for row in connection.execute(
+                "SELECT owner_id, record_json, status FROM desktop_process_launch_owners",
+            )
+        }
+        assert receipts[bad.record.owner_id] == (record_json, status)
+        assert receipts[good.record.owner_id][1] == "complete"
+        assert connection.execute(
+            "SELECT closed FROM desktop_process_launches WHERE launch_digest = ?",
+            (cleanup._launch_digest(_NONCE),),
+        ).fetchone()[0] == 1
+
+
 def test_natural_completion_racing_helper_uses_positive_receipt(tmp_path, monkeypatch):
     control, _state = _configure(tmp_path)
     scope = process_tree._current_task_process_scope()

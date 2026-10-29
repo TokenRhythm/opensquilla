@@ -694,7 +694,7 @@ export interface Platform {
    * undefined so the renderer falls back to navigator.language.
    */
   getOsLocale: () => Promise<string | undefined>
-  setNativeTheme: (payload: { source: 'light' | 'dark' | 'system' }) => Promise<unknown>
+  setNativeTheme: (payload: { source: 'light' | 'dark' | 'system'; palette?: Record<string, string> }) => Promise<unknown>
   /**
    * Whether THIS host applies updates natively (electron-updater). Web always
    * returns false; desktop returns the shell's live native-update capability,

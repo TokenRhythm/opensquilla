@@ -14,6 +14,16 @@ function session(raw: SessionRow): SessionItem {
 }
 
 describe('persisted project sidebar arrangement', () => {
+  it('keeps managed task roots flat while catalog membership is pending', () => {
+    const rows = arrangeSidebarSections([
+      session({ key: 'agent:main:webchat:ordinary', title: 'Ordinary', updatedAt: 3,
+        workspace: '/tasks/20300101-managed', workspaceLabel: '20300101-managed' }),
+      session({ key: 'agent:main:webchat:project-task', title: 'Project task', updatedAt: 2, workspaceId: 'project-a' }),
+      session({ key: 'agent:main:webchat:removed-task', title: 'Removed task', updatedAt: 1, workspaceId: 'removed' }),
+    ])[0].rows
+    expect(rows.map(row => [row.rowKind, row.key])).toEqual([['session', 'agent:main:webchat:ordinary']])
+  })
+
   it('keeps fixed projects first, includes empty projects, and leaves ordinary tasks last', () => {
     const projects: ProjectWorkspaceItem[] = [
       { id: 'project-b', name: 'Project B', path: '/repo/b', taskCount: 0, pinned: true, available: true },
@@ -74,7 +84,7 @@ describe('persisted project sidebar arrangement', () => {
     })
   })
 
-  it('keeps workspace-bound tasks visible while the canonical project list is unavailable', () => {
+  it('keeps workspace-bound tasks visible only in explicitly selected legacy mode', () => {
     const rows = arrangeSidebarSections([
       session({
         key: 'agent:main:webchat:project-task',
@@ -82,7 +92,7 @@ describe('persisted project sidebar arrangement', () => {
         updatedAt: 100,
         workspaceId: 'project-a',
       }),
-    ], undefined)[0].rows
+    ], { kind: 'legacy' })[0].rows
 
     expect(rows.map(row => row.key)).toContain('agent:main:webchat:project-task')
   })

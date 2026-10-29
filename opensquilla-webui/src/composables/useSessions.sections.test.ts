@@ -250,7 +250,7 @@ describe('arrangeSidebarSections — workspace grouping', () => {
         title: 'Session 4',
         updatedAt: 100,
       }),
-    ])
+    ], { kind: 'legacy' })
 
     expect(sectionFor(sections, 'chats').rows.map(r => ({
       rowKind: r.rowKind,
@@ -285,7 +285,7 @@ describe('arrangeSidebarSections — workspace grouping', () => {
         workspaceLabel: 'project',
         parent: { key: parentKey, taskId: 'task-workspace-child', spawnDepth: 1 },
       } as SessionRow),
-    ])
+    ], { kind: 'legacy' })
 
     expect(sectionFor(sections, 'chats').rows.map(r => ({
       rowKind: r.rowKind,

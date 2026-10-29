@@ -84,6 +84,7 @@ const props = withDefaults(defineProps<{
   sessionOrder?: string[]
   canManageProjects?: boolean
   canCreateProjects?: boolean
+  projectCatalogState?: 'ready' | 'loading' | 'unavailable'
 }>(), {
   sessionOrder: () => [],
   loadingMore: false,
@@ -91,6 +92,7 @@ const props = withDefaults(defineProps<{
   hasMore: false,
   canManageProjects: false,
   canCreateProjects: false,
+  projectCatalogState: 'ready',
 })
 
 const emit = defineEmits<{
@@ -227,8 +229,7 @@ function projectCollapseKey(identity: string): string {
 
 /**
  * The persisted project catalog normally gives rows a stable workspace id.
- * During startup, on older gateways, and for non-owner sessions the sidebar
- * can temporarily use its path-only compatibility projection instead. Keep
+ * An explicitly selected legacy projection can use a path-only identity. Keep
  * both identities when available: a compatibility header can be path-only
  * while its session rows already carry the catalog id (or the reverse).
  */
@@ -386,7 +387,7 @@ const displayBlocks = computed<SidebarDisplayBlock[]>(() => {
       showHeading: true,
     })
   }
-  if (props.canManageProjects || projection.projectCount > 0) {
+  if (props.canManageProjects || projection.projectCount > 0 || props.projectCatalogState !== 'ready') {
     blocks.push({
       key: 'projects',
       zone: 'projects',
@@ -1303,6 +1304,7 @@ watch(() => sidebarVirtualizer.hasRow(pointerDrag.value?.key || ''), present => 
       || totalRows > 0
       || displayProjection.projectCount > 0
       || props.canManageProjects
+      || props.projectCatalogState !== 'ready'
     "
     class="sidebar-section sidebar-history"
     :class="{
@@ -1445,7 +1447,7 @@ watch(() => sidebarVirtualizer.hasRow(pointerDrag.value?.key || ''), present => 
           :data-sidebar-zone-heading="block.zone"
         >
           <span class="sidebar-zone-heading__label">{{ block.label }}</span>
-          <span class="sidebar-zone-heading__count">{{ block.count }}</span>
+          <span v-if="block.zone !== 'projects' || props.projectCatalogState === 'ready'" class="sidebar-zone-heading__count">{{ block.count }}</span>
           <button
             v-if="
               block.zone === 'projects'
@@ -1474,6 +1476,9 @@ watch(() => sidebarVirtualizer.hasRow(pointerDrag.value?.key || ''), present => 
           </button>
         </div>
 
+        <div v-if="block.zone === 'projects' && props.projectCatalogState !== 'ready'" class="sidebar-zone-empty" role="status">
+          {{ t(props.projectCatalogState === 'loading' ? 'sessions.loading' : 'workspaces.catalogUnavailable') }}
+        </div>
         <button
           v-if="block.showFamilyHeader && block.family"
           type="button"
@@ -1486,7 +1491,7 @@ watch(() => sidebarVirtualizer.hasRow(pointerDrag.value?.key || ''), present => 
           <span class="sidebar-group__label">{{ block.familyLabel }}</span>
           <span class="sidebar-group__count">{{ block.rows.length }}</span>
         </button>
-        <div v-if="block.zone === 'recents' && block.rows.length === 0" class="sidebar-zone-empty">
+        <div v-if="block.zone === 'recents' && block.rows.length === 0 && props.projectCatalogState === 'ready'" class="sidebar-zone-empty">
           <div class="sidebar-zone-empty__body">{{ t('shared.sidebar.noConversations') }}</div>
         </div>
         </div>
