@@ -394,6 +394,7 @@ class OllamaProvider:
         rejected_argument_ids: set[str] = set()
         candidate_call_key = 0
         saw_done = False
+        done_stop_reason = "stop"
 
         try:
             async with httpx.AsyncClient(
@@ -690,6 +691,8 @@ class OllamaProvider:
                         # Final chunk carries usage stats
                         if chunk.get("done") is True:
                             saw_done = True
+                            if chunk.get("done_reason") == "length":
+                                done_stop_reason = "length"
                             input_tokens = chunk.get("prompt_eval_count", 0)
                             output_tokens = chunk.get("eval_count", 0)
                             break
@@ -770,7 +773,7 @@ class OllamaProvider:
                             "input_tokens": input_tokens,
                             "output_tokens": output_tokens,
                         },
-                        stop_reason="stop",
+                        stop_reason=done_stop_reason,
                         actual_model=self._model,
                         assistant_text="".join(assistant_text_parts),
                         tool_calls=[
@@ -784,7 +787,7 @@ class OllamaProvider:
                         ],
                     )
                     yield DoneEvent(
-                        stop_reason="stop",
+                        stop_reason=done_stop_reason,
                         input_tokens=input_tokens,
                         output_tokens=output_tokens,
                         model=self._model,
