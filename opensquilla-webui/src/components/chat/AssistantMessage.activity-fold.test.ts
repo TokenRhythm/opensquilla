@@ -1970,3 +1970,176 @@ describe('AssistantMessage activity disclosure', () => {
     expect(el.querySelector('.msg-ai-text')?.textContent).toBe('Canonical answer')
   })
 })
+
+describe('incomplete terminal activity', () => {
+  it.each([1, 2])('keeps %i committed calls ordered and moves aggregate reasoning outside chronology', async callCount => {
+    const texts = ['First narration.', 'Second narration.'].slice(0, callCount)
+    const committedReasoning = ['First reasoning.', 'Second reasoning.'].slice(0, callCount).join('\n')
+    const timelineItems: ChatStreamTimelineItem[] = texts.flatMap((rawText, index) => [
+      { type: 'text' as const, key: `narration-${index}`, html: rawText, rawText, presentation: 'intermediate' as const },
+      timelineGroup(successfulCall(`call-${index + 1}`, 'record')),
+    ])
+    const el = mountMessage(baseMessage({
+      text: '', timelineItems,
+      reasoning: { text: committedReasoning, seconds: 0 },
+      reasoningBlocks: [
+        { id: 'live-failed', index: callCount, text: 'Uncommitted failed reasoning.', status: 'error', startedAt: 1, contentKind: 'reasoning', activityOrder: 50 },
+      ],
+      parts: [{ type: 'reasoning', key: 'reasoning', text: 'Stale optimistic reasoning.', seconds: 60 }],
+      statusHistory: [],
+      activitySnapshotIncomplete: true,
+      activitySnapshot: { version: 2, taskId: 'task', turnId: 'turn', complete: false, entries: [] },
+      terminalFailure: true,
+    }))
+    await nextTick()
+
+    const summary = el.querySelector('.assistant-reasoning-summary')!
+    expect(summary.querySelector('summary')?.textContent).toBe('Reasoning summary · order not recorded')
+    expect(summary.querySelector('.thinking-block__body')?.textContent).toBe(committedReasoning)
+    expect(summary.closest('.assistant-activity')).toBeNull()
+    expect(summary.querySelector('[data-activity-entry]')).toBeNull()
+    expect(summary.querySelector('.thinking-fold--timeline-phase')).toBeNull()
+    expect(el.querySelector('[data-activity-type="reasoning"]')).toBeNull()
+    expect(el.textContent).not.toContain('Uncommitted failed reasoning.')
+    expect(el.textContent).not.toContain('Stale optimistic reasoning.')
+    expect(el.textContent).not.toContain('60s')
+    expect(el.querySelectorAll('.tool-row')).toHaveLength(callCount)
+    const transcriptNodes = [...el.querySelectorAll('.activity-narration, .tool-row')]
+    expect(transcriptNodes.map(node => node.textContent)).toEqual(
+      texts.flatMap(text => [text, 'Tool callrecord']),
+    )
+    expect(el.querySelector('.assistant-answer')).toBeNull()
+  })
+
+  it('keeps unsequenced provider events separate from text, tools and the reasoning summary', async () => {
+    const el = mountMessage(baseMessage({
+      text: 'Canonical answer',
+      reasoning: { text: 'Committed reasoning.', seconds: 0 },
+      timelineItems: [
+        { type: 'text', key: 'before', html: 'Before tool.', rawText: 'Before tool.', presentation: 'intermediate' },
+        timelineGroup(successfulCall('call-1', 'record')),
+        { type: 'text', key: 'after', html: 'After tool.', rawText: 'After tool.', presentation: 'intermediate' },
+        timelineGroup(successfulCall('call-2', 'record')),
+      ],
+      statusHistory: [
+        { action: 'provider:fallback', label: 'Switching to backup model', at: 20000 },
+        { action: 'write:2', label: 'Writing reply', at: 21000 },
+      ],
+      activitySnapshotIncomplete: true,
+      terminalFailure: true,
+    }))
+    await nextTick()
+
+    const events = el.querySelector('.assistant-activity-unordered-events')!
+    expect(events.querySelector('.assistant-activity-status__row')).not.toBeNull()
+    expect(events.textContent).toContain('order relative to transcript unavailable')
+    expect(events.textContent).not.toContain('Answer composition')
+    expect(events.closest('.assistant-activity')).toBeNull()
+    expect(el.querySelector('.assistant-activity .assistant-activity-status__row')).toBeNull()
+    const transcript = [...el.querySelectorAll('.assistant-activity .activity-narration, .assistant-activity .tool-row')]
+    expect(transcript.map(node => node.textContent)).toEqual(['Before tool.', 'Tool callrecord', 'After tool.', 'Tool callrecord'])
+    expect(el.querySelector('.assistant-answer')?.textContent).toBe('Canonical answer')
+  })
+
+  it.each([undefined, false])('preserves the existing reasoning timeline when incomplete is %s', async activitySnapshotIncomplete => {
+    const el = mountMessage(baseMessage({ activitySnapshotIncomplete }))
+    await nextTick()
+    expect(el.querySelector('.assistant-reasoning-summary')).toBeNull()
+    expect(el.querySelector('.assistant-activity .thinking-fold--timeline-phase')).not.toBeNull()
+  })
+})
+
+describe('terminal activity compatibility boundaries', () => {
+  it('separates the reasoning summary for persisted successful calls followed by a partial failure', async () => {
+    const { activitySnapshotMatchesMessage, normalizeActivitySnapshot } = await import('@/utils/chat/activitySnapshot')
+    const first = successfulCall('call-1', 'record_one')
+    const second = successfulCall('call-2', 'record_two')
+    const aggregate = 'first text.second text.'
+    const snapshot = normalizeActivitySnapshot({
+      version: 2, task_id: 'task', turn_id: 'turn', complete: false, reasoning_utf16_length: 48,
+      entries: [
+        { type: 'reasoning', id: 'r1', order: 4, block_index: 0, started_at: 1000, ended_at: 2000, status: 'completed', content_kind: 'reasoning', text_start_utf16: 0, text_end_utf16: 15 },
+        { type: 'segment', id: 'text:0', order: 8, segment_type: 'text', text_index: 0, text_utf16_length: 11, at: 2000, ended_at: 2000 },
+        { type: 'segment', id: 'tool:call-1', order: 9, segment_type: 'tool', tool_use_id: 'call-1', name: 'record_one', started_at: 3000, ended_at: 4000, is_error: false },
+        { type: 'reasoning', id: 'r2', order: 16, block_index: 1, started_at: 5000, ended_at: 6000, status: 'completed', content_kind: 'reasoning', text_start_utf16: 16, text_end_utf16: 32 },
+        { type: 'segment', id: 'text:1', order: 20, segment_type: 'text', text_index: 1, text_utf16_length: 12, at: 6000, ended_at: 6000 },
+        { type: 'segment', id: 'tool:call-2', order: 21, segment_type: 'tool', tool_use_id: 'call-2', name: 'record_two', started_at: 7000, ended_at: 8000, is_error: false },
+        { type: 'reasoning', id: 'r3', order: 28, block_index: 2, started_at: 9000, ended_at: 10000, status: 'completed', content_kind: 'reasoning', text_start_utf16: 33, text_end_utf16: 48 },
+        { type: 'segment', id: 'text:2', order: 32, segment_type: 'text', text_index: 2, text_utf16_length: 11, at: 10000, ended_at: 10000 },
+      ],
+    })!
+    const reasoning = { text: 'first reasoning\nsecond reasoning', seconds: 0 }
+    const message = baseMessage({
+      text: aggregate, reasoning, statusHistory: [], terminalFailure: true,
+      activitySnapshot: snapshot, activitySnapshotIncomplete: true,
+      parts: [{ type: 'reasoning', key: 'reasoning', ...reasoning }],
+      timelineItems: [
+        { type: 'text', key: 'text-1', rawText: 'first text.', html: 'first text.', presentation: 'intermediate' },
+        timelineGroup(first),
+        { type: 'text', key: 'text-2', rawText: 'second text.', html: 'second text.', presentation: 'intermediate' },
+        timelineGroup(second),
+        { type: 'text', key: 'aggregate', rawText: aggregate, html: aggregate, presentation: 'answer' },
+      ],
+    })
+    expect(activitySnapshotMatchesMessage(snapshot, {
+      role: 'assistant', text: aggregate, ts: null, reasoning,
+    })).toBe(false)
+    const el = mountMessage(message)
+    await nextTick()
+    expect([...el.querySelectorAll('.tool-row')].map(row => row.textContent))
+      .toEqual(['Tool callrecord_one', 'Tool callrecord_two'])
+    const summary = el.querySelector('.assistant-reasoning-summary')!
+    expect(summary.closest('.assistant-activity')).toBeNull()
+    expect(summary.textContent).toContain('order not recorded')
+    expect(summary.querySelector('.thinking-block__body')?.textContent).toBe(reasoning.text)
+    expect(el.querySelector('[data-activity-type="reasoning"]')).toBeNull()
+    expect(el.textContent).not.toContain('third reasoning')
+    expect(el.textContent).not.toContain('third text.')
+    expect(el.querySelector('.assistant-answer')?.textContent).toBe(aggregate)
+  })
+
+  it('keeps live reasoning visible until an incomplete turn settles', async () => {
+    const el = mountMessage(baseMessage({ isStreaming: true, activitySnapshotIncomplete: true }))
+    await nextTick()
+    expect(el.querySelector('.assistant-reasoning-summary')).toBeNull()
+    expect(el.querySelector('.thinking-fold__body')?.textContent).toBe('Checked the available evidence.')
+  })
+})
+
+describe('unordered reasoning summary share contract', () => {
+  it.each([false, true])('exports the summary as static text only when expanded is %s', async expanded => {
+    const { buildShareDom } = await import('@/composables/chat/useChatShareExport')
+    const el = mountMessage(baseMessage({
+      text: 'Answer', reasoning: { text: 'Committed reasoning.', seconds: 0 },
+      activitySnapshotIncomplete: true, statusHistory: [], timelineItems: [],
+    }))
+    await nextTick()
+    const summary = el.querySelector<HTMLDetailsElement>('.assistant-reasoning-summary')!
+    if (expanded) {
+      summary.querySelector<HTMLElement>('summary')!.click()
+      await vi.waitFor(() => expect(summary.dataset.shareExpanded).toBe('true'))
+    }
+    const stage = buildShareDom([el])
+    expect(stage.querySelector('.assistant-reasoning-summary')).toBeNull()
+    if (expanded) {
+      expect(stage.querySelector('.chat-share-export-activity__label')?.textContent)
+        .toBe('Reasoning summary · order not recorded')
+      expect(stage.querySelector('.chat-share-export-activity__body')?.textContent)
+        .toBe('Committed reasoning.')
+    } else {
+      expect(stage.textContent).not.toContain('Committed reasoning.')
+    }
+  })
+
+  it('does not use stale live parts or blocks when no committed aggregate exists', async () => {
+    const el = mountMessage(baseMessage({
+      activitySnapshotIncomplete: true, reasoning: undefined,
+      reasoningBlocks: [{ id: 'failed', index: 0, text: 'Uncommitted reasoning.', status: 'error', startedAt: 1, contentKind: 'reasoning' }],
+      parts: [{ type: 'reasoning', key: 'failed', text: 'Uncommitted reasoning.', seconds: 8 }],
+    }))
+    await nextTick()
+    expect(el.querySelector('.assistant-reasoning-summary')).toBeNull()
+    expect(el.querySelector('.thinking-fold')).toBeNull()
+    expect(el.textContent).not.toContain('Uncommitted reasoning.')
+  })
+})

@@ -109,7 +109,9 @@ export function mergeLiveOnlyFields(
   if (serverSeconds <= 0 && (prev.reasoning?.seconds ?? 0) > 0) {
     if (server.reasoning) {
       merged.reasoning = { ...server.reasoning, seconds: prev.reasoning!.seconds }
-    } else if (!contentRevisionChanged) {
+    } else if (!contentRevisionChanged && !server.activitySnapshotIncomplete) {
+      // An incomplete terminal record can omit uncommitted failed-call text.
+      // Its absent aggregate must not be refilled from the optimistic stream.
       merged.reasoning = prev.reasoning
     }
   }

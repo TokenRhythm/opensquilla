@@ -4398,7 +4398,9 @@
       "stale": "Still working — no recent signal",
       "liveStep": "step {n}",
       "phaseElapsed": "Current step {duration}",
-      "recordIncomplete": "Activity record incomplete; showing the compatible history view."
+      "recordIncomplete": "Activity record incomplete; showing the compatible history view.",
+      "reasoningOrderUnavailable": "Reasoning summary · order not recorded",
+      "eventsOrderUnavailable": "Model events · order relative to transcript unavailable"
     },
     "missingCitationSources": "Some citations do not map to available sources: {citations}",
     "suggestedTasks": "Suggested tasks",
