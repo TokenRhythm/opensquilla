@@ -4966,7 +4966,10 @@ async def test_windows_job_kills_descendant_after_direct_leader_exits(tmp_path) 
         "import os\n"
         "import pathlib\n"
         "import time\n"
-        f"pathlib.Path({str(child_pid)!r}).write_text(str(os.getpid()))\n"
+        f"pid_file = pathlib.Path({str(child_pid)!r})\n"
+        "pending = pid_file.with_suffix('.pending')\n"
+        "pending.write_text(str(os.getpid()), encoding='utf-8')\n"
+        "pending.replace(pid_file)\n"
         "time.sleep(30)\n",
         encoding="utf-8",
     )
