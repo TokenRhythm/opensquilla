@@ -19,11 +19,19 @@ const source = ts.createSourceFile(
   ts.ScriptTarget.Latest, true, ts.ScriptKind.JS,
 )
 const functions = []
+const productionQuitNames = new Set([
+  'quitOwnedGateway', 'terminateOwnedGatewayForQuit',
+  'confirmOwnedGatewayProcessCleanup', 'drainOwnedGatewayForLegacyQuit',
+])
+const productionQuitFunctions = []
 let beforeQuitHandler
 function collect(node) {
   if (ts.isFunctionDeclaration(node)
     && ['showDesktopQuitFailure', 'forceOwnedGatewayForQuit', 'terminateGatewayProcess'].includes(node.name?.text)) {
     functions.push(node.getText(source))
+  }
+  if (ts.isFunctionDeclaration(node) && productionQuitNames.has(node.name?.text)) {
+    productionQuitFunctions.push(node.getText(source))
   }
   if (ts.isCallExpression(node) && node.expression.getText(source) === 'app.on'
     && ts.isStringLiteral(node.arguments[0]) && node.arguments[0].text === 'before-quit') {
@@ -33,10 +41,11 @@ function collect(node) {
 }
 collect(source)
 assert.equal(functions.length, 3)
+assert.equal(productionQuitFunctions.length, productionQuitNames.size)
 assert.ok(beforeQuitHandler)
 const flush = () => new Promise(resolve => setImmediate(resolve))
 
-async function scenario(run, { platform = 'darwin', exited = false, dev = false } = {}) {
+async function scenario(run, { platform = 'darwin', exited = false, dev = false, productionQuit = false } = {}) {
   let now = 0
   let budgets = 0
   const calls = { exits: [], signals: [], errors: [], logs: [], drains: 0, prevented: 0 }
@@ -78,6 +87,7 @@ async function scenario(run, { platform = 'darwin', exited = false, dev = false 
   }
   const beforeQuit = new Function('env', `with (env) {
     ${functions.join('\n')}
+    ${productionQuit ? productionQuitFunctions.join('\n') : ''}
     return ${beforeQuitHandler}
   }`)(env)
   const request = () => beforeQuit({ preventDefault: () => { calls.prevented += 1 } })
@@ -91,7 +101,7 @@ async function scenario(run, { platform = 'darwin', exited = false, dev = false 
   }
   mock.timers.enable({ apis: ['setTimeout'] })
   try {
-    await run({ child, launch, calls, env, request, advance, budgets: () => budgets })
+    await run({ child, launch, calls, env, request, advance, budgets: () => budgets, now: () => now })
   } finally { mock.timers.reset() }
 }
 
@@ -152,6 +162,188 @@ for (const exited of [false, true]) {
     'Quit reaps an earlier taskkill operation before root fallback, including an exited root')
     assert.deepEqual(h.calls.exits, [0])
   }, { platform: 'win32', exited })
+}
+
+// Retain the production unsupported-peer branch as well as the outer Quit
+// handler. A mocked quitOwnedGateway cannot expose a legacy drain that spends
+// the tree-termination allowance waiting for the launcher to exit.
+function legacyQuitRuntime(h, { request = 'accepted', helperHangs = false } = {}) {
+  const treeCalls = []
+  const exitWaiters = new Set()
+  let descendantAlive = true
+  let shutdownRequests = 0
+  const finishRoot = signal => {
+    h.child.signalCode = signal
+    for (const resolve of [...exitWaiters]) resolve(true)
+  }
+  h.child.kill = signal => {
+    h.calls.signals.push(['child', signal])
+    finishRoot(signal)
+    return true
+  }
+  h.env.quitUnconfirmedProcessTrees.clear()
+  if (h.env.process.platform === 'win32') h.env.gatewayProcessCleanupContexts.clear()
+  Object.assign(h.env, {
+    quitGatewayWithinBudget,
+    ownedGatewayRecord: child => {
+      assert.equal(child, h.child)
+      return { instanceNonce: h.launch.instanceNonce }
+    },
+    requestVerifiedDesktopGatewayQuit: async () => {
+      h.calls.drains += 1
+      return { kind: 'unsupported' }
+    },
+    requestOwnedGatewayShutdown: async () => {
+      shutdownRequests += 1
+      if (request === 'throw') throw new Error('synthetic legacy shutdown transport failure')
+      if (request === 'request-hang') return new Promise(() => {})
+      return Promise.resolve(request !== 'rejected')
+    },
+    waitForGatewayProcessExit: (child, timeoutMs = 80_000) => {
+      assert.equal(child, h.child)
+      if (h.env.hasGatewayProcessExited(child)) return Promise.resolve(true)
+      return new Promise(resolve => {
+        const complete = exited => {
+          clearTimeout(timer)
+          exitWaiters.delete(complete)
+          resolve(exited)
+        }
+        const timer = setTimeout(() => complete(false), timeoutMs)
+        exitWaiters.add(complete)
+      })
+    },
+    terminateWindowsProcessTree: options => {
+      treeCalls.push({ at: h.now(), timeoutMs: options.timeoutMs })
+      assert.equal(h.env.hasGatewayProcessExited(h.child), false,
+        'the retained launcher must remain live until tree termination starts')
+      assert.deepEqual(h.calls.signals, [], 'never kill only the launcher before its descendants')
+      return terminateWindowsProcessTree({ ...options, spawnProcess: (command, args, settings) => {
+        assert.equal(command, 'taskkill')
+        assert.deepEqual(args, ['/pid', String(h.child.pid), '/t', '/f'])
+        assert.equal(settings.windowsHide, true)
+        const killer = Object.assign(new EventEmitter(), {
+          exitCode: null, signalCode: null,
+          kill(signal) {
+            h.calls.signals.push(['taskkill-helper', signal])
+            this.signalCode = signal
+            return true
+          },
+        })
+        if (!helperHangs) setTimeout(() => {
+          descendantAlive = false
+          finishRoot('SIGKILL')
+          killer.exitCode = 0
+          killer.emit('exit', 0, null)
+        }, 100)
+        return killer
+      } })
+    },
+    hardTerminateGatewayProcess: () => assert.fail('ordinary legacy Quit must use its shared tree budget'),
+    clearKnownOwnedGatewayPidFile: async () => {},
+    GATEWAY_HARD_KILL_BACKSTOP_MS: 5_000,
+    GATEWAY_SHUTDOWN_KILL_AFTER_MS: 75_000,
+  })
+  return {
+    treeCalls,
+    shutdownRequests: () => shutdownRequests,
+    descendantAlive: () => descendantAlive,
+    finishGracefully: () => { descendantAlive = false; finishRoot('SIGTERM') },
+  }
+}
+
+for (const request of ['accepted', 'rejected', 'throw', 'request-hang']) {
+  await scenario(async h => {
+    const runtime = legacyQuitRuntime(h, { request })
+    h.request()
+    await flush()
+    assert.equal(runtime.shutdownRequests(), 1)
+    if (request === 'accepted' || request === 'request-hang') {
+      await h.advance(9_999)
+      assert.deepEqual(runtime.treeCalls, [])
+      assert.deepEqual(h.calls.exits, [])
+      await h.advance(1)
+      assert.deepEqual(runtime.treeCalls, [{ at: 10_000, timeoutMs: 5_000 }],
+        `${request}: reserve the final five seconds for the retained Windows process tree`)
+    } else {
+      assert.equal(runtime.treeCalls.length, 1, `${request}: failed legacy shutdown must still clean the owned tree`)
+      assert.equal(runtime.treeCalls[0].at, 0)
+      assert.equal(runtime.treeCalls[0].timeoutMs, 15_000)
+    }
+    assert.deepEqual(h.calls.exits, [], 'wait for the tree helper before exiting Electron')
+    await h.advance(100)
+    await h.env.quitGatewayDrainPromise
+    await flush()
+    assert.equal(runtime.descendantAlive(), false)
+    assert.equal(h.env.hasGatewayProcessExited(h.child), true)
+    assert.deepEqual(h.calls.signals, [], 'successful tree cleanup needs no direct launcher fallback')
+    assert.deepEqual(h.calls.exits, [0])
+    assert.equal(h.calls.drains, 1)
+    assert.deepEqual(h.calls.logs.filter(row => row.event === 'quit_finalize_failed'), [])
+  }, { platform: 'win32', dev: true, productionQuit: true })
+}
+
+await scenario(async h => {
+  const runtime = legacyQuitRuntime(h)
+  h.request()
+  await flush()
+  await h.advance(1_000)
+  runtime.finishGracefully()
+  await h.env.quitGatewayDrainPromise
+  await flush()
+  assert.deepEqual(runtime.treeCalls, [], 'a fast legacy graceful exit needs no taskkill')
+  assert.deepEqual(h.calls.signals, [])
+  assert.deepEqual(h.calls.exits, [0])
+}, { platform: 'win32', dev: true, productionQuit: true })
+
+await scenario(async h => {
+  const runtime = legacyQuitRuntime(h, { helperHangs: true })
+  h.request()
+  await flush()
+  await h.advance(10_000)
+  assert.deepEqual(runtime.treeCalls, [{ at: 10_000, timeoutMs: 5_000 }])
+  await h.advance(4_999)
+  assert.deepEqual(h.calls.exits, [])
+  await h.advance(1)
+  await h.env.quitGatewayDrainPromise
+  await flush()
+  assert.deepEqual(h.calls.exits, [0], 'a wedged taskkill still cannot exceed the total Quit deadline')
+  assert.deepEqual(h.calls.signals, [['taskkill-helper', 'SIGKILL'], ['child', 'SIGKILL']])
+  assert.equal(runtime.descendantAlive(), true, 'root fallback is not evidence that descendants exited')
+  assert.equal(h.env.quitUnconfirmedProcessTrees.has(h.child), true)
+}, { platform: 'win32', dev: true, productionQuit: true })
+
+for (const platform of ['darwin', 'linux', 'win32']) {
+  await scenario(async h => {
+    const runtime = legacyQuitRuntime(h)
+    h.env.quitFromSignal = true
+    h.request()
+    await flush()
+    await h.advance(15_000)
+    assert.deepEqual(h.calls.exits, [], 'signal-triggered legacy shutdown retains its full graceful drain')
+    assert.deepEqual(runtime.treeCalls, [])
+    runtime.finishGracefully()
+    await h.env.quitGatewayDrainPromise
+    await flush()
+    assert.deepEqual(h.calls.exits, [0])
+    assert.deepEqual(h.calls.signals, [])
+  }, { platform, dev: true, productionQuit: true })
+}
+
+for (const platform of ['darwin', 'linux']) {
+  await scenario(async h => {
+    const runtime = legacyQuitRuntime(h)
+    h.request()
+    await flush()
+    await h.advance(10_000)
+    assert.deepEqual(runtime.treeCalls, [], 'POSIX legacy drain retains its existing policy')
+    assert.deepEqual(h.calls.signals, [])
+    assert.deepEqual(h.calls.exits, [])
+    runtime.finishGracefully()
+    await h.env.quitGatewayDrainPromise
+    await flush()
+    assert.deepEqual(h.calls.exits, [0])
+    assert.deepEqual(h.calls.signals, [])
+  }, { platform, dev: true, productionQuit: true })
 }
 
 for (const failure of ['legacy-hang', 'helper-hang', 'throw', 'preview-throw', 'finalize-throw', 'diagnostic-throw']) {

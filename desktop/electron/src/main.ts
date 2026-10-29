@@ -16541,7 +16541,24 @@ async function quitOwnedGateway(
       })
       return result
     },
-    legacyDrain: () => drainOwnedGatewayForLegacyQuit(child, '', true, true),
+    legacyDrain: async () => {
+      if (process.platform !== 'win32') return drainOwnedGatewayForLegacyQuit(child, '', true, true)
+      if (hasGatewayProcessExited(child)) return true
+      // A Windows dev child is the uv launcher, not the Python Gateway. Keep
+      // the legacy handshake, but reserve time for taskkill before the outer
+      // Quit deadline falls back to terminating only that direct child.
+      const request = await budget.cleanup(requestOwnedGatewayShutdown(child, '').catch(() => false))
+      const accepted = request.completed && request.value
+      desktopLog('quit_gateway_shutdown_requested', { accepted, alreadyStopping: false })
+      if (accepted && !hasGatewayProcessExited(child)) {
+        await budget.cleanup(waitForGatewayProcessExit(child, budget.remainingCleanupMs))
+      }
+      if (hasGatewayProcessExited(child)) return true
+      cleanupAttempted = true
+      setAppExitPhase('terminating', 'legacy Windows quit cleanup deadline reached')
+      const terminated = await budget.termination(terminateOwnedGatewayForQuit(child, budget))
+      return terminated.completed && terminated.value
+    },
     waitForExit: timeoutMs => waitForGatewayProcessExit(child, timeoutMs),
     terminate: () => {
       cleanupAttempted = true
