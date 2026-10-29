@@ -19,6 +19,7 @@ const recoveryRequired = computed(() => account.state?.status === 'storage_unava
   && ['ACCOUNT_LOCAL_KEY_MISSING', 'ACCOUNT_LOCAL_KEY_INVALID', 'ACCOUNT_LOCAL_DATA_INVALID'].includes(account.state?.errorCode || ''))
 const errorText = computed(() => failure.value && te(`account.errors.${failure.value}`) ? t(`account.errors.${failure.value}`) : t('account.errors.generic'))
 const wallet = computed(() => account.state?.wallet)
+const refreshing = computed(() => account.refreshing || account.state?.walletStatus === 'loading')
 const walletUpdatedAt = computed(() => {
   const date = new Date(wallet.value?.asOf || '')
   if (Number.isNaN(date.getTime())) return '—'
@@ -77,7 +78,7 @@ onMounted(() => { void account.init() })
         <div class="account-balance__footer">
           <div class="account-balance__updated">
             <p v-if="wallet" class="control-section__desc">{{ t('account.asOf') }} {{ walletUpdatedAt }}</p>
-            <button type="button" class="account-refresh" :disabled="account.busy" :aria-label="t('account.refresh')" :title="t('account.refresh')" @click="act('refresh')">
+            <button type="button" class="account-refresh" :disabled="account.busy || refreshing" :aria-busy="refreshing" :aria-label="t('account.refresh')" :title="t('account.refresh')" @click="act('refresh')">
               <Icon name="refresh" :size="14" aria-hidden="true" />
             </button>
           </div>
@@ -127,7 +128,7 @@ onMounted(() => { void account.init() })
 .account-refresh { position: relative; display: inline-grid; place-items: center; width: 16px; height: 16px; padding: 0; border: 0; background: transparent; color: var(--text-muted); cursor: pointer; }
 .account-refresh::before { content: ''; position: absolute; inset: -4px; }
 .account-refresh:hover { color: var(--text); }
-.account-refresh:disabled { cursor: not-allowed; opacity: var(--state-disabled-opacity); }
+.account-refresh:disabled { cursor: wait; }
 .account-more-info:focus-visible, .account-refresh:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; border-radius: var(--radius-sm); }
 .account-actions--wallet { margin-left: auto; }
 .account-error { color: var(--danger); font-size: var(--fs-sm); }

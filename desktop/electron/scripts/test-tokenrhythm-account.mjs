@@ -195,6 +195,39 @@ test('old absolute same-origin links remain compatible and invalid links never o
 })
 test('cancel and timeout never establish a session',async t=>{const f=await fixture(t,{loginTimeoutMs:20});await f.account.login();await until(()=>f.account.snapshot().status==='signed_out');assert.equal(f.account.snapshot().errorCode,'ACCOUNT_LOGIN_TIMEOUT');await f.account.login();f.account.cancel();assert.equal(f.account.snapshot().status,'signed_out');assert.equal(f.calls.length,0)})
 test('wallet and key errors preserve valid login',async t=>{const f=await fixture(t,{walletFailure:true,keyFailure:true});await f.login();assert.equal(f.account.snapshot().status,'signed_in');assert.equal(f.account.snapshot().walletStatus,'error');assert.equal(f.account.snapshot().wallet,null);await assert.rejects(()=>f.account.selectSource('account'));f.env.walletFailure=false;f.env.keyFailure=false;await f.account.retryKey();assert.equal(f.account.snapshot().keyStatus,'ready');await f.account.selectSource('account')})
+test('scheduled and manual wallet refreshes retain balances and only mark real failures stale', async t => {
+ let holdWallet = false, release
+ const f = await fixture(t, { beforeFetch: async url => {
+  if (holdWallet && new URL(url).pathname.endsWith('/wallet')) await new Promise(resolve => { release = resolve })
+ } })
+ await f.login()
+ const wallet = f.account.snapshot().wallet
+ const events = []
+ f.deps.onState = state => events.push(state)
+ for (const force of [false, true]) {
+  f.advance(60_000)
+  holdWallet = true; release = undefined; events.length = 0
+  const refreshing = f.account.verify(force)
+  await until(() => Boolean(release))
+  assert.equal(f.account.snapshot().walletStatus, 'ready')
+  assert.deepEqual(f.account.snapshot().wallet, wallet)
+  assert.ok(events.every(state => state.status === 'signed_in' && state.walletStatus === 'ready' && !state.walletErrorCode))
+  release(); await refreshing
+  assert.ok(events.every(state => state.walletStatus === 'ready' && !state.walletErrorCode))
+ }
+ release = undefined; events.length = 0; f.env.walletFailure = true
+ const failing = f.account.verify(true)
+ await until(() => Boolean(release))
+ assert.equal(f.account.snapshot().walletStatus, 'ready')
+ release(); await failing
+ assert.equal(f.account.snapshot().walletStatus, 'stale')
+ assert.ok(f.account.snapshot().walletErrorCode)
+ assert.deepEqual(f.account.snapshot().wallet, wallet)
+ f.env.walletFailure = false; holdWallet = false
+ await f.account.verify(true)
+ assert.equal(f.account.snapshot().walletStatus, 'ready')
+ assert.equal(f.account.snapshot().walletErrorCode, null)
+})
 test('refresh is singleflight and atomically persisted',async t=>{const f=await fixture(t);await f.login();f.advance(40_000);await Promise.all([f.account.verify(true),f.account.verify(true),f.account.verify(true)]);assert.equal(f.refreshes,1);assert.ok(f.deps.decrypt(await readFile(join(f.directory,'account.enc'),'utf8')).includes('refresh-a-1'))})
 test('network loss keeps login but closes model authorization',async t=>{const f=await fixture(t);await f.login();await f.account.selectSource('account');const old=(await f.account.runtimeState()).credential;f.env.offline=true;await f.account.verify(true);assert.equal(f.account.snapshot().status,'unverified');await assert.rejects(()=>f.account.modelCredential(old));f.env.offline=false;await f.account.verify(true);assert.notEqual((await f.account.runtimeState()).credential,old)})
 test('logout preserves old binding, revokes only old session, and isolates video jobs',async t=>{const f=await fixture(t);await f.login();await f.account.selectSource('account');const lease=(await f.account.runtimeState()).credential;await f.account.recordVideoJob('video-a',lease);assert.ok(f.account.ownsVideoJob('video-a'));f.env.offline=true;await f.account.logout();assert.equal(f.account.snapshot().status,'signed_out');assert.equal(f.account.snapshot().source,'account');assert.equal(f.account.snapshot().selectedAccountId,'a');assert.equal(f.account.snapshot().pendingRevocation,true);await assert.rejects(()=>f.account.modelCredential(lease));f.env.offline=false;f.setIdentity('b');await f.login();assert.equal(f.account.snapshot().selectedAccountId,'a');assert.equal(f.account.ownsVideoJob('video-a'),false);const revoked=f.calls.filter(c=>c.path.endsWith('/session'));assert.ok(revoked.some(c=>c.headers.Authorization==='Bearer access-a'));assert.ok(!revoked.some(c=>c.headers.Authorization==='Bearer access-b'))})

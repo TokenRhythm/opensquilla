@@ -74,6 +74,30 @@ describe('account settings and source visibility',()=>{
   expect(document.querySelector('[role="dialog"]')).not.toBeNull()
   expect(mock.store.action).not.toHaveBeenCalled()
  })
+ it('keeps the account card and logout available during refresh without a wallet warning',async()=>{
+  const wallet={currency:'CNY',balances:{available:'27.97',recharge:'0',bonus:'27.97',debt:'0',frozen:'0'},asOf:new Date().toISOString()}
+  const el=await mount(SettingsAccountPanel,state({status:'signed_in',profile,keyStatus:'ready',walletStatus:'ready',wallet}))
+  const identity=el.querySelector('.account-identity')
+  const balance=el.querySelector('.account-wallet')
+  const logout=[...el.querySelectorAll('button')].find(button=>button.textContent==='退出登录')!
+  const refresh=el.querySelector<HTMLButtonElement>('.account-refresh')!
+  refresh.click();await nextTick()
+  expect(mock.store.action).toHaveBeenCalledWith('refresh')
+  mock.store.refreshing=true;await nextTick()
+  expect(refresh.disabled).toBe(true)
+  expect(refresh.getAttribute('aria-busy')).toBe('true')
+  expect(logout.disabled).toBe(false)
+  expect(el.querySelector('.account-identity')).toBe(identity)
+  expect(el.querySelector('.account-wallet')).toBe(balance)
+  expect(el.querySelector('.account-error')).toBeNull()
+  expect(el.textContent).toContain('¥27.97')
+  mock.store.refreshing=false;await nextTick()
+  expect(refresh.disabled).toBe(false)
+  expect(logout.disabled).toBe(false)
+  mock.store.state.walletStatus='stale';mock.store.state.walletErrorCode='ACCOUNT_NETWORK_UNAVAILABLE';await nextTick()
+  expect(el.textContent).toContain('暂时无法获取余额')
+  expect(el.textContent).toContain('¥27.97')
+ })
  it('hides account provider while signed out, disables activation before the key is ready',async()=>{
   const el=await mount(AccountProviderCard,state());expect(el.querySelector('[data-testid="account-provider"]')).toBeNull()
   mock.store.loggedIn=true;mock.store.state.profile=profile;mock.store.state.status='signed_in';await nextTick()

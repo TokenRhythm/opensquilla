@@ -63,8 +63,8 @@ const resultScript = `(() => {
 const resultStyles = `
 :root { color-scheme: light; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif; color: #17191c; background: #fff; -webkit-font-smoothing: antialiased; }
 * { box-sizing: border-box; }
-body { margin: 0; min-width: 280px; }
-main { width: min(400px, calc(100% - 40px)); margin: 0 auto; padding: clamp(80px, calc(45svh - 24px), 520px) 0 56px; text-align: center; }
+body { display: flex; flex-direction: column; margin: 0; min-width: 280px; min-height: 100vh; min-height: 100svh; padding: 24px 20px; }
+main { flex: none; width: min(400px, 100%); margin: auto; padding: 32px 0; text-align: center; }
 .brand { display: flex; align-items: center; justify-content: center; gap: 10px; flex-wrap: wrap; margin-bottom: 78px; }
 .wordmark { display: inline-flex; align-items: center; gap: 7px; font-size: 25px; font-weight: 650; letter-spacing: -1px; }
 .mark { width: 40px; height: 27px; flex: none; }
@@ -77,8 +77,8 @@ h1 { margin: 0; font-size: 19px; line-height: 28px; font-weight: 500; }
 .open-app:focus-visible { outline: 2px solid #5271ff; outline-offset: 4px; }
 [hidden] { display: none !important; }
 .hint { margin: 14px 0 0; min-height: 20px; color: #8a8f97; font-size: 12px; line-height: 20px; }
-@media (max-width: 600px) { main { padding-top: max(80px, 28svh); } .brand { margin-bottom: 60px; } .actions { margin-top: 56px; } }
-@media (max-height: 600px) { main { padding-top: 64px; } .brand { margin-bottom: 40px; } .actions { margin-top: 40px; } }
+@media (max-width: 600px) { .brand { margin-bottom: 60px; } .actions { margin-top: 56px; } }
+@media (max-height: 600px) { .brand { margin-bottom: 40px; } .actions { margin-top: 40px; } }
 `
 
 function resultPage(nonce: string, useProtocol: boolean, webReturnUrl: string): string {

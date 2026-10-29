@@ -524,7 +524,9 @@ export class TokenRhythmAccount {
     return this.verifyPromise
   }
   private async refreshWallet(epoch: number): Promise<void> {
-    this.publish({ walletStatus: this.state.wallet ? 'stale' : 'loading' })
+    // Keep the last result visible during revalidation. A cached wallet only
+    // becomes stale when a request actually fails, not when one starts.
+    if (!this.state.wallet) this.publish({ walletStatus: 'loading' })
     try {
       const raw = await this.resource('wallet')
       if (epoch !== this.epoch) return
