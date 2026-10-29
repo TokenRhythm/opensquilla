@@ -196,6 +196,7 @@ function makeEnvironment() {
     quitWriterAdmission: null, quitFromSignal: false, quitConfirmed: false, quitConfirmationPromise: null,
     quitConfirmationWantsExit: false, quitUnconfirmedProcessTrees: new Set(),
     gatewayProcessCleanupContexts: new Map(), gatewayProcessCleanupOperations: new WeakMap(),
+    gatewayProcessTreeTerminations: new Map(),
     gatewayHardTerminatedProcesses: new WeakSet(), gatewayProcessDiagnostics: new WeakMap(),
     desktopWriters: new DesktopWriterAdmission(), nativeWorkbenchSurfaces: manager,
     gatewayProcess: taskAlive() ? task : null, gatewayState: { status: 'ready', owned: true, url: 'synthetic://fixture', error: null },

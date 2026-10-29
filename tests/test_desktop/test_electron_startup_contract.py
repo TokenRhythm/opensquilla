@@ -3144,9 +3144,9 @@ def test_desktop_renderer_loss_revokes_artifact_preview_leases() -> None:
 
 
 def test_desktop_quit_drains_gateway_before_exit_on_every_platform() -> None:
-    # Every platform joins its owned children before exiting. Ordinary quit
-    # shares a cancellation budget with local cleanup; older peers and signals
-    # keep the complete legacy drain.
+    # Every platform attempts to join its owned children before exiting.
+    # Ordinary quit bounds all cleanup, including older peers; signals keep
+    # their complete legacy drain and require confirmed cleanup before exit.
     main_ts = _read("desktop/electron/src/main.ts")
 
     before_quit = _section(main_ts, "app.on('before-quit'", "function shutdownFromSignal")
@@ -3159,7 +3159,7 @@ def test_desktop_quit_drains_gateway_before_exit_on_every_platform() -> None:
     owned_gateway_quit = _section(
         before_quit,
         "if (children.length > 0",
-        "// Fail closed while",
+        "const drain = (signalQuit",
     )
     preview_create = _section(
         main_ts,
@@ -3191,7 +3191,9 @@ def test_desktop_quit_drains_gateway_before_exit_on_every_platform() -> None:
         "ipcMain.handle('desktop:workbench:surface:destroy'",
         "// ── Desktop data cleanup",
     )
-    assert "process.platform === 'win32'" not in before_quit
+    # Drain admission is shared by every platform; the finalizer may cancel
+    # platform-specific helpers after the shared cleanup has settled.
+    assert "process.platform === 'win32'" not in before_quit[:before_quit.index("const cleanup =")]
     assert "event.preventDefault()" in before_quit
     assert "requestOwnedGatewayShutdown(" in drain
     assert "waitForGatewayProcessExit(child)" in drain
@@ -3235,12 +3237,19 @@ def test_desktop_quit_drains_gateway_before_exit_on_every_platform() -> None:
     assert "if (quitGatewayDrainPromise)" in before_quit
     assert "...liveLifecycleOwnedGatewayProcesses()" in before_quit
     assert "gatewayProcessCleanupContexts.keys()" in before_quit
-    assert "Promise.all(children.map(child => quitFromSignal" in owned_gateway_quit
+    assert "const signalQuit = quitFromSignal" in owned_gateway_quit
+    assert (
+        "Promise.allSettled(children.map(child => Promise.resolve().then(() => signalQuit"
+        in owned_gateway_quit
+    )
     assert "drainOwnedGatewayForLegacyQuit(" in owned_gateway_quit
     assert "quitOwnedGateway(child, budget)" in owned_gateway_quit
     assert "const budget = new DesktopQuitBudget()" in owned_gateway_quit
     assert "artifactPreviewLeaseBroker.shutdown({ signal: budget.signal })" in owned_gateway_quit
-    assert "const surfaceCleanup = nativeWorkbenchSurfaces.destroyAll()" in owned_gateway_quit
+    assert (
+        "const surfaceCleanup = Promise.resolve().then(() => nativeWorkbenchSurfaces.destroyAll())"
+        in owned_gateway_quit
+    )
     assert owned_gateway_quit.index(
         "artifactPreviewLeaseBroker.shutdown("
     ) < owned_gateway_quit.index(
@@ -3251,11 +3260,18 @@ def test_desktop_quit_drains_gateway_before_exit_on_every_platform() -> None:
     )
     assert "await quitGatewayWithinBudget({" in bounded_quit
     assert "requestVerifiedDesktopGatewayQuit(record, { remainingMs })" in bounded_quit
-    assert "confirmExit: () => confirmOwnedGatewayProcessCleanup(child, budget)" in bounded_quit
+    confirm_exit = _section(bounded_quit, "confirmExit: () => {", "onLegacyDrain:")
+    assert "cleanupAttempted = true" in confirm_exit
+    assert "return confirmOwnedGatewayProcessCleanup(child, budget)" in confirm_exit
     assert (
         "budget.cleanup(Promise.allSettled([previewCleanup, surfaceCleanup]))" in owned_gateway_quit
     )
     assert "quitUnconfirmedProcessTrees.size === 0" in owned_gateway_quit
+    assert "results.every(result => result.status === 'fulfilled' && result.value)" in (
+        owned_gateway_quit
+    )
+    assert "liveLifecycleOwnedGatewayProcesses().length === 0" in owned_gateway_quit
+    assert "(signalQuit || gatewayProcessCleanupContexts.size === 0)" in owned_gateway_quit
     exit_admission_guard = "appExitPhase !== 'running'"
     assert exit_admission_guard in preview_create
     assert exit_admission_guard in preview_renew
@@ -3263,8 +3279,8 @@ def test_desktop_quit_drains_gateway_before_exit_on_every_platform() -> None:
     assert exit_admission_guard in surface_navigate
     assert exit_admission_guard not in preview_revoke
     assert exit_admission_guard not in surface_destroy
-    assert "if (exited)" in before_quit
-    assert before_quit.index("if (exited)") < before_quit.index("app.exit(0)")
+    assert "if (exited || !signalQuit)" in before_quit
+    assert before_quit.index("if (exited || !signalQuit)") < before_quit.index("app.exit(0)")
 
 
 def test_desktop_signal_quit_keeps_gateway_handle_for_before_quit_drain() -> None:
@@ -3373,16 +3389,50 @@ def test_desktop_update_drain_defers_user_quit_until_safe_handoff_or_retry() -> 
     assert "setImmediate(() => app.quit())" in restore
 
 
-def test_desktop_quit_failure_is_fail_closed_and_retryable() -> None:
+def test_desktop_quit_failure_exits_normally_but_signals_remain_fail_closed() -> None:
     main_ts = _read("desktop/electron/src/main.ts")
     before_quit = _section(main_ts, "app.on('before-quit'", "function shutdownFromSignal")
 
+    # The ordinary Quit deadline begins only after confirmation and protected
+    # writers (including import) settle. An updater still owns its handoff.
+    budget_start = before_quit.index("const budget = new DesktopQuitBudget()")
+    assert before_quit.index("if (updateApplying)") < budget_start
+    assert before_quit.index("if (holdQuitForTaskConfirmation(event)) return") < budget_start
+    writer_gate = _section(
+        before_quit,
+        "if (desktopWriters.activeCount > 0 || quitDeferredForDesktopWriters)",
+        "desktopLog('before_quit'",
+    )
+    assert "event.preventDefault()" in writer_gate
+    assert "quitWriterAdmission ??= desktopWriters.close('quit')" in writer_gate
+    assert "waitForDesktopWriterOperations().then(() => {" in writer_gate
+    assert "app.quit()" in writer_gate
+    assert "return\n  }" in writer_gate
+    assert before_quit.index("waitForDesktopWriterOperations()") < budget_start
+
+    # Legacy peers and rejected/hung cleanup share the ordinary Quit envelope;
+    # signals wait for complete cleanup and remain retryable on failure.
+    assert "const drain = (signalQuit ? cleanup : budget.termination(cleanup)" in before_quit
+    assert ".then(result => result.completed && result.value))" in before_quit
+    assert ".finally(() => budget.dispose())" in before_quit
     assert "quitUnconfirmedProcessTrees.size === 0" in before_quit
-    assert "if (exited)" in before_quit
-    assert before_quit.index("if (exited)") < before_quit.index("app.exit(0)")
-    failed_drain = _section(before_quit, "// Fail closed while", "return\n  }")
+    assert "if (finalized) return" in before_quit
+    assert before_quit.index("finalized = true") < before_quit.index("if (exited || !signalQuit)")
+    finalizer = _section(
+        before_quit, "if (exited || !signalQuit)", "quitGatewayDrainPromise = null"
+    )
+    assert "forceOwnedGatewayForQuit(child)" in finalizer
+    assert "cleanupConfirmed: exited" in finalizer
+    assert "setAppExitPhase('committed'" in finalizer
+    assert "desktopLog('quit_finalize_failed'" in finalizer
+    assert "finally {\n          app.exit(0)\n        }" in finalizer
+    assert "quitUnconfirmedProcessTrees.clear()" not in finalizer
+    assert "gatewayProcessCleanupContexts.clear()" not in finalizer
+    assert "gatewayProcessCleanupContexts.delete(" not in finalizer
+    failed_drain = _section(before_quit, "quitGatewayDrainPromise = null", "return\n  }")
     assert "quitGatewayDrainPromise = null" in failed_drain
     assert "showDesktopQuitFailure()" in failed_drain
+    assert "app.exit(" not in failed_drain
     failed = _section(main_ts, "function showDesktopQuitFailure", "app.on('before-quit'")
     assert "isQuitting = true" in failed
     assert "setAppExitPhase('failed'" in failed

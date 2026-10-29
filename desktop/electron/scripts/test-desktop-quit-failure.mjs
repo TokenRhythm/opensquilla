@@ -1,10 +1,16 @@
 import assert from 'node:assert/strict'
 import { readFileSync } from 'node:fs'
 import { EventEmitter } from 'node:events'
+import { join } from 'node:path'
 import { mock } from 'node:test'
+import { createContext, runInContext } from 'node:vm'
 import ts from '@typescript/typescript6'
 
-import { DesktopQuitBudget, quitGatewayWithinBudget } from '../dist/desktop-quit.js'
+import { DesktopQuitBudget, DesktopQuitConfirmation, quitGatewayWithinBudget } from '../dist/desktop-quit.js'
+import { buildDesktopQuitDialogHtml, normalizeDesktopQuitDialogPalette, parseDesktopQuitDialogResponse } from '../dist/desktop-quit-dialog.js'
+import { DesktopWriterAdmission } from '../dist/desktop-writer-admission.js'
+import { mainWindowCloseAction } from '../dist/desktop-window-lifecycle.js'
+import { normalizeGatewayLocale } from '../dist/desktop-locale.js'
 import { terminateWindowsProcessTree } from '../dist/windows-process-tree.js'
 
 // Execute production handlers without Electron or real process termination.
@@ -252,5 +258,62 @@ await scenario(async h => {
   assert.equal(h.calls.errors.length, 1)
   assert.deepEqual(h.calls.signals, [])
 })
+
+// Execute the native fixture's own host construction on every platform. A
+// separate unit-test environment cannot detect missing globals in that host.
+{
+  const nativeFixture = ts.createSourceFile('fixture.mjs', readFileSync(
+    new URL('./fixtures/desktop-quit-acceptance/main.mjs', import.meta.url), 'utf8',
+  ), ts.ScriptTarget.Latest, true, ts.ScriptKind.JS)
+  const environmentFactory = nativeFixture.statements.find(node =>
+    ts.isFunctionDeclaration(node) && node.name?.text === 'makeEnvironment')
+  const requiredDeclaration = nativeFixture.statements.filter(ts.isVariableStatement)
+    .flatMap(node => [...node.declarationList.declarations])
+    .find(node => node.name.getText(nativeFixture) === 'required')
+  assert.ok(environmentFactory)
+  assert.ok(ts.isArrayLiteralExpression(requiredDeclaration?.initializer))
+  const required = requiredDeclaration.initializer.elements.map(node => {
+    assert.ok(ts.isStringLiteral(node))
+    return node.text
+  })
+  const productionFunctions = new Map(source.statements.filter(ts.isFunctionDeclaration)
+    .filter(node => node.name).map(node => [node.name.text, node.getText(source)]))
+  for (const name of required) assert.ok(productionFunctions.has(name))
+  for (const platform of ['darwin', 'linux', 'win32']) {
+    const logs = [], signals = []
+    const task = { pid: 12346, exitCode: null, signalCode: null,
+      kill(signal) { signals.push(signal); this.signalCode = signal; return true } }
+    const host = {
+      env: null, EventEmitter, createContext, runInContext, join,
+      process: { platform }, BrowserWindow: class {}, ipcMain: {}, screen: {}, dialog: {},
+      app: { exit: () => assert.fail('the fixture must keep its real host open') }, exitOnQuit: false,
+      settings: { cleanupFailure: true, locale: 'en', manualNativeErrors: false },
+      ledger: { quitRequests: 0, acceptedExit: 0, drain: 0, errorBoxes: [] },
+      log: (event, detail = {}) => logs.push({ event, ...detail }), renderOwner() {},
+      task, taskAlive: () => task.exitCode === null && task.signalCode === null,
+      stopTask: () => assert.fail('the failed-cleanup adapter must leave the final signal to production'),
+      owner: null, manager: { destroyAll: async () => {} }, distDir: '/synthetic/dist',
+      buildDesktopQuitDialogHtml, normalizeDesktopQuitDialogPalette, parseDesktopQuitDialogResponse,
+      DesktopQuitBudget, DesktopQuitConfirmation, DesktopWriterAdmission,
+      nativeTheme: { shouldUseDarkColors: false }, mainWindowCloseAction, normalizeGatewayLocale,
+      functions: productionFunctions, required, messages: '{}', beforeQuit: beforeQuitHandler,
+    }
+    const environment = new Function('host', `with (host) {
+      ${environmentFactory.getText(nativeFixture)}
+      makeEnvironment(); return env;
+    }`)(host)
+    environment.quitConfirmed = true
+    environment.app.quit()
+    await environment.quitGatewayDrainPromise
+    await flush()
+    assert.deepEqual(logs.filter(row => row.event === 'quit_finalize_failed'), [],
+      `${platform} native fixture must provide every production quit dependency`)
+    assert.deepEqual(signals, ['SIGKILL'])
+    assert.equal(environment.appExitPhase, 'committed')
+    assert.equal(host.ledger.acceptedExit, 1)
+    assert.equal(host.ledger.drain, 1)
+    assert.equal(environment.quitUnconfirmedProcessTrees.has(task), true)
+  }
+}
 
 console.log('desktop bounded quit failure and protected admission checks passed')
