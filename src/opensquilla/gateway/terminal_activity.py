@@ -275,6 +275,26 @@ def _json_record(value: object) -> Mapping[str, Any] | None:
     return parsed if isinstance(parsed, Mapping) else None
 
 
+def _matches_committed_output(
+    done: Mapping[str, Any], *, reasoning_length: int, text_length: int
+) -> bool:
+    """Whether streamed reasoning/text lengths equal what ``done`` committed.
+
+    Producers that do not report a committed value (older ``done`` payloads)
+    cannot be checked and are accepted as before.
+    """
+
+    if "reasoning_content" in done:
+        committed = done["reasoning_content"]
+        if committed is None or isinstance(committed, str):
+            if _utf16_length(committed or "") != reasoning_length:
+                return False
+    committed_text = done.get("text_snapshot")
+    if isinstance(committed_text, str) and _utf16_length(committed_text) != text_length:
+        return False
+    return True
+
+
 def build_terminal_activity_snapshot(
     events: object,
     *,
@@ -305,6 +325,7 @@ def build_terminal_activity_snapshot(
     maintenance: dict[str, int] = {}
     interrupts: dict[str, dict[str, Any]] = {}
     terminal_boundary = _safe_positive_int(terminal_at)
+    done_payload: Mapping[str, Any] | None = None
 
     def append(entry: dict[str, Any]) -> None:
         nonlocal complete
@@ -319,6 +340,8 @@ def build_terminal_activity_snapshot(
 
         if suffix in {"done", "error"}:
             terminal_boundary = _event_end_at(payload)
+            if suffix == "done":
+                done_payload = payload
             continue
 
         if suffix == "answer_generation_reset":
@@ -727,6 +750,20 @@ def build_terminal_activity_snapshot(
             block["status"] = "completed"
         append(block)
         persisted_reasoning_blocks += 1
+
+    if done_payload is not None and not _matches_committed_output(
+        done_payload,
+        reasoning_length=reasoning_offset,
+        text_length=sum(
+            int(entry["text_utf16_length"])
+            for entry in entries
+            if entry["type"] == "segment" and entry["segment_type"] == "text"
+        ),
+    ):
+        # A model call that failed after streaming leaves deltas that the
+        # committed transcript never keeps. The stream order is still recorded,
+        # but the record can no longer claim to cover the transcript.
+        complete = False
 
     for interrupt in interrupts.values():
         if "resolution" not in interrupt or "ended_at" not in interrupt:
