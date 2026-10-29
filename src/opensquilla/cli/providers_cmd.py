@@ -33,14 +33,14 @@ def providers_list(
         print_json(provider_catalog_payload())
         return
 
-    console = Console(width=200, force_terminal=False)
+    console = Console(force_terminal=False)
     table = Table(title="Providers")
-    table.add_column("provider", no_wrap=True)
-    table.add_column("label", no_wrap=True)
-    table.add_column("runtime", no_wrap=True)
-    table.add_column("requires key", no_wrap=True)
-    table.add_column("requires base url", no_wrap=True)
-    table.add_column("default base url")
+    table.add_column("provider", overflow="fold")
+    table.add_column("label", overflow="fold")
+    table.add_column("runtime", overflow="fold")
+    table.add_column("requires key", overflow="fold")
+    table.add_column("requires base url", overflow="fold")
+    table.add_column("default base url", overflow="fold")
     for s in list_provider_setup_specs():
         table.add_row(
             s.provider_id,
@@ -77,16 +77,16 @@ def providers_status(
         print_json(payload)
         return
 
-    console = Console(width=180, force_terminal=False)
+    console = Console(force_terminal=False)
     table = Table(title="Provider status")
-    table.add_column("provider", no_wrap=True)
-    table.add_column("active", no_wrap=True)
-    table.add_column("configured", no_wrap=True)
-    table.add_column("buildable", no_wrap=True)
-    table.add_column("model")
-    table.add_column("error")
+    table.add_column("provider", overflow="fold")
+    table.add_column("active", overflow="fold")
+    table.add_column("configured", overflow="fold")
+    table.add_column("buildable", overflow="fold")
+    table.add_column("model", overflow="fold")
+    table.add_column("error", overflow="fold")
     if probe_models:
-        table.add_column("probe")
+        table.add_column("probe", overflow="fold")
     for row in payload.get("providers", []):
         values = [
             str(row.get("providerId") or ""),

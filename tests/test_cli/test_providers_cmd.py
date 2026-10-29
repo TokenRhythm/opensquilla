@@ -22,6 +22,8 @@ def test_providers_list_shows_all_supported(tmp_path: Path, monkeypatch):
 
 
 def test_providers_list_marks_unsupported(tmp_path, monkeypatch):
+    # Wide terminal so content assertions are not split by wrapping.
+    monkeypatch.setenv("COLUMNS", "300")
     monkeypatch.setenv("OPENSQUILLA_GATEWAY_CONFIG_PATH", str(tmp_path / "c.toml"))
     result = runner.invoke(app, ["providers", "list"])
     assert result.exit_code == 0
@@ -105,6 +107,8 @@ def test_providers_configure_vllm_requires_base_url(tmp_path, monkeypatch):
 
 
 def test_providers_status_probe_column_surfaces_failure_kind(monkeypatch):
+    # Wide terminal so content assertions are not split by wrapping.
+    monkeypatch.setenv("COLUMNS", "300")
     monkeypatch.setattr(
         "opensquilla.cli.providers_cmd.run_gateway_sync",
         lambda *_args, **_kwargs: {
