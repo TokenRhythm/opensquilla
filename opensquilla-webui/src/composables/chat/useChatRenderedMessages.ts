@@ -318,6 +318,41 @@ function rehomeCompletedSessionCards(
   }
 }
 
+/**
+ * A queued follow-up appends its user row as soon as it is accepted, while the
+ * running turn may still emit its router receipt (and later text) afterwards
+ * with the older turn id. Arrival order then leaves that receipt below the
+ * queued bubble, so the strip and its activity read as the follow-up's work.
+ * Group rows by the first position of their turn; rows inside one turn keep
+ * their arrival order, and rows without a turn key stay where they are.
+ */
+function alignRowsToTurns(rows: ChatRenderedMessage[]): ChatRenderedMessage[] {
+  if (rows.length < 2) return rows
+  const turnStart = new Map<string, number>()
+  rows.forEach((row, index) => {
+    const key = row.turnKey
+    if (key && !turnStart.has(key)) turnStart.set(key, index)
+  })
+  let ordered = true
+  for (let index = 1; index < rows.length; index++) {
+    const previous = turnStart.get(rows[index - 1]!.turnKey || '') ?? index - 1
+    const current = turnStart.get(rows[index]!.turnKey || '') ?? index
+    if (current < previous) {
+      ordered = false
+      break
+    }
+  }
+  if (ordered) return rows
+  return rows
+    .map((row, index) => ({
+      row,
+      index,
+      anchor: turnStart.get(row.turnKey || '') ?? index,
+    }))
+    .sort((a, b) => a.anchor - b.anchor || a.index - b.index)
+    .map(entry => entry.row)
+}
+
 export function useChatRenderedMessages(options: UseChatRenderedMessagesOptions) {
   // A live route card exists before the first provider delta reveals its
   // physical call id. Preserve the event key while teaching that call (and a
@@ -753,7 +788,7 @@ export function useChatRenderedMessages(options: UseChatRenderedMessagesOptions)
       result,
       options.isSubagentCompletionMessage,
     )
-    return result
+    return alignRowsToTurns(result)
   })
 
   function renderedRouterStrip(
