@@ -4295,7 +4295,9 @@
       "stale": "Sigue trabajando — sin señal reciente",
       "liveStep": "paso {n}",
       "phaseElapsed": "Paso actual: {duration}",
-      "recordIncomplete": "El registro de actividad está incompleto; se muestra la vista de historial compatible."
+      "recordIncomplete": "El registro de actividad está incompleto; se muestra la vista de historial compatible.",
+      "reasoningOrderUnavailable": "Resumen del razonamiento · orden no registrado",
+      "eventsOrderUnavailable": "Eventos del modelo · orden respecto a la conversación no disponible"
     },
     "missingCitationSources": "Algunas citas no corresponden a fuentes disponibles: {citations}",
     "suggestedTasks": "Tareas sugeridas",

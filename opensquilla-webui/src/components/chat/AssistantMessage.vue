@@ -82,7 +82,7 @@
           <UnifiedAssistantActivityTimeline
             :session-key="sessionKey"
             v-if="hasUnifiedActivityOrder"
-            :projection="visibleActivityProjection"
+            :projection="chronologicalActivityProjection"
             :timeline-items="visibleActivityItems"
             :reasoning-blocks="reasoningBlocks"
             :state-scope="toolStateScope"
@@ -111,7 +111,7 @@
           <AssistantActivityTimeline
             :session-key="sessionKey"
             v-if="hasBeforeReasoningActivity"
-            :projection="visibleActivityProjection"
+            :projection="chronologicalActivityProjection"
             status-position="before-reasoning"
             :show-items="false"
             :state-scope="toolStateScope"
@@ -144,7 +144,7 @@
               visibleActivityItems.length
               || hasAfterReasoningActivity
             "
-            :projection="visibleActivityProjection"
+            :projection="chronologicalActivityProjection"
             status-position="after-reasoning"
             :timeline-items="visibleActivityItems"
             :state-scope="toolStateScope"
@@ -237,10 +237,47 @@
           </template>
         </ToolCallTimeline>
         <StatusHistoryPart
-          v-if="statusHistory.length"
+          v-if="statusHistory.length && !hasUnorderedActivity"
           :entries="statusHistory"
         />
       </template>
+
+      <section
+        v-if="unorderedActivityStatusSteps.length"
+        class="assistant-activity-unordered-events"
+        :aria-label="t('chat.activity.eventsOrderUnavailable')"
+      >
+        <p class="assistant-activity-unordered__label">{{ t('chat.activity.eventsOrderUnavailable') }}</p>
+        <AssistantActivityTimeline
+          :session-key="sessionKey"
+          :projection="visibleActivityProjection"
+          :show-items="false"
+          :state-scope="toolStateScope"
+          :is-tool-group-open="isToolGroupOpen"
+          :is-tool-item-open="isToolItemOpen"
+          :tool-group-status-text="toolGroupStatusText"
+          :tool-status-text="toolStatusText"
+          :tool-secondary-text="toolSecondaryText"
+        />
+      </section>
+      <details
+        v-if="unorderedReasoningPart"
+        class="assistant-reasoning-summary"
+        data-share-activity="true"
+        :data-share-expanded="unorderedReasoningOpen ? 'true' : 'false'"
+        @toggle="onUnorderedReasoningToggle"
+      >
+        <summary data-share-activity-label>{{ t('chat.activity.reasoningOrderUnavailable') }}</summary>
+        <div data-share-activity-body>
+          <ReasoningPart
+            :part="unorderedReasoningPart"
+            embedded
+            hide-summary
+            :live="false"
+            :motion-active="false"
+          />
+        </div>
+      </details>
 
       <TextPart
         v-if="
@@ -689,7 +726,20 @@ const statusHistory = computed(() => props.message.statusHistory ?? [])
 // Reasoning still comes from the normalized parts surface. The visible answer
 // is projected separately from authoritative message.text below; timeline text
 // is never treated as a terminal-answer heuristic.
+const hasUnorderedActivity = computed(() =>
+  props.message.activitySnapshotIncomplete === true && !props.message.isStreaming,
+)
+const unorderedReasoningPart = computed<Extract<ChatPart, { type: 'reasoning' }> | null>(() => {
+  if (!hasUnorderedActivity.value) return null
+  // A history refresh can retain live blocks from a failed physical call.
+  // Only the committed aggregate is suitable for this unordered summary.
+  const text = props.message.reasoning?.text ?? ''
+  return text ? {
+    type: 'reasoning', key: `${props.message.id}:reasoning-summary`, text, seconds: 0,
+  } : null
+})
 const reasoningPart = computed(() => {
+  if (hasUnorderedActivity.value) return null
   const part = props.message.parts?.find(
       (part): part is Extract<ChatPart, { type: 'reasoning' }> => part.type === 'reasoning',
     ) ?? null
@@ -714,7 +764,7 @@ const reasoningPart = computed(() => {
   return measuredSeconds > 0 ? { ...part, seconds: measuredSeconds } : part
 })
 const reasoningBlocks = computed(() =>
-  (props.message.reasoningBlocks ?? [])
+  (hasUnorderedActivity.value ? [] : props.message.reasoningBlocks ?? [])
     .filter(block => block.text)
     .map(block => ({ ...block })),
 )
@@ -1020,7 +1070,10 @@ const visibleActivityClusters = computed(() =>
   ),
 )
 const visibleActivityStatusSteps = computed(() =>
-  activityProjection.value.statusSteps.filter(isVisibleActivityStatusStep),
+  activityProjection.value.statusSteps.filter(step =>
+    isVisibleActivityStatusStep(step)
+    && (!hasUnorderedActivity.value || !isRoutineActivityPhaseStep(step)),
+  ),
 )
 const visibleActivityProjection = computed(() => ({
   ...activityProjection.value,
@@ -1032,16 +1085,27 @@ const hasUnifiedActivityOrder = computed(() => canMergeAssistantActivityOrder(
   reasoningBlocks.value,
   visibleActivityItems.value,
 ))
+const unorderedActivityStatusSteps = computed(() =>
+  hasUnorderedActivity.value && (!activityProjection.value.canSeparateActivity || !hasUnifiedActivityOrder.value)
+    ? visibleActivityStatusSteps.value : [],
+)
+const chronologicalActivityProjection = computed(() => ({
+  ...visibleActivityProjection.value,
+  // Legacy phases have no verified relation to the committed tool/text rows.
+  // Keep them inspectable without presenting them ahead of later work.
+  statusSteps: unorderedActivityStatusSteps.value.length ? [] : visibleActivityStatusSteps.value,
+}))
 const hasBeforeReasoningActivity = computed(() =>
-  visibleActivityStatusSteps.value.some(isBeforeReasoningActivityStatusStep),
+  chronologicalActivityProjection.value.statusSteps.some(isBeforeReasoningActivityStatusStep),
 )
 const hasAfterReasoningActivity = computed(() =>
-  visibleActivityStatusSteps.value.some(step => !isBeforeReasoningActivityStatusStep(step)),
+  chronologicalActivityProjection.value.statusSteps.some(step => !isBeforeReasoningActivityStatusStep(step)),
 )
 const hasVisibleActivityItem = computed(() => visibleActivityItems.value.length > 0)
 const hasActivity = computed(() =>
   reasoningBlocks.value.length > 0
   || !!reasoningPart.value
+  || !!unorderedReasoningPart.value
   || hasVisibleActivityItem.value
   || visibleActivityStatusSteps.value.length > 0,
 )
@@ -1052,6 +1116,14 @@ const showActivityDisclosure = computed(() =>
 const activityDetailsOpen = ref(false)
 const legacyReasoningOpen = ref(false)
 const legacyToolsOpen = ref(false)
+const unorderedReasoningOpen = ref(false)
+const historyDetailsOpen = computed(() => Boolean(unorderedReasoningPart.value && unorderedReasoningOpen.value) || (
+  activityProjection.value.canSeparateActivity
+    ? activityDetailsOpen.value : legacyReasoningOpen.value || legacyToolsOpen.value
+))
+function onUnorderedReasoningToggle(event: Event) {
+  unorderedReasoningOpen.value = (event.currentTarget as HTMLDetailsElement).open
+}
 let detailsDisposed = false
 provide(HISTORY_DETAILS_READY, () => {
   if (!props.message.historyPayloadPreview?.detailsTruncated) return true
@@ -1062,15 +1134,13 @@ provide(HISTORY_DETAILS_READY, () => {
     await nextTick()
     return !detailsDisposed && identity === JSON.stringify(props.message.contentRef)
       && props.message.historyPayloadPreview?.detailsTruncated === false
-      && (activityProjection.value.canSeparateActivity
-        ? activityDetailsOpen.value : legacyReasoningOpen.value || legacyToolsOpen.value)
+      && historyDetailsOpen.value
   })
 })
 watch(() => [
   props.message.contentRef,
   props.message.historyPayloadPreview?.detailsTruncated,
-  activityProjection.value.canSeparateActivity
-    ? activityDetailsOpen.value : legacyReasoningOpen.value || legacyToolsOpen.value,
+  historyDetailsOpen.value,
 ] as const, ([, truncated, open]) => emit('detailsDisclosure', props.message, Boolean(truncated && open)), { flush: 'post' })
 onBeforeUnmount(() => { detailsDisposed = true; emit('detailsDisclosure', props.message, false) })
 
@@ -1292,6 +1362,19 @@ function fmtUsd(value: number): string {
 <style scoped src="../../styles/chat-assistant-row.css"></style>
 
 <style scoped>
+.assistant-reasoning-summary,
+.assistant-activity-unordered-events {
+  margin: 0.5rem 0;
+  color: var(--text-muted);
+  font-size: 0.75rem;
+}
+.assistant-reasoning-summary > summary {
+  cursor: pointer;
+}
+.assistant-activity-unordered__label {
+  margin: 0 0 0.375rem;
+}
+
 .assistant-activity-incomplete {
   margin: 0.375rem 0 0;
   color: var(--text-muted);

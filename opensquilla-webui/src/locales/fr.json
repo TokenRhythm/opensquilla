@@ -4295,7 +4295,9 @@
       "stale": "Toujours en cours — aucun signal récent",
       "liveStep": "étape {n}",
       "phaseElapsed": "Étape actuelle : {duration}",
-      "recordIncomplete": "L’historique d’activité est incomplet ; affichage de la vue compatible."
+      "recordIncomplete": "L’historique d’activité est incomplet ; affichage de la vue compatible.",
+      "reasoningOrderUnavailable": "Résumé du raisonnement · ordre non enregistré",
+      "eventsOrderUnavailable": "Événements du modèle · ordre par rapport à la conversation indisponible"
     },
     "missingCitationSources": "Certaines citations ne correspondent à aucune source disponible : {citations}",
     "suggestedTasks": "Tâches suggérées",

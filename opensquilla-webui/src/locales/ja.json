@@ -4295,7 +4295,9 @@
       "stale": "処理を継続中 — 最近の信号はありません",
       "liveStep": "ステップ {n}",
       "phaseElapsed": "現在のステップ：{duration}",
-      "recordIncomplete": "アクティビティ記録が不完全なため、互換履歴ビューを表示しています。"
+      "recordIncomplete": "アクティビティ記録が不完全なため、互換履歴ビューを表示しています。",
+      "reasoningOrderUnavailable": "思考の要約 · 順序は記録されていません",
+      "eventsOrderUnavailable": "モデルイベント · 会話記録との前後関係は不明です"
     },
     "missingCitationSources": "一部の引用に対応する参照元がありません：{citations}",
     "suggestedTasks": "おすすめのタスク",

@@ -1526,3 +1526,23 @@ describe('reconcileRunningHistoryMessages', () => {
     expect(reconcileRunningHistoryMessages(out, incoming)).toEqual(out)
   })
 })
+
+describe('incomplete terminal reasoning refresh', () => {
+  it('does not restore uncommitted live reasoning when the terminal aggregate is absent', () => {
+    const previous = msg({ reasoning: { text: 'Uncommitted failed reasoning.', seconds: 8 } })
+    const merged = mergeLiveOnlyFields(previous, msg({
+      activitySnapshotIncomplete: true,
+      reasoning: undefined,
+    }))
+    expect(merged.reasoning).toBeUndefined()
+  })
+
+  it('retains the committed aggregate rather than the longer live text', () => {
+    const previous = msg({ reasoning: { text: 'Committed.\nUncommitted failed reasoning.', seconds: 8 } })
+    const merged = mergeLiveOnlyFields(previous, msg({
+      activitySnapshotIncomplete: true,
+      reasoning: { text: 'Committed.', seconds: 0 },
+    }))
+    expect(merged.reasoning?.text).toBe('Committed.')
+  })
+})

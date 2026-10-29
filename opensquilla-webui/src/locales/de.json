@@ -4295,7 +4295,9 @@
       "stale": "Arbeitet weiter — kein aktuelles Signal",
       "liveStep": "Schritt {n}",
       "phaseElapsed": "Aktueller Schritt: {duration}",
-      "recordIncomplete": "Aktivitätsprotokoll unvollständig; kompatible Verlaufsansicht wird angezeigt."
+      "recordIncomplete": "Aktivitätsprotokoll unvollständig; kompatible Verlaufsansicht wird angezeigt.",
+      "reasoningOrderUnavailable": "Zusammenfassung der Überlegungen · Reihenfolge nicht aufgezeichnet",
+      "eventsOrderUnavailable": "Modellereignisse · Reihenfolge zum Gesprächsverlauf unbekannt"
     },
     "missingCitationSources": "Für einige Quellenverweise sind keine Quellen verfügbar: {citations}",
     "suggestedTasks": "Vorgeschlagene Aufgaben",
