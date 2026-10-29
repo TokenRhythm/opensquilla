@@ -64,12 +64,12 @@ def agents_list(
 
     console = Console(force_terminal=False)
     table = Table(title=f"Agents in {target}")
-    table.add_column("id")
-    table.add_column("name")
-    table.add_column("type")
-    table.add_column("enabled")
-    table.add_column("model")
-    table.add_column("workspace")
+    table.add_column("id", overflow="fold")
+    table.add_column("name", overflow="fold")
+    table.add_column("type", overflow="fold")
+    table.add_column("enabled", overflow="fold")
+    table.add_column("model", overflow="fold")
+    table.add_column("workspace", overflow="fold")
     for agent in agents:
         table.add_row(
             str(agent.get("id", "")),

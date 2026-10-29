@@ -531,6 +531,8 @@ def test_doctor_ready_table_summarizes_without_dumping_ok_findings(monkeypatch) 
 
 
 def test_doctor_table_shows_gateway_config_and_agent_context(tmp_path, monkeypatch) -> None:
+    # Keep this content assertion independent of wrapping inside long temporary paths.
+    monkeypatch.setenv("COLUMNS", "300")
     _ReadyGatewayClient.calls = []
     target = tmp_path / "custom.toml"
     target.write_text('host = "127.0.0.1"\nport = 20003\n', encoding="utf-8")

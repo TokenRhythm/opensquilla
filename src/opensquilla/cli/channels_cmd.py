@@ -72,11 +72,11 @@ def _render_channels_table(entries: list[dict[str, Any]], *, title: str) -> None
         return
     console = Console(force_terminal=False)
     table = Table(title=title)
-    table.add_column("name")
-    table.add_column("type")
-    table.add_column("enabled")
-    table.add_column("agent_id")
-    table.add_column("details")
+    table.add_column("name", overflow="fold")
+    table.add_column("type", overflow="fold")
+    table.add_column("enabled", overflow="fold")
+    table.add_column("agent_id", overflow="fold")
+    table.add_column("details", overflow="fold")
     for e in entries:
         details = ", ".join(
             f"{k}={v}"
@@ -110,14 +110,14 @@ def _status_diagnostic_text(row: dict[str, Any]) -> str:
 def _render_status_table(payload: dict[str, Any], *, name: str | None = None) -> None:
     rows = _filter_status_rows(payload, name)
     table = Table(title="Channel status", show_header=True, header_style=ACCENT_HEADER)
-    table.add_column("Name")
-    table.add_column("Type")
-    table.add_column("Status")
-    table.add_column("Connected")
-    table.add_column("Enabled")
-    table.add_column("Configured")
-    table.add_column("Restart attempts", justify="right")
-    table.add_column("Diagnostic")
+    table.add_column("Name", overflow="fold")
+    table.add_column("Type", overflow="fold")
+    table.add_column("Status", overflow="fold")
+    table.add_column("Connected", overflow="fold")
+    table.add_column("Enabled", overflow="fold")
+    table.add_column("Configured", overflow="fold")
+    table.add_column("Restart attempts", justify="right", overflow="fold")
+    table.add_column("Diagnostic", overflow="fold")
     for row in rows:
         table.add_row(
             str(row.get("name") or ""),
@@ -400,11 +400,11 @@ def channels_types(
         ])
         return
     table = Table(title="Supported channel types")
-    table.add_column("type")
-    table.add_column("label")
-    table.add_column("transport")
-    table.add_column("public URL")
-    table.add_column("extras")
+    table.add_column("type", overflow="fold")
+    table.add_column("label", overflow="fold")
+    table.add_column("transport", overflow="fold")
+    table.add_column("public URL", overflow="fold")
+    table.add_column("extras", overflow="fold")
     for s in specs:
         table.add_row(
             s.type, s.label, s.transport,
@@ -458,12 +458,12 @@ def channels_describe(
         f"docs={spec.docs_hint}"
     )
     table = Table(title="Fields")
-    table.add_column("name")
-    table.add_column("type")
-    table.add_column("required")
-    table.add_column("secret")
-    table.add_column("default")
-    table.add_column("choices")
+    table.add_column("name", overflow="fold")
+    table.add_column("type", overflow="fold")
+    table.add_column("required", overflow="fold")
+    table.add_column("secret", overflow="fold")
+    table.add_column("default", overflow="fold")
+    table.add_column("choices", overflow="fold")
     for f in spec.fields:
         table.add_row(
             f.name,
@@ -548,12 +548,12 @@ def channels_certify(
         print_json(evidence)
     else:
         table = Table(title="Channel certification", show_header=True)
-        table.add_column("Provider")
-        table.add_column("Operation")
-        table.add_column("Status")
-        table.add_column("Authenticated")
-        table.add_column("Latency", justify="right")
-        table.add_column("Detail")
+        table.add_column("Provider", overflow="fold")
+        table.add_column("Operation", overflow="fold")
+        table.add_column("Status", overflow="fold")
+        table.add_column("Authenticated", overflow="fold")
+        table.add_column("Latency", justify="right", overflow="fold")
+        table.add_column("Detail", overflow="fold")
         for row in evidence["providers"]:
             detail = str(row.get("detail") or "")
             missing = row.get("missingEnvironment")
@@ -579,11 +579,11 @@ channels_app.add_typer(pairings_app, name="pairings")
 
 def _render_pairings_table(records: list[dict[str, Any]], *, channel: str) -> None:
     table = Table(title=f"Pairing requests: {channel}", header_style=ACCENT_HEADER)
-    table.add_column("Code")
-    table.add_column("Sender")
-    table.add_column("Status")
-    table.add_column("Requested")
-    table.add_column("Approved")
+    table.add_column("Code", overflow="fold")
+    table.add_column("Sender", overflow="fold")
+    table.add_column("Status", overflow="fold")
+    table.add_column("Requested", overflow="fold")
+    table.add_column("Approved", overflow="fold")
     for record in records:
         sender = str(record.get("senderName") or record.get("senderId") or "")
         table.add_row(

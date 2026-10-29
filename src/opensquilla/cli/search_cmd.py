@@ -67,11 +67,11 @@ def search_list(
 
     console = Console(force_terminal=False)
     table = Table(title="Search providers")
-    table.add_column("provider")
-    table.add_column("label")
-    table.add_column("runtime")
-    table.add_column("requires key")
-    table.add_column("env key")
+    table.add_column("provider", overflow="fold")
+    table.add_column("label", overflow="fold")
+    table.add_column("runtime", overflow="fold")
+    table.add_column("requires key", overflow="fold")
+    table.add_column("env key", overflow="fold")
     for spec in list_search_provider_setup_specs():
         table.add_row(
             spec.provider_id,
@@ -104,13 +104,13 @@ def search_status(
 
     console = Console(force_terminal=False)
     table = Table(title="Search status")
-    table.add_column("provider")
-    table.add_column("active")
-    table.add_column("configured")
-    table.add_column("buildable")
-    table.add_column("network")
-    table.add_column("fallback")
-    table.add_column("error")
+    table.add_column("provider", overflow="fold")
+    table.add_column("active", overflow="fold")
+    table.add_column("configured", overflow="fold")
+    table.add_column("buildable", overflow="fold")
+    table.add_column("network", overflow="fold")
+    table.add_column("fallback", overflow="fold")
+    table.add_column("error", overflow="fold")
     network_blocked = str(payload.get("networkBlockedReason") or "")
     table.add_row(
         str(payload.get("provider") or ""),
@@ -220,9 +220,9 @@ def search_query(
 
     console = Console(force_terminal=False)
     table = Table(title=f"Search: {query}")
-    table.add_column("Title")
-    table.add_column("URL")
-    table.add_column("Snippet")
+    table.add_column("Title", overflow="fold")
+    table.add_column("URL", overflow="fold")
+    table.add_column("Snippet", overflow="fold")
     for row in payload.get("results", []):
         table.add_row(
             str(row.get("title") or ""),
@@ -290,13 +290,13 @@ def _emit_invalid_request(message: str, *, json_output: bool) -> NoReturn:
 def _print_research_results(query: str, payload: dict[str, Any]) -> None:
     console = Console(force_terminal=False)
     table = Table(title=f"Research search: {query}")
-    table.add_column("Rank")
-    table.add_column("Title")
-    table.add_column("Domain")
-    table.add_column("Provider")
-    table.add_column("Fetched")
-    table.add_column("URL")
-    table.add_column("Excerpt")
+    table.add_column("Rank", overflow="fold")
+    table.add_column("Title", overflow="fold")
+    table.add_column("Domain", overflow="fold")
+    table.add_column("Provider", overflow="fold")
+    table.add_column("Fetched", overflow="fold")
+    table.add_column("URL", overflow="fold")
+    table.add_column("Excerpt", overflow="fold")
     for index, row in enumerate(payload.get("results", []), start=1):
         if not isinstance(row, dict):
             continue
@@ -337,9 +337,9 @@ def search_benchmark(
 
     console = Console(force_terminal=False)
     table = Table(title=f"Search benchmark: {profile}")
-    table.add_column("Metric")
-    table.add_column("v1", justify="right")
-    table.add_column("v2", justify="right")
+    table.add_column("Metric", overflow="fold")
+    table.add_column("v1", justify="right", overflow="fold")
+    table.add_column("v2", justify="right", overflow="fold")
     for metric in (
         "p50_latency_ms",
         "p95_latency_ms",

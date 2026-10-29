@@ -35,12 +35,12 @@ def providers_list(
 
     console = Console(force_terminal=False)
     table = Table(title="Providers")
-    table.add_column("provider")
-    table.add_column("label")
-    table.add_column("runtime")
-    table.add_column("requires key")
-    table.add_column("requires base url")
-    table.add_column("default base url")
+    table.add_column("provider", overflow="fold")
+    table.add_column("label", overflow="fold")
+    table.add_column("runtime", overflow="fold")
+    table.add_column("requires key", overflow="fold")
+    table.add_column("requires base url", overflow="fold")
+    table.add_column("default base url", overflow="fold")
     for s in list_provider_setup_specs():
         table.add_row(
             s.provider_id,
@@ -79,14 +79,14 @@ def providers_status(
 
     console = Console(force_terminal=False)
     table = Table(title="Provider status")
-    table.add_column("provider")
-    table.add_column("active")
-    table.add_column("configured")
-    table.add_column("buildable")
-    table.add_column("model")
-    table.add_column("error")
+    table.add_column("provider", overflow="fold")
+    table.add_column("active", overflow="fold")
+    table.add_column("configured", overflow="fold")
+    table.add_column("buildable", overflow="fold")
+    table.add_column("model", overflow="fold")
+    table.add_column("error", overflow="fold")
     if probe_models:
-        table.add_column("probe")
+        table.add_column("probe", overflow="fold")
     for row in payload.get("providers", []):
         values = [
             str(row.get("providerId") or ""),

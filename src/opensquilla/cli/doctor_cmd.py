@@ -683,11 +683,11 @@ def _render_report(report: dict[str, Any]) -> None:
         return
     step_column = _step_column(visible_findings)
     table = Table(show_header=True)
-    table.add_column("Severity")
-    table.add_column("Impact")
-    table.add_column("Surface")
-    table.add_column("Finding")
-    table.add_column(step_column)
+    table.add_column("Severity", overflow="fold")
+    table.add_column("Impact", overflow="fold")
+    table.add_column("Surface", overflow="fold")
+    table.add_column("Finding", overflow="fold")
+    table.add_column(step_column, overflow="fold")
     for finding in visible_findings:
         recovery = "\n".join(_fix_step_text(step) for step in finding.get("fixSteps") or [])
         restart = " Recovery requires restart." if finding.get("restartRequired") else ""
