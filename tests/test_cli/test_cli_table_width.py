@@ -8,20 +8,29 @@ every CLI table render wider than the user's terminal regardless of
 from __future__ import annotations
 
 import re
+from functools import partial
 from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 from rich.cells import cell_len
+from rich.console import Console
 from typer.testing import CliRunner
 
-from opensquilla.cli import agents_cmd, channels_cmd, doctor_cmd, search_cmd
+from opensquilla.cli import agents_cmd, channels_cmd, doctor_cmd, providers_cmd, search_cmd
 from opensquilla.cli.main import app
 from opensquilla.onboarding.provider_specs import list_provider_setup_specs
 
 runner = CliRunner()
 
 _HARDCODED_WIDTH = re.compile(r"Console\([^)]*width=\d+")
+
+
+@pytest.fixture(params=[False, True], ids=["modern", "legacy-windows"])
+def terminal_style(monkeypatch, request) -> None:
+    # Exercise Windows' safe-box fallback even when running on Linux or macOS.
+    for module in (agents_cmd, channels_cmd, doctor_cmd, providers_cmd, search_cmd):
+        monkeypatch.setattr(module, "Console", partial(Console, legacy_windows=request.param))
 
 
 def _assert_fits(output: str, width: int) -> None:
@@ -31,16 +40,22 @@ def _assert_fits(output: str, width: int) -> None:
 
 def _column_text(output: str, index: int) -> str:
     """Reassemble a displayed column across folded lines, ignoring whitespace."""
-    return "".join(
-        "".join(line.split("│")[index + 1].split())
-        for line in output.splitlines()
-        if line.startswith("│")
-    )
+    cells = []
+    in_body = False
+    for line in output.splitlines():
+        # Windows' safe box uses the same vertical border for header and body.
+        # Start after the header divider in either box style.
+        if line.startswith(("┡", "├")):
+            in_body = True
+        elif in_body and line.startswith("│"):
+            cells.append("".join(line.split("│")[index + 1].split()))
+    assert in_body, output
+    return "".join(cells)
 
 
 @pytest.mark.parametrize("width", [40, 80])
 def test_providers_list_preserves_ids_within_terminal_width(
-    tmp_path: Path, monkeypatch, width: int,
+    tmp_path: Path, monkeypatch, terminal_style, width: int,
 ) -> None:
     monkeypatch.setenv("OPENSQUILLA_GATEWAY_CONFIG_PATH", str(tmp_path / "c.toml"))
     monkeypatch.setenv("COLUMNS", str(width))
@@ -53,7 +68,9 @@ def test_providers_list_preserves_ids_within_terminal_width(
 
 
 @pytest.mark.parametrize("width", [40, 80])
-def test_agents_list_preserves_identifiers_and_workspace(monkeypatch, capsys, width: int) -> None:
+def test_agents_list_preserves_identifiers_and_workspace(
+    monkeypatch, capsys, terminal_style, width: int,
+) -> None:
     agent = {
         "id": "support-assistant",
         "name": "演示助手",
@@ -79,7 +96,7 @@ def test_agents_list_preserves_identifiers_and_workspace(monkeypatch, capsys, wi
 
 
 @pytest.mark.parametrize("width", [40, 80])
-def test_pairings_preserve_complete_code(monkeypatch, capsys, width: int) -> None:
+def test_pairings_preserve_complete_code(monkeypatch, capsys, terminal_style, width: int) -> None:
     monkeypatch.setenv("COLUMNS", str(width))
     channels_cmd._render_pairings_table([{
         "pairingCode": "abcdef12",
@@ -96,7 +113,9 @@ def test_pairings_preserve_complete_code(monkeypatch, capsys, width: int) -> Non
 
 
 @pytest.mark.parametrize("width", [40, 80])
-def test_doctor_preserves_complete_recovery_command(monkeypatch, capsys, width: int) -> None:
+def test_doctor_preserves_complete_recovery_command(
+    monkeypatch, capsys, terminal_style, width: int,
+) -> None:
     command = (
         "opensquilla providers configure example --api-key YOUR_API_KEY "
         "--config /workspace/project-with-a-long-name/config.toml"
@@ -119,7 +138,9 @@ def test_doctor_preserves_complete_recovery_command(monkeypatch, capsys, width: 
 
 
 @pytest.mark.parametrize("width", [40, 80])
-def test_research_results_preserve_complete_url(monkeypatch, capsys, width: int) -> None:
+def test_research_results_preserve_complete_url(
+    monkeypatch, capsys, terminal_style, width: int,
+) -> None:
     url = "https://example.com/research/a-long-result-path"
     monkeypatch.setenv("COLUMNS", str(width))
     search_cmd._print_research_results("example", {"results": [{
