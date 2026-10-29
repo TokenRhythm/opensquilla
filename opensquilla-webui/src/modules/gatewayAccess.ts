@@ -54,6 +54,10 @@ export interface GatewayAccess {
   readonly guestSessionOwnerId: string | null
   /** Proven delivery authority; retained only while the same connection intent retries. */
   readonly deliveryIdentity: string | null
+  /** In-memory display lifetime; never grants permission or validates a directory. */
+  readonly presentationScope?: number | null
+  /** Missing/filtered methods do not identify an older project protocol. */
+  readonly projectCatalogAvailability?: 'unknown' | 'available' | 'unavailable'
   readonly canManageProjectWorkspaces: boolean
   readonly canChooseProject: boolean
   readonly canCreateProjectWorkspace?: boolean

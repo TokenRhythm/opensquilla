@@ -10,7 +10,7 @@ import { createContext, runInContext } from 'node:vm'
 import ts from '@typescript/typescript6'
 import { DesktopWriterAdmission } from '../../../dist/desktop-writer-admission.js'
 import { DesktopQuitBudget, DesktopQuitConfirmation } from '../../../dist/desktop-quit.js'
-import { buildDesktopQuitDialogHtml, parseDesktopQuitDialogResponse } from '../../../dist/desktop-quit-dialog.js'
+import { buildDesktopQuitDialogHtml, normalizeDesktopQuitDialogPalette, parseDesktopQuitDialogResponse } from '../../../dist/desktop-quit-dialog.js'
 import { mainWindowCloseAction } from '../../../dist/desktop-window-lifecycle.js'
 import { normalizeGatewayLocale } from '../../../dist/desktop-locale.js'
 import { NativeWorkbenchSurfaceManager } from '../../../dist/native-workbench-surface.js'
@@ -39,7 +39,7 @@ function collect(node) {
   ts.forEachChild(node, collect)
 }
 collect(source)
-const required = ['desktopT', 'showDesktopQuitConfirmation', 'promptForMainWindowClose', 'handleMainWindowClose', 'holdQuitForTaskConfirmation', 'showDesktopQuitFailure', 'shutdownFromSignal']
+const required = ['desktopT', 'applyDesktopNativeTheme', 'showDesktopQuitConfirmation', 'promptForMainWindowClose', 'handleMainWindowClose', 'holdQuitForTaskConfirmation', 'showDesktopQuitFailure', 'forceOwnedGatewayForQuit', 'shutdownFromSignal']
 for (const name of required) if (!functions.has(name)) throw new Error(`Production handler missing: ${name}`)
 if (!messages || !beforeQuit) throw new Error('Production messages/before-quit handler missing.')
 
@@ -54,6 +54,7 @@ let pageNumber = 0
 let resetting = false
 let resetGeneration = 0
 let stopped = false
+let exitOnQuit = false
 let dialogCount = 0
 const settings = { behavior: 'ask', locale: 'en', theme: 'light', activity: 'active', cleanupFailure: false,
   manualNativeErrors: process.argv.includes('--manual-native-errors') }
@@ -165,7 +166,11 @@ function makeEnvironment() {
     shim.emit('before-quit', { preventDefault() { prevented = true } })
     if (!prevented) { ledger.acceptedExit += 1; log('fixture_ordinary_exit') }
   }
-  shim.exit = code => { ledger.acceptedExit += 1; log('fixture_exit_committed', { code }) }
+  shim.exit = code => {
+    ledger.acceptedExit += 1
+    log('fixture_exit_committed', { code, realExit: exitOnQuit })
+    if (exitOnQuit) app.exit(code)
+  }
   const cleanupChild = async () => {
     ledger.drain += 1
     if (settings.cleanupFailure) { env.quitUnconfirmedProcessTrees.add(task); return false }
@@ -181,7 +186,8 @@ function makeEnvironment() {
     if (settings.manualNativeErrors) dialog.showErrorBox(title, content)
   } }
   env = createContext({ app: shim, process, BrowserWindow, ipcMain, screen, dialog: fixtureDialog, join, __dirname: distDir,
-    buildDesktopQuitDialogHtml, parseDesktopQuitDialogResponse, DesktopQuitConfirmation, DesktopQuitBudget,
+    buildDesktopQuitDialogHtml, normalizeDesktopQuitDialogPalette, parseDesktopQuitDialogResponse, DesktopQuitConfirmation, DesktopQuitBudget,
+    nativeTheme, desktopQuitDialogPalette: {}, onboardingWindow: null, desktopWindowBackgroundColor: () => nativeTheme.shouldUseDarkColors ? '#18181A' : '#FFFFFF',
     mainWindowCloseAction, desktopQuitConfirmation: new DesktopQuitConfirmation(), desktopLocale: normalizeGatewayLocale(settings.locale),
     mainWindow: owner, mainWindowClosePrompt: null, windowsTray: {}, appExitPhase: 'running', isQuitting: false,
     systemSessionEnding: false, updateApplying: false, updateInstallHandoffReady: false,
@@ -190,9 +196,13 @@ function makeEnvironment() {
     quitWriterAdmission: null, quitFromSignal: false, quitConfirmed: false, quitConfirmationPromise: null,
     quitConfirmationWantsExit: false, quitUnconfirmedProcessTrees: new Set(),
     gatewayProcessCleanupContexts: new Map(), gatewayProcessCleanupOperations: new WeakMap(),
+    gatewayProcessTreeTerminations: new Map(),
+    gatewayHardTerminatedProcesses: new WeakSet(), gatewayProcessDiagnostics: new WeakMap(),
     desktopWriters: new DesktopWriterAdmission(), nativeWorkbenchSurfaces: manager,
     gatewayProcess: taskAlive() ? task : null, gatewayState: { status: 'ready', owned: true, url: 'synthetic://fixture', error: null },
     hasGatewayProcessExited: child => !child || child.exitCode !== null || child.signalCode !== null,
+    // The fixture owns a direct synthetic child, not a dev launcher group.
+    terminateGatewayProcess: (child, signal) => child.kill(signal),
     liveLifecycleOwnedGatewayProcesses: () => taskAlive() ? [task] : [],
     quitOwnedGateway: cleanupChild, drainOwnedGatewayForLegacyQuit: cleanupChild,
     ownedGatewayRecord: () => ({ synthetic: true }),
@@ -219,13 +229,14 @@ async function command(action, options = {}) {
   if (action === 'configure') {
     Object.assign(settings, options)
     env.desktopLocale = normalizeGatewayLocale(settings.locale)
-    nativeTheme.themeSource = settings.theme
+    env.applyDesktopNativeTheme(settings.theme, options.palette)
     if (settings.activity === 'active') startTask()
   } else if (action === 'show-main') { if (!owner || owner.isDestroyed()) await makeOwner(); owner.show(); owner.focus() }
   else if (action === 'close-main') owner.close()
   else if (action === 'quit') env.app.quit()
   else if (action === 'repeat-quit') { for (let index = 0; index < 4; index += 1) env.app.quit() }
   else if (action === 'signal') env.shutdownFromSignal()
+  else if (action === 'exit-on-quit') exitOnQuit = true
   else if (action === 'add-page') await addPage()
   else if (action === 'remove-pages') await manager.destroyAll()
   else if (action === 'navigate-page') { const record = pages().at(-1); if (record) await record.contents.loadURL(`${pageOrigin}/navigation-${Date.now()}`) }
@@ -236,6 +247,7 @@ async function command(action, options = {}) {
     void env.showDesktopQuitConfirmation({ ...copy, parent: owner }).then(result => log('fixture_long_copy_decision', { result }))
   } else if (action === 'reset') {
     resetting = true
+    exitOnQuit = false
     finishWriter?.(); finishWriter = null
     for (const window of BrowserWindow.getAllWindows()) if (window !== controller && window !== owner) window.destroy()
     await env.quitConfirmationPromise?.catch(() => {})

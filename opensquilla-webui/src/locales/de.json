@@ -1,4 +1,11 @@
 {
+  "desktopRuntime": {
+    "starting": "OpenSquilla wird gestartet…",
+    "startFailed": "OpenSquilla konnte nicht gestartet werden.",
+    "sandboxUpgradeIncomplete": "Die Sandbox-Einstellungen wurden nicht vollständig aktualisiert. Die Anwendung ist weiterhin nutzbar. Prüfen Sie das Protokoll und versuchen Sie es nach einem Neustart erneut.",
+    "retry": "Erneut versuchen",
+    "showLog": "Protokoll anzeigen"
+  },
   "visualize": {
     "runtimeError": "Dieses Canvas konnte nicht ausgeführt werden",
     "runtimeErrorHint": "Im Code ist ein Fehler aufgetreten. Bitte die KI um eine Reparatur oder führe diese Version erneut aus.",
@@ -130,6 +137,7 @@
     "unavailable": "Quelldatei nicht verfügbar. Vorhandene Vorschauen und Downloads bleiben unverändert.", "failed": "Dateiaktion fehlgeschlagen."
   },
   "workspaces": {
+    "catalogUnavailable": "Die Projektliste ist nicht verfügbar.",
     "openDirectory": "Im Dateimanager öffnen",
     "copyDirectoryPath": "Projektverzeichnispfad kopieren",
     "openDirectoryFailed": "Projektverzeichnis konnte nicht geöffnet werden. Bitte erneut versuchen.",

@@ -33,6 +33,7 @@ interface GatewayAccessSource {
   readonly auth: Record<string, unknown> | null
   readonly policy: Record<string, unknown> | null
   readonly connectionGeneration: number
+  readonly presentationScope?: number
   readonly deliveryContext: {
     readonly targetId: string
     readonly principal: unknown
@@ -212,6 +213,13 @@ function hostExecuteUnavailableReason(source: GatewayAccessSource): HostExecuteU
 /** Project v4 transport/hello state into semantic application capabilities. */
 export function createV4GatewayAccess(source: GatewayAccessSource): GatewayAccess {
   return {
+    get presentationScope() {
+      return source.presentationScope ?? null
+    },
+    get projectCatalogAvailability() {
+      if (source.state !== 'connected' || !objectValue(source.auth?.principal)) return 'unknown'
+      return source.canManageProjectWorkspaces ? 'available' : 'unavailable'
+    },
     get availability() {
       if (source.runtimeStarting && source.state !== 'connected') return 'preparing'
       return availability(source.state)

@@ -400,6 +400,37 @@ try {
     error: 'taskkill exceeded 25ms',
   })
 
+  for (const phase of ['before-spawn', 'pending', 'after-exit', 'exited-before-event']) {
+    const controller = new AbortController()
+    const killer = new EventEmitter()
+    const signals = []
+    Object.assign(killer, {
+      exitCode: null, signalCode: null,
+      kill: signal => { signals.push(signal); return true },
+    })
+    let spawns = 0
+    if (phase === 'before-spawn') controller.abort()
+    const operation = terminateWindowsProcessTree({
+      pid: 43, timeoutMs: 100, signal: controller.signal,
+      fallback: () => assert.fail('cancelling a helper must not signal its old target PID'),
+      spawnProcess: () => { spawns += 1; return killer },
+    })
+    if (phase === 'after-exit') {
+      killer.exitCode = 0
+      killer.emit('exit', 0, null)
+    } else if (phase === 'exited-before-event') {
+      killer.exitCode = 0
+    }
+    controller.abort()
+    assert.deepEqual(signals, phase === 'pending' ? ['SIGKILL'] : [],
+      'cancellation synchronously stops only the still-live helper handle')
+    assert.equal(await operation, phase === 'after-exit')
+    assert.equal(spawns, phase === 'before-spawn' ? 0 : 1)
+    assert.equal(getEventListeners(controller.signal, 'abort').length, 0)
+    killer.emit('exit', 0, null)
+    assert.deepEqual(signals, phase === 'pending' ? ['SIGKILL'] : [], 'late exit cannot signal a recycled PID')
+  }
+
   // Execute the first-chat fixture's own completion/cleanup helpers. A visible
   // response is insufficient: signed activity must become idle without consent.
   const firstChatFixture = await readFile(join(scriptDir, 'test-onboarding-first-chat.mjs'), 'utf8')

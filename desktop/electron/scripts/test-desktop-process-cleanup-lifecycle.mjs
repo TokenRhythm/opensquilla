@@ -19,6 +19,7 @@ const source = ts.createSourceFile(
 )
 const names = new Set([
   'confirmOwnedGatewayProcessCleanup', 'terminateOwnedGatewayForQuit', 'quitOwnedGateway',
+  'forceOwnedGatewayForQuit',
   'retireStoppedGatewayProcessCleanup',
   'stopAndJoinAllLifecycleOwnedGateways',
   'joinGatewayProcessRetirements', 'confirmStoppedGatewayProcessScopes',
@@ -71,6 +72,7 @@ function harness({ exited = false, platform = 'darwin', complete = true } = {}) 
   const launch = { instanceNonce: 'retained-private-nonce', ownershipDir: '/synthetic/retained-profile' }
   const order = []
   const logs = []
+  child.kill = signal => { order.push('kill-root'); child.signalCode = signal; return true }
   const env = {
     process: { platform },
     DesktopQuitBudget, DESKTOP_QUIT_TERMINATION_MS,
@@ -88,7 +90,7 @@ function harness({ exited = false, platform = 'darwin', complete = true } = {}) 
     gatewayProcessCleanupRetirements: new Map(),
     quitUnconfirmedProcessTrees: new Set(),
     gatewayHardTerminatedProcesses: new WeakSet(),
-    gatewayProcessTreeTerminations: new WeakMap(),
+    gatewayProcessTreeTerminations: new Map(),
     quitGatewayWithinBudget,
     hasGatewayProcessExited: value => value.exitCode !== null || value.signalCode !== null,
     desktopLog: (event, detail) => logs.push({ event, ...detail }),
@@ -216,7 +218,8 @@ for (const platform of ['darwin', 'linux']) {
     await withBudget(async budget => {
       const h = harness({ platform, exited, complete: false })
       assert.equal(await h.handlers.terminateOwnedGatewayForQuit(h.child, budget), false)
-      assert.deepEqual(h.order, ['cleanup'], 'uncertain tool cleanup must not become root-only success')
+      assert.deepEqual(h.order, exited ? ['cleanup'] : ['cleanup', 'kill-root'],
+        'uncertain cleanup still stops the exact live root without claiming tree success')
       assert.equal(h.env.gatewayProcessCleanupContexts.get(h.child), h.launch)
       assert.equal(h.env.quitUnconfirmedProcessTrees.has(h.child), true)
     })
@@ -256,7 +259,7 @@ await withBudget(async budget => {
   const h = harness()
   h.env.requestVerifiedDesktopGatewayQuit = async () => ({ kind: 'unsupported' })
   assert.equal(await h.handlers.quitOwnedGateway(h.child, budget), true)
-  assert.deepEqual(h.order, ['legacy-drain'], 'unsupported peers keep the existing full drain')
+  assert.deepEqual(h.order, ['legacy-drain'], 'unsupported peers use their legacy protocol')
   assert.equal(h.env.gatewayProcessCleanupContexts.size, 0)
 })
 
@@ -264,6 +267,38 @@ await withBudget(async budget => {
   const h = harness({ platform: 'win32' })
   assert.equal(await h.handlers.terminateOwnedGatewayForQuit(h.child, budget), true)
   assert.deepEqual(h.order, ['windows-tree'], 'Windows keeps its existing tree termination')
+})
+
+for (const platform of ['darwin', 'linux', 'win32']) {
+  const budget = new DesktopQuitBudget(0, 0)
+  const h = harness({ platform })
+  try {
+    assert.equal(await h.handlers.terminateOwnedGatewayForQuit(h.child, budget), false)
+    assert.deepEqual(h.order, ['kill-root'], 'an exhausted deadline still signals the exact live child')
+  } finally { budget.dispose() }
+}
+
+for (const failure of ['rejected', 'request-error']) {
+  await withBudget(async budget => {
+    const h = harness()
+    h.env.requestVerifiedDesktopGatewayQuit = async () => {
+      if (failure === 'request-error') throw new Error('synthetic request failure')
+      return { kind: 'rejected' }
+    }
+    assert.equal(await h.handlers.quitOwnedGateway(h.child, budget), true)
+    assert.deepEqual(h.order, ['cleanup', 'kill-root'],
+      'a failed endpoint request must still clean the independently authenticated launch scope')
+  })
+}
+
+await withBudget(async budget => {
+  const h = harness({ platform: 'win32' })
+  h.env.gatewayProcessTreeTerminations.set(h.child, {
+    promise: Promise.resolve(false), controller: new AbortController(),
+  })
+  assert.equal(await h.handlers.terminateOwnedGatewayForQuit(h.child, budget), false)
+  assert.deepEqual(h.order, ['kill-root'], 'failed in-flight taskkill cannot suppress the exact child fallback')
+  assert.equal(h.env.quitUnconfirmedProcessTrees.has(h.child), true, 'root exit cannot manufacture tree proof')
 })
 
 for (const scenario of ['clean-stop', 'crash', 'unexpected-clean-exit', 'unexpected-signal', 'quitting', 'update']) {
@@ -480,13 +515,15 @@ await withBudget(async budget => {
     nativeWorkbenchSurfaces: { hasBrowserTabs: () => false, destroyAll: async () => {} },
     quitOwnedGateway: async value => { assert.equal(value, child); calls.push('cleanup'); return false },
     dialog: { showErrorBox: title => calls.push(title) },
-    app: { exit: () => assert.fail('an unconfirmed scope must retain the desktop') },
+    app: { exit: () => calls.push('exit') },
+    desktopReliabilityTelemetry: { finishSession() {} }, destroyWindowsTray() {},
+    desktopBrowser: { close: async () => {} },
   }
   const beforeQuit = new Function('env', `with (env) { ${failureSource}; return ${beforeQuitSource}; }`)(env)
   beforeQuit({ preventDefault() {} })
   await env.quitGatewayDrainPromise
   await new Promise(resolve => setImmediate(resolve))
-  assert.deepEqual(calls, ['cleanup', 'quit.failed'], 'a dead root remains eligible for scoped retry')
+  assert.deepEqual(calls, ['cleanup', 'exit'], 'unconfirmed proof survives a completed ordinary Quit')
   assert.equal(env.gatewayProcessCleanupContexts.get(child), launch)
 }
 

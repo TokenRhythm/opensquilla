@@ -65,7 +65,7 @@ function i18n() {
       en: {
         chrome: { searchChats: 'Search tasks' },
         chat: { copySessionLink: 'Copy session link' },
-        sessions: { filter: { chats: 'Tasks' } },
+        sessions: { loading: 'Loading…', filter: { chats: 'Tasks' } },
         shared: {
           sidebar: {
             recentConversations: 'Recent tasks',
@@ -84,6 +84,7 @@ function i18n() {
         },
         workspaces: {
           projects: 'Projects',
+          catalogUnavailable: 'Projects are unavailable.',
           createProject: 'Create project',
           addProject: 'Add project',
           projectInfo: '{path}; {count} tasks',
@@ -114,6 +115,7 @@ async function mountSidebar(
   canManageProjects = true,
   canCreateProjects = canManageProjects,
   sessionOrder: string[] = [],
+  projectCatalogState: 'ready' | 'loading' | 'unavailable' = 'ready',
 ) {
   const sections: SidebarSection[] = [{ family: 'chats', label: 'Tasks', rows }]
   const events = {
@@ -138,6 +140,7 @@ async function mountSidebar(
     contractDebugEnabled: false,
     canManageProjects,
     canCreateProjects,
+    projectCatalogState,
     onSelect: events.select,
     onNewProject: events.newProject,
     onNewProjectTask: events.newProjectTask,
@@ -165,6 +168,16 @@ afterEach(() => {
 })
 
 describe('SidebarConversations project workspaces', () => {
+  it.each(['loading', 'unavailable'] as const)('shows %s catalog status without claiming there are zero projects', async state => {
+    const { host } = await mountSidebar([], false, false, [], state)
+    const projects = host.querySelector('[data-sidebar-zone-group="projects"]')!
+    expect(projects).not.toBeNull()
+    expect(projects.querySelector('.sidebar-zone-heading__count')).toBeNull()
+    expect(projects.querySelector('[role="status"]')?.textContent)
+      .toContain(state === 'loading' ? 'Loading…' : 'Projects are unavailable.')
+    expect(projects.querySelector('[data-testid="sidebar-create-project"]')).toBeNull()
+  })
+
   it('creates projects from the section header while project-row creation actions remain task scoped', async () => {
     const { host, events } = await mountSidebar([projectRow(), taskRow()])
     const createProject = host.querySelector<HTMLButtonElement>('[data-testid="sidebar-create-project"]')

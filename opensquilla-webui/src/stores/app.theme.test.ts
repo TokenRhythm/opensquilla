@@ -1,11 +1,18 @@
 // @vitest-environment happy-dom
 import { nextTick } from 'vue'
-import { beforeEach, describe, expect, it, vi } from 'vitest'
+import { readFileSync } from 'node:fs'
+import { dirname, resolve } from 'node:path'
+import { fileURLToPath } from 'node:url'
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { createPinia, setActivePinia } from 'pinia'
 import { useAppStore } from './app'
 
 const THEME_KEY = 'opensquilla-theme'
 const DARK_SCHEME_QUERY = '(prefers-color-scheme: dark)'
+const testDir = dirname(fileURLToPath(import.meta.url))
+const arcticTokens = readFileSync(resolve(testDir, '../themes/arctic/tokens.css'), 'utf8')
+const greenTokens = readFileSync(resolve(testDir, '../themes/crt-green/tokens.css'), 'utf8')
+const lightTokens = readFileSync(resolve(testDir, '../themes/light/tokens.css'), 'utf8')
 
 function stubMatchMedia(initialMatches = false) {
   type ChangeListener = (event: MediaQueryListEvent) => void
@@ -51,7 +58,7 @@ function stubMatchMedia(initialMatches = false) {
 
 function stubDesktopThemeBridge() {
   const setNativeTheme = vi.fn(
-    async (_payload: { source: 'light' | 'dark' | 'system' }) => undefined,
+    async (_payload: { source: 'light' | 'dark' | 'system'; palette?: Record<string, string> }) => undefined,
   )
   ;(window as unknown as {
     opensquillaDesktop?: { setNativeTheme: typeof setNativeTheme }
@@ -69,6 +76,18 @@ describe('app store — theme persistence + legacy id migration', () => {
     // 'light' (distinct from the renamed dark themes under test).
     stubMatchMedia(false)
   })
+
+  afterEach(() => {
+    document.querySelectorAll('style[data-quit-theme-test]').forEach(style => style.remove())
+    vi.restoreAllMocks()
+  })
+
+  function installThemeStyles(css: string) {
+    const style = document.createElement('style')
+    style.dataset.quitThemeTest = ''
+    style.textContent = css
+    document.head.append(style)
+  }
 
   it('migrates a persisted legacy id ("nord") to its renamed theme ("arctic")', () => {
     localStorage.setItem(THEME_KEY, 'nord')
@@ -123,6 +142,67 @@ describe('app store — theme persistence + legacy id migration', () => {
     await nextTick()
     expect(setNativeTheme).toHaveBeenLastCalledWith({ source: 'light' })
 
+    store.destroyTheme()
+  })
+
+  it('shares the fixed Light palette from its applied CSS with desktop dialogs', async () => {
+    installThemeStyles(lightTokens)
+    const setNativeTheme = stubDesktopThemeBridge()
+    localStorage.setItem(THEME_KEY, 'light')
+    const store = useAppStore()
+    store.initTheme()
+    await nextTick()
+
+    expect(setNativeTheme).toHaveBeenLastCalledWith({ source: 'light', palette: {
+      '--bg-surface': '#FFFFFF', '--bg-hover': '#F0F0F0',
+      '--text': '#202020', '--text-muted': '#626262', '--border': '#E5E5E5',
+      '--accent': '#BA4D0F', '--accent-hover': '#A5440C', '--accent-foreground': '#FFFFFF',
+    } })
+    store.destroyTheme()
+  })
+
+  it('updates custom dialog colors even when the native scheme stays dark and clears them in System', async () => {
+    installThemeStyles(`${arcticTokens}\n${greenTokens}`)
+    const media = stubMatchMedia(true)
+    const setNativeTheme = stubDesktopThemeBridge()
+    const readStyle = vi.spyOn(window, 'getComputedStyle')
+    localStorage.setItem(THEME_KEY, 'arctic')
+    const store = useAppStore()
+    store.initTheme()
+    await nextTick()
+
+    expect(setNativeTheme).toHaveBeenLastCalledWith({ source: 'dark', palette: {
+      '--bg-surface': '#333B49', '--bg-hover': '#4C566A',
+      '--text': '#ECEFF4', '--text-muted': '#C8D0DE', '--border': '#3B4252',
+      '--accent': '#88C0D0', '--accent-hover': '#99D1E0', '--accent-foreground': '#2E3440',
+    } })
+
+    store.setTheme('crt-green')
+    await nextTick()
+    expect(setNativeTheme).toHaveBeenLastCalledWith({ source: 'dark', palette: {
+      '--bg-surface': '#08200f', '--bg-hover': '#164024',
+      '--text': '#d6ffe2', '--text-muted': '#8fd6a5', '--border': '#1d5230',
+      '--accent': '#39ff14', '--accent-hover': '#5cff45', '--accent-foreground': '#04120a',
+    } })
+
+    readStyle.mockClear()
+    store.setTheme('system')
+    await nextTick()
+    expect(setNativeTheme).toHaveBeenLastCalledWith({ source: 'system' })
+    media.setMatches(false)
+    await nextTick()
+    expect(setNativeTheme).toHaveBeenLastCalledWith({ source: 'system' })
+    expect(readStyle).not.toHaveBeenCalled()
+    store.destroyTheme()
+  })
+
+  it('does not read desktop dialog colors in the web app', async () => {
+    const readStyle = vi.spyOn(window, 'getComputedStyle')
+    localStorage.setItem(THEME_KEY, 'light')
+    const store = useAppStore()
+    store.initTheme()
+    await nextTick()
+    expect(readStyle).not.toHaveBeenCalled()
     store.destroyTheme()
   })
 

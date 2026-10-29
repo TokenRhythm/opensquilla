@@ -1,23 +1,29 @@
 import assert from 'node:assert/strict'
 import { readFileSync } from 'node:fs'
+import { EventEmitter } from 'node:events'
+import { join } from 'node:path'
+import { mock } from 'node:test'
+import { createContext, runInContext } from 'node:vm'
 import ts from '@typescript/typescript6'
 
-import { DesktopQuitBudget } from '../dist/desktop-quit.js'
+import { DesktopQuitBudget, DesktopQuitConfirmation, quitGatewayWithinBudget } from '../dist/desktop-quit.js'
+import { buildDesktopQuitDialogHtml, normalizeDesktopQuitDialogPalette, parseDesktopQuitDialogResponse } from '../dist/desktop-quit-dialog.js'
+import { DesktopWriterAdmission } from '../dist/desktop-writer-admission.js'
+import { mainWindowCloseAction } from '../dist/desktop-window-lifecycle.js'
+import { normalizeGatewayLocale } from '../dist/desktop-locale.js'
+import { terminateWindowsProcessTree } from '../dist/windows-process-tree.js'
 
-// Execute the shipped failure path without launching Electron or terminating
-// real processes. In particular, a dead root must never become a PID retry.
+// Execute production handlers without Electron or real process termination.
 const source = ts.createSourceFile(
-  'main.js',
-  readFileSync(new URL('../dist/main.js', import.meta.url), 'utf8'),
-  ts.ScriptTarget.Latest,
-  true,
-  ts.ScriptKind.JS,
+  'main.js', readFileSync(new URL('../dist/main.js', import.meta.url), 'utf8'),
+  ts.ScriptTarget.Latest, true, ts.ScriptKind.JS,
 )
-let failureHandler
+const functions = []
 let beforeQuitHandler
 function collect(node) {
-  if (ts.isFunctionDeclaration(node) && node.name?.text === 'showDesktopQuitFailure') {
-    failureHandler = node.getText(source)
+  if (ts.isFunctionDeclaration(node)
+    && ['showDesktopQuitFailure', 'forceOwnedGatewayForQuit', 'terminateGatewayProcess'].includes(node.name?.text)) {
+    functions.push(node.getText(source))
   }
   if (ts.isCallExpression(node) && node.expression.getText(source) === 'app.on'
     && ts.isStringLiteral(node.arguments[0]) && node.arguments[0].text === 'before-quit') {
@@ -26,93 +32,288 @@ function collect(node) {
   ts.forEachChild(node, collect)
 }
 collect(source)
-assert.ok(failureHandler, 'Expected production quit failure handler.')
-assert.ok(beforeQuitHandler, 'Expected production before-quit handler.')
+assert.equal(functions.length, 3)
+assert.ok(beforeQuitHandler)
+const flush = () => new Promise(resolve => setImmediate(resolve))
 
-const child = { pid: 12345 }
-let rootExited = false
-let quitAttempts = 0
-let preventions = 0
-const failures = []
-const statuses = []
-const unexpected = () => assert.fail('Failed cleanup must not commit exit or signal a dead root.')
-const env = {
-  DesktopQuitBudget,
-  systemSessionEnding: false,
-  updateApplying: false,
-  quitGatewayDrainPromise: null,
-  holdQuitForTaskConfirmation: () => false,
-  desktopUpdateCheckScheduler: { stop() {} },
-  desktopWriters: { activeCount: 0, close: () => Symbol('quit') },
-  quitDeferredForDesktopWriters: false,
-  quitWriterAdmission: null,
-  desktopLog() {},
-  process: { platform: 'win32' },
-  isQuitting: false,
-  cancelGatewayUnexpectedExitRestart() {},
-  gatewayProcess: child,
-  gatewayState: { owned: true, status: 'ready' },
-  hasGatewayProcessExited: value => {
-    assert.equal(value, child)
-    return rootExited
-  },
-  liveLifecycleOwnedGatewayProcesses: () => rootExited ? [] : [child],
-  quitFromSignal: false,
-  quitUnconfirmedProcessTrees: new Set([child]),
-  gatewayProcessCleanupContexts: new Map(),
-  setAppExitPhase: phase => { statuses.push(phase) },
-  setQuitStatus: key => { statuses.push(key) },
-  artifactPreviewLeaseBroker: { shutdown: async () => {} },
-  nativeWorkbenchSurfaces: { hasBrowserTabs: () => false, destroyAll: async () => {} },
-  quitOwnedGateway: async value => {
-    assert.equal(value, child)
-    assert.equal(rootExited, false, 'Never retry an exited root PID.')
-    quitAttempts += 1
-    return false
-  },
-  desktopT: key => key,
-  publishGatewayConnection() {},
-  dialog: { showErrorBox: (title, detail) => failures.push({ title, detail }) },
-  app: { exit: unexpected },
-  desktopReliabilityTelemetry: { finishSession: unexpected },
-  destroyWindowsTray: unexpected,
-  desktopBrowser: { close: unexpected },
-  stopGateway: unexpected,
-}
-const beforeQuit = new Function('env', `with (env) {
-  ${failureHandler}
-  return ${beforeQuitHandler}
-}`)(env)
-
-async function attemptQuit() {
-  const previousFailures = failures.length
-  beforeQuit({ preventDefault: () => { preventions += 1 } })
-  for (let attempt = 0; attempt < 100 && failures.length === previousFailures; attempt += 1) {
-    await new Promise(resolve => setImmediate(resolve))
+async function scenario(run, { platform = 'darwin', exited = false, dev = false } = {}) {
+  let now = 0
+  let budgets = 0
+  const calls = { exits: [], signals: [], errors: [], logs: [], drains: 0, prevented: 0 }
+  const child = { pid: 12345, exitCode: exited ? 0 : null, signalCode: null,
+    kill: signal => { calls.signals.push(['child', signal]); return true } }
+  const launch = { instanceNonce: 'synthetic-retained-launch' }
+  const env = {
+    DesktopQuitBudget: class extends DesktopQuitBudget {
+      constructor() { super(10_000, 5_000, () => now); budgets += 1 }
+    },
+    systemSessionEnding: false, updateApplying: false, updateInstallHandoffReady: false,
+    quitRequestedDuringUpdateDrain: false, quitGatewayDrainPromise: null,
+    holdQuitForTaskConfirmation: () => false, desktopUpdateCheckScheduler: { stop() {} },
+    desktopWriters: { activeCount: 0, close: () => Symbol('quit') },
+    quitDeferredForDesktopWriters: false, quitWriterAdmission: null,
+    desktopLog: (event, detail) => calls.logs.push({ event, ...detail }),
+    process: { platform, kill: (pid, signal) => calls.signals.push(['group', pid, signal]) },
+    isQuitting: false, appExitPhase: 'running',
+    cancelGatewayUnexpectedExitRestart() {}, gatewayProcess: child,
+    gatewayState: { owned: true, status: 'ready' },
+    hasGatewayProcessExited: value => value.exitCode !== null || value.signalCode !== null,
+    liveLifecycleOwnedGatewayProcesses: () => env.hasGatewayProcessExited(child) ? [] : [child],
+    gatewayProcessDiagnostics: new WeakMap(), gatewayHardTerminatedProcesses: new WeakSet(),
+    gatewayProcessTreeChildren: new WeakSet(dev ? [child] : []),
+    gatewayProcessTreeTerminations: new Map(),
+    quitFromSignal: false, quitUnconfirmedProcessTrees: new Set([child]),
+    gatewayProcessCleanupContexts: new Map([[child, launch]]),
+    setAppExitPhase: phase => { env.appExitPhase = phase }, setQuitStatus() {},
+    artifactPreviewLeaseBroker: { shutdown: async () => {} },
+    nativeWorkbenchSurfaces: { destroyAll: async () => {} },
+    quitOwnedGateway: async () => { calls.drains += 1; return false },
+    drainOwnedGatewayForLegacyQuit: async () => false,
+    desktopT: key => key, publishGatewayConnection() {},
+    desktopGatewayConnectionSuspendedForExit: () => false,
+    dialog: { showErrorBox: (...args) => calls.errors.push(args) },
+    app: { exit: code => calls.exits.push(code) },
+    desktopReliabilityTelemetry: { finishSession() {} }, destroyWindowsTray() {},
+    desktopBrowser: { close: async () => {} },
   }
-  assert.equal(failures.length, previousFailures + 1)
-  assert.equal(env.quitGatewayDrainPromise, null)
-  assert.equal(env.isQuitting, true)
-  assert.equal(env.gatewayState.status, 'error')
-  assert.deepEqual([...env.quitUnconfirmedProcessTrees], [child], 'Keep unconfirmed cleanup evidence.')
+  const beforeQuit = new Function('env', `with (env) {
+    ${functions.join('\n')}
+    return ${beforeQuitHandler}
+  }`)(env)
+  const request = () => beforeQuit({ preventDefault: () => { calls.prevented += 1 } })
+  env.app.quit = request
+  const advance = async milliseconds => {
+    now += milliseconds
+    mock.timers.tick(milliseconds)
+    await flush()
+    mock.timers.tick(0)
+    await flush()
+  }
+  mock.timers.enable({ apis: ['setTimeout'] })
+  try {
+    await run({ child, launch, calls, env, request, advance, budgets: () => budgets })
+  } finally { mock.timers.reset() }
 }
 
-await attemptQuit()
-assert.deepEqual(failures.at(-1), { title: 'quit.failed', detail: 'quit.failedDetail' })
-assert.equal(quitAttempts, 1, 'A still-live owned root may be retried.')
+for (const platform of ['darwin', 'linux', 'win32']) {
+  for (const exited of [false, true]) {
+    await scenario(async h => {
+      h.request()
+      h.request()
+      await h.env.quitGatewayDrainPromise
+      await flush()
+      assert.deepEqual(h.calls.exits, [0], 'failed proof cannot keep a confirmed Quit open')
+      assert.equal(h.calls.drains, 1, 'repeated Quit joins the same operation')
+      assert.equal(h.env.appExitPhase, 'committed')
+      assert.deepEqual(h.calls.errors, [])
+      assert.equal(h.calls.signals.length, exited ? 0 : 1)
+      if (!exited) assert.deepEqual(h.calls.signals[0], ['child', 'SIGKILL'])
+      assert.equal(h.env.gatewayProcessCleanupContexts.get(h.child), h.launch)
+      assert.equal(h.env.quitUnconfirmedProcessTrees.has(h.child), true, 'retain unconfirmed proof')
+      assert.deepEqual(h.calls.logs.find(row => row.event === 'quit_cleanup_finished'), {
+        event: 'quit_cleanup_finished', rootExited: exited, cleanupConfirmed: false,
+      })
+    }, { platform, exited })
+  }
+}
 
-// The root can exit after a failed taskkill, for example through its watchdog.
-rootExited = true
-for (let attempt = 0; attempt < 2; attempt += 1) {
-  await attemptQuit()
-  assert.deepEqual(failures.at(-1), {
-    title: 'quit.manualRecovery', detail: 'quit.manualRecoveryDetail',
+for (const platform of ['darwin', 'linux']) {
+  for (const exited of [false, true]) {
+    await scenario(async h => {
+      h.request()
+      await h.env.quitGatewayDrainPromise
+      await flush()
+      assert.deepEqual(h.calls.signals, exited ? [] : [['group', -h.child.pid, 'SIGKILL']],
+        'a dev launcher needs its owned group, whose ID must never be reused after root exit')
+    }, { platform, exited, dev: true })
+  }
+}
+
+for (const exited of [false, true]) {
+  await scenario(async h => {
+    const controller = new AbortController()
+    const killer = Object.assign(new EventEmitter(), {
+      exitCode: null, signalCode: null,
+      kill: signal => { h.calls.signals.push(['taskkill-helper', signal]); return true },
+    })
+    const promise = terminateWindowsProcessTree({
+      pid: h.child.pid, timeoutMs: 5_000, signal: controller.signal,
+      spawnProcess: () => killer,
+      fallback: () => assert.fail('helper cancellation cannot reuse an old target PID'),
+    })
+    h.env.gatewayProcessTreeTerminations.set(h.child, { promise, controller })
+    h.request()
+    await h.env.quitGatewayDrainPromise
+    await flush()
+    assert.equal(await promise, false)
+    assert.deepEqual(h.calls.signals, exited
+      ? [['taskkill-helper', 'SIGKILL']]
+      : [['taskkill-helper', 'SIGKILL'], ['child', 'SIGKILL']],
+    'Quit reaps an earlier taskkill operation before root fallback, including an exited root')
+    assert.deepEqual(h.calls.exits, [0])
+  }, { platform: 'win32', exited })
+}
+
+for (const failure of ['legacy-hang', 'helper-hang', 'throw', 'preview-throw', 'finalize-throw', 'diagnostic-throw']) {
+  await scenario(async h => {
+    let completeLate
+    if (failure.endsWith('hang')) {
+      h.env.quitOwnedGateway = (_child, budget) => {
+        h.calls.drains += 1
+        const stuck = () => new Promise(resolve => { completeLate = resolve })
+        if (failure === 'helper-hang') return stuck()
+        return quitGatewayWithinBudget({
+          budget, hasExited: () => false, requestQuit: async () => ({ kind: 'unsupported' }),
+          legacyDrain: stuck, onLegacyDrain() {},
+          waitForExit: () => assert.fail('legacy owns its wait'),
+          terminate: () => assert.fail('legacy owns its termination'), onTerminating() {},
+        })
+      }
+    } else if (failure === 'throw') {
+      h.env.quitOwnedGateway = () => { h.calls.drains += 1; throw new Error('synthetic cleanup failure') }
+    } else if (failure === 'preview-throw') {
+      h.env.artifactPreviewLeaseBroker.shutdown = () => { throw new Error('synthetic preview failure') }
+    } else if (failure === 'diagnostic-throw') {
+      h.env.desktopLog = event => {
+        if (event === 'quit_cleanup_finished') throw new Error('synthetic diagnostic failure')
+      }
+    } else {
+      h.env.desktopReliabilityTelemetry.finishSession = () => { throw new Error('synthetic finalization failure') }
+    }
+    h.request()
+    await flush()
+    if (completeLate) {
+      await h.advance(14_999)
+      assert.deepEqual(h.calls.exits, [])
+      h.request()
+      await h.advance(1)
+    }
+    await h.env.quitGatewayDrainPromise
+    await flush()
+    assert.deepEqual(h.calls.exits, [0], failure)
+    assert.equal(h.calls.drains, 1, 'another local cleanup failure must not skip Gateway cleanup')
+    assert.equal(h.calls.signals.length, 1, 'deadline exhaustion must not skip the final signal')
+    if (completeLate) {
+      completeLate(true)
+      await flush()
+      assert.deepEqual(h.calls.exits, [0], 'late cleanup cannot commit a second exit')
+    }
   })
-  assert.equal(env.gatewayState.error, 'quit.manualRecovery')
-  assert.equal(statuses.at(-1), 'quit.manualRecovery')
-  assert.equal(quitAttempts, 1, 'Repeated Quit cannot reuse the dead root PID.')
 }
-assert.equal(preventions, 3)
-assert.equal(statuses.includes('committed'), false)
 
-console.log('desktop quit failure recovery checks passed')
+await scenario(async h => {
+  const other = { pid: 23456, exitCode: null, signalCode: null,
+    kill: signal => { h.calls.signals.push(['other-child', signal]); return true } }
+  let finishOther
+  h.env.liveLifecycleOwnedGatewayProcesses = () => [h.child, other]
+  h.env.quitOwnedGateway = child => {
+    h.calls.drains += 1
+    if (child === h.child) throw new Error('synthetic first-child failure')
+    return new Promise(resolve => { finishOther = resolve })
+  }
+  h.request()
+  await flush()
+  assert.equal(h.calls.drains, 2)
+  await h.advance(5_000)
+  assert.deepEqual(h.calls.exits, [], 'one failed child must not abort another child cleanup')
+  finishOther(true)
+  await h.env.quitGatewayDrainPromise
+  await flush()
+  assert.deepEqual(h.calls.exits, [0])
+  assert.equal(h.calls.signals.length, 2)
+})
+
+await scenario(async h => {
+  let finishWriter
+  h.env.desktopWriters.activeCount = 1
+  h.env.waitForDesktopWriterOperations = () => new Promise(resolve => { finishWriter = resolve })
+  h.request()
+  await h.advance(60_000)
+  assert.equal(h.budgets(), 0, 'the Quit budget starts only after protected writes settle')
+  assert.equal(h.calls.drains, 0)
+  assert.deepEqual(h.calls.exits, [])
+  h.env.desktopWriters.activeCount = 0
+  finishWriter()
+  await flush()
+  await h.env.quitGatewayDrainPromise
+  assert.equal(h.budgets(), 1)
+  assert.deepEqual(h.calls.exits, [0])
+})
+
+await scenario(async h => {
+  h.env.updateApplying = true
+  h.request()
+  await h.advance(60_000)
+  assert.equal(h.budgets(), 0, 'an update owns handoff; ordinary Quit cannot bypass it')
+  assert.equal(h.env.quitRequestedDuringUpdateDrain, true)
+  assert.deepEqual(h.calls.exits, [])
+})
+
+await scenario(async h => {
+  h.env.quitFromSignal = true
+  h.request()
+  await h.env.quitGatewayDrainPromise
+  await flush()
+  assert.deepEqual(h.calls.exits, [], 'signals retain their existing failure policy')
+  assert.equal(h.calls.errors.length, 1)
+  assert.deepEqual(h.calls.signals, [])
+})
+
+// Execute the native fixture's own host construction on every platform. A
+// separate unit-test environment cannot detect missing globals in that host.
+{
+  const nativeFixture = ts.createSourceFile('fixture.mjs', readFileSync(
+    new URL('./fixtures/desktop-quit-acceptance/main.mjs', import.meta.url), 'utf8',
+  ), ts.ScriptTarget.Latest, true, ts.ScriptKind.JS)
+  const environmentFactory = nativeFixture.statements.find(node =>
+    ts.isFunctionDeclaration(node) && node.name?.text === 'makeEnvironment')
+  const requiredDeclaration = nativeFixture.statements.filter(ts.isVariableStatement)
+    .flatMap(node => [...node.declarationList.declarations])
+    .find(node => node.name.getText(nativeFixture) === 'required')
+  assert.ok(environmentFactory)
+  assert.ok(ts.isArrayLiteralExpression(requiredDeclaration?.initializer))
+  const required = requiredDeclaration.initializer.elements.map(node => {
+    assert.ok(ts.isStringLiteral(node))
+    return node.text
+  })
+  const productionFunctions = new Map(source.statements.filter(ts.isFunctionDeclaration)
+    .filter(node => node.name).map(node => [node.name.text, node.getText(source)]))
+  for (const name of required) assert.ok(productionFunctions.has(name))
+  for (const platform of ['darwin', 'linux', 'win32']) {
+    const logs = [], signals = []
+    const task = { pid: 12346, exitCode: null, signalCode: null,
+      kill(signal) { signals.push(signal); this.signalCode = signal; return true } }
+    const host = {
+      env: null, EventEmitter, createContext, runInContext, join,
+      process: { platform }, BrowserWindow: class {}, ipcMain: {}, screen: {}, dialog: {},
+      app: { exit: () => assert.fail('the fixture must keep its real host open') }, exitOnQuit: false,
+      settings: { cleanupFailure: true, locale: 'en', manualNativeErrors: false },
+      ledger: { quitRequests: 0, acceptedExit: 0, drain: 0, errorBoxes: [] },
+      log: (event, detail = {}) => logs.push({ event, ...detail }), renderOwner() {},
+      task, taskAlive: () => task.exitCode === null && task.signalCode === null,
+      stopTask: () => assert.fail('the failed-cleanup adapter must leave the final signal to production'),
+      owner: null, manager: { destroyAll: async () => {} }, distDir: '/synthetic/dist',
+      buildDesktopQuitDialogHtml, normalizeDesktopQuitDialogPalette, parseDesktopQuitDialogResponse,
+      DesktopQuitBudget, DesktopQuitConfirmation, DesktopWriterAdmission,
+      nativeTheme: { shouldUseDarkColors: false }, mainWindowCloseAction, normalizeGatewayLocale,
+      functions: productionFunctions, required, messages: '{}', beforeQuit: beforeQuitHandler,
+    }
+    const environment = new Function('host', `with (host) {
+      ${environmentFactory.getText(nativeFixture)}
+      makeEnvironment(); return env;
+    }`)(host)
+    environment.quitConfirmed = true
+    environment.app.quit()
+    await environment.quitGatewayDrainPromise
+    await flush()
+    assert.deepEqual(logs.filter(row => row.event === 'quit_finalize_failed'), [],
+      `${platform} native fixture must provide every production quit dependency`)
+    assert.deepEqual(signals, ['SIGKILL'])
+    assert.equal(environment.appExitPhase, 'committed')
+    assert.equal(host.ledger.acceptedExit, 1)
+    assert.equal(host.ledger.drain, 1)
+    assert.equal(environment.quitUnconfirmedProcessTrees.has(task), true)
+  }
+}
+
+console.log('desktop bounded quit failure and protected admission checks passed')

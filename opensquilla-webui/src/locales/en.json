@@ -1,4 +1,11 @@
 {
+  "desktopRuntime": {
+    "starting": "Starting OpenSquilla…",
+    "startFailed": "OpenSquilla failed to start.",
+    "sandboxUpgradeIncomplete": "Sandbox settings were not fully upgraded. The runtime is usable; check the log and retry after restarting.",
+    "retry": "Retry",
+    "showLog": "Show log"
+  },
   "visualize": {
     "runtimeError": "This canvas could not run",
     "runtimeErrorHint": "Its code encountered an error. You can ask AI to repair it, or run this version again.",
@@ -131,6 +138,7 @@
     "failed": "The file action failed."
   },
   "workspaces": {
+    "catalogUnavailable": "Projects are unavailable.",
     "openDirectory": "Open in file manager",
     "copyDirectoryPath": "Copy project directory path",
     "openDirectoryFailed": "Could not open the project directory. Try again.",

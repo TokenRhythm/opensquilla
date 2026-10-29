@@ -1,4 +1,4 @@
-import { ref, computed } from 'vue'
+import { ref, computed, shallowRef, watch } from 'vue'
 import i18n from '@/i18n'
 import type { WorkspaceItem as ProjectWorkspaceItem } from '@/modules/workspaceCatalog'
 import type { SessionTaskAttention } from '@/composables/useSessionTaskAttention'
@@ -113,6 +113,34 @@ export interface SidebarSection {
   rows: SidebarSectionRow[]
 }
 
+export type SidebarProjectProjection =
+  | { kind: 'canonical'; projects: readonly ProjectWorkspaceItem[] }
+  | { kind: 'pending' }
+  | { kind: 'legacy' }
+
+/** One view's last catalog, kept separately from operation validation/authority. */
+export function useSidebarProjectDisplay(source: {
+  scope: () => number | null
+  catalog: () => readonly ProjectWorkspaceItem[] | null
+  unavailable: () => boolean
+}) {
+  const snapshot = shallowRef<readonly ProjectWorkspaceItem[] | null>(null)
+  watch(source.scope, () => { snapshot.value = null }, { flush: 'sync' })
+  watch(source.unavailable, unavailable => {
+    if (unavailable) snapshot.value = null
+  }, { flush: 'sync' })
+  // Catalog resets update rows before hasLoaded. Observe their settled batch,
+  // otherwise that transient empty array replaces the last complete display.
+  watch(source.catalog, catalog => {
+    if (catalog !== null && source.scope() !== null && !source.unavailable()) {
+      snapshot.value = catalog.map(project => ({ ...project }))
+    }
+  }, { immediate: true, flush: 'pre' })
+  return computed<SidebarProjectProjection>(() => snapshot.value === null
+    ? { kind: 'pending' }
+    : { kind: 'canonical', projects: snapshot.value })
+}
+
 /** Place query results into the three sidebar families; hide non-Web chat surfaces. */
 function sidebarFamilyForSession(item: SessionItem): SidebarSectionFamily | null {
   if (item.sessionKind === 'chat') {
@@ -136,10 +164,13 @@ const SIDEBAR_SECTION_ORDER: SidebarSectionFamily[] = ['chats', 'channels', 'aut
 /** Build the ordered, recency-sorted sidebar projection without mutating query data. */
 export function arrangeSidebarSections(
   items: SessionItem[],
-  projects?: readonly ProjectWorkspaceItem[],
+  projects: readonly ProjectWorkspaceItem[] | SidebarProjectProjection = { kind: 'pending' },
   sessionOrder: readonly string[] = [],
   pinnedSessionKeys: readonly string[] = [],
 ): SidebarSection[] {
+  const projectProjection: SidebarProjectProjection = Array.isArray(projects)
+    ? { kind: 'canonical', projects }
+    : projects as SidebarProjectProjection
   const buckets: Record<SidebarSectionFamily, SessionItem[]> = {
     chats: [],
     channels: [],
@@ -326,9 +357,13 @@ export function arrangeSidebarSections(
     let rows: SidebarSectionRow[]
     if (family === 'chats') {
       const ledger = arrangeSessionLedger([...bucket].sort(bySidebarOrder))
-      rows = projects === undefined
+      rows = projectProjection.kind === 'legacy'
         ? arrangeWorkspaceRows(ledger)
-        : arrangePersistedProjectRows(ledger, projects)
+        : projectProjection.kind === 'canonical'
+          ? arrangePersistedProjectRows(ledger, projectProjection.projects)
+          // Until membership is known, leave ordinary tasks visible without
+          // inventing projects or revealing tasks of a removed project.
+          : ledger.filter(entry => !entry.item.workspaceId).map(entry => toRow(entry.item, entry.depth))
     } else {
       rows = [...bucket].sort(byRecency).map(item => toRow(item, 0))
     }

@@ -40,14 +40,13 @@
       #desktop-runtime-banner[data-state='migration-warning'] { border-color: #c98522; }
       #desktop-runtime-banner button { margin-left: 8px; }
     </style>
-    <script type="module" src="/src/desktop-runtime-banner.ts"></script>
     <script type="module" src="/src/main.ts"></script>
   </head>
   <body>
-    <div id="desktop-runtime-banner" role="status" aria-live="polite">
-      <span id="desktop-runtime-message">Preparing the local runtime…</span>
-      <button id="desktop-runtime-retry" type="button" hidden>Retry</button>
-      <button id="desktop-runtime-log" type="button" hidden>Show log</button>
+    <div id="desktop-runtime-banner" role="status" aria-live="polite" hidden>
+      <span id="desktop-runtime-message"></span>
+      <button id="desktop-runtime-retry" type="button" hidden></button>
+      <button id="desktop-runtime-log" type="button" hidden></button>
     </div>
     <div id="app"></div>
     <div id="opensquilla-data" data-base-path="/" style="display:none"></div>

@@ -171,6 +171,8 @@ const compiled = ts.transpileModule(`${extracted}\nconst beforeQuit = ${beforeQu
     await until(() => exits.length > 0, 'native fixture ordinary quit')
     assert.deepEqual(exits, [0])
     assert.equal(fixture.liveLifecycleOwnedGatewayProcesses().length, 0)
+    assert.deepEqual(logs.filter(row => row.event === 'quit_finalize_failed'), [],
+      'the native fixture must provide every production quit dependency')
     assert.equal(fixture.phase(), 'committed')
     assert.equal(fixture.confirmationPending(), null)
     assert.ok(logs.findIndex(row => row.event === 'gateway_exit')
@@ -295,6 +297,7 @@ function lifecycleFixture(options = {}) {
     quitConfirmationPromise: null, quitConfirmed: false, quitFromSignal: false,
     quitUnconfirmedProcessTrees: new Set(),
     gatewayProcessCleanupContexts: new Map(),
+    gatewayProcessTreeTerminations: new Map(),
     holdQuitForTaskConfirmation: () => false,
     cancelGatewayUnexpectedExitRestart: () => {},
     showDesktopQuitFailure: () => { assert.fail('synthetic normal quit cleanup must succeed') },
@@ -332,7 +335,11 @@ function lifecycleFixture(options = {}) {
         calls.quitEvents.push(event)
         return event
       },
-      exit: (code) => { calls.exits.push(code) },
+      exit: (code) => {
+        assert.deepEqual(f.events.filter(row => row.name === 'quit_finalize_failed'), [],
+          'normal quit must finish without a missing fixture dependency')
+        calls.exits.push(code)
+      },
     },
   })
   return { ...f, lifecycleCalls: calls,

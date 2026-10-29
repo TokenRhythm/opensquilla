@@ -248,7 +248,7 @@ async function runQuitProcessDiagnosticsWiringCases() {
       gatewayProcessDiagnostics: new WeakMap([[child, tracker]]),
       gatewayStoppingProcesses: stopping,
       gatewayHardTerminatedProcesses: new WeakSet(),
-      gatewayProcessTreeTerminations: new WeakMap(),
+      gatewayProcessTreeTerminations: new Map(), AbortController,
       quitUnconfirmedProcessTrees: new Set(),
       process: { platform: 'win32' }, updateApplying: entrypoint === 'update',
       hasGatewayProcessExited: () => child.exitCode !== null,
@@ -484,6 +484,7 @@ function mainExitHarness() {
     gatewayProcess: child,
     gatewayProcessOwnershipContexts: new Map([[child, { nonce: 'synthetic-owner' }]]),
     gatewayProcessCleanupContexts: new Map(),
+    gatewayProcessTreeTerminations: new Map(),
     desktopGatewayAuthToken: nonce => `auth-${nonce}`,
     activeDesktopProfile: () => ({ home: 'synthetic-profile' }),
     desktopProfileFingerprint: () => 'synthetic-fingerprint',
@@ -518,6 +519,11 @@ function mainExitHarness() {
     destroyWindowsTray() {}, stopGateway() {},
     hasGatewayProcessExited: () => childExited,
     liveLifecycleOwnedGatewayProcesses: () => childExited ? [] : [child],
+    forceOwnedGatewayForQuit: value => {
+      assert.equal(value, child)
+      assert.equal(childExited, false)
+      calls.order.push('final-owned-signal')
+    },
     quitOwnedGateway: async (process) => {
       assert.equal(process, child)
       calls.order.push('gateway-shutdown')
@@ -596,6 +602,7 @@ async function runQuitDrainDescriptorCase(exited) {
   const harness = mainExitHarness()
   harness.quit()
   assertRendererStopped(harness.calls.published.at(-1))
+  await harness.drainRequested
   assert.deepEqual(harness.calls.order, ['descriptor:stopped', 'preview-cleanup', 'gateway-shutdown'],
     'task cancellation must begin without waiting for preview cleanup')
   harness.previewCleanup.resolve()
@@ -608,9 +615,10 @@ async function runQuitDrainDescriptorCase(exited) {
     assertRendererStopped(harness.snapshot())
     assert.deepEqual(harness.calls.exits, [0])
   } else {
-    assert.equal(harness.calls.published.at(-1).status, 'stopped', 'failed quit must keep renderer admission closed')
-    assert.equal(harness.calls.errors.length, 1)
-    assert.deepEqual(harness.calls.exits, [])
+    assert.equal(harness.calls.published.at(-1).status, 'stopped', 'unconfirmed quit keeps renderer admission closed')
+    assert.equal(harness.calls.errors.length, 0)
+    assert.equal(harness.calls.order.at(-1), 'final-owned-signal')
+    assert.deepEqual(harness.calls.exits, [0], 'ordinary Quit exits while retaining uncertain cleanup proof')
   }
 }
 

@@ -1,4 +1,11 @@
 {
+  "desktopRuntime": {
+    "starting": "正在启动 OpenSquilla…",
+    "startFailed": "OpenSquilla 启动失败。",
+    "sandboxUpgradeIncomplete": "沙箱设置升级未完成，当前运行仍可用；请查看日志并重启后重试。",
+    "retry": "重试",
+    "showLog": "查看日志"
+  },
   "visualize": {
     "runtimeError": "画布运行出错",
     "runtimeErrorHint": "画布代码遇到了问题。可以请 AI 修复，或重新运行此版本。",
@@ -130,6 +137,7 @@
     "unavailable": "当前源文件不可用；已有预览和下载保持不变。", "failed": "文件操作失败。"
   },
   "workspaces": {
+    "catalogUnavailable": "项目列表暂不可用。",
     "openDirectory": "在资源管理器中打开",
     "copyDirectoryPath": "复制项目目录路径",
     "openDirectoryFailed": "无法打开项目目录，请重试。",

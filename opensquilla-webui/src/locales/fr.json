@@ -1,4 +1,11 @@
 {
+  "desktopRuntime": {
+    "starting": "Démarrage d’OpenSquilla…",
+    "startFailed": "OpenSquilla n’a pas pu démarrer.",
+    "sandboxUpgradeIncomplete": "La mise à niveau des paramètres du bac à sable est incomplète. Vous pouvez continuer à utiliser l’application. Consultez le journal et réessayez après un redémarrage.",
+    "retry": "Réessayer",
+    "showLog": "Afficher le journal"
+  },
   "visualize": {
     "runtimeError": "Ce canevas n’a pas pu s’exécuter",
     "runtimeErrorHint": "Son code a rencontré une erreur. Demandez une correction à l’IA ou relancez cette version.",
@@ -130,6 +137,7 @@
     "unavailable": "Le fichier source est indisponible. Les aperçus et téléchargements existants sont inchangés.", "failed": "L’opération sur le fichier a échoué."
   },
   "workspaces": {
+    "catalogUnavailable": "La liste des projets est indisponible.",
     "openDirectory": "Ouvrir dans le gestionnaire de fichiers",
     "copyDirectoryPath": "Copier le chemin du dossier du projet",
     "openDirectoryFailed": "Impossible d’ouvrir le dossier du projet. Réessayez.",
