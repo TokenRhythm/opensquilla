@@ -273,6 +273,7 @@ CASES: list[GoldenCase] = [
     GoldenCase("anthropic", "stop_reason_usage_cache.sse", _anthropic_collector()),
     # ollama (OllamaProvider, JSONL)
     GoldenCase("ollama", "text_then_done.jsonl", _ollama_collector()),
+    GoldenCase("ollama", "length_then_done.jsonl", _ollama_collector()),
     GoldenCase(
         "ollama",
         "whole_chunk_tool_call.jsonl",
