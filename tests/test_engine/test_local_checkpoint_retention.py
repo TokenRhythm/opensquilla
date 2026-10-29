@@ -7,6 +7,7 @@ from types import SimpleNamespace
 
 import pytest
 
+from opensquilla import token_estimation
 from opensquilla.engine import Agent, AgentConfig
 from opensquilla.engine.agent import _CompactionSummaryMessage, _LiveTurnCheckpointMessage
 from opensquilla.engine.request_window import compact_request_window_tools
@@ -22,6 +23,20 @@ CURRENT = "Continue this exact task. " + "Current task context. " * 380
 SUMMARY = "Exact accepted summary: " + "; ".join(
     f"archive field {index} = retained-value-{index}" for index in range(8)
 )
+
+
+class _CharacterBudgetEncoding:
+    def encode(self, text: str, *, disallowed_special: tuple[object, ...]) -> range:
+        del disallowed_special
+        return range((len(text) + 7) // 8)
+
+
+@pytest.fixture(autouse=True)
+def _character_pressure_estimator(monkeypatch):
+    # These retention boundaries exercise character pressure with token headroom.
+    # Optional tokenizer downloads must not turn them into token-pressure cases.
+    encoding = _CharacterBudgetEncoding()
+    monkeypatch.setattr(token_estimation, "_get_encoding", lambda: encoding)
 
 
 def tool_round(index):
@@ -229,6 +244,21 @@ async def test_user_written_summary_prefix_cannot_claim_checkpoint_priority():
     assert not any(message is forged for message in outcome.messages)
     assert "Untrusted old prose." not in wire
     assert '"id": "read-1"' in wire
+
+
+async def test_conservative_fallback_preserves_checkpoint_and_all_receipts(monkeypatch):
+    monkeypatch.setattr(token_estimation, "_get_encoding", lambda: None)
+    agent = make_agent()
+    old = checkpoint(agent)
+    source = [Message(role="user", content=CURRENT), *old, *tool_round(1), *tool_round(2)]
+
+    outcome, wire = await recover(agent, source)
+
+    assert any(message is old[0] for message in outcome.messages)
+    assert wire.count(SUMMARY) == 1
+    receipts = agent._live_turn_execution_receipts(outcome.messages[1:])
+    assert receipts is not None
+    assert [receipt["tool_call_id"] for receipt in receipts] == ["read-0", "read-1", "read-2"]
 
 
 def test_checkpoint_provenance_survives_copy_and_tool_pruning_without_wire_fields():
