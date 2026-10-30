@@ -144,7 +144,7 @@
     },
     "onnxruntime_reference": "https://github.com/microsoft/onnxruntime/blob/v1.24.4/include/onnxruntime/core/session/onnxruntime_session_options_config_keys.h#L157-L161",
     "fixture_acceptance": {
-      "scope": "Only long_three_segments uses the wider numerical bounds below. The other five unchanged source_parity_cases.json inputs retain the original strict numerical bounds. All six require exact labels and policy decisions. These are not bounds on arbitrary requests or unmeasured CPU/runtime combinations.",
+      "scope": "For x86, only long_three_segments uses the wider numerical bounds below. The other five source inputs retain their original strict bounds. ARM64-specific evidence and bounds are recorded separately below. All six always require exact labels and policy decisions; these are not bounds on arbitrary inputs or unmeasured CPU/runtime combinations.",
       "semantic_feature_indices": [
         [
           0,
@@ -189,6 +189,117 @@
         "probability_relative_tolerance": 1e-10,
         "probability_absolute_tolerance": 1e-12
       }
+    },
+    "apple_arm64": {
+      "host": "Apple M5",
+      "platform": "macOS-26.5.2-arm64-arm-64bit",
+      "machine": "arm64",
+      "method": "Native arm64 Python and CPUExecutionProvider with the same pinned runtime versions; no Rosetta. The full model test file passed on this host, native x86 AVX-512/VNNI, and CPUID-masked AVX2. Original source fixtures and learned bytes are unchanged.",
+      "session_config": {
+        "optimization.disable_specified_optimizers": "MatMulIntegerToFloatFusion;GeluFusionL2"
+      },
+      "original_fused_graph_tier_probability_max_abs": 0.09544998406404825,
+      "configured_tier_probability_max_abs": 0.0028238415033203235,
+      "cases": [
+        {
+          "name": "cold_start_zh",
+          "semantic_feature_max_abs": 5.960464477539063e-08,
+          "other_feature_max_abs": 1.4901161193847656e-08,
+          "intent_probability_max_abs": 0.0,
+          "tier_probability_max_abs": 0.0
+        },
+        {
+          "name": "code_debug",
+          "semantic_feature_max_abs": 0.00639711320400238,
+          "other_feature_max_abs": 2.9802322387695312e-08,
+          "intent_probability_max_abs": 0.0006391705050320384,
+          "tier_probability_max_abs": 0.0017489577329584949
+        },
+        {
+          "name": "continue_with_history",
+          "semantic_feature_max_abs": 5.21540641784668e-08,
+          "other_feature_max_abs": 7.450580596923828e-09,
+          "intent_probability_max_abs": 1.1102230246251565e-16,
+          "tier_probability_max_abs": 0.0
+        },
+        {
+          "name": "redo",
+          "semantic_feature_max_abs": 5.960464477539063e-08,
+          "other_feature_max_abs": 7.450580596923828e-09,
+          "intent_probability_max_abs": 0.0,
+          "tier_probability_max_abs": 0.0
+        },
+        {
+          "name": "long_three_segments",
+          "semantic_feature_max_abs": 0.00606517493724823,
+          "other_feature_max_abs": 1.862645149230957e-09,
+          "intent_probability_max_abs": 0.0014951235274058838,
+          "tier_probability_max_abs": 0.0028238415033203235
+        },
+        {
+          "name": "unicode_normalization",
+          "semantic_feature_max_abs": 5.21540641784668e-08,
+          "other_feature_max_abs": 2.9802322387695312e-08,
+          "intent_probability_max_abs": 1.1102230246251565e-16,
+          "tier_probability_max_abs": 0.0
+        }
+      ],
+      "source_case_labels": {
+        "cases": 6,
+        "intent_labels_equal": true,
+        "tier_labels_equal": true,
+        "policy_decisions_equal": true
+      },
+      "classifier_golden": {
+        "intent": {
+          "cases": 8,
+          "max_abs": 1.1102230246251565e-16
+        },
+        "tier": {
+          "cases": 8,
+          "max_abs": 2.220446049250313e-16
+        }
+      },
+      "first_quantization_difference": {
+        "case": "code_debug",
+        "graph": "ORT_ENABLE_BASIC with original weights and intermediate outputs",
+        "node": "/encoder/layer.1/attention/self/Reshape_3_output_0_quantized",
+        "index": [
+          0,
+          380,
+          221
+        ],
+        "input_abs_difference": 1.4901161193847656e-08,
+        "quantized_mismatch_count": 1,
+        "x86_64": {
+          "float_input": 0.19614535570144653,
+          "scale": 0.02064688131213188,
+          "zero_point": 142,
+          "input_div_scale_float32": 9.499999046325684,
+          "quantized": 151
+        },
+        "arm64": {
+          "float_input": 0.19614537060260773,
+          "scale": 0.02064688131213188,
+          "zero_point": 142,
+          "input_div_scale_float32": 9.5,
+          "quantized": 152
+        }
+      },
+      "fixture_acceptance": {
+        "code_debug": {
+          "semantic_feature_absolute_tolerance": 0.0065,
+          "intent_probability_absolute_tolerance": 0.00065,
+          "tier_probability_absolute_tolerance": 0.0018
+        },
+        "long_three_segments": {
+          "semantic_feature_absolute_tolerance": 0.0062,
+          "intent_probability_absolute_tolerance": 0.003,
+          "tier_probability_absolute_tolerance": 0.007
+        },
+        "scope": "Only arm64/aarch64 and these two frozen inputs use these bounds. Non-BGE features, four other inputs, and all fixed-feature classifier checks retain their strict precision; all six require identical classifier labels, full policy decisions and next states. No accuracy guarantee for arbitrary inputs or unmeasured ARM kernels."
+      },
+      "optimizer_name_reference": "https://github.com/microsoft/onnxruntime/blob/v1.24.4/onnxruntime/core/optimizer/gelu_fusion.h#L20-L27"
     }
   }
 }

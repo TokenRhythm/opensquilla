@@ -12,11 +12,15 @@ BERT, registry CLI, unused batch transforms, training-only transformer
 constructors, and unused encoder inspection/context-manager methods were removed.
 The local loader owns the encoder and featurizer directly, without the redundant
 feature-runtime wrapper. The unused SQLite embedding cache and its identity
-helpers were removed; encoder construction, close, and encode retain the
-original memory-cache path with only the unused persistence branches removed.
+helpers were removed. The memory cache now retains at most 2,048 normalized
+embedding rows in least-recently-used order (4 MiB of vector data for this model,
+plus keys and container overhead). Cached rows own their storage, and close
+releases them. Evicted inputs are recomputed using the same arithmetic.
 Tokenization, batching, ordering, and normalization are unchanged. ONNX session
 configuration additionally enables `session.x64quantprecision=1` to avoid x64
-U8S8 saturation on CPUs without VNNI; the encoder file is unchanged.
+U8S8 saturation on CPUs without VNNI; the encoder file is unchanged. On ARM64,
+`MatMulIntegerToFloatFusion` and `GeluFusionL2` are disabled to preserve the
+unfused operations' numerical behavior; all other optimizations remain enabled.
 Other retained function/method definitions preserve the original arithmetic;
 imports, module/class descriptions, and type-only annotations/casts were adjusted.
 `features/text.py` and `input_contract.py` retain the original extracted definitions.
@@ -82,9 +86,9 @@ This is separate from U8S8 saturation and remains after explicit unsigned-weight
 conversion. The measured CPU profiles and first divergent tensor are recorded in
 `runtime_compatibility.json`.
 
-Only the `long_three_segments` full-pipeline reference fixture therefore uses
-absolute error bounds of 0.0035 for the three BGE/PCA feature blocks, 0.003 for
-intent probabilities, and 0.007 for tier probabilities, modestly above its
+On x86, only the `long_three_segments` full-pipeline reference fixture therefore
+uses absolute error bounds of 0.0035 for the three BGE/PCA feature blocks, 0.003
+for intent probabilities, and 0.007 for tier probabilities, modestly above its
 measured maxima. Its non-BGE features and all five other fixtures retain their
 original feature and probability tolerances. Across all six fixtures, both
 classifier labels and the final policy intent, tier, thinking, prompt, reset,
@@ -93,3 +97,30 @@ and AVX2 profiles; this does not guarantee unchanged decisions for arbitrary
 requests or unmeasured hardware. The sixteen fixed-feature classifier golden
 cases keep the original tight numerical checks (relative 1e-10, absolute 1e-12).
 Original golden data, trained assets, and their pinned hashes are unchanged.
+
+Native Apple M5 ARM64 validation used the same pinned runtime versions above
+(without Rosetta). The default fused graph differed from the source by as much
+as 0.095450 in tier probabilities. Disabling only
+`MatMulIntegerToFloatFusion;GeluFusionL2` reduces that maximum to 0.002824;
+four fixtures then match the original feature and probability tolerances.
+These are the optimizer names in
+[ONNX Runtime 1.24.4](https://github.com/microsoft/onnxruntime/blob/v1.24.4/onnxruntime/core/optimizer/gelu_fusion.h#L20-L27),
+and the session's optimizer list is semicolon-delimited.
+
+On this ARM64 profile, `code_debug` differs by at most 0.0063972 in BGE/PCA
+features, 0.0006392 in intent probabilities and 0.0017490 in tier probabilities.
+Only ARM64 uses corresponding fixture bounds of 0.0065, 0.00065 and 0.0018.
+`long_three_segments` differs by at most 0.0060652 in BGE/PCA features,
+0.0014952 in intent probabilities and 0.0028239 in tier probabilities; its
+ARM64 semantic bound is 0.0062, with the existing probability bounds unchanged.
+All non-BGE features and the other four ARM64 fixtures keep their strict checks.
+The full native ARM64 tests require exactly the same classifier labels, final
+policy decisions and next states as the frozen source, plus the unchanged
+sixteen fixed-feature goldens. These measured fixture bounds are not a general
+accuracy guarantee for unseen inputs or other ARM implementations.
+
+Instrumenting the original graph with basic optimizations reproduces the ARM
+`code_debug` rounding boundary: a 1.4902e-8 input difference at layer 1 dynamic
+quantization changes input/scale from 9.49999905 to 9.5, producing 151 versus
+152. This is the same discrete amplification mechanism observed on AVX2;
+`runtime_compatibility.json` records the tensor location and values.

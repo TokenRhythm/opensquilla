@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import os
+import platform
+from collections import OrderedDict
 from concurrent.futures import ThreadPoolExecutor
 from collections.abc import Mapping, Sequence
 from hashlib import sha256
@@ -18,6 +20,7 @@ PCA_DIM = 64
 SVD_DIM = 100
 BGE_MAX_CONTENT_TOKENS = 510
 _BGE_CACHE_WRITE_BATCH = 256
+_BGE_MEMORY_CACHE_MAX_ENTRIES = 2048
 
 
 def _dense_2d(values: object, *, name: str) -> np.ndarray:
@@ -188,6 +191,13 @@ class BGEOnnxEncoder:
             # U8S8 kernels saturate on x64 without VNNI; ORT's precision mode
             # avoids that integer overflow without changing the frozen model bytes.
             options.add_session_config_entry("session.x64quantprecision", "1")
+            if platform.machine().lower() in {"arm64", "aarch64"}:
+                # ARM fused arithmetic amplifies dynamic-quantization rounding.
+                # Keep the original operations; see runtime_compatibility.json.
+                options.add_session_config_entry(
+                    "optimization.disable_specified_optimizers",
+                    "MatMulIntegerToFloatFusion;GeluFusionL2",
+                )
             session = ort.InferenceSession(
                 str(self.model_path),
                 sess_options=options,
@@ -198,7 +208,7 @@ class BGEOnnxEncoder:
         self.cls_token_id = _special_token_id(tokenizer, "cls", "[CLS]")
         self.sep_token_id = _special_token_id(tokenizer, "sep", "[SEP]")
         self.pad_token_id = _special_token_id(tokenizer, "pad", "[PAD]")
-        self._memory_cache: dict[str, np.ndarray] = {}
+        self._memory_cache: OrderedDict[str, np.ndarray] = OrderedDict()
         self._cache_hits = 0
         self._cache_misses = 0
         self._closed = False
@@ -207,6 +217,7 @@ class BGEOnnxEncoder:
         if self._closed:
             return
         self._closed = True
+        self._memory_cache.clear()
 
     def _input_specs(self) -> dict[str, object]:
         get_inputs = getattr(self.session, "get_inputs", None)
@@ -294,6 +305,7 @@ class BGEOnnxEncoder:
             cache_key = self._sequence_cache_key(sequence)
             cached = self._memory_cache.get(cache_key)
             if cached is not None:
+                self._memory_cache.move_to_end(cache_key)
                 results[index] = cached
                 self._cache_hits += 1
                 continue
@@ -339,8 +351,12 @@ class BGEOnnxEncoder:
                     where=norms > 0,
                 ).astype(np.float32, copy=False)
                 for item_index, (cache_key, (_, indices)) in enumerate(items):
-                    value = normalized[item_index]
+                    # Own only this row; a view could retain an entire batch
+                    # after all its other cache entries have been evicted.
+                    value = normalized[item_index].copy()
                     self._memory_cache[cache_key] = value
+                    while len(self._memory_cache) > _BGE_MEMORY_CACHE_MAX_ENTRIES:
+                        self._memory_cache.popitem(last=False)
                     for index in indices:
                         results[index] = value
                 self._cache_hits += sum(len(indices) - 1 for _, (_, indices) in items)
