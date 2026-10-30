@@ -817,11 +817,13 @@ async def test_close_cancels_stalled_upload_and_preserves_unacknowledged_event(
     offline_uploads.handler = stalled
     runtime = ScopedTelemetryRuntime(config=_config(tmp_path))
     closing = None
+    # Reaching the upload includes SQLite claim I/O; only cancellation after
+    # the explicit deadline below is subject to the one-second assertion.
     try:
         assert (await runtime.record(_turn_event())).status is RecordStatus.RECORDED
         if start_upload:
             await runtime.start()
-            await asyncio.wait_for(entered.wait(), timeout=1)
+            await asyncio.wait_for(entered.wait(), timeout=10)
         assert (runtime._upload_task is not None) is start_upload
         monkeypatch.setattr(runtime_module, "SHUTDOWN_UPLOAD_TIMEOUT_SECONDS", 0.05)
         if pause_before_guard:
@@ -838,7 +840,7 @@ async def test_close_cancels_stalled_upload_and_preserves_unacknowledged_event(
             monkeypatch.setattr(runtime, "prepare_shutdown", preempted_shutdown)
         closing = asyncio.create_task(runtime.close())
         if not start_upload:
-            await asyncio.wait_for(entered.wait(), timeout=1)
+            await asyncio.wait_for(entered.wait(), timeout=10)
         assert not cancelled.is_set()
         timeouts = await expire_shutdown_deadline(runtime, cancel=not cancel_close)
         if cancel_close:
