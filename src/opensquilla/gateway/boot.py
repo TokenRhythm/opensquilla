@@ -3077,9 +3077,9 @@ def validate_squilla_router_runtime(config: GatewayConfig) -> None:
         return
 
     if getattr(router_cfg, "strategy", "lightgbm_model") != "legacy_v4_phase3":
-        from opensquilla.squilla_router.lightgbm_model import validate_artifacts
+        from opensquilla.engine.steps.squilla_router import validate_model_assets
 
-        validate_artifacts(_squilla_router_bundle_dir(router_cfg))
+        validate_model_assets(_squilla_router_bundle_dir(router_cfg))
         return
 
     bundle_dir = _squilla_router_bundle_dir(router_cfg)

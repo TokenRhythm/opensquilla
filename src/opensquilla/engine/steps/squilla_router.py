@@ -15,6 +15,7 @@ import time
 from collections.abc import Mapping
 from dataclasses import dataclass
 from inspect import Parameter, signature
+from pathlib import Path
 from typing import TYPE_CHECKING, Any, Protocol, cast
 
 import structlog
@@ -678,6 +679,13 @@ def _get_strategy(config: object) -> RouterStrategy | LightGBMRouterModel:
         _strategy = strategy
         _strategy_key = key
         return strategy
+
+
+def validate_model_assets(model_dir: Path) -> None:
+    """Check model assets through the engine boundary without loading inference."""
+    from opensquilla.squilla_router.lightgbm_model import validate_artifacts
+
+    validate_artifacts(model_dir)
 
 
 def preload_strategy(config: object) -> RouterStrategy | LightGBMRouterModel:
