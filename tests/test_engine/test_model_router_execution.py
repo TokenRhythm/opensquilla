@@ -8,7 +8,7 @@ import pytest
 from opensquilla.engine.model_policy_recovery import ModelPolicyRecovery
 from opensquilla.engine.runtime import TurnRunner, _SelectorFallbackProvider
 from opensquilla.engine.steps import squilla_router
-from opensquilla.engine.types import AgentConfig
+from opensquilla.engine.types import AgentConfig, ThinkingLevel
 from opensquilla.gateway.config import GatewayConfig
 from opensquilla.provider.selector import ModelSelector, ProviderConfig, SelectorConfig
 from opensquilla.provider.types import ChatConfig, Message
@@ -96,7 +96,7 @@ async def test_applied_model_route_is_single_and_removes_configured_fallback(exe
     assert [item.model for item in e.selector.remaining_chain()] == ["qwen/qwen3.7-flash"]
     assert not e.selector.has_fallback()
     assert type(e.provider).__name__ != "EnsembleProvider"
-    assert e.runner._resolve_turn_thinking(e.turn) is False
+    assert e.runner._resolve_turn_thinking(e.turn) is ThinkingLevel.HIGH
     wrapper = _SelectorFallbackProvider(e.provider, e.selector, e.turn.metadata)
     assert (
         wrapper._config_for_active_leg(ChatConfig(physical_attempt_limit=4)).physical_attempt_limit
@@ -312,8 +312,9 @@ async def test_missing_cross_provider_credentials_does_not_admit_wrong_model(
 @pytest.mark.asyncio
 @pytest.mark.parametrize("cross_provider", [False, True])
 @pytest.mark.parametrize("explicit_proof_cap", [0, 777777])
+@pytest.mark.parametrize("overflow_threshold", [0.6, 0.85])
 async def test_quality_retry_activates_exact_preflight_and_thinking_budget(
-    execution, monkeypatch, cross_provider, explicit_proof_cap
+    execution, monkeypatch, cross_provider, explicit_proof_cap, overflow_threshold,
 ):
     import opensquilla.engine.model_router_quality as quality
     from opensquilla.engine import Agent
@@ -339,12 +340,14 @@ async def test_quality_retry_activates_exact_preflight_and_thinking_budget(
         model_id=e.turn.model,
         metadata=e.turn.metadata,
         max_provider_retries=3,
+        thinking=e.runner._resolve_turn_thinking(e.turn),
         thinking_budget_tokens=999 if explicit_proof_cap else -1,
         max_tokens=1024,
         context_window_tokens=32000,
         context_window_known=False,
         model_vision_support="supported",
         provider_request_proof_max_chars=explicit_proof_cap,
+        context_overflow_threshold=overflow_threshold,
     )
     agent = Agent(provider=wrapper, config=config)
     wrapper._last_model_chat_config = agent._provider_admission_chat_config(
@@ -382,9 +385,11 @@ async def test_quality_retry_activates_exact_preflight_and_thinking_budget(
     if cross_provider:
         assert e.turn.metadata["routed_provider_applied"] == "tokenrhythm"
     level = ThinkingLevel(admitted_config.thinking_level)
-    assert admitted_config.thinking_budget_tokens == THINKING_BUDGETS[level]
-    # The actual next Agent request must use the same budget, including when
-    # a previous explicit budget would otherwise override the new tier effort.
+    assert admitted_config.thinking_budget_tokens == (
+        999 if explicit_proof_cap else THINKING_BUDGETS[level]
+    )
+    # The actual next Agent request must retain the admitted budget, including
+    # a user-specified budget that takes priority over automatic tier effort.
     for key, value in updates.items():
         setattr(config, key, value)
     assert config.resolve_thinking() == (
@@ -470,3 +475,81 @@ async def test_quality_retry_returns_to_global_provider_when_tier_omits_provider
     assert e.selector.current_config.provider == "openrouter"
     assert turn.metadata["routed_provider"] == "openrouter"
     assert turn.metadata["routed_tier"] == "c1"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "model,tier,auto_thinking,explicit_thinking,has_image,expected_level",
+    [
+        (None, "c3", False, "off", False, "off"),
+        (None, "c3", True, "off", False, "off"),
+        (None, "c3", False, None, False, "off"),
+        (None, "c3", True, None, False, "high"),
+        (None, "c0", False, "high", False, "high"),
+        (None, "c0", True, "high", False, "high"),
+        ("qwen/qwen-vl-max", "c0", True, None, False, "off"),
+        ("qwen/qwen-vl-max", "c0", True, None, True, "off"),
+        ("qwen/qwen-vl-max", "c3", False, "off", False, "off"),
+        ("qwen/qwen-vl-max", "c3", False, "off", True, "off"),
+    ],
+)
+async def test_model_execution_respects_actual_thinking_requirement(
+    execution, monkeypatch, model, tier, auto_thinking, explicit_thinking, has_image,
+    expected_level,
+):
+    from opensquilla.engine import Agent
+    from opensquilla.engine.types import THINKING_BUDGETS
+    from opensquilla.provider.ensemble import EnsembleProvider
+
+    e = execution
+    e.turn.config.llm.thinking = explicit_thinking
+    e.turn.config.squilla_router.auto_thinking = auto_thinking
+    if model is not None:
+        e.turn.config.squilla_router.tiers[tier]["model"] = model
+
+    class SelectedTier(ScriptedClassifier):
+        def predict(self, value):
+            result = super().predict(value)
+            result.tier_probabilities = {
+                name: float(name == tier) for name in ("c0", "c1", "c2", "c3")
+            }
+            return result
+
+    monkeypatch.setattr(squilla_router, "_get_strategy", lambda _: SelectedTier())
+    entry = await e.manager.append_message(e.node.session_key, "user", "Hello")
+    turn, provider = await e.runner._run_pipeline(
+        "Hello", e.node.session_key, e.selector.resolve(), e.selector,
+        [], "system", [{"mime_type": "image/png"}] if has_image else [],
+        bound_user_message_id=entry.message_id,
+        expected_session_id=e.node.session_id,
+        expected_session_epoch=0,
+        model_router_context={
+            "router_model_state": e.turn.metadata["router_model_decision"]["state"]
+        },
+    )
+    assert turn.metadata["routed_tier"] == tier
+    assert not isinstance(provider, EnsembleProvider)
+    assert not e.selector.has_fallback()
+    assert turn.metadata["thinking_mode"] == ("T3" if tier == "c3" else "T0")
+    assert turn.metadata["router_model_decision"]["state_committed"] is True
+    if not auto_thinking:
+        assert "thinking_requested" not in turn.metadata
+    # Exercise the execution resolver and the actual Agent request-config builder,
+    # not only the controller's suggested thinking metadata.
+    agent = Agent(
+        provider=provider,
+        config=AgentConfig(
+            model_id=turn.model,
+            metadata=turn.metadata,
+            thinking=e.runner._resolve_turn_thinking(turn),
+        ),
+    )
+    request = agent._provider_admission_chat_config(
+        "Hello", context_window_tokens=agent.config.context_window_tokens
+    )
+    assert request.thinking is (expected_level != "off")
+    assert request.thinking_budget_tokens == THINKING_BUDGETS[ThinkingLevel(expected_level)]
+    if expected_level == "off":
+        assert request.thinking_level in {None, ThinkingLevel.OFF}
+    else:
+        assert request.thinking_level is ThinkingLevel(expected_level)

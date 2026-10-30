@@ -481,9 +481,9 @@ def build_model_router_context(
     recent_rows = [
         row
         for row in state_rows
-        if int(_decision(row).get("decided_at_ms") or getattr(row, "created_at", 0))
+        if int(_decision(row).get("decided_at_ms") or getattr(row, "created_at", 0) or 0)
         >= history_cutoff
-        and int(_decision(row).get("decided_at_ms") or getattr(row, "created_at", 0))
+        and int(_decision(row).get("decided_at_ms") or getattr(row, "created_at", 0) or 0)
         <= history_before
     ]
     for row in recent_rows[-5:]:

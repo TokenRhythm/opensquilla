@@ -41,6 +41,10 @@ class ModelRouterQualityRetry:
         chat_config: ChatConfig | None,
         tools: Any,
         activate_prepared: Callable[[Any, Any], None],
+        prepare_request: Callable[
+            [Any, Any, list[Any], Any, ChatConfig], tuple[list[Any], ChatConfig]
+        ] | None = None,
+        context_overflow_threshold: float | None = None,
     ) -> dict[str, Any] | None:
         metadata = self.turn.metadata
         envelope = metadata.get("router_model_decision")
@@ -58,8 +62,19 @@ class ModelRouterQualityRetry:
             return None
         decision = ModelPolicyDecision.from_dict(envelope["decision"])
         thinking_mode, prompt_policy = quality_retry_controls(decision, target)
-        level = {"T0": "off", "T1": "low", "T2": "medium", "T3": "high"}[thinking_mode]
         router_cfg = self.turn.config.squilla_router
+        explicit_thinking = str(self.turn.config.llm.thinking or "").strip()
+        automatic_thinking = router_cfg.auto_thinking and not explicit_thinking
+        if automatic_thinking:
+            level = {"T0": "off", "T1": "low", "T2": "medium", "T3": "high"}[thinking_mode]
+            thinking_level = ThinkingLevel(level) if level != "off" else None
+            thinking_enabled = level != "off"
+            thinking_budget = THINKING_BUDGETS[ThinkingLevel(level)]
+        else:
+            thinking_level = chat_config.thinking_level
+            thinking_enabled = chat_config.thinking
+            thinking_budget = chat_config.thinking_budget_tokens if thinking_enabled else 0
+            level = (thinking_level or "medium") if thinking_enabled else "off"
         tier_cfg = router_cfg.tiers.get(target)
         if not isinstance(tier_cfg, dict) or not tier_cfg.get("model"):
             return None
@@ -185,12 +200,14 @@ class ModelRouterQualityRetry:
             api_key=deployment.api_key,
             base_url=deployment.base_url,
         )
-        thinking_budget = THINKING_BUDGETS[ThinkingLevel(level)]
         proof_budget = ContextBudgetGovernor.from_values(
             context_window_tokens=window,
             max_output_tokens=maximum,
             thinking_budget_tokens=thinking_budget,
-            context_overflow_threshold=AgentConfig().context_overflow_threshold,
+            context_overflow_threshold=(
+                context_overflow_threshold if context_overflow_threshold is not None
+                else AgentConfig().context_overflow_threshold
+            ),
             provider_request_proof_max_chars=chat_config.provider_request_max_chars_explicit_cap,
         ).snapshot().provider_request_max_chars
         bound = chat_config.model_copy(
@@ -200,16 +217,24 @@ class ModelRouterQualityRetry:
                 "provider_request_max_chars": proof_budget,
                 "model_capabilities": caps,
                 "model_vision_support": vision_support,
-                "thinking": level != "off",
-                "thinking_level": ThinkingLevel(level) if level != "off" else None,
+                "thinking": thinking_enabled,
+                "thinking_level": thinking_level,
                 "thinking_budget_tokens": thinking_budget,
-                "thinking_budget_explicit": True,
+                "thinking_budget_explicit": (
+                    automatic_thinking or chat_config.thinking_budget_explicit
+                ),
                 "physical_attempt_limit": 1,
             }
         )
         from opensquilla.provider.execution_identity import rebind_execution_identity
 
-        bound = rebind_execution_identity(bound, provider=provider_id, model=model)
+        rebound = rebind_execution_identity(bound, provider=provider_id, model=model)
+        assert rebound is not None
+        bound = rebound
+        if prepare_request is not None:
+            messages, bound = prepare_request(
+                candidate_provider, candidate_selector, messages, tools, bound,
+            )
         if validate_provider_chat_admission(candidate_provider, messages, bound) is not None:
             return None
         projection = project_provider_final_request(candidate_provider, messages, tools, bound)
@@ -254,7 +279,7 @@ class ModelRouterQualityRetry:
         metadata.update(
             applied_model=model,
             prompt_policy=prompt_policy,
-            thinking_source="model_tier_policy",
+            thinking_source="model_tier_policy" if automatic_thinking else "config",
             router_model_decision=committed,
             requested_provider=provider_id,
             requested_model=model,
@@ -272,6 +297,8 @@ class ModelRouterQualityRetry:
             "context_window_known": window_source != "default",
             "model_capabilities": caps,
             "model_vision_support": vision_support,
-            "thinking": False if level == "off" else ThinkingLevel(level),
-            "thinking_budget_tokens": bound.thinking_budget_tokens,
+            "thinking": (thinking_level or True) if thinking_enabled else False,
+            "thinking_budget_tokens": (
+                bound.thinking_budget_tokens if bound.thinking_budget_explicit else -1
+            ),
         }

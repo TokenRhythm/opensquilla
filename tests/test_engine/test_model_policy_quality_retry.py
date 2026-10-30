@@ -3,6 +3,7 @@ from __future__ import annotations
 import copy
 from collections.abc import AsyncIterator, Sequence
 from typing import Any
+from unittest.mock import AsyncMock
 
 import pytest
 
@@ -13,6 +14,7 @@ from opensquilla.provider import ErrorEvent as ProviderError
 from opensquilla.provider import TextDeltaEvent as ProviderText
 from opensquilla.provider import ToolUseEndEvent as ProviderToolUseEnd
 from opensquilla.provider import ToolUseStartEvent as ProviderToolUseStart
+from tests.test_engine.test_model_router_execution import execution as execution
 
 
 class _QualityProvider:
@@ -47,6 +49,9 @@ class _QualityProvider:
         scope_id: str,
         remaining_budget: int,
         messages: Sequence[Message],
+        chat_config: ChatConfig | None = None,
+        tools: list[ToolDefinition] | None = None,
+        context_overflow_threshold: float | None = None,
     ) -> dict[str, Any] | None:
         self.quality_calls.append(
             {
@@ -54,6 +59,8 @@ class _QualityProvider:
                 "scope_id": scope_id,
                 "remaining_budget": remaining_budget,
                 "messages": copy.deepcopy(messages),
+                "chat_config": chat_config,
+                "tools": tools,
             }
         )
         self.timeline.append("quality")
@@ -178,6 +185,86 @@ async def test_real_agent_validation_failure_calls_quality_retry_once(reason: st
     assert agent.config.model_id == "quality-c2"
     assert len(provider.calls) == 3
     assert any(event.kind == "done" and event.text == "done" for event in events)
+
+
+async def test_quality_retry_admits_the_same_assembled_messages_as_dispatch() -> None:
+    provider = _QualityProvider([_tool_stream(1), _final_stream()])
+    agent = _agent(provider)
+    agent.config.request_context_prompt = "request-only context"
+
+    events = [event async for event in agent.run_turn("hello")]
+
+    admitted = provider.quality_calls[0]
+    assert admitted["messages"] == provider.calls[1]["messages"]
+    contents = str(admitted["messages"])
+    assert "request-only context" in contents
+    assert "Runtime context for this turn" in contents
+    assert admitted["tools"] == agent.tool_definitions
+    assert any(event.kind == "done" for event in events)
+
+
+@pytest.mark.parametrize("context_kind", ["request", "runtime"])
+async def test_quality_retry_large_transient_context_does_not_commit_or_activate(
+    execution, monkeypatch, context_kind,
+) -> None:
+    import opensquilla.engine.model_router_quality as quality
+    from opensquilla.engine.runtime import _SelectorFallbackProvider
+
+    e = execution
+    e.turn.config.llm.thinking = "off"
+    e.turn.config.llm.max_tokens = 256
+    e.turn.config.squilla_router.auto_thinking = False
+    before = copy.deepcopy(e.turn.metadata["router_model_decision"])
+    advance = AsyncMock(wraps=e.manager.advance_model_router_quality_retry)
+    monkeypatch.setattr(e.manager, "advance_model_router_quality_retry", advance)
+    provider = _QualityProvider([_tool_stream(1), _final_stream()])
+    wrapper = _SelectorFallbackProvider(provider, e.selector, e.turn.metadata)
+    agent = _agent(provider)
+    agent.provider = wrapper
+    agent.config.metadata = e.turn.metadata
+    agent.config.model_id = e.turn.model
+    agent.config.provider_id = "openrouter"
+    agent.config.context_window_tokens = 64000
+    agent.config.context_window_known = True
+    agent.config.max_tokens = 256
+    agent.config.thinking = False
+    large_context = "extra context " * 1500
+    if context_kind == "request":
+        agent.config.request_context_prompt = large_context
+    else:
+        monkeypatch.setattr(agent, "_runtime_context_block", lambda: large_context)
+    monkeypatch.setattr(
+        quality, "resolve_effective_context_window", lambda *a, **k: (4096, "catalog"),
+    )
+    # A broken early admission must fail locally, never call a live provider.
+    monkeypatch.setattr(type(e.provider), "chat", lambda *a, **k: provider._stream(_final_stream()))
+    projected = []
+    project = quality.project_provider_final_request
+
+    def capture(candidate, messages, tools, config):
+        result = project(candidate, messages, tools, config)
+        small = project(candidate, [Message(role="user", content="hello")], tools, config)
+        projected.append((copy.deepcopy(messages), result, small))
+        assert config.thinking is False
+        assert config.thinking_budget_tokens == 0
+        return result
+
+    monkeypatch.setattr(quality, "project_provider_final_request", capture)
+    events = [event async for event in agent.run_turn("hello")]
+
+    assert len(projected) == 1
+    messages, projection, small_projection = projected[0]
+    assert large_context.strip() in str(messages)
+    assert small_projection is not None and small_projection.fits
+    assert projection is not None and not projection.fits
+    advance.assert_not_awaited()
+    assert e.turn.metadata["router_model_decision"] == before
+    assert e.selector.current_config.model == e.turn.model == "qwen/qwen3.7-flash"
+    assert wrapper._provider is provider
+    rows = await e.manager.get_model_router_transcript(e.node.session_key)
+    assert rows[0].turn_context["router_model_decision"] == before
+    assert len(provider.calls) == 2
+    assert any(event.kind == "done" for event in events)
 
 
 async def test_real_agent_no_progress_calls_quality_retry_once() -> None:
@@ -391,3 +478,65 @@ async def test_local_preflight_repair_keeps_first_dispatch_with_zero_retry_budge
     assert len(provider.calls) == 1
     assert any(event.kind == "done" for event in events)
     assert not any(event.kind == "error" for event in events)
+
+
+async def test_quality_retry_projects_the_same_physical_leg_as_dispatch(
+    execution, monkeypatch,
+) -> None:
+    import opensquilla.engine.model_router_quality as quality
+    from opensquilla.engine.model_policy_recovery import ModelPolicyRecovery
+    from opensquilla.engine.runtime import _SelectorFallbackProvider
+    from opensquilla.provider.types import ContentBlockImage, ContentBlockText
+
+    e = execution
+    wrapper = _SelectorFallbackProvider(e.provider, e.selector, e.turn.metadata)
+    provider_type = type(e.provider)
+    monkeypatch.setattr(
+        provider_type, "requires_complete_reasoning_history", lambda *a, **k: True,
+    )
+    monkeypatch.setattr(provider_type, "can_replay_reasoning", lambda *a, **k: False)
+    messages = [
+        Message(role="user", content="previous request"),
+        Message(role="assistant", content="previous reply without native reasoning"),
+        Message(role="user", content=[
+            ContentBlockText(text="retry with this image"),
+            ContentBlockImage(media_type="image/png", data="c3ludGhldGlj"),
+        ]),
+    ]
+    config = ChatConfig(max_tokens=1024, thinking=True)
+    projected = []
+    dispatched = []
+    project = quality.project_provider_final_request
+
+    def capture_projection(provider, request, tools, bound):
+        projected.append((copy.deepcopy(request), bound))
+        # Previewing a candidate must not change live routing metadata.
+        assert "image_input_marker_count" not in e.turn.metadata
+        assert not e.turn.metadata.get("reasoning_replay_context_rebuilt")
+        return project(provider, request, tools, bound)
+
+    async def chat(provider, request, tools=None, config=None):
+        dispatched.append((copy.deepcopy(request), config))
+        yield ProviderText(text="done")
+        yield ProviderDone(input_tokens=1, output_tokens=1)
+
+    monkeypatch.setattr(quality, "project_provider_final_request", capture_projection)
+    monkeypatch.setattr(provider_type, "chat", chat)
+    recovery = ModelPolicyRecovery(AgentConfig(
+        model_id=e.turn.model, metadata=e.turn.metadata, max_provider_retries=1,
+    ))
+    updates = await recovery.prepare(
+        wrapper, "validation_failure", messages, chat_config=config,
+    )
+    assert updates is not None
+    admitted_messages, admitted_config = projected[0]
+    assert admitted_messages != messages
+    assert "Recorded conversation context" in str(admitted_messages)
+    assert not any(
+        isinstance(block, ContentBlockImage)
+        for message in admitted_messages if isinstance(message.content, list)
+        for block in message.content
+    )
+    events = [event async for event in wrapper.chat(messages, config=admitted_config)]
+    assert events
+    assert dispatched == [(admitted_messages, admitted_config)]

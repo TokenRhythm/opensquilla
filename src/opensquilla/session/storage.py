@@ -17782,7 +17782,7 @@ class SessionStorage:
         expected_epoch: int,
     ) -> dict[str, Any]:
         """Persist classification without advancing the admitted task state."""
-        staged = json.loads(json.dumps(decision, allow_nan=False))
+        staged: dict[str, Any] = json.loads(json.dumps(decision, allow_nan=False))
         staged.update(status="staged", state_committed=False)
         staged.setdefault("decided_at_ms", _now_ms())
         async with self._write_transaction("stage_model_router_decision") as conn:

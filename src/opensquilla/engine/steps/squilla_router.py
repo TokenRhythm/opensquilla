@@ -15,7 +15,7 @@ import time
 from collections.abc import Mapping
 from dataclasses import dataclass
 from inspect import Parameter, signature
-from typing import Any, Protocol, cast
+from typing import TYPE_CHECKING, Any, Protocol, cast
 
 import structlog
 
@@ -75,6 +75,9 @@ from opensquilla.squilla_router.controller import (
 )
 from opensquilla.token_estimation import estimate_material_text_tokens, estimate_tokens
 
+if TYPE_CHECKING:
+    from opensquilla.squilla_router.lightgbm_model import LightGBMRouterModel
+
 log = structlog.get_logger(__name__)
 _log_std = logging.getLogger(__name__)
 
@@ -89,7 +92,7 @@ class RouterStrategy(Protocol):
     ) -> tuple[str, float, str, dict]: ...
 
 
-_strategy: RouterStrategy | None = None
+_strategy: RouterStrategy | LightGBMRouterModel | None = None
 _strategy_key: tuple | None = None
 _strategy_lock = threading.Lock()
 _router_runtime_warning_lock = threading.Lock()
@@ -625,7 +628,7 @@ def _degraded_fallback_strategy(error: Exception) -> RouterStrategy:
         return _UnavailableV4Strategy(error)
 
 
-def _get_strategy(config: object) -> RouterStrategy:
+def _get_strategy(config: object) -> RouterStrategy | LightGBMRouterModel:
     global _strategy, _strategy_key  # noqa: PLW0603
     with _strategy_lock:
         key = _strategy_cache_key(config)
@@ -638,8 +641,7 @@ def _get_strategy(config: object) -> RouterStrategy:
             from opensquilla.squilla_router.lightgbm_model import LightGBMRouterModel
 
             # Integrity failures must not substitute an unrelated classifier.
-            strategy = LightGBMRouterModel(getattr(config, "lightgbm_model_dir", None))
-            _strategy = cast(RouterStrategy, strategy)
+            _strategy = LightGBMRouterModel(getattr(config, "lightgbm_model_dir", None))
             _strategy_key = key
             return _strategy
 
@@ -678,7 +680,7 @@ def _get_strategy(config: object) -> RouterStrategy:
         return strategy
 
 
-def preload_strategy(config: object) -> RouterStrategy:
+def preload_strategy(config: object) -> RouterStrategy | LightGBMRouterModel:
     return _get_strategy(config)
 
 
@@ -2487,7 +2489,8 @@ async def apply_squilla_router(ctx: TurnContext) -> TurnContext:
             )
             return ctx
 
-    strategy = _get_strategy(router_cfg)
+    # The model-policy strategy was dispatched before this legacy classify path.
+    strategy = cast(RouterStrategy, _get_strategy(router_cfg))
     strategy_name = _strategy_name(router_cfg)
     defer_history = bool(ctx.metadata.get(_DEFER_ROUTING_HISTORY_KEY))
 

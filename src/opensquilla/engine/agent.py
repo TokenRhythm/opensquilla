@@ -6284,10 +6284,15 @@ class Agent:
         )
 
         model_policy_recovery = ModelPolicyRecovery(self.config)
+        pending_model_quality_retry: str | None = None
 
-        async def _try_model_quality_retry(reason: str, messages: list[Message]) -> bool:
+        async def _try_model_quality_retry(
+            reason: str, messages: list[Message], tools: list[ToolDefinition] | None,
+        ) -> bool:
             nonlocal chat_cfg, thinking_enabled, thinking_budget
-            updates = await model_policy_recovery.prepare(self.provider, reason, messages)
+            updates = await model_policy_recovery.prepare(
+                self.provider, reason, messages, chat_config=chat_cfg, tools=tools,
+            )
             if updates is None:
                 return False
             # Callback has preflighted and durably committed the effective tier.
@@ -7326,6 +7331,15 @@ class Agent:
                         finally:
                             self._provider_call_tool_result_retrieval_available = (
                                 previous_call_retrieval
+                            )
+                        if pending_model_quality_retry is not None:
+                            reason = pending_model_quality_retry
+                            pending_model_quality_retry = None
+                            # Admit the fully assembled next request, including
+                            # transient context and provider-view transformations,
+                            # before committing or activating the higher tier.
+                            await _try_model_quality_retry(
+                                reason, request_messages, provider_tools_for_call,
                             )
                         # Project only this physical request. ``turn_messages`` and
                         # ``request_turn_messages`` remain image-bearing canonical
@@ -12246,7 +12260,7 @@ class Agent:
                     self.config.metadata["repeated_tool_call_recoveries"] = (
                         self.config.metadata.get("repeated_tool_call_recoveries", 0) + 1
                     )
-                    await _try_model_quality_retry("no_progress", turn_messages)
+                    pending_model_quality_retry = "no_progress"
                     yield WarningEvent(
                         code="repeated_tool_call_recovery",
                         message=(
@@ -13458,7 +13472,7 @@ class Agent:
                     )
                 model_policy_recovery.observe_results(tool_calls, executed_results)
                 if not turn_yielded and validation_failure(executed_results):
-                    await _try_model_quality_retry("validation_failure", turn_messages)
+                    pending_model_quality_retry = "validation_failure"
                 if turn_yielded:
                     break
                 if tool_failure_recovery.exhausted:

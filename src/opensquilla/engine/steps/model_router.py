@@ -33,8 +33,9 @@ async def apply_model_router(ctx: TurnContext) -> TurnContext:
     phase = config.rollout_phase
     state_raw = ctx.metadata.get("router_model_state")
     state = ModelPolicyState.from_dict(state_raw) if isinstance(state_raw, Mapping) else None
-    envelope = ctx.metadata.get("router_model_decision")
-    replay = isinstance(envelope, Mapping) and isinstance(envelope.get("decision"), Mapping)
+    raw_envelope = ctx.metadata.get("router_model_decision")
+    envelope = raw_envelope if isinstance(raw_envelope, Mapping) else {}
+    replay = isinstance(envelope.get("decision"), Mapping)
     if replay and envelope.get("status") == "staged":
         # The source retains rejected/incomplete admission for idempotency;
         # it never reruns classification or treats that proposed tier as live.
@@ -187,10 +188,9 @@ async def apply_model_router(ctx: TurnContext) -> TurnContext:
         )
     else:
         ctx.metadata.update(thinking_mode=thinking_mode, prompt_policy=prompt_policy)
-    if applied and phase == "full":
-        # v5 owns the per-turn effort, including an explicit T0 disable.
-        # The legacy controller returns None for T0, which would otherwise
-        # leave provider defaults or a saved global thinking setting active.
+    if applied and phase == "full" and config.auto_thinking:
+        # Preserve the policy's explicit T0 disable when automatic thinking is
+        # enabled. Runtime still gives an explicit llm.thinking setting priority.
         ctx.metadata.update(
             thinking_requested=True,
             thinking_level={"T0": "off", "T1": "low", "T2": "medium", "T3": "high"}[thinking_mode],
@@ -227,6 +227,8 @@ def validate_model_route_capacity(
 
     config = ctx.config.squilla_router
     selected = tier or ctx.metadata.get("routed_tier")
+    if not isinstance(selected, str):
+        raise ModelRouteError("Selected model-policy tier is missing")
     raw = config.tiers.get(selected)
     if not isinstance(raw, dict):
         raise ModelRouteError("Selected model-policy deployment is missing")
@@ -249,8 +251,14 @@ def validate_model_route_capacity(
     # Relay adapters can intentionally leave the control dialect unset while
     # the catalog still verifies that the underlying model reasons. Admission
     # checks that model fact; request controls remain provider-owned.
-    entry = catalog.resolve_entry(model, provider=provider)
-    if entry.supports_reasoning is not True:
+    thinking_budget = common._route_thinking_budget_tokens(
+        ctx, config, raw,
+        thinking_mode=thinking_mode or ctx.metadata.get("thinking_mode"),
+        rollout_phase=config.rollout_phase,
+    )
+    if thinking_budget > 0 and catalog.resolve_entry(
+        model, provider=provider
+    ).supports_reasoning is not True:
         raise ModelRouteError(f"Selected tier {selected} does not support reasoning")
     if ctx.tool_defs and not capabilities.supports_tools:
         raise ModelRouteError(f"Selected tier {selected} does not support tool calls")

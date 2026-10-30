@@ -77,6 +77,7 @@ async def test_model_policy_bypasses_legacy_complaint_confidence_and_context_rul
         confidence_threshold=1.0,
         budget={"action": "cap", "cap_tier": "c0", "limit_usd": 0.01},
     )
+    ctx.metadata.update(session_billed_cost_usd=1.0, session_cost_source="billed")
     result = await squilla_router.apply_squilla_router(ctx)
     assert result.metadata["routed_tier"] == expected
     assert result.model == result.config.squilla_router.tiers[expected]["model"]
@@ -269,17 +270,32 @@ async def test_default_step_runs_pinned_pair_and_reuses_durable_redo(monkeypatch
 
     from opensquilla.squilla_router.lightgbm_model import default_model_root
 
-    fixture = json.loads((default_model_root() / "source_parity_cases.json").read_text())["cases"][
-        0
-    ]
+    fixture = json.loads(
+        (default_model_root() / "source_parity_cases.json").read_text(encoding="utf-8")
+    )["cases"][0]
     ctx = context(message=fixture["input"]["current_request"])
     ctx.metadata["router_model_input"] = fixture["input"]
+    model = squilla_router.preload_strategy(ctx.config.squilla_router)
+    predict = model.predict
+    evidence = {}
+
+    def capture_prediction(value):
+        prediction = predict(value)
+        evidence.update(
+            input=value,
+            feature_hash=prediction.feature_vector_hash,
+            identity=prediction.identity,
+            features=model.build_features(value).tolist(),
+        )
+        return prediction
+
+    monkeypatch.setattr(model, "predict", capture_prediction)
     await squilla_router.apply_squilla_router(ctx)
     original = ctx.metadata["router_model_decision"]["decision"]
     assert original["tier_audit"]["probabilities"] == pytest.approx(
         {k.lower(): v for k, v in fixture["tier_probabilities"].items()},
         abs=1e-10,
-    )
+    ), evidence
     assert ctx.metadata["routed_tier"] == "c0"
     status = squilla_router.router_runtime_status()
     assert status["loaded"] is True
@@ -374,3 +390,12 @@ def test_model_strategy_cache_ignores_legacy_settings_but_tracks_assets(monkeypa
     config.lightgbm_model_dir = "/another-model-bundle"
     assert squilla_router.preload_strategy(config) is not first
     assert loaded == [None, "/another-model-bundle"]
+
+
+def test_explicit_thinking_requires_reasoning_even_when_policy_suggests_t0():
+    ctx = context(auto_thinking=False)
+    ctx.config.llm.thinking = "high"
+    ctx.config.squilla_router.tiers["c0"]["model"] = "qwen/qwen-vl-max"
+    ctx.metadata.update(routing_applied=True, routed_tier="c0", thinking_mode="T0")
+    with pytest.raises(ModelRouteError, match="does not support reasoning"):
+        validate_model_route_capacity(ctx)

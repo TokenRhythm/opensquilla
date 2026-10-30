@@ -14,6 +14,7 @@ from pathlib import Path
 from typing import Any
 
 from opensquilla.engine.routing.model_policy import quality_retry_tier
+from opensquilla.provider.types import ChatConfig, ToolDefinition
 
 VALIDATION_REASONS = frozenset(
     {
@@ -59,6 +60,7 @@ def validation_failure(results: Sequence[Any]) -> bool:
 class ModelPolicyRecovery:
     def __init__(self, config: Any) -> None:
         self.metadata = config.metadata
+        self.context_overflow_threshold = float(config.context_overflow_threshold)
         self.enabled = (
             self.metadata.get("router_tier_policy") == "model"
             and self.metadata.get("routing_applied") is True
@@ -85,7 +87,9 @@ class ModelPolicyRecovery:
         return True
 
     async def prepare(
-        self, provider: Any, reason: str, messages: list[Any]
+        self, provider: Any, reason: str, messages: list[Any], *,
+        chat_config: ChatConfig | None = None,
+        tools: list[ToolDefinition] | None = None,
     ) -> dict[str, Any] | None:
         callback = getattr(provider, "prepare_quality_retry", None)
         tier = self.metadata.get("routed_tier")
@@ -107,12 +111,16 @@ class ModelPolicyRecovery:
             return None
         # A refused preflight is not repeatedly attempted later in this turn.
         self.quality_attempted = True
-        updates = await callback(
-            reason=reason,
-            scope_id=self.scope_id,
-            remaining_budget=self.budget - self.used,
-            messages=messages,
-        )
+        request = {
+            "reason": reason,
+            "scope_id": self.scope_id,
+            "remaining_budget": self.budget - self.used,
+            "messages": messages,
+            "context_overflow_threshold": self.context_overflow_threshold,
+        }
+        if chat_config is not None:
+            request.update(chat_config=chat_config, tools=tools)
+        updates = await callback(**request)
         if updates is None:
             return None
         if not isinstance(updates, dict) or set(updates) - {

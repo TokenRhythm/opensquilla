@@ -2361,15 +2361,46 @@ class _SelectorFallbackProvider:
 
     async def prepare_quality_retry(
         self, *, reason: str, scope_id: str, remaining_budget: int, messages: list[Any],
+        chat_config: ChatConfig | None = None, tools: Any = None,
+        context_overflow_threshold: float | None = None,
     ) -> dict[str, Any] | None:
         callback = (self._turn_metadata or {}).get("router_model_quality_retry_callback")
         if not callable(callback):
             return None
-        return await callback(
+
+        def prepare_request(
+            provider: Any, selector: Any, request: list[Any], request_tools: Any,
+            config: ChatConfig,
+        ) -> tuple[list[Any], ChatConfig]:
+            # Preview the same physical-leg transformations used by _chat, with
+            # isolated selector/metadata/cache state until durable admission.
+            preview = object.__new__(type(self))
+            preview.__dict__ = self.__dict__.copy()
+            preview._provider = provider
+            preview._selector = selector
+            preview._turn_metadata = dict(self._turn_metadata or {})
+            preview._fallback_limits = self._fallback_limits.copy()
+            preview._fallback_deployment_limits = self._fallback_deployment_limits.copy()
+            preview._fallback_deployment_capabilities = (
+                self._fallback_deployment_capabilities.copy()
+            )
+            preview._fallback_deployment_vision_support = (
+                self._fallback_deployment_vision_support.copy()
+            )
+            preview._last_request_had_tools = bool(request_tools)
+            bound = preview.compaction_chat_config(config)
+            return preview._project_image_messages_for_active_leg(
+                request, bound, stage="primary",
+            ), bound
+
+        return cast("dict[str, Any] | None", await callback(
             reason=reason, scope_id=scope_id, remaining_budget=remaining_budget, messages=messages,
-            chat_config=self._last_model_chat_config, tools=self._last_model_tools,
+            chat_config=chat_config if chat_config is not None else self._last_model_chat_config,
+            tools=tools if chat_config is not None else self._last_model_tools,
             activate_prepared=self.activate_prepared_deployment,
-        )
+            prepare_request=prepare_request,
+            context_overflow_threshold=context_overflow_threshold,
+        ))
 
     def activate_prepared_deployment(self, provider: Any, deployment: ProviderConfig) -> None:
         """Install the exact retry leg that passed preflight before its durable CAS."""
@@ -5152,6 +5183,8 @@ class TurnRunner:
             return None
         from opensquilla.session.model_router_state import model_generation_transcript
 
+        if self._session_manager is None:
+            raise RuntimeError("Model routing requires a session manager")
         canonical = await self._session_manager.get_model_router_transcript(
             session_key, expected_session_id=expected_session_id,
             expected_session_epoch=expected_session_epoch,
@@ -9279,16 +9312,6 @@ class TurnRunner:
     def _resolve_turn_thinking(self, turn: Any) -> bool | ThinkingLevel:
         """Resolve explicit config thinking before squilla-router suggestions."""
 
-        model_metadata = getattr(turn, "metadata", {}) or {}
-        if (
-            model_metadata.get("router_tier_policy") == "model"
-            and model_metadata.get("routing_applied") is True
-        ):
-            level = model_metadata.get("thinking_level", "off")
-            if level == "off":
-                return False
-            parsed = self._parse_thinking_level(level, source="model_tier_policy")
-            return parsed if parsed is not None else False
         llm_cfg = getattr(self._config, "llm", None) if self._config else None
         explicit = getattr(llm_cfg, "thinking", None)
         parsed = self._parse_thinking_level(
@@ -11654,6 +11677,8 @@ class TurnRunner:
         envelope = turn.metadata.get("router_model_decision")
         if not isinstance(envelope, dict) or not input_message_id:
             raise RuntimeError("Model admission requires a staged accepted input")
+        if self._session_manager is None:
+            raise RuntimeError("Model routing admission requires a session manager")
         committed = await self._session_manager.admit_model_router_decision(
             turn.session_key, input_message_id,
             expected_session_id=expected_session_id,
@@ -14964,8 +14989,9 @@ class TurnRunner:
         if history:
             agent.set_history(history)
         if prepared_window is not None and prepared_window.consumer_admission is not None:
-            if isinstance(getattr(agent_config, "metadata", None), dict):
-                agent_config.metadata["router_model_prepared_window_admitted"] = True
+            agent_metadata = getattr(agent_config, "metadata", None)
+            if isinstance(agent_metadata, dict):
+                agent_metadata["router_model_prepared_window_admitted"] = True
             return _format_compaction_summary_context([prepared_window.summary])
         if model_generation_reset:
             # A checkpoint can summarize turns from before explicit New Task.
