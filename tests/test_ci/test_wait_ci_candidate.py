@@ -51,6 +51,8 @@ def test_api_retries_only_transient_http_errors_with_pagination(helper, monkeypa
     ("gh: Forbidden (HTTP 403); connection reset", 1, "http-403"),
     ("gh: Not Found (HTTP 404); i/o timeout", 1, "http-404"),
     ("gh: rate limit (HTTP 429)", 1, "http-429"),
+    ("gh: Bad Request (HTTP 400)", 1, "http-400"),
+    ("gh: Validation Failed (HTTP 422)", 1, "http-422"),
     ("net/http: TLS handshake timeout", 3, "tls-handshake-timeout"),
     ("read tcp: connection reset by peer", 3, "connection-reset"),
     ("wsarecv: An existing connection was forcibly closed by the remote host.",
@@ -58,8 +60,9 @@ def test_api_retries_only_transient_http_errors_with_pagination(helper, monkeypa
     ("dial tcp: i/o timeout", 3, "network-timeout"),
     ("net/http: request canceled (Client.Timeout exceeded while awaiting headers)",
      3, "network-timeout"),
-    ("x509: certificate signed by unknown authority", 1, "unknown-cli-failure"),
-    ("unknown failure", 1, "unknown-cli-failure"),
+    ("x509: certificate signed by unknown authority", 1, "certificate-error"),
+    ("unknown failure", 3, "unknown-cli-failure"),
+    ("", 3, "unknown-cli-failure"),
 ])
 def test_api_preserves_failure_and_bounds_retries(helper, monkeypatch, stderr, attempts, reason):
     calls, sleeps = [], []
@@ -109,9 +112,11 @@ def test_api_unknown_failure_summary_does_not_echo_stderr(helper, monkeypatch):
         raise failure
 
     monkeypatch.setattr(helper.subprocess, "run", run)
+    monkeypatch.setattr(helper.time, "sleep", lambda _: None)
     with pytest.raises(helper.MetadataApiError, match="unknown-cli-failure") as caught:
         helper.api("repos/owner/repo/actions/jobs/1")
     assert caught.value.__cause__ is failure
+    assert "attempts=3" in str(caught.value)
     assert "sensitive" not in str(caught.value)
 
 
@@ -426,3 +431,40 @@ def test_wait_poll_sleep_stays_inside_original_budget(helper, monkeypatch, tmp_p
     assert len(calls) == 2
     assert clock[0] == helper.WAIT_SECONDS
     assert not (tmp_path / "download").exists()
+
+
+@pytest.mark.parametrize("returncode", [2, 4])
+def test_api_cli_cancellation_and_authentication_are_not_retried(helper, monkeypatch, returncode):
+    calls, sleeps = [], []
+    failure = subprocess.CalledProcessError(returncode, ["gh"], stderr="TLS handshake timeout")
+
+    def run(*args, **kwargs):
+        calls.append(args)
+        raise failure
+
+    monkeypatch.setattr(helper.subprocess, "run", run)
+    monkeypatch.setattr(helper.time, "sleep", sleeps.append)
+    with pytest.raises(helper.MetadataApiError, match="attempts=1") as caught:
+        helper.api("repos/owner/repo/actions/jobs/1")
+    assert caught.value.__cause__ is failure
+    assert len(calls) == 1
+    assert not sleeps
+
+
+def test_api_unclassified_exit_one_can_recover_without_disclosing_cli_output(helper, monkeypatch):
+    calls, sleeps = [], []
+    failure = subprocess.CalledProcessError(
+        1, ["gh"], stderr="opaque-sensitive-cli-error", output="sensitive-body",
+    )
+
+    def run(command, **kwargs):
+        calls.append(command)
+        if len(calls) == 1:
+            raise failure
+        return subprocess.CompletedProcess(command, 0, stdout='{"status":"completed"}')
+
+    monkeypatch.setattr(helper.subprocess, "run", run)
+    monkeypatch.setattr(helper.time, "sleep", sleeps.append)
+    assert helper.api("repos/owner/repo/actions/jobs/1") == {"status": "completed"}
+    assert len(calls) == 2
+    assert sleeps == [1]
