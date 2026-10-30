@@ -843,10 +843,15 @@ async def test_close_cancels_stalled_upload_and_preserves_unacknowledged_event(
         timeouts = await expire_shutdown_deadline(runtime, cancel=not cancel_close)
         if cancel_close:
             closing.cancel()
+        # Bound the upload cancellation separately from durable SQLite cleanup;
+        # disk-worker scheduling must not turn a completed network cancellation
+        # into a second cancellation of close().
+        await asyncio.wait_for(cancelled.wait(), timeout=1)
+        if cancel_close:
             with pytest.raises(asyncio.CancelledError):
-                await asyncio.wait_for(closing, timeout=1)
+                await asyncio.wait_for(closing, timeout=10)
         else:
-            await asyncio.wait_for(closing, timeout=1)
+            await asyncio.wait_for(closing, timeout=10)
         assert any(timeout.expired() for timeout in timeouts) is not cancel_close
 
         assert cancelled.is_set()
