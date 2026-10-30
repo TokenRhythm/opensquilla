@@ -112,7 +112,7 @@ jobs:
       shell: bash
       run: |
         set -euo pipefail
-        git lfs pull --include="src/opensquilla/squilla_router/models/v4.2_phase3_inference/**"
+        git lfs pull --include="src/opensquilla/squilla_router/models/v4.2_phase3_inference/**,src/opensquilla/squilla_router/lightgbm_model/assets/**"
         mcp_image="opensquilla-mcp-ci:${GITHUB_SHA}"
         docker build --file Dockerfile --tag "${mcp_image}" . \
           2>&1 | tee "${CI_REPORT_DIR}/mcp-docker-build.log"
