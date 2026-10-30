@@ -58,7 +58,6 @@ LIGHTGBM_ASSET_PREFIX = "opensquilla/squilla_router/lightgbm_model/assets"
 LIGHTGBM_ASSET_RELS = (
     "artifact_manifest.json",
     "model_manifest.json",
-    "inference_manifest.json",
     "intent/model.txt.gz",
     "tier/model.txt.gz",
 )

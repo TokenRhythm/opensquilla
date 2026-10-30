@@ -6,10 +6,7 @@ names, offsets, defaults, and block boundaries cannot drift independently.
 
 from __future__ import annotations
 
-import argparse
-import json
-from dataclasses import asdict, dataclass
-from pathlib import Path
+from dataclasses import dataclass
 
 
 SCHEMA_VERSION = "numeric88.registry.v1"
@@ -183,42 +180,3 @@ def _make_registry() -> tuple[NumericFeature, ...]:
 
 
 NUMERIC88_REGISTRY = _make_registry()
-
-
-def numeric88_contract() -> dict[str, object]:
-    blocks = []
-    for name, offset, dimension in (
-        ("current.rule", 0, 48),
-        ("history.route", 48, 16),
-        ("previous.signal", 64, 19),
-        ("context", 83, 5),
-    ):
-        blocks.append({"name": name, "offset": offset, "dimension": dimension})
-    return {
-        "schema_version": SCHEMA_VERSION,
-        "feature_version": FEATURE_VERSION,
-        "dimension": 88,
-        "dtype": DTYPE,
-        "blocks": blocks,
-        "features": [asdict(feature) for feature in NUMERIC88_REGISTRY],
-    }
-
-
-def write_contract(path: str | Path) -> None:
-    target = Path(path)
-    target.parent.mkdir(parents=True, exist_ok=True)
-    target.write_text(
-        json.dumps(numeric88_contract(), ensure_ascii=False, indent=2) + "\n",
-        encoding="utf-8",
-    )
-
-
-def main() -> None:
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--output", type=Path, required=True)
-    args = parser.parse_args()
-    write_contract(args.output)
-
-
-if __name__ == "__main__":
-    main()

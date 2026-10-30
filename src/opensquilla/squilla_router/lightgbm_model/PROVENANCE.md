@@ -5,9 +5,14 @@ This package contains the exact LightGBM pair selected by the 2026-10-20 model-p
 - Training code identity: `git:d4441356584423be07361495e55b488c95c5db43`.
 - Runtime snapshot: `router-training-a34e5ae` beside the experiment's frozen OpenSquilla source.
 
-`assets/provenance.json` records the original source paths and hashes. Files under
-`_vendor/features/`, `_vendor/ids.py`, and `_vendor/errors.py` are unchanged copies.
-`input_contract.py` and `calibration.py` contain verbatim extracted definitions.
+`assets/provenance.json` records the upstream source paths and original file
+hashes; these identify the source snapshot, not checksums of the local extracts.
+`_vendor/` retains only the inference subset: training, artifact export/loading,
+BERT, registry CLI, unused identity helpers, and unused batch transforms were
+removed. Retained function and method definitions are verbatim; imports and
+module/class descriptions were trimmed. `features/text.py`, `features/numeric.py`,
+and the complete `BGEOnnxEncoder` definition are unchanged. `input_contract.py`
+and `calibration.py` also contain verbatim extracted definitions.
 The original training package declares `LicenseRef-Proprietary`; that declaration
 and its original package metadata are retained in `assets/upstream-pyproject.toml`.
 The frozen snapshot contains no separate license file. These source files retain

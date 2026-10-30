@@ -223,7 +223,7 @@ markers = [
 [tool.ruff]
 target-version = "py312"
 line-length = 100
-# Frozen upstream feature code stays byte-identical to its provenance hashes.
+# Extracted upstream inference definitions retain their original formatting.
 extend-exclude = ["src/opensquilla/squilla_router/lightgbm_model/_vendor"]
 
 [tool.ruff.lint]

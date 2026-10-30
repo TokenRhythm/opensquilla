@@ -1,38 +1,27 @@
-"""Concrete, train-split-safe runtimes for the two feature views.
-
-The sklearn objects stored by this module are pickle based.  Loading therefore
-requires both an explicit ``trusted=True`` acknowledgement and hash verification
-of every file before ``joblib.load`` is called.
-"""
+"""Frozen BGE and LightGBM feature inference definitions; see ../../PROVENANCE.md."""
 
 from __future__ import annotations
 
 import json
 import os
-import shutil
 import sqlite3
-import tempfile
 from concurrent.futures import ThreadPoolExecutor
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass
 from hashlib import sha256
-from pathlib import Path, PurePosixPath
+from pathlib import Path
 from typing import Any
 
 import numpy as np
 
 from ..ids import canonical_json_bytes, sha256_file
-from .lightgbm380 import FEATURE_DIM, LightGBM380Featurizer
-from .numeric import extract_numeric88
-from .text import SEGMENT_KINDS, SegmentKind, extract_text_segments, truncate_content_tokens
+from .lightgbm380 import LightGBM380Featurizer
+from .text import SegmentKind, truncate_content_tokens
 
 
 PCA_DIM = 64
 TFIDF_MAX_FEATURES = 10_000
 SVD_DIM = 100
 BGE_MAX_CONTENT_TOKENS = 510
-BERT_EMPTY_TEXT = "[EMPTY]"
-BERT_SEGMENT_LENGTHS = (128, 80, 48)
 _BGE_CACHE_SCHEMA = "bge_embedding_cache.v1"
 _BGE_CACHE_WRITE_BATCH = 256
 
@@ -47,14 +36,6 @@ def _sklearn() -> tuple[Any, Any, Any, Any]:
     return PCA, TruncatedSVD, TfidfVectorizer, StandardScaler
 
 
-def _joblib() -> Any:
-    try:
-        import joblib
-    except ImportError as exc:  # pragma: no cover - exercised only in minimal installs
-        raise RuntimeError("joblib is required to save or load feature artifacts") from exc
-    return joblib
-
-
 def _row_mapping(row: object) -> Mapping[str, object]:
     if isinstance(row, Mapping):
         return row
@@ -64,16 +45,6 @@ def _row_mapping(row: object) -> Mapping[str, object]:
         if isinstance(value, Mapping):
             return value
     raise TypeError("feature rows must be mappings or Pydantic models")
-
-
-def _train_rows(rows: Sequence[object]) -> list[Mapping[str, object]]:
-    values = [_row_mapping(row) for row in rows]
-    if not values:
-        raise ValueError("train_rows must not be empty")
-    invalid = [str(row.get("sample_id", "<unknown>")) for row in values if row.get("split") != "train"]
-    if invalid:
-        raise ValueError(f"fit accepts only rows explicitly marked split='train': {invalid[:5]}")
-    return values
 
 
 def _dense_2d(values: object, *, name: str) -> np.ndarray:
@@ -109,30 +80,11 @@ class SklearnPCA64Projector:
         self.estimator: object | None = None
         self.fitted_components = 0
 
-    def fit(self, values: object) -> "SklearnPCA64Projector":
-        if self.estimator is not None:
-            raise RuntimeError("PCA projector is immutable after fit")
-        matrix = _dense_2d(values, name="PCA input")
-        PCA, _, _, _ = _sklearn()
-        self.fitted_components = min(PCA_DIM, matrix.shape[0], matrix.shape[1])
-        self.estimator = PCA(n_components=self.fitted_components, svd_solver="full")
-        self.estimator.fit(matrix)
-        return self
-
     def transform(self, values: object) -> np.ndarray:
         if self.estimator is None:
             raise RuntimeError("PCA projector is not fitted")
         matrix = _dense_2d(values, name="PCA input")
         return _pad_columns(self.estimator.transform(matrix), PCA_DIM, name="PCA output")
-
-    def metadata(self) -> dict[str, object]:
-        return {
-            "type": "sklearn.decomposition.PCA",
-            "output_dim": PCA_DIM,
-            "fitted_components": self.fitted_components,
-            "svd_solver": "full",
-        }
-
 
 class SklearnCharTfidfVectorizer:
     """Frozen character ``char_wb`` TF-IDF configuration."""
@@ -146,22 +98,8 @@ class SklearnCharTfidfVectorizer:
             dtype=np.float32,
         )
 
-    def fit_transform(self, texts: Sequence[str]) -> object:
-        return self.estimator.fit_transform(list(texts))
-
     def transform(self, texts: Sequence[str]) -> object:
         return self.estimator.transform(list(texts))
-
-    @staticmethod
-    def metadata() -> dict[str, object]:
-        return {
-            "type": "sklearn.feature_extraction.text.TfidfVectorizer",
-            "analyzer": "char_wb",
-            "ngram_range": [2, 4],
-            "max_features": TFIDF_MAX_FEATURES,
-            "dtype": "float32",
-        }
-
 
 class SklearnSVD100Projector:
     """TruncatedSVD fitted on train TF-IDF, with a fixed 100-column output."""
@@ -173,38 +111,10 @@ class SklearnSVD100Projector:
         self.estimator: object | None = None
         self.fitted_components = 0
 
-    def fit(self, values: object) -> "SklearnSVD100Projector":
-        if self.estimator is not None:
-            raise RuntimeError("SVD projector is immutable after fit")
-        shape = getattr(values, "shape", None)
-        if shape is None or len(shape) != 2 or shape[0] < 1 or shape[1] < 1:
-            raise ValueError(f"SVD input must be a non-empty 2-D matrix, got {shape}")
-        _, TruncatedSVD, _, _ = _sklearn()
-        self.fitted_components = min(SVD_DIM, int(shape[0]), int(shape[1]))
-        self.estimator = TruncatedSVD(
-            n_components=self.fitted_components,
-            algorithm="randomized",
-            n_iter=7,
-            random_state=self.random_state,
-        )
-        self.estimator.fit(values)
-        return self
-
     def transform(self, values: object) -> np.ndarray:
         if self.estimator is None:
             raise RuntimeError("SVD projector is not fitted")
         return _pad_columns(self.estimator.transform(values), SVD_DIM, name="SVD output")
-
-    def metadata(self) -> dict[str, object]:
-        return {
-            "type": "sklearn.decomposition.TruncatedSVD",
-            "output_dim": SVD_DIM,
-            "fitted_components": self.fitted_components,
-            "algorithm": "randomized",
-            "n_iter": 7,
-            "random_state": self.random_state,
-        }
-
 
 def _tokenizer_content_ids(tokenizer: object, text: str) -> list[int]:
     encode = getattr(tokenizer, "encode", None)
@@ -803,173 +713,6 @@ class BGEOnnxEncoder:
         return normalized.astype(np.float32, copy=False)
 
 
-def _component_metadata(component: object) -> dict[str, object]:
-    metadata = getattr(component, "metadata", None)
-    if callable(metadata):
-        value = metadata()
-        if isinstance(value, Mapping):
-            return dict(value)
-    return {"type": f"{type(component).__module__}.{type(component).__qualname__}"}
-
-
-def _atomic_directory(destination: Path, writer: Any) -> None:
-    destination = destination.resolve(strict=False)
-    destination.parent.mkdir(parents=True, exist_ok=True)
-    if destination.exists():
-        raise FileExistsError(destination)
-    temporary = Path(tempfile.mkdtemp(prefix=f".{destination.name}.", dir=destination.parent))
-    try:
-        writer(temporary)
-        os.rename(temporary, destination)
-    finally:
-        if temporary.exists():
-            shutil.rmtree(temporary)
-
-
-def _artifact_records(directory: Path, names: Sequence[str]) -> list[dict[str, object]]:
-    return [
-        {
-            "path": name,
-            "size": (directory / name).stat().st_size,
-            "sha256": sha256_file(directory / name),
-        }
-        for name in names
-    ]
-
-
-_BGE_ASSET_TYPES = {
-    "onnx_model": "bge_onnx_model",
-    "tokenizer": "bge_tokenizer",
-}
-
-
-def _copy_encoder_assets(
-    directory: Path,
-    embedder: object,
-) -> list[dict[str, object]]:
-    provider = getattr(embedder, "serving_asset_files", None)
-    if not callable(provider):
-        return []
-    raw_assets = provider()
-    if not isinstance(raw_assets, Mapping) or set(raw_assets) != set(_BGE_ASSET_TYPES):
-        raise ValueError("BGE serving assets must contain exactly onnx_model and tokenizer")
-    records: list[dict[str, object]] = []
-    for role in sorted(_BGE_ASSET_TYPES):
-        source_value = raw_assets[role]
-        if not isinstance(source_value, (str, Path)):
-            raise TypeError(f"BGE serving asset {role} must be a local path")
-        source = Path(source_value).expanduser().resolve(strict=True)
-        if not source.is_file():
-            raise ValueError(f"BGE serving asset is not a file: {source}")
-        digest = sha256_file(source)
-        extension = ".onnx" if role == "onnx_model" else ".json"
-        relative = PurePosixPath(
-            "bge",
-            role,
-            "sha256",
-            digest.removeprefix("sha256:") + extension,
-        )
-        destination = directory / Path(*relative.parts)
-        destination.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copyfile(source, destination)
-        if destination.stat().st_size != source.stat().st_size or sha256_file(destination) != digest:
-            raise ValueError(f"BGE serving asset changed while being copied: {source}")
-        records.append(
-            {
-                "role": role,
-                "artifact_type": _BGE_ASSET_TYPES[role],
-                "path": relative.as_posix(),
-                "size": destination.stat().st_size,
-                "sha256": digest,
-            }
-        )
-    return records
-
-
-def _verified_encoder_assets(
-    directory: Path,
-    manifest: Mapping[str, object],
-) -> dict[str, Path]:
-    raw_assets = manifest.get("encoder_assets", ())
-    if not isinstance(raw_assets, Sequence) or isinstance(raw_assets, (str, bytes)):
-        raise ValueError("encoder_assets must be a sequence")
-    if not raw_assets:
-        return {}
-    if manifest.get("encoder_asset_schema_version") != "bge_encoder_assets.v1":
-        raise ValueError("unsupported BGE encoder asset schema")
-    verified: dict[str, Path] = {}
-    for raw in raw_assets:
-        if not isinstance(raw, Mapping):
-            raise ValueError("encoder asset record must be an object")
-        role = raw.get("role")
-        artifact_type = raw.get("artifact_type")
-        name = raw.get("path")
-        size = raw.get("size")
-        digest = raw.get("sha256")
-        if (
-            not isinstance(role, str)
-            or role not in _BGE_ASSET_TYPES
-            or artifact_type != _BGE_ASSET_TYPES[role]
-            or not isinstance(name, str)
-            or isinstance(size, bool)
-            or not isinstance(size, int)
-            or size < 0
-            or not isinstance(digest, str)
-        ):
-            raise ValueError("encoder asset record is incomplete")
-        if role in verified:
-            raise ValueError(f"duplicate encoder asset role: {role}")
-        relative = PurePosixPath(name)
-        if relative.is_absolute() or ".." in relative.parts or "\\" in name:
-            raise ValueError(f"unsafe encoder asset path: {name!r}")
-        expected_suffix = ".onnx" if role == "onnx_model" else ".json"
-        expected_name = digest.removeprefix("sha256:") + expected_suffix
-        if (
-            len(relative.parts) != 4
-            or relative.parts[:3] != ("bge", role, "sha256")
-            or relative.name != expected_name
-        ):
-            raise ValueError(f"encoder asset path is not content-addressed: {name}")
-        resolved = (directory / Path(*relative.parts)).resolve()
-        if directory != resolved and directory not in resolved.parents:
-            raise ValueError(f"encoder asset path escapes its directory: {name}")
-        if (
-            not resolved.is_file()
-            or resolved.stat().st_size != size
-            or sha256_file(resolved) != digest
-        ):
-            raise ValueError(f"encoder asset hash mismatch: {name}")
-        verified[str(role)] = resolved
-    if set(verified) != set(_BGE_ASSET_TYPES):
-        raise ValueError("embedded BGE assets must contain ONNX model and tokenizer")
-    return verified
-
-
-def _verified_joblib_files(directory: Path, manifest: Mapping[str, object]) -> dict[str, Path]:
-    raw_files = manifest.get("files")
-    if not isinstance(raw_files, Sequence) or isinstance(raw_files, (str, bytes)):
-        raise ValueError("artifact manifest files must be a sequence")
-    verified: dict[str, Path] = {}
-    for raw in raw_files:
-        if not isinstance(raw, Mapping):
-            raise ValueError("artifact file record must be an object")
-        name = raw.get("path")
-        digest = raw.get("sha256")
-        if not isinstance(name, str) or not isinstance(digest, str):
-            raise ValueError("artifact file record is incomplete")
-        relative = PurePosixPath(name)
-        if relative.is_absolute() or ".." in relative.parts or len(relative.parts) != 1:
-            raise ValueError(f"unsafe artifact path: {name!r}")
-        path = directory / name
-        resolved = path.resolve()
-        if directory not in resolved.parents:
-            raise ValueError(f"artifact path escapes its directory: {name}")
-        if not resolved.is_file() or sha256_file(resolved) != digest:
-            raise ValueError(f"artifact hash mismatch: {name}")
-        verified[name] = resolved
-    return verified
-
-
 class LightGBMFeatureRuntime:
     """Concrete BGE/PCA + TF-IDF/SVD implementation of the 380 contract."""
 
@@ -995,18 +738,6 @@ class LightGBMFeatureRuntime:
         )
         self._closed = False
 
-    @classmethod
-    def from_local_bge(cls, model_dir: str | Path, **encoder_options: object) -> "LightGBMFeatureRuntime":
-        return cls(embedder=BGEOnnxEncoder(model_dir, **encoder_options))
-
-    @property
-    def fitted(self) -> bool:
-        return self._featurizer.fitted
-
-    @property
-    def closed(self) -> bool:
-        return self._closed
-
     def _ensure_open(self) -> None:
         if self._closed:
             raise RuntimeError("LightGBM feature runtime is closed")
@@ -1019,345 +750,6 @@ class LightGBMFeatureRuntime:
             close()
         self._closed = True
 
-    def __enter__(self) -> "LightGBMFeatureRuntime":
-        self._ensure_open()
-        return self
-
-    def __exit__(self, exc_type: object, exc: object, traceback: object) -> None:
-        del exc_type, exc, traceback
-        self.close()
-
-    def fit(self, train_rows: Sequence[object]) -> "LightGBMFeatureRuntime":
-        self._ensure_open()
-        self._featurizer.fit(_train_rows(train_rows))
-        return self
-
     def transform_row(self, row: object) -> np.ndarray:
         self._ensure_open()
         return self._featurizer.transform_row(_row_mapping(row))
-
-    def transform_rows(self, rows: Sequence[object]) -> np.ndarray:
-        self._ensure_open()
-        return self._featurizer.transform_rows([_row_mapping(row) for row in rows])
-
-    def metadata(self) -> dict[str, object]:
-        return {
-            "schema_version": self.schema_version,
-            "feature_dim": FEATURE_DIM,
-            "dtype": "float32",
-            "encoder": _component_metadata(self.embedder),
-            "pca": _component_metadata(self.semantic_projector),
-            "tfidf": _component_metadata(self.text_vectorizer),
-            "svd": _component_metadata(self.character_projector),
-            "empty_semantic_segment": "zero64_and_bypass_encoder",
-        }
-
-    def save_artifacts(self, directory: str | Path) -> Path:
-        self._ensure_open()
-        if not self.fitted:
-            raise RuntimeError("fit(train_rows) before saving feature artifacts")
-        destination = Path(directory)
-        joblib = _joblib()
-
-        def write(temporary: Path) -> None:
-            files = {
-                "pca64.joblib": self.semantic_projector,
-                "tfidf_char_wb_2_4.joblib": self.text_vectorizer,
-                "svd100.joblib": self.character_projector,
-            }
-            for name, value in files.items():
-                joblib.dump(value, temporary / name)
-            encoder_assets = _copy_encoder_assets(temporary, self.embedder)
-            manifest = {
-                "schema_version": self.schema_version,
-                "encoder_asset_schema_version": "bge_encoder_assets.v1",
-                "metadata": self.metadata(),
-                "files": _artifact_records(temporary, sorted(files)),
-                "encoder_assets": encoder_assets,
-            }
-            (temporary / "runtime_manifest.json").write_bytes(canonical_json_bytes(manifest))
-
-        _atomic_directory(destination, write)
-        return destination
-
-    @classmethod
-    def load_artifacts(
-        cls,
-        directory: str | Path,
-        *,
-        trusted: bool = False,
-        embedder: object | None = None,
-        bge_model_dir: str | Path | None = None,
-        **encoder_options: object,
-    ) -> "LightGBMFeatureRuntime":
-        if not trusted:
-            raise PermissionError("joblib feature artifacts require trusted=True")
-        source = Path(directory).resolve()
-        manifest = json.loads((source / "runtime_manifest.json").read_text(encoding="utf-8"))
-        if manifest.get("schema_version") != cls.schema_version:
-            raise ValueError("unsupported LightGBM runtime artifact version")
-        files = _verified_joblib_files(source, manifest)
-        required = {"pca64.joblib", "tfidf_char_wb_2_4.joblib", "svd100.joblib"}
-        if set(files) != required:
-            raise ValueError("LightGBM runtime artifact set is incomplete")
-        embedded_assets = _verified_encoder_assets(source, manifest)
-        if embedder is None:
-            if embedded_assets:
-                embedder = BGEOnnxEncoder(
-                    source,
-                    model_path=embedded_assets["onnx_model"],
-                    tokenizer_path=embedded_assets["tokenizer"],
-                    **encoder_options,
-                )
-            elif bge_model_dir is not None:
-                # Backward compatibility for feature views created before assets
-                # were embedded into the immutable view.
-                embedder = BGEOnnxEncoder(bge_model_dir, **encoder_options)
-            else:
-                raise ValueError(
-                    "legacy artifacts require embedder or local bge_model_dir; "
-                    "new artifacts embed BGE assets"
-                )
-        saved_encoder = manifest.get("metadata", {}).get("encoder", {})
-        actual_encoder = _component_metadata(embedder)
-        for key in ("model_sha256", "tokenizer_sha256", "max_content_tokens"):
-            if key in saved_encoder and saved_encoder[key] != actual_encoder.get(key):
-                raise ValueError(f"BGE encoder does not match saved artifact: {key}")
-        joblib = _joblib()
-        runtime = cls(
-            embedder=embedder,
-            semantic_projector=joblib.load(files["pca64.joblib"]),
-            text_vectorizer=joblib.load(files["tfidf_char_wb_2_4.joblib"]),
-            character_projector=joblib.load(files["svd100.joblib"]),
-        )
-        runtime._featurizer._fitted = True
-        return runtime
-
-
-@dataclass(frozen=True, slots=True)
-class BertRowFeatures:
-    current_request: str
-    recent_history: str
-    previous_answer: str
-    numeric88: np.ndarray
-    input_ids: tuple[np.ndarray, np.ndarray, np.ndarray] | None = None
-    attention_masks: tuple[np.ndarray, np.ndarray, np.ndarray] | None = None
-
-
-class BertFeatureRuntime:
-    """Three BERT text segments plus train-only StandardScaler numeric88."""
-
-    schema_version = "bert_text88_runtime.v1"
-
-    def __init__(
-        self,
-        *,
-        tokenizer: object | None = None,
-        tokenizer_id: str | None = None,
-        tokenizer_sha256: str | None = None,
-        segment_lengths: tuple[int, int, int] = BERT_SEGMENT_LENGTHS,
-        empty_text: str = BERT_EMPTY_TEXT,
-        scaler: object | None = None,
-        clip_value: float = 5.0,
-    ) -> None:
-        if len(segment_lengths) != 3 or any(value < 2 for value in segment_lengths):
-            raise ValueError("segment_lengths must contain three values >= 2")
-        if not empty_text:
-            raise ValueError("empty_text must not be empty")
-        if clip_value <= 0:
-            raise ValueError("clip_value must be positive")
-        if tokenizer is not None and not tokenizer_id:
-            tokenizer_id = str(getattr(tokenizer, "name_or_path", "")) or (
-                f"{type(tokenizer).__module__}.{type(tokenizer).__qualname__}"
-            )
-        if tokenizer is not None and not tokenizer_sha256:
-            raise ValueError(
-                "tokenized BERT features require the tokenizer content SHA-256"
-            )
-        if tokenizer is None and tokenizer_sha256 is not None:
-            raise ValueError("tokenizer_sha256 requires a tokenizer")
-        self.tokenizer = tokenizer
-        self.tokenizer_id = tokenizer_id
-        self.tokenizer_sha256 = tokenizer_sha256
-        self.segment_lengths = segment_lengths
-        self.empty_text = empty_text
-        self.clip_value = float(clip_value)
-        self.scaler = scaler
-        self._fitted = scaler is not None
-
-    @property
-    def fitted(self) -> bool:
-        return self._fitted
-
-    def fit(self, train_rows: Sequence[object]) -> "BertFeatureRuntime":
-        if self._fitted:
-            raise RuntimeError("BERT numeric scaler is immutable after fit")
-        rows = _train_rows(train_rows)
-        values = np.stack([extract_numeric88(row) for row in rows]).astype(np.float32)
-        _, _, _, StandardScaler = _sklearn()
-        self.scaler = StandardScaler()
-        self.scaler.fit(values)
-        self._fitted = True
-        return self
-
-    def _tokenize(self, texts: tuple[str, str, str]) -> tuple[
-        tuple[np.ndarray, np.ndarray, np.ndarray], tuple[np.ndarray, np.ndarray, np.ndarray]
-    ]:
-        if self.tokenizer is None:
-            raise RuntimeError("tokenizer is not configured")
-        cls_id = _special_token_id(self.tokenizer, "cls", "[CLS]")
-        sep_id = _special_token_id(self.tokenizer, "sep", "[SEP]")
-        pad_id = _special_token_id(self.tokenizer, "pad", "[PAD]")
-        tensor_length = max(self.segment_lengths)
-        all_ids: list[np.ndarray] = []
-        all_masks: list[np.ndarray] = []
-        for kind, text, content_length in zip(
-            SEGMENT_KINDS, texts, self.segment_lengths, strict=True
-        ):
-            content = truncate_content_tokens(
-                kind,
-                _tokenizer_content_ids(self.tokenizer, text),
-                max_content_tokens=content_length - 2,
-            )
-            sequence = [cls_id, *content, sep_id]
-            ids = np.full(tensor_length, pad_id, dtype=np.int32)
-            mask = np.zeros(tensor_length, dtype=np.int32)
-            ids[: len(sequence)] = sequence
-            mask[: len(sequence)] = 1
-            all_ids.append(ids)
-            all_masks.append(mask)
-        return tuple(all_ids), tuple(all_masks)  # type: ignore[return-value]
-
-    def transform_row(self, row: object) -> BertRowFeatures:
-        if not self._fitted or self.scaler is None:
-            raise RuntimeError("call fit(train_rows) before transform_row")
-        mapping = _row_mapping(row)
-        segments = extract_text_segments(mapping)
-        texts = (
-            segments.current_request,
-            segments.recent_history or self.empty_text,
-            segments.previous_answer or self.empty_text,
-        )
-        raw = extract_numeric88(mapping).reshape(1, -1)
-        numeric = np.asarray(self.scaler.transform(raw), dtype=np.float32)[0]
-        numeric = np.clip(numeric, -self.clip_value, self.clip_value).astype(
-            np.float32, copy=False
-        )
-        if numeric.shape != (88,) or not np.isfinite(numeric).all():
-            raise ValueError("scaled numeric88 is invalid")
-        ids: tuple[np.ndarray, np.ndarray, np.ndarray] | None = None
-        masks: tuple[np.ndarray, np.ndarray, np.ndarray] | None = None
-        if self.tokenizer is not None:
-            ids, masks = self._tokenize(texts)
-        return BertRowFeatures(*texts, numeric, ids, masks)
-
-    def transform_rows(self, rows: Sequence[object]) -> tuple[BertRowFeatures, ...]:
-        return tuple(self.transform_row(row) for row in rows)
-
-    def metadata(self) -> dict[str, object]:
-        return {
-            "schema_version": self.schema_version,
-            "numeric_dim": 88,
-            "numeric_dtype": "float32",
-            "scaler": "sklearn.preprocessing.StandardScaler",
-            "scaler_clip": [-self.clip_value, self.clip_value],
-            "empty_text": self.empty_text,
-            "tokenizer_id": self.tokenizer_id,
-            "tokenizer_sha256": self.tokenizer_sha256,
-            "segment_lengths": list(self.segment_lengths),
-            "tensor_sequence_length": max(self.segment_lengths),
-            "segment_truncation": {
-                "current_request": "head_tail_3_to_1",
-                "recent_history": "tail",
-                "previous_answer": "head_tail_1_to_1",
-            },
-        }
-
-    def save_artifacts(self, directory: str | Path) -> Path:
-        if not self._fitted or self.scaler is None:
-            raise RuntimeError("fit(train_rows) before saving feature artifacts")
-        destination = Path(directory)
-        joblib = _joblib()
-
-        def write(temporary: Path) -> None:
-            name = "standard_scaler88.joblib"
-            joblib.dump(self.scaler, temporary / name)
-            manifest = {
-                "schema_version": self.schema_version,
-                "metadata": self.metadata(),
-                "files": _artifact_records(temporary, [name]),
-            }
-            (temporary / "runtime_manifest.json").write_bytes(canonical_json_bytes(manifest))
-
-        _atomic_directory(destination, write)
-        return destination
-
-    @classmethod
-    def load_artifacts(
-        cls,
-        directory: str | Path,
-        *,
-        trusted: bool = False,
-        tokenizer: object | None = None,
-        tokenizer_id: str | None = None,
-        tokenizer_sha256: str | None = None,
-    ) -> "BertFeatureRuntime":
-        if not trusted:
-            raise PermissionError("joblib feature artifacts require trusted=True")
-        source = Path(directory).resolve()
-        manifest = json.loads((source / "runtime_manifest.json").read_text(encoding="utf-8"))
-        if manifest.get("schema_version") != cls.schema_version:
-            raise ValueError("unsupported BERT runtime artifact version")
-        files = _verified_joblib_files(source, manifest)
-        if set(files) != {"standard_scaler88.joblib"}:
-            raise ValueError("BERT runtime artifact set is incomplete")
-        metadata = manifest.get("metadata")
-        if not isinstance(metadata, Mapping):
-            raise ValueError("BERT runtime metadata is missing")
-        saved_tokenizer_id = metadata.get("tokenizer_id")
-        actual_id = tokenizer_id
-        if tokenizer is not None and not actual_id:
-            actual_id = str(getattr(tokenizer, "name_or_path", "")) or (
-                f"{type(tokenizer).__module__}.{type(tokenizer).__qualname__}"
-            )
-        if saved_tokenizer_id != actual_id:
-            raise ValueError("tokenizer_id does not match saved BERT artifacts")
-        if metadata.get("tokenizer_sha256") != tokenizer_sha256:
-            raise ValueError("tokenizer_sha256 does not match saved BERT artifacts")
-        scaler = _joblib().load(files["standard_scaler88.joblib"])
-        lengths = metadata.get("segment_lengths", list(BERT_SEGMENT_LENGTHS))
-        clip = metadata.get("scaler_clip", [-5.0, 5.0])
-        return cls(
-            tokenizer=tokenizer,
-            tokenizer_id=actual_id,
-            tokenizer_sha256=tokenizer_sha256,
-            segment_lengths=tuple(int(value) for value in lengths),
-            empty_text=str(metadata.get("empty_text", BERT_EMPTY_TEXT)),
-            scaler=scaler,
-            clip_value=float(clip[1]),
-        )
-
-
-# Short aliases used by deployment code and manifests.
-PCA64Projector = SklearnPCA64Projector
-CharTfidfVectorizer = SklearnCharTfidfVectorizer
-SVD100Projector = SklearnSVD100Projector
-OnnxBGEEncoder = BGEOnnxEncoder
-
-
-__all__ = [
-    "BERT_EMPTY_TEXT",
-    "BERT_SEGMENT_LENGTHS",
-    "BGE_MAX_CONTENT_TOKENS",
-    "BGEOnnxEncoder",
-    "BertFeatureRuntime",
-    "BertRowFeatures",
-    "CharTfidfVectorizer",
-    "LightGBMFeatureRuntime",
-    "OnnxBGEEncoder",
-    "PCA64Projector",
-    "SVD100Projector",
-    "SklearnCharTfidfVectorizer",
-    "SklearnPCA64Projector",
-    "SklearnSVD100Projector",
-]

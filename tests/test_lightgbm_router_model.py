@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import math
+import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -126,19 +127,8 @@ def test_tampered_manifest_fails_closed(tmp_path: Path):
 
 
 def test_tampered_calibration_is_rejected_before_deserialization(tmp_path: Path):
-    root = default_model_root()
-    for child in root.iterdir():
-        if child.name not in {"intent", "inference_manifest.json"}:
-            (tmp_path / child.name).symlink_to(child, target_is_directory=child.is_dir())
-    index = json.loads((root / "inference_manifest.json").read_text())
-    index["artifacts"].sort(key=lambda item: item["path"] != "intent/calibration.json")
-    (tmp_path / "inference_manifest.json").write_text(json.dumps(index))
-    (tmp_path / "intent").mkdir()
-    for child in (root / "intent").iterdir():
-        if child.name == "calibration.json":
-            (tmp_path / "intent" / child.name).write_text("{}")
-        else:
-            (tmp_path / "intent" / child.name).symlink_to(child)
+    shutil.copytree(default_model_root(), tmp_path, dirs_exist_ok=True)
+    (tmp_path / "intent/calibration.json").write_text("{}")
     with patch("opensquilla.squilla_router.lightgbm_model.model._load_transformer") as loader:
         with pytest.raises(
             LightGBMModelError,
@@ -148,23 +138,17 @@ def test_tampered_calibration_is_rejected_before_deserialization(tmp_path: Path)
         loader.assert_not_called()
 
 
-def test_artifact_index_cannot_relocate_verified_files(tmp_path: Path):
-    root = default_model_root()
-    (tmp_path / "model_manifest.json").write_bytes((root / "model_manifest.json").read_bytes())
-    index = json.loads((root / "inference_manifest.json").read_text())
-    index["artifacts"][0]["path"] = "elsewhere.json"
-    (tmp_path / "inference_manifest.json").write_text(json.dumps(index))
-    with pytest.raises(LightGBMModelError, match="artifact layout differs"):
-        validate_artifacts(tmp_path)
+def test_missing_preprocess_asset_is_rejected_before_deserialization(tmp_path: Path):
+    shutil.copytree(default_model_root(), tmp_path, dirs_exist_ok=True)
+    (tmp_path / "preprocess/feature/artifacts/pca64.joblib").unlink()
+    with patch("opensquilla.squilla_router.lightgbm_model.model._load_transformer") as loader:
+        with pytest.raises(LightGBMModelError, match="assets are missing or invalid"):
+            LightGBMRouterModel(tmp_path)
+        loader.assert_not_called()
 
 
 def test_truncated_compressed_model_fails_closed(tmp_path: Path):
-    root = default_model_root()
-    (tmp_path / "model_manifest.json").write_bytes((root / "model_manifest.json").read_bytes())
-    index = json.loads((root / "inference_manifest.json").read_text())
-    index["artifacts"].sort(key=lambda item: item["path"] != "intent/model.txt.gz")
-    (tmp_path / "inference_manifest.json").write_text(json.dumps(index))
-    (tmp_path / "intent").mkdir()
+    shutil.copytree(default_model_root(), tmp_path, dirs_exist_ok=True)
     (tmp_path / "intent/model.txt.gz").write_bytes(b"\x1f\x8b\x08")
     with pytest.raises(LightGBMModelError) as caught:
         validate_artifacts(tmp_path)

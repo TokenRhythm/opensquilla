@@ -63,20 +63,13 @@ def _verified_artifacts(model_root: str | Path | None) -> tuple[dict[str, Any], 
             or manifest["outputs"] != {"intent": list(INTENT_LABELS), "tier": list(TIER_LABELS)}
         ):
             raise LightGBMModelError("bundled LightGBM model contract mismatch")
-        index = json.loads((root / "inference_manifest.json").read_text(encoding="utf-8"))
-        references = {
-            ref["path"]: ref
+        references = [
+            ref
             for ref in manifest["models"] + manifest["preprocess"]
             if ref["artifact_type"] not in _EXCLUDED_TYPES
-        }
-        entries = index["artifacts"]
-        if len(entries) != len(references) or {item["source_path"] for item in entries} != set(
-            references
-        ):
-            raise LightGBMModelError("bundled LightGBM inference artifact closure is incomplete")
+        ]
         paths = {}
-        for entry in entries:
-            ref = references[entry["source_path"]]
+        for ref in references:
             source = Path(ref["path"])
             if "/preprocess/" in ref["path"]:
                 local = "preprocess/" + ref["path"].split("/preprocess/", 1)[1].split("/", 1)[1]
@@ -84,24 +77,20 @@ def _verified_artifacts(model_root: str | Path | None) -> tuple[dict[str, Any], 
                 local = "bundles/" + source.name
             else:
                 local = source.parent.name + "/" + source.name
-            expected_encoding = "gzip" if ref["artifact_type"] == "lightgbm_model" else "identity"
-            if expected_encoding == "gzip":
+            compressed = ref["artifact_type"] == "lightgbm_model"
+            if compressed:
                 local += ".gz"
-            if entry["path"] != local or entry["encoding"] != expected_encoding:
-                raise LightGBMModelError(
-                    "bundled LightGBM artifact layout differs from the frozen closure"
-                )
-            path = _safe_path(root, entry["path"])
-            if entry["encoding"] == "gzip":
+            path = _safe_path(root, local)
+            if compressed:
                 with gzip.open(path, "rb") as handle:
                     payload = handle.read(ref["size"] + 1)
             else:
                 payload = path.read_bytes()
             if len(payload) != ref["size"] or _hash(payload) != ref["sha256"]:
                 raise LightGBMModelError(
-                    f"bundled LightGBM artifact hash mismatch: {entry['path']}"
+                    f"bundled LightGBM artifact hash mismatch: {local}"
                 )
-            paths[entry["source_path"]] = path
+            paths[ref["path"]] = path
         return manifest, paths
     except LightGBMModelError:
         raise

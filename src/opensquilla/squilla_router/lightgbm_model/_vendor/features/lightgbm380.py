@@ -1,4 +1,4 @@
-"""Injectable, train-split-safe LightGBM 380-dimensional feature pipeline.
+"""Frozen LightGBM 380-dimensional feature inference pipeline.
 
 This module creates features only. It intentionally does not import LightGBM.
 """
@@ -30,14 +30,10 @@ class EmbeddingEncoder(Protocol):
 
 
 class Projector(Protocol):
-    def fit(self, values: object) -> object: ...
-
     def transform(self, values: object) -> object: ...
 
 
 class TextVectorizer(Protocol):
-    def fit_transform(self, texts: Sequence[str]) -> object: ...
-
     def transform(self, texts: Sequence[str]) -> object: ...
 
 
@@ -74,7 +70,7 @@ def _matrix(values: object, *, rows: int | None = None, columns: int | None = No
 
 
 class LightGBM380Featurizer:
-    """Fit PCA/TF-IDF/SVD on explicit train rows and transform canonical rows."""
+    """Transform canonical rows with the frozen PCA/TF-IDF/SVD artifacts."""
 
     def __init__(
         self,
@@ -89,55 +85,6 @@ class LightGBM380Featurizer:
         self._text_vectorizer = text_vectorizer
         self._character_projector = character_projector
         self._fitted = False
-
-    @property
-    def fitted(self) -> bool:
-        return self._fitted
-
-    def fit(self, train_rows: Sequence[Mapping[str, object]]) -> "LightGBM380Featurizer":
-        if self._fitted:
-            raise RuntimeError("featurizer is immutable after fit; create a new version")
-        rows = list(train_rows)
-        if not rows:
-            raise ValueError("train_rows must not be empty")
-        invalid = [row.get("sample_id", "<unknown>") for row in rows if row.get("split") != "train"]
-        if invalid:
-            raise ValueError(f"fit accepts only rows explicitly marked split='train': {invalid[:5]}")
-
-        segments = [extract_text_segments(row) for row in rows]
-        nonempty = [
-            (kind, text)
-            for item in segments
-            for kind, text in zip(SEGMENT_KINDS, item.as_tuple(), strict=True)
-            if text
-        ]
-        if not nonempty:
-            raise ValueError("train rows contain no non-empty text segments")
-        embeddings = _matrix(
-            self._embedder.encode(
-                [text for _, text in nonempty],
-                segment_kinds=[kind for kind, _ in nonempty],
-            ),
-            rows=len(nonempty),
-        )
-        self._semantic_projector.fit(embeddings)
-
-        current_texts = [item.current_request for item in segments]
-        tfidf_matrix = self._text_vectorizer.fit_transform(current_texts)
-        self._character_projector.fit(tfidf_matrix)
-        # Fail during fit if injected components cannot satisfy the frozen widths.
-        projected = _matrix(
-            self._semantic_projector.transform(embeddings[:1]), rows=1, columns=SEMANTIC_DIM
-        )
-        del projected
-        reduced = _matrix(
-            self._character_projector.transform(self._text_vectorizer.transform(current_texts[:1])),
-            rows=1,
-            columns=CHARACTER_DIM,
-        )
-        del reduced
-        self._fitted = True
-        return self
 
     def _semantic_blocks(self, segments: TextSegments) -> np.ndarray:
         texts = segments.as_tuple()
@@ -188,66 +135,4 @@ class LightGBM380Featurizer:
             raise AssertionError(f"feature vector shape drifted to {result.shape}")
         if not np.isfinite(result).all():
             raise ValueError("feature vector contains non-finite values")
-        return result
-
-    def transform_rows(self, rows: Sequence[Mapping[str, object]]) -> np.ndarray:
-        if not self._fitted:
-            raise RuntimeError("call fit(train_rows) before transform_rows")
-        values = list(rows)
-        if not values:
-            return np.empty((0, FEATURE_DIM), dtype=np.float32)
-        segments = [extract_text_segments(row) for row in values]
-        semantic = np.zeros((len(values), 3, SEMANTIC_DIM), dtype=np.float32)
-        positions = [
-            (row_index, segment_index, kind, text)
-            for row_index, item in enumerate(segments)
-            for segment_index, (kind, text) in enumerate(
-                zip(SEGMENT_KINDS, item.as_tuple(), strict=True)
-            )
-            if text
-        ]
-        if positions:
-            embeddings = _matrix(
-                self._embedder.encode(
-                    [item[3] for item in positions],
-                    segment_kinds=[item[2] for item in positions],
-                ),
-                rows=len(positions),
-            )
-            projected = _matrix(
-                self._semantic_projector.transform(embeddings),
-                rows=len(positions),
-                columns=SEMANTIC_DIM,
-            )
-            for index, (row_index, segment_index, _, _) in enumerate(positions):
-                semantic[row_index, segment_index] = projected[index]
-
-        current_texts = [item.current_request for item in segments]
-        character = _matrix(
-            self._character_projector.transform(
-                self._text_vectorizer.transform(current_texts)
-            ),
-            rows=len(values),
-            columns=CHARACTER_DIM,
-        )
-        numeric = np.stack([extract_numeric88(row) for row in values]).astype(
-            np.float32, copy=False
-        )
-        result = np.concatenate(
-            (
-                semantic[:, 0, :],
-                character,
-                numeric[:, 0:48],
-                semantic[:, 1, :],
-                numeric[:, 48:64],
-                semantic[:, 2, :],
-                numeric[:, 64:83],
-                numeric[:, 83:88],
-            ),
-            axis=1,
-        ).astype(np.float32, copy=False)
-        if result.shape != (len(values), FEATURE_DIM):
-            raise AssertionError(f"feature matrix shape drifted to {result.shape}")
-        if not np.isfinite(result).all():
-            raise ValueError("feature matrix contains non-finite values")
         return result

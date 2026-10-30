@@ -46,5 +46,6 @@
     }
   ],
   "source_license": "LicenseRef-Proprietary (original pyproject.toml; no LICENSE file in frozen snapshot)",
-  "changes": "Feature modules, ids.py and errors.py copied verbatim. RouterInput/ContractModel and four calibration functions extracted verbatim. Loader resolves original artifact paths from a static manifest and remaps only the three frozen joblib wrapper class names; transforms and model bytes unchanged. Training run manifests/metrics omitted from inference package."
+  "changes": "Vendored inference subset extracted from feature modules, ids.py and errors.py. Training, artifact export/loading, BERT, registry CLI, unused identity helpers and unused batch transforms removed; imports and module/class descriptions trimmed. All retained function and method definitions remain verbatim, including the complete BGEOnnxEncoder. RouterInput/ContractModel and four calibration functions extracted verbatim. Loader resolves original artifact paths from a static manifest and remaps only the three frozen joblib wrapper class names; transforms and model bytes unchanged. Training run manifests/metrics omitted from inference package.",
+  "source_files_description": "Paths and SHA-256 hashes identify complete original upstream files, not the local inference extracts."
 }

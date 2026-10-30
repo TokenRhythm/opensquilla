@@ -12,11 +12,6 @@
       "sha256": "7a4d0dd5617559d912488866aea4c311ba6dfec64608bcfe866c48477e1e5650"
     },
     {
-      "path": "inference_manifest.json",
-      "size_bytes": 4888,
-      "sha256": "67be6856d3a70c97c5483700761a054014ed0283f1bd13ba67aed74059c25bb5"
-    },
-    {
       "path": "intent/calibration.json",
       "size_bytes": 116,
       "sha256": "fd4e2361aa56276eb2d0ca5b3990e510dc77e255310fbb38a4f3f691140bd781"
@@ -88,8 +83,8 @@
     },
     {
       "path": "provenance.json",
-      "size_bytes": 2480,
-      "sha256": "51b0ab2c9cbc867ff9883b4d9fb29c156561999d47e898e4d7fd3f9380f21c9e"
+      "size_bytes": 2904,
+      "sha256": "7380151d446f4df05cba33587eb748203d86868469833bc8124719c6d2c70288"
     },
     {
       "path": "runtime_compatibility.json",
