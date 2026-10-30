@@ -1050,3 +1050,82 @@ def test_release_workflow_publishes_from_version_tags() -> None:
     assert "github.event.inputs.tag" in workflow
     assert "github.event_name == 'push' || github.event.inputs.tag != ''" in workflow
     assert "TAG: ${{ env.RELEASE_TAG }}" in workflow
+
+
+def _lightgbm_preflight_fixture(tmp_path: Path):
+    import hashlib
+    import json
+
+    module = load_script()
+    model_root = tmp_path / "squilla_router" / "models"
+    for path in module.required_router_assets(model_root):
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(b"materialized asset")
+    asset_root = model_root.parent / "lightgbm_model" / "assets"
+    relative = "preprocess/feature/artifacts/tokenizer.json"
+    payload = b'{"frozen": true}'
+    record = {
+        "path": relative,
+        "size_bytes": len(payload),
+        "sha256": hashlib.sha256(payload).hexdigest(),
+    }
+    (asset_root / "artifact_manifest.json").write_text(json.dumps({
+        "schema_version": 1, "files": [record],
+    }))
+    return module, model_root, asset_root / relative, payload
+
+
+def test_router_preflight_checks_every_manifest_asset(tmp_path: Path) -> None:
+    module, model_root, nested_asset, payload = _lightgbm_preflight_fixture(tmp_path)
+    assert nested_asset in module.check_router_assets(model_root).missing_files
+    nested_asset.parent.mkdir(parents=True)
+    nested_asset.write_bytes(payload)
+    assert module.check_router_assets(model_root).ok
+    nested_asset.write_text(module.LFS_POINTER_LINE + "\noid sha256:dummy\nsize 1\n")
+    assert nested_asset in module.check_router_assets(model_root).pointer_files
+
+
+def test_router_preflight_rejects_tampered_manifest_asset(tmp_path: Path) -> None:
+    module, model_root, nested_asset, _ = _lightgbm_preflight_fixture(tmp_path)
+    nested_asset.parent.mkdir(parents=True)
+    nested_asset.write_bytes(b"tampered")
+    with pytest.raises(SystemExit, match="LightGBM artifact integrity mismatch"):
+        module.check_router_assets(model_root)
+
+
+def test_router_preflight_rejects_escaping_manifest_path(tmp_path: Path) -> None:
+    import json
+
+    module, model_root, _, _ = _lightgbm_preflight_fixture(tmp_path)
+    manifest = model_root.parent / "lightgbm_model" / "assets" / "artifact_manifest.json"
+    data = json.loads(manifest.read_text())
+    data["files"][0]["path"] = "../outside.json"
+    manifest.write_text(json.dumps(data))
+    with pytest.raises(SystemExit, match="Invalid LightGBM artifact manifest"):
+        module.check_router_assets(model_root)
+
+
+def test_release_wheel_permits_lightgbm_source_provenance() -> None:
+    module = load_script()
+    assert module.forbidden_release_wheel_entries([
+        "opensquilla/squilla_router/lightgbm_model/PROVENANCE.md",
+    ]) == []
+
+
+def test_wheel_check_expands_lightgbm_artifact_manifest(tmp_path: Path) -> None:
+    import json
+
+    module = load_script()
+    wheel = tmp_path / "fixture.whl"
+    prefix = module.LIGHTGBM_ASSET_PREFIX
+    extra = "preprocess/feature/artifacts/tokenizer.json"
+    with ZipFile(wheel, "w") as archive:
+        for relative in module.ROUTER_ASSET_RELS:
+            archive.writestr(f"{module.WHEEL_ROUTER_PREFIX}/{relative}", b"asset")
+        for relative in module.LIGHTGBM_ASSET_RELS:
+            if relative != "artifact_manifest.json":
+                archive.writestr(f"{prefix}/{relative}", b"asset")
+        archive.writestr(f"{prefix}/artifact_manifest.json", json.dumps({
+            "schema_version": 1, "files": [{"path": extra}],
+        }))
+    assert module.missing_router_assets_in_wheel(wheel) == [f"{prefix}/{extra}"]

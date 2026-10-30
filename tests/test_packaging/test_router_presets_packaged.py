@@ -56,3 +56,41 @@ def test_source_tree_ships_all_packaged_router_presets() -> None:
     presets_dir = REPO_ROOT / "src" / "opensquilla" / "provider" / "presets"
     present = {p.stem for p in presets_dir.glob("*.toml")}
     assert present == set(PACKAGED_PRESET_IDS), present
+
+
+def test_wheel_contains_complete_verified_lightgbm_bundle(isolated_core_wheel: Path) -> None:
+    import gzip
+    import hashlib
+    import json
+
+    prefix = "opensquilla/squilla_router/lightgbm_model"
+    with zipfile.ZipFile(isolated_core_wheel) as wheel:
+        names = set(wheel.namelist())
+        assert {
+            f"{prefix}/model.py",
+            f"{prefix}/input_contract.py",
+            f"{prefix}/calibration.py",
+            f"{prefix}/_vendor/features/runtime.py",
+            f"{prefix}/_vendor/features/numeric.py",
+            f"{prefix}/PROVENANCE.md",
+        } <= names
+        asset_prefix = f"{prefix}/assets"
+        manifest = json.loads(wheel.read(f"{asset_prefix}/artifact_manifest.json"))
+        for record in manifest["files"]:
+            path = f"{asset_prefix}/{record['path']}"
+            assert path in names, f"missing model artifact: {path}"
+            payload = wheel.read(path)
+            assert len(payload) == record["size_bytes"], path
+            assert hashlib.sha256(payload).hexdigest() == record["sha256"], path
+        original = wheel.read(f"{asset_prefix}/model_manifest.json")
+        assert hashlib.sha256(original).hexdigest() == (
+            "29fb79337458c4f35d3e0d1148fbdb1175c20069a5fa8ee6441633b0e2eee357"
+        )
+        source = json.loads(original)
+        for target in ("intent", "tier"):
+            reference = next(ref for ref in source["models"] if (
+                ref["artifact_type"] == "lightgbm_model" and f"/{target}/" in ref["path"]
+            ))
+            decoded = gzip.decompress(wheel.read(f"{asset_prefix}/{target}/model.txt.gz"))
+            assert len(decoded) == reference["size"]
+            assert "sha256:" + hashlib.sha256(decoded).hexdigest() == reference["sha256"]
