@@ -442,6 +442,15 @@ async function assertSubmitActionsDoNotOverlap(page) {
   }
 }
 
+async function pauseClockAtCurrentTime(page) {
+  const now = Date.now()
+  // Freeze Date across the pause RPC so host scheduling cannot make its target
+  // stale, then let Date advance with the manually controlled timers again.
+  await page.clock.setFixedTime(now)
+  await page.clock.pauseAt(now)
+  await page.clock.setSystemTime(now)
+}
+
 async function verifyBootPhaseTimer(app) {
   const page = await bootWindow(app)
   const phase = page.locator('#phase')
@@ -470,9 +479,7 @@ async function verifyBootPhaseTimer(app) {
   // The boot window sits behind the setup invitation, where Chromium may throttle
   // its 100 ms timer. Drive elapsed time explicitly instead of racing a brief
   // wall-clock reset window, and install before reload so every timer is owned.
-  const bootClockOrigin = Date.now()
-  await page.clock.install({ time: bootClockOrigin })
-  await page.clock.pauseAt(bootClockOrigin + 1_000)
+  await pauseClockAtCurrentTime(page)
   await page.reload({ waitUntil: 'domcontentloaded' })
   await waitForBootProgress(page, persistedProgress)
   await waitFor(async () => (
@@ -855,9 +862,7 @@ async function verifySubmitFeedbackAndSingleFlight() {
     // gateway-owned shell lifecycle.
     await loadBootContractWindow(app)
     await verifyBootPhaseTimer(app)
-    const submitClockOrigin = Date.now()
-    await page.clock.install({ time: submitClockOrigin })
-    await page.clock.pauseAt(submitClockOrigin + 1_000)
+    await pauseClockAtCurrentTime(page)
     const apiKey = page.locator('#apiKey')
     await apiKey.fill('synthetic-submit-key')
     await page.locator('#onboardingLocale').selectOption('de')
