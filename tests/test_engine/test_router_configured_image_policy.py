@@ -1,4 +1,7 @@
-"""Router image policy: only the configured c0-c3 ladder may execute."""
+"""Legacy image routing: only the configured c0-c3 ladder may execute.
+
+The model policy's selected-deployment preflight is covered by model-router tests.
+"""
 
 from __future__ import annotations
 
@@ -47,7 +50,10 @@ def _context(
     *,
     message: str = "Describe the image.",
 ) -> TurnContext:
-    config = GatewayConfig(llm={"provider": "openrouter"})
+    config = GatewayConfig(
+        llm={"provider": "openrouter"},
+        squilla_router={"strategy": "legacy_v4_phase3"},
+    )
     config.squilla_router.tiers = tiers
     return TurnContext(
         message=message,

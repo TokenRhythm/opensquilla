@@ -195,3 +195,20 @@ async def test_pending_replay_validates_and_atomically_consumes_exact_revision()
         }
     ]
     assert ports.events.index("consume-pending") < ports.events.index("project")
+
+
+@pytest.mark.parametrize("control", ["new_task", "redo"])
+async def test_router_controls_require_durable_acceptance(control) -> None:
+    ports = _ReplayPorts()
+    with pytest.raises(AdmissionUnavailableError, match="router controls"):
+        await DurableTurnAdmission(ports).admit(
+            replace(_command(), surface="webchat", router_control_event=control)
+        )
+
+
+async def test_internal_admission_validates_router_control() -> None:
+    ports = _ReplayPorts()
+    with pytest.raises(ValueError, match="routerControlEvent"):
+        await DurableTurnAdmission(ports).admit(
+            replace(_command(), surface="webchat", router_control_event="unknown")
+        )

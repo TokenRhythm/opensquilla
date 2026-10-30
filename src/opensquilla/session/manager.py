@@ -2977,6 +2977,116 @@ class SessionManager:
             return False
         return await self._storage.delete_transcript_entry(node.session_id, message_id)
 
+    async def get_model_router_transcript(
+        self,
+        session_key: str,
+        *,
+        expected_session_id: str | None = None,
+        expected_session_epoch: int | None = None,
+    ) -> list[TranscriptEntry]:
+        """Read model-policy state across compaction under one session owner."""
+        session_key = canonicalize_session_key(session_key)
+        node = await self._storage.get_session(session_key)
+        if node is None:
+            raise KeyError(f"Session not found: {session_key}")
+        _require_compatible_session_owner(
+            node, expected_session_id=expected_session_id,
+            expected_session_epoch=expected_session_epoch, operation="model router read",
+        )
+        rows = await self._storage.get_canonical_transcript(node.session_id)
+        from opensquilla.session.model_router_state import MODEL_DECISION_KEY
+
+        state_rows = [
+            entry for entry in rows
+            if entry.role == "user"
+            and isinstance(record := (entry.turn_context or {}).get(MODEL_DECISION_KEY), dict)
+            and record.get("status") == "admitted" and record.get("state_committed") is True
+        ][-2:]
+        # A provider failure can finish without an assistant row. Reuse the
+        # ownership-checked task/fork outcome projection rather than guessing
+        # success from an older assistant answer.
+        outcomes = await self._resolve_fork_terminal_outcomes(
+            node, state_rows, target_session_id=node.session_id,
+            target_session_key=node.session_key,
+        )
+        for entry in state_rows:
+            projection = outcomes.projections.get(_entry_turn_id(entry) or "")
+            if projection is not None:
+                entry.turn_context = {
+                    **(entry.turn_context or {}),
+                    "router_model_previous_outcome": dict(projection.get("outcome") or {}),
+                }
+        current = await self._storage.get_session(session_key)
+        if current is None or current.session_id != node.session_id or current.epoch != node.epoch:
+            raise StaleEpochError("Session owner changed during model router read")
+        return rows
+
+    async def stage_model_router_decision(
+        self,
+        session_key: str,
+        message_id: str,
+        decision: dict[str, Any],
+        *,
+        expected_session_id: str | None = None,
+        expected_session_epoch: int | None = None,
+    ) -> dict[str, Any]:
+        """Persist a classification before deployment admission."""
+        session_key = canonicalize_session_key(session_key)
+        node = await self._storage.get_session(session_key)
+        if node is None:
+            raise KeyError(f"Session not found: {session_key}")
+        _require_compatible_session_owner(
+            node, expected_session_id=expected_session_id,
+            expected_session_epoch=expected_session_epoch, operation="model router stage",
+        )
+        return await self._storage.stage_model_router_decision(
+            session_key, message_id, decision,
+            expected_session_id=node.session_id, expected_epoch=int(node.epoch or 0),
+        )
+
+    async def admit_model_router_decision(
+        self,
+        session_key: str,
+        message_id: str,
+        *,
+        expected_previous_version: int | None,
+        expected_session_id: str | None = None,
+        expected_session_epoch: int | None = None,
+    ) -> dict[str, Any] | None:
+        """Advance task state after selected-deployment preflight under the same owner."""
+        session_key = canonicalize_session_key(session_key)
+        node = await self._storage.get_session(session_key)
+        if node is None:
+            raise KeyError(f"Session not found: {session_key}")
+        _require_compatible_session_owner(
+            node, expected_session_id=expected_session_id,
+            expected_session_epoch=expected_session_epoch, operation="model router admission",
+        )
+        return await self._storage.admit_model_router_decision(
+            session_key, message_id, expected_session_id=node.session_id,
+            expected_epoch=int(node.epoch or 0),
+            expected_previous_version=expected_previous_version,
+        )
+
+    async def advance_model_router_quality_retry(
+        self, session_key: str, message_id: str, *, expected_session_id: str | None,
+        expected_session_epoch: int | None, expected_version: int, target_tier: str,
+        reason: str, scope_id: str, execution_update: dict[str, Any],
+    ) -> dict[str, Any] | None:
+        node = await self._storage.get_session(session_key)
+        if node is None:
+            raise KeyError(f"Session not found: {session_key}")
+        _require_compatible_session_owner(
+            node, expected_session_id=expected_session_id,
+            expected_session_epoch=expected_session_epoch, operation="model quality retry",
+        )
+        return await self._storage.advance_model_router_quality_retry(
+            session_key, message_id, expected_session_id=node.session_id,
+            expected_epoch=int(node.epoch or 0), expected_version=expected_version,
+            target_tier=target_tier, reason=reason, scope_id=scope_id,
+            execution_update=execution_update,
+        )
+
     async def update_message_turn_context(
         self,
         session_key: str,

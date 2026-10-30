@@ -508,7 +508,8 @@ def _run_step(
 
 
 def _gate_config() -> GatewayConfig:
-    config = GatewayConfig()
+    # Walk-up belongs to the explicit legacy rule policy.
+    config = GatewayConfig(squilla_router={"strategy": "legacy_v4_phase3"})
     config.llm.provider = "mainprov"
     config.llm.model = "dummy-base-model"
     config.squilla_router.enabled = True

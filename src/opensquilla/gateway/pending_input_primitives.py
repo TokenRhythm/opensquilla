@@ -78,6 +78,7 @@ def pending_input_payload(turn: AdmitTurn, confirmed_plain_text: bool) -> dict[s
         ("initialRoutingMode", turn.initial_routing_mode),
         ("initialModel", turn.initial_model),
         ("initialProvider", turn.initial_provider),
+        ("routerControlEvent", turn.router_control_event),
         ("displayText", turn.display_text),
     ):
         if value is not None:
@@ -151,7 +152,7 @@ def pending_input_projection(
     routing = payload.get("initialRoutingMode")
     if isinstance(routing, str):
         result["initialRoutingMode"] = routing
-    for field in ("initialModel", "initialProvider"):
+    for field in ("initialModel", "initialProvider", "routerControlEvent"):
         if isinstance(payload.get(field), str):
             result[field] = payload[field]
     return cast(PendingInputProjection, result)

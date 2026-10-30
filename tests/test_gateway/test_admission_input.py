@@ -303,3 +303,60 @@ def test_initial_model_identity_normalizes_aliases_but_preserves_provider_and_mo
     assert decode_admit_turn(base).request_fingerprint == decode_admit_turn({
         **base, "initialModel": None, "initialProvider": None,
     }).request_fingerprint
+
+
+@pytest.mark.parametrize("surface", ["webchat", "session"])
+@pytest.mark.parametrize("alias", ["routerControlEvent", "router_control_event"])
+@pytest.mark.parametrize("control", [None, "new_task", "redo"])
+async def test_router_control_reaches_typed_admission(surface, alias, control):
+    application = SimpleNamespace(admit=AsyncMock(return_value={"status": "accepted"}))
+    params = {
+        "sessionKey" if surface == "webchat" else "key": "agent:main:synthetic",
+        "message": "ordinary text", alias: control,
+    }
+    await GatewayTurnAdmissionAdapter(application).admit(params, surface=surface)
+    assert application.admit.await_args.args[0].router_control_event == control
+
+
+@pytest.mark.parametrize("surface", ["webchat", "session"])
+@pytest.mark.parametrize("fields", [
+    {"routerControlEvent": "new"},
+    {"router_control_event": "continue"},
+    {"routerControlEvent": " redo "},
+    {"routerControlEvent": 1},
+    {"routerControlEvent": []},
+    {"routerControlEvent": "new_task", "router_control_event": "redo"},
+    {"routerControlEvent": None, "router_control_event": "redo"},
+])
+async def test_invalid_router_control_never_reaches_admission(surface, fields):
+    application = SimpleNamespace(admit=AsyncMock())
+    params = {
+        "sessionKey" if surface == "webchat" else "key": "agent:main:synthetic",
+        "message": "ordinary text", **fields,
+    }
+    with pytest.raises(ValueError, match="routerControlEvent"):
+        await GatewayTurnAdmissionAdapter(application).admit(params, surface=surface)
+    application.admit.assert_not_awaited()
+
+
+def test_router_control_identity_is_alias_independent_and_binds_the_event():
+    base = {"key": "agent:main:synthetic", "message": "ordinary text"}
+    redo = decode_admit_turn({**base, "routerControlEvent": "redo"})
+    alias = decode_admit_turn({**base, "router_control_event": "redo"})
+    duplicate = decode_admit_turn({
+        **base, "routerControlEvent": "redo", "router_control_event": "redo",
+    })
+    assert redo.request_fingerprint == alias.request_fingerprint == duplicate.request_fingerprint
+    assert redo.request_fingerprint != decode_admit_turn(base).request_fingerprint
+    assert redo.request_fingerprint != decode_admit_turn({
+        **base, "routerControlEvent": "new_task",
+    }).request_fingerprint
+    assert decode_admit_turn(base).request_fingerprint == decode_admit_turn({
+        **base, "routerControlEvent": None,
+    }).request_fingerprint
+
+
+@pytest.mark.parametrize("message", ["/new", "/redo", "Start a new task", "redo the answer"])
+def test_message_text_cannot_manufacture_trusted_router_control(message):
+    command = decode_admit_turn({"key": "agent:main:synthetic", "message": message})
+    assert command.router_control_event is None

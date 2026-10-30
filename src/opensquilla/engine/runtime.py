@@ -2321,6 +2321,8 @@ class _SelectorFallbackProvider:
         self._pending_fallback_hops = 0
         self._last_executed_model = ""
         self._last_request_had_tools = False
+        self._last_model_chat_config: ChatConfig | None = None
+        self._last_model_tools: Any = None
         self._retry_policy = FallbackPolicy()
         self._image_marker_deployment: _FallbackDeploymentIdentity | None = None
         self._image_marker_state = ImageMarkerState.NOT_ANALYZED
@@ -2357,6 +2359,23 @@ class _SelectorFallbackProvider:
     def configure_retry_policy(self, policy: FallbackPolicy) -> None:
         self._retry_policy = policy
 
+    async def prepare_quality_retry(
+        self, *, reason: str, scope_id: str, remaining_budget: int, messages: list[Any],
+    ) -> dict[str, Any] | None:
+        callback = (self._turn_metadata or {}).get("router_model_quality_retry_callback")
+        if not callable(callback):
+            return None
+        return await callback(
+            reason=reason, scope_id=scope_id, remaining_budget=remaining_budget, messages=messages,
+            chat_config=self._last_model_chat_config, tools=self._last_model_tools,
+            activate_prepared=self.activate_prepared_deployment,
+        )
+
+    def activate_prepared_deployment(self, provider: Any, deployment: ProviderConfig) -> None:
+        """Install the exact retry leg that passed preflight before its durable CAS."""
+        self._selector.override_provider_config(deployment, preserve_existing_tail=False)
+        self._provider = provider
+
     async def _retry_provider_stream(
         self,
         stream_factory: Callable[[], AsyncGenerator[Any, None]],
@@ -2376,7 +2395,11 @@ class _SelectorFallbackProvider:
             provider=provider, model=model, config=config,
             content_started=content_started,
             reset_attempt=reset_attempt,
-            max_retries=self._retry_policy.max_retries,
+            max_retries=(0 if (
+                (self._turn_metadata or {}).get("router_tier_policy") == "model"
+                and (self._turn_metadata or {}).get("routing_applied") is True
+            )
+                         else self._retry_policy.max_retries),
             base_ms=self._retry_policy.base_backoff_ms,
             max_ms=self._retry_policy.max_backoff_ms,
             # Preserve selector semantics: overload/transport may choose another
@@ -3115,6 +3138,12 @@ class _SelectorFallbackProvider:
 
         provider_id, model = self._active_deployment()
         config = rebind_execution_identity(config, provider=provider_id, model=model)
+        if (
+            (self._turn_metadata or {}).get("router_tier_policy") == "model"
+            and (self._turn_metadata or {}).get("routing_applied") is True
+            and isinstance(config, ChatConfig)
+        ):
+            config = config.model_copy(update={"physical_attempt_limit": 1})
         if not self._used_fallback and not self._image_continuation_rebound:
             return config
         updates: dict[str, Any] = {}
@@ -3804,6 +3833,8 @@ class _SelectorFallbackProvider:
         execution_context: TurnExecutionContext | None = None,
     ) -> AsyncIterator[Any]:
         self._last_request_had_tools = bool(tools)
+        self._last_model_chat_config = config if isinstance(config, ChatConfig) else None
+        self._last_model_tools = tools
         self._stream_recovery_request = None
         emitted_user_visible_content = False
         pre_text_buffer = _SelectorPreTextBuffer()
@@ -5104,6 +5135,30 @@ class TurnRunner:
         # Compatibility for direct callers that still install a complete
         # config object in accepted_turn_config_scope().
         return accepted
+
+    def _uses_model_tier_policy(self, session_key: str) -> bool:
+        config = getattr(self._turn_config(), "squilla_router", None)
+        return bool(
+            getattr(config, "enabled", False)
+            and getattr(config, "strategy", "lightgbm_model") != "legacy_v4_phase3"
+            and ":subagent:" not in session_key
+        )
+
+    async def _model_router_generation(
+        self, session_key: str, bound_user_message_id: str | None, *,
+        expected_session_id: str | None, expected_session_epoch: int | None,
+    ) -> list[Any] | None:
+        if not self._uses_model_tier_policy(session_key):
+            return None
+        from opensquilla.session.model_router_state import model_generation_transcript
+
+        canonical = await self._session_manager.get_model_router_transcript(
+            session_key, expected_session_id=expected_session_id,
+            expected_session_epoch=expected_session_epoch,
+        )
+        return model_generation_transcript(
+            canonical, bound_user_message_id, include_current_staged=True,
+        )
 
     def _session_model_pin_applies(self) -> bool:
         """A saved single-model choice must not override a routed session turn."""
@@ -7629,6 +7684,26 @@ class TurnRunner:
                     ),
                     initial_provider_config=capacity_initial_provider_config,
                 )
+            if turn.metadata.get("router_model_capacity_retry_pending") is True:
+                if agent.config.metadata.get("router_model_prepared_window_admitted") is True:
+                    # The selected deployment's exact consumer gate proved
+                    # this request-local window, including its summary.
+                    turn.metadata["router_model_capacity_retry_pending"] = False
+                else:
+                    await self._readmit_model_router_capacity(
+                        turn, RouterHistoryReplayRequest(
+                            exclude_last_user=history_has_persisted_user,
+                            bound_user_message_id=bound_user_message_id,
+                            transcript_snapshot=transcript_snapshot,
+                            expected_session_id=expected_session_id,
+                            expected_session_epoch=expected_session_epoch,
+                        ), initial_provider_config=capacity_initial_provider_config,
+                    )
+                await self._admit_model_router_turn(
+                    turn, bound_user_message_id,
+                    expected_session_id=expected_session_id,
+                    expected_session_epoch=expected_session_epoch,
+                )
 
             compaction_source_entries: tuple[Any, ...] | None = None
             compaction_source_preimage: tuple[tuple[Any, ...], ...] | None = None
@@ -9204,6 +9279,16 @@ class TurnRunner:
     def _resolve_turn_thinking(self, turn: Any) -> bool | ThinkingLevel:
         """Resolve explicit config thinking before squilla-router suggestions."""
 
+        model_metadata = getattr(turn, "metadata", {}) or {}
+        if (
+            model_metadata.get("router_tier_policy") == "model"
+            and model_metadata.get("routing_applied") is True
+        ):
+            level = model_metadata.get("thinking_level", "off")
+            if level == "off":
+                return False
+            parsed = self._parse_thinking_level(level, source="model_tier_policy")
+            return parsed if parsed is not None else False
         llm_cfg = getattr(self._config, "llm", None) if self._config else None
         explicit = getattr(llm_cfg, "thinking", None)
         parsed = self._parse_thinking_level(
@@ -10230,6 +10315,7 @@ class TurnRunner:
         prev_assistant_text: str | None = None,
         prev_assistant_usage: dict[str, Any] | None = None,
         history_user_texts: list[str] | None = None,
+        model_router_context: dict[str, Any] | None = None,
         history_capacity_estimated_tokens: int = 0,
         history_capacity_message_count: int = 0,
         history_capacity_estimate_complete: bool = True,
@@ -10281,6 +10367,7 @@ class TurnRunner:
 
         router_cfg = getattr(self._turn_config(), "squilla_router", None)
         router_timeout = float(getattr(router_cfg, "routing_timeout_seconds", 5.0) or 5.0)
+        model_policy_active = self._uses_model_tier_policy(session_key)
 
         def _copy_router_turn(turn: TurnContext) -> TurnContext:
             # Detach mutable per-turn facts, but retain opaque runtime services.
@@ -10498,6 +10585,20 @@ class TurnRunner:
             initial_metadata["router_prev_assistant_usage"] = dict(prev_assistant_usage)
         if history_user_texts:
             initial_metadata["router_history_user_texts"] = list(history_user_texts)
+        if model_policy_active:
+            from opensquilla.session.model_router_state import prepare_model_router_metadata
+
+            initial_metadata.update(prepare_model_router_metadata(
+                model_router_context,
+                current_request=semantic_message if semantic_message is not None else message,
+                input_message_id=bound_user_message_id,
+                history_user=history_user_texts,
+                previous_answer=prev_assistant_text,
+                previous_usage=prev_assistant_usage,
+                tool_defs=tool_defs,
+                attachments=attachments,
+                channel_kind=str(getattr(tool_context, "channel_kind", "") or "").strip(),
+            ))
         initial_metadata["routing_history_capacity_estimated_tokens"] = max(
             0,
             int(history_capacity_estimated_tokens),
@@ -10605,6 +10706,8 @@ class TurnRunner:
         from opensquilla.engine.steps.selected_skills import load_selected_skills
 
         turn = await load_selected_skills(turn, tool_context)
+        if model_policy_active and turn.surface_kind and turn.surface_kind != "unknown":
+            turn.metadata["router_model_input"]["context"]["entrypoint"] = turn.surface_kind
         pipeline_steps: list[TurnStep] = [resolve_model]
         pipeline_steps.extend(
             [
@@ -10620,7 +10723,25 @@ class TurnRunner:
                 apply_prompt_cache,
             ]
         )
-        turn = await run_pipeline(turn, pipeline_steps)
+        turn = await run_pipeline(
+            turn, pipeline_steps,
+            required_steps=("apply_squilla_router",) if model_policy_active else (),
+        )
+        if (
+            turn.metadata.get("routing_applied") is True
+            and turn.metadata.get("router_model_decision") is not None
+        ):
+            if self._session_manager is None or not bound_user_message_id:
+                raise RuntimeError("Model routing requires a durable accepted user input")
+            record = turn.metadata["router_model_decision"]
+            committed = await self._session_manager.stage_model_router_decision(
+                session_key, bound_user_message_id, record,
+                expected_session_id=expected_session_id,
+                expected_session_epoch=expected_session_epoch,
+            )
+            if committed.get("state") != record.get("state"):
+                raise RuntimeError("Model router input already has a different durable decision")
+            turn.metadata["router_model_decision"] = committed
         if router_history_replay_request is not None:
             history_capacity = await self._router_history_capacity_for_request(
                 session_key,
@@ -10665,6 +10786,49 @@ class TurnRunner:
                 cloned_selector, turn.metadata,
                 reason="Attachment request capacity could not be established.",
             )
+
+        if (
+            turn.metadata.get("router_tier_policy") == "model"
+            and turn.metadata.get("routing_applied") is True
+        ):
+            from opensquilla.engine.model_router_quality import ModelRouterQualityRetry
+            from opensquilla.engine.selector_override import (
+                apply_model_override,
+                cross_provider_tier_config,
+            )
+
+            if cloned_selector is None:
+                raise RuntimeError("Model routing requires a concrete provider selector")
+            provider = apply_model_override(
+                cloned_selector, turn.model, turn_metadata=turn.metadata,
+                realign_routed_model=False, strict_router_fallback_chain=[],
+                tier_provider_config=cross_provider_tier_config(
+                    turn.config, turn.metadata, turn.model,
+                    active_provider_id=getattr(cloned_selector, "active_provider_id", ""),
+                    session_key=session_key,
+                ),
+            )
+            tier = turn.config.squilla_router.tiers[turn.metadata["routed_tier"]]
+            deployment = cloned_selector.current_config
+            if deployment.model != tier["model"] or deployment.provider != (
+                tier.get("provider") or turn.config.llm.provider
+            ):
+                from opensquilla.engine.steps.model_router import ModelRouteError
+
+                raise ModelRouteError("Selected model-policy deployment could not be resolved")
+            if bound_user_message_id and self._session_manager is not None:
+                turn.metadata["router_model_quality_retry_callback"] = ModelRouterQualityRetry(
+                    turn=turn, selector=cloned_selector, manager=self._session_manager,
+                    input_message_id=bound_user_message_id,
+                    session_id=expected_session_id, epoch=expected_session_epoch,
+                )
+            if turn.metadata.get("router_model_capacity_retry_pending") is not True:
+                await self._admit_model_router_turn(
+                    turn, bound_user_message_id,
+                    expected_session_id=expected_session_id,
+                    expected_session_epoch=expected_session_epoch,
+                )
+            return turn, provider
 
         # Image routing is a capability boundary, not an Ensemble activation.
         # This applies to the dedicated image row and to any text tier selected
@@ -11483,6 +11647,45 @@ class TurnRunner:
             entry_projector=_entry_projector,
         )
 
+    async def _admit_model_router_turn(
+        self, turn: TurnContext, input_message_id: str | None, *,
+        expected_session_id: str | None, expected_session_epoch: int | None,
+    ) -> None:
+        envelope = turn.metadata.get("router_model_decision")
+        if not isinstance(envelope, dict) or not input_message_id:
+            raise RuntimeError("Model admission requires a staged accepted input")
+        committed = await self._session_manager.admit_model_router_decision(
+            turn.session_key, input_message_id,
+            expected_session_id=expected_session_id,
+            expected_session_epoch=expected_session_epoch,
+            expected_previous_version=(int(envelope["state"]["version"]) - 1) or None,
+        )
+        if not isinstance(committed, dict) or committed.get("state_committed") is not True:
+            raise RuntimeError("Model routing state admission lost its version fence")
+        turn.metadata["router_model_decision"] = committed
+
+    async def _readmit_model_router_capacity(
+        self, turn: TurnContext, request: RouterHistoryReplayRequest, *,
+        initial_provider_config: Any,
+    ) -> None:
+        from opensquilla.engine.steps.model_router import validate_model_route_capacity
+
+        if request.transcript_snapshot is not None:
+            request.transcript_snapshot.invalidate()
+        measured = await self._router_history_capacity_for_request(
+            turn.session_key, request, max_history_turns=0,
+            preserve_image_attachments=True,
+            reachable_provider_kinds=self._route_capacity_provider_kinds(
+                turn, initial_provider_config=initial_provider_config,
+            ),
+        )
+        for key in ("history_capacity_estimated_tokens", "history_capacity_message_count",
+                    "history_capacity_estimate_complete"):
+            turn.metadata[f"routing_{key}"] = measured.get(
+                key, False if key.endswith("complete") else 0,
+            )
+        validate_model_route_capacity(turn)
+
     async def _readmit_attachment_capacity(
         self,
         turn: TurnContext,
@@ -11580,6 +11783,14 @@ class TurnRunner:
                     transcript = await transcript
                 entries = list(transcript or [])
 
+            generation = await self._model_router_generation(
+                session_key, request.bound_user_message_id,
+                expected_session_id=request.expected_session_id,
+                expected_session_epoch=request.expected_session_epoch,
+            )
+            model_generation_reset = generation is not None
+            if generation is not None:
+                entries = generation
             bound_index: int | None = None
             if request.bound_user_message_id is not None:
                 for index, entry in enumerate(entries):
@@ -11597,6 +11808,7 @@ class TurnRunner:
                 reachable_provider_kinds=reachable_provider_kinds,
                 expected_session_id=request.expected_session_id,
                 expected_session_epoch=request.expected_session_epoch,
+                exclude_compaction_context=model_generation_reset,
             )
         except Exception as exc:  # noqa: BLE001 - capacity admission fails closed
             # Never serialize the exception: storage/provider errors may echo
@@ -11605,6 +11817,10 @@ class TurnRunner:
                 "turn_runner.router_capacity_projection_failed",
                 error_type=type(exc).__name__,
             )
+            if isinstance(exc, StaleEpochError):
+                return {"history_capacity_estimate_complete": False,
+                        "history_capacity_estimated_tokens": 0,
+                        "history_capacity_message_count": 0}
             return {"history_capacity_estimate_complete": False}
 
     async def _router_history_capacity_context(
@@ -11620,6 +11836,7 @@ class TurnRunner:
         reachable_provider_kinds: Collection[str] | None = None,
         expected_session_id: str | None = None,
         expected_session_epoch: int | None = None,
+        exclude_compaction_context: bool = False,
     ) -> dict[str, Any]:
         """Measure the route-specific pre-current replay projection."""
 
@@ -11669,6 +11886,15 @@ class TurnRunner:
             replay,
             max_history_turns=max_history_turns,
         )
+        if exclude_compaction_context:
+            return {
+                "history_capacity_estimated_tokens": capacity.estimated_tokens,
+                "history_capacity_message_count": capacity.message_count,
+                "history_capacity_estimate_complete": bool(
+                    capacity.estimate_complete
+                    and (bound_user_message_id is None or bound_index is not None)
+                ),
+            }
         legacy_summary_markers = list(replay.legacy_summary_markers)
 
         summaries: list[Any] = []
@@ -11835,7 +12061,10 @@ class TurnRunner:
                 else {}
             )
         get_transcript = getattr(self._session_manager, "get_transcript", None)
+        model_policy_active = self._uses_model_tier_policy(session_key)
         if not callable(get_transcript):
+            if model_policy_active:
+                raise RuntimeError("Model router requires an authoritative transcript reader")
             return {"history_capacity_estimate_complete": False} if include_capacity else {}
         try:
             exact_owner = _require_optional_exact_session_owner(
@@ -11863,10 +12092,37 @@ class TurnRunner:
                 transcript = get_transcript(session_key, **transcript_kwargs)
                 if inspect.isawaitable(transcript):
                     transcript = await transcript
-        except Exception:  # noqa: BLE001 - router context must never block a turn
+        except Exception:  # noqa: BLE001 - legacy router context remains best-effort
+            if model_policy_active:
+                raise
             log.debug("turn_runner.router_context_failed", session_key=session_key)
             return {"history_capacity_estimate_complete": False} if include_capacity else {}
         entries = list(transcript or [])
+        model_context: dict[str, Any] = {}
+        if model_policy_active:
+            from opensquilla.session.model_router_state import build_model_router_context
+
+            model_entries = await self._session_manager.get_model_router_transcript(
+                session_key,
+                expected_session_id=expected_session_id,
+                expected_session_epoch=expected_session_epoch,
+            )
+            model_session_id = expected_session_id or next((
+                row.session_id for row in model_entries if row.session_id
+            ), None)
+            canonical_complete = False
+            if model_session_id:
+                coverage = await self._session_manager.storage.get_canonical_transcript_coverage(
+                    model_session_id
+                )
+                canonical_complete = coverage.canonical_complete is True
+            model_context = build_model_router_context(
+                model_entries,
+                bound_user_message_id=bound_user_message_id,
+                exclude_last_user=exclude_last_user,
+                feature_entries=entries,
+                canonical_complete=canonical_complete,
+            )
         # When the turn is bound to a specific user message id (queued-sends
         # path), exclude the bound current prompt AND every later user entry
         # (still-queued future prompts persisted at ingress), mirroring
@@ -11949,7 +12205,7 @@ class TurnRunner:
                 text = text[-_ROUTER_HISTORY_USER_MAX_CHARS:]
             user_texts.append(text)
 
-        context: dict[str, Any] = dict(capacity_context)
+        context: dict[str, Any] = {**capacity_context, **model_context}
         if user_texts:
             context["history_user_texts"] = user_texts[-_ROUTER_HISTORY_USER_MAX_TURNS:]
         router_cfg = getattr(self._turn_config(), "squilla_router", None)
@@ -12673,6 +12929,46 @@ class TurnRunner:
                 transcript = await get_transcript(session_key, **transcript_kwargs)
         except KeyError:
             return None  # session doesn't exist yet
+        generation = await self._model_router_generation(
+            session_key, bound_user_message_id,
+            expected_session_id=expected_session_id,
+            expected_session_epoch=expected_session_epoch,
+        )
+        if generation is not None:
+            # Explicit New Task owns only a request-local generation.
+            # Keep the user's transcript and prior checkpoints unchanged.
+            if consumer_admission is not None and consumer_admission(
+                "", [self._entry_for_emergency_compaction(row) for row in generation],
+            ):
+                return None
+            if consumer_admission is None:
+                from opensquilla.session.compaction import (
+                    estimate_entries_model_replay_chars,
+                    estimate_entry_model_replay_tokens,
+                )
+
+                if (
+                    sum(estimate_entry_model_replay_tokens(row) for row in generation)
+                    <= history_window_tokens
+                    and (history_capacity_chars is None or
+                         estimate_entries_model_replay_chars(generation)
+                         <= history_capacity_chars)
+                ):
+                    return None
+            return await self._prepare_request_window(
+                session_key, generation, history_window_tokens,
+                compaction_id=new_compaction_id(), phase="preflight",
+                reason="model_generation_context",
+                protected_recent_messages=self._protected_current_turn_suffix_count(
+                    generation, history_has_persisted_user=history_has_persisted_user,
+                    bound_user_message_id=bound_user_message_id,
+                ),
+                history_capacity_chars=history_capacity_chars,
+                expected_session_id=expected_session_id,
+                expected_session_epoch=expected_session_epoch,
+                consumer_admission=consumer_admission,
+                preserve_historical_images=preserve_historical_images,
+            )
         (
             checkpoint_tokens,
             checkpoint_chars,
@@ -13536,9 +13832,12 @@ class TurnRunner:
         )
         from opensquilla.session.tokenizer import estimate_tokens
 
-        context_records = await self._load_compaction_context_records(
-            session_key, [], expected_session_id=expected_session_id,
-            expected_session_epoch=expected_session_epoch,
+        context_records = (
+            [] if reason == "model_generation_context"
+            else await self._load_compaction_context_records(
+                session_key, [], expected_session_id=expected_session_id,
+                expected_session_epoch=expected_session_epoch,
+            )
         )
         recovered_entries = [entry for record in context_records
                              for entry in record.source_entries]
@@ -14065,13 +14364,47 @@ class TurnRunner:
                     transcript_kwargs["expected_session_epoch"] = expected_session_epoch
             transcript = await get_transcript(session_key, **transcript_kwargs)
 
+        generation = await self._model_router_generation(
+            session_key, bound_user_message_id,
+            expected_session_id=expected_session_id,
+            expected_session_epoch=expected_session_epoch,
+        )
+        model_generation_reset = generation is not None
+        if generation is not None:
+            transcript = generation
+            if prepared_window is not None:
+                if prepared_window.reason != "model_generation_context":
+                    prepared_window = None
+                else:
+                    if (
+                        prepared_window.expected_session_id != expected_session_id
+                        or prepared_window.expected_session_epoch != expected_session_epoch
+                    ):
+                        raise RuntimeError("Model generation window ownership changed")
+                    if (
+                        self._emergency_source_fingerprint(generation)
+                        != prepared_window.source_fingerprint
+                    ):
+                        raise RuntimeError(
+                            "Model generation changed after request admission"
+                        )
+                    if prepared_window.consumer_admission is not None and not (
+                        prepared_window.consumer_admission(
+                            prepared_window.summary,
+                            [self._entry_for_emergency_compaction(row)
+                             for row in prepared_window.kept_entries],
+                        )
+                    ):
+                        raise RuntimeError("Model generation window lost request admission")
+                    transcript = list(prepared_window.kept_entries)
+
         from opensquilla.engine.history import reconstruct_messages_from_entry
         from opensquilla.provider.types import ContentBlockImage, ContentBlockText
 
         history: list[Message] = []
         summary_markers: list[str] = []
         exact_owner = expected_session_id is not None or expected_session_epoch is not None
-        if prepared_window is not None:
+        if prepared_window is not None and not model_generation_reset:
             override_has_owner = (
                 prepared_window.expected_session_id is not None
                 or prepared_window.expected_session_epoch is not None
@@ -14645,10 +14978,18 @@ class TurnRunner:
             context_states=context_states,
             provider_kind=str(getattr(provider, "provider_name", "")),
         )
-        if provider_context.messages and prepared_window is None:
+        if provider_context.messages and prepared_window is None and not model_generation_reset:
             history = provider_context.messages + history
         if history:
             agent.set_history(history)
+        if prepared_window is not None and prepared_window.consumer_admission is not None:
+            if isinstance(getattr(agent_config, "metadata", None), dict):
+                agent_config.metadata["router_model_prepared_window_admitted"] = True
+            return _format_compaction_summary_context([prepared_window.summary])
+        if model_generation_reset:
+            # A checkpoint can summarize turns from before explicit New Task.
+            # The canonical generation above is the complete authorized replay.
+            return None
         if prepared_window is not None:
             # Already contains the optional complete checkpoint exactly once.
             return _format_compaction_summary_context([prepared_window.summary])

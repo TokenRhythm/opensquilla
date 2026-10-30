@@ -16,8 +16,9 @@ import base64
 import io
 import json
 from collections.abc import AsyncIterator
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 from unittest.mock import MagicMock
 
@@ -64,6 +65,7 @@ class _TranscriptEntry:
     tool_calls: list[Any] | None = None
     reasoning_content: str | None = None
     token_count: int | None = None
+    session_id: str = ""
 
 
 @dataclass
@@ -81,6 +83,7 @@ class _FakeSessionManager:
         self._summaries: dict[str, list[SessionSummary]] = {}
         self._context_states: dict[str, list[SessionContextState]] = {}
         self._counter = 0
+        self.storage = self
 
     async def create(self, session_key: str) -> _SessionNode:
         node = _SessionNode(session_key=session_key, session_id=f"id-{len(self._nodes) + 1}")
@@ -94,8 +97,30 @@ class _FakeSessionManager:
         self._transcripts.setdefault(session_key, []).append(entry)
         return entry
 
-    async def get_transcript(self, session_key: str) -> list[_TranscriptEntry]:
+    async def get_transcript(
+        self, session_key: str, *, expected_session_id: str | None = None,
+        expected_session_epoch: int | None = None,
+    ) -> list[_TranscriptEntry]:
+        node = self._nodes[session_key]
+        assert expected_session_id in (None, node.session_id)
+        assert expected_session_epoch in (None, 0)
         return list(self._transcripts.get(session_key, []))
+
+    async def get_model_router_transcript(
+        self, session_key: str, *, expected_session_id: str | None = None,
+        expected_session_epoch: int | None = None,
+    ) -> list[_TranscriptEntry]:
+        node = self._nodes[session_key]
+        rows = await self.get_transcript(
+            session_key, expected_session_id=expected_session_id,
+            expected_session_epoch=expected_session_epoch,
+        )
+        return [replace(row, session_id=node.session_id) for row in rows]
+
+    async def get_canonical_transcript_coverage(self, session_id: str) -> SimpleNamespace:
+        key = next(key for key, node in self._nodes.items() if node.session_id == session_id)
+        # This fixture keeps no archived copy after compaction.
+        return SimpleNamespace(canonical_complete=not self._summaries.get(key))
 
     async def get_session(self, session_key: str) -> _SessionNode | None:
         return self._nodes.get(session_key)
@@ -1524,7 +1549,13 @@ async def test_router_capacity_marks_transcript_read_failure_incomplete() -> Non
             raise RuntimeError("synthetic transcript failure")
 
     manager = _FailingTranscriptManager()
-    context = await _new_runner(manager)._router_previous_assistant_context(
+    runner = _new_runner(manager)
+    with pytest.raises(RuntimeError, match="synthetic transcript failure"):
+        await runner._router_previous_assistant_context(
+            "agent:main:failed-transcript", include_capacity=True,
+        )
+    runner._config.squilla_router.strategy = "legacy_v4_phase3"
+    context = await runner._router_previous_assistant_context(
         "agent:main:failed-transcript",
         include_capacity=True,
     )

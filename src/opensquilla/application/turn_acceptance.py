@@ -91,6 +91,11 @@ class DurableTurnAdmission:
                 return await _replay_retired_request(command, ports)
             try:
                 _ensure_required_services(command, ports)
+                if command.router_control_event is not None and (
+                    not isinstance(command.router_control_event, str)
+                    or command.router_control_event not in {"new_task", "redo"}
+                ):
+                    raise ValueError("routerControlEvent must be new_task or redo")
                 if command.initial_model is not None or command.initial_provider is not None:
                     if command.intent != "new_chat" or not command.intent_was_provided:
                         raise ValueError("initialModel requires explicit new_chat intent")
@@ -101,9 +106,11 @@ class DurableTurnAdmission:
                             or command.initial_routing_mode
                             or command.initial_model is not None
                             or command.initial_provider is not None
+                            or command.router_control_event is not None
                         ):
                             raise AdmissionUnavailableError(
-                                "Initial session controls require atomic turn acceptance"
+                                "Initial session controls and router controls require "
+                                "atomic turn acceptance"
                             )
                         return {
                             "ok": True,
@@ -1021,7 +1028,10 @@ async def _accept_turn_in_scope(
     route_envelope = ports.refine_route(
         route_envelope,
         metadata={
-            **route_envelope.metadata,
+            **{
+                name: value for name, value in route_envelope.metadata.items()
+                if name != "router_model_control_event"
+            },
             "client_request_id": ingress_identity.client_request_id,
             "client_message_id": client_message_id,
             "surface_id": surface_id,
@@ -1031,6 +1041,10 @@ async def _accept_turn_in_scope(
             "task_id": turn_id,
             "turn_context_intent": "send",
             "turn_context_revision": 1,
+            **(
+                {"router_model_control_event": command.router_control_event}
+                if command.router_control_event is not None else {}
+            ),
             **(
                 {
                     "plan_run_id": plan_run.run_id,
@@ -1094,6 +1108,10 @@ async def _accept_turn_in_scope(
         "intent": "send",
         "disposition": "queued" if ports.runtime is not None else "applied",
         "revision": 1,
+        **(
+            {"router_model_control_event": command.router_control_event}
+            if command.router_control_event is not None else {}
+        ),
         "sandbox_mode_resolution": {
             "desiredMode": mode_resolution.desired_mode.value,
             "effectiveMode": mode_resolution.effective_mode.value,
@@ -1133,7 +1151,10 @@ async def _accept_turn_in_scope(
 
     task_runtime = task_runtime_candidate
     requested_mode = command.queue_mode or getattr(session, "queue_mode", None) or "followup"
-    if requested_mode == "steer" and not command.selected_skills:
+    if (
+        requested_mode == "steer" and not command.selected_skills
+        and command.router_control_event is None
+    ):
         log.info(
             "sessions.send.legacy_steer_queue_mode_used",
             session_key=key,
@@ -1142,8 +1163,9 @@ async def _accept_turn_in_scope(
             replacement="sessions.steer.v2",
         )
         ports.steer_metric("legacy_interrupt_requested", session_key=key)
+    # A task control owns one routing decision; collection or live steering would lose it.
     runtime_mode = (
-        "followup" if command.selected_skills
+        "followup" if command.selected_skills or command.router_control_event is not None
         else "interrupt" if requested_mode == "steer" else requested_mode
     )
     if atomic_intent_plan is not None and atomic_intent_plan.action == "reset":
@@ -2134,7 +2156,7 @@ async def _accept_turn_in_scope(
     if task_runtime is not None:
         requested_mode = command.queue_mode or getattr(session, "queue_mode", None) or "followup"
         runtime_mode = (
-            "followup" if command.selected_skills
+            "followup" if command.selected_skills or command.router_control_event is not None
             else "interrupt" if requested_mode == "steer" else requested_mode
         )
         try:

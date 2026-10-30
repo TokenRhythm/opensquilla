@@ -169,10 +169,18 @@ cache_write_cost_per_mtok = 2.5
 [openrouter."deepseek/deepseek-v4-flash"]
 context_window = 1024000
 max_output_tokens = 384000
+supports_reasoning = true
+supports_tools = true
+supports_vision = false
+reasoning_format = "openrouter"
 
 [openrouter."deepseek/deepseek-v4-pro"]
 context_window = 1048576
 max_output_tokens = 393216
+supports_reasoning = true
+supports_tools = true
+supports_vision = false
+reasoning_format = "openrouter"
 
 [openrouter."z-ai/glm-5.2"]
 context_window = 1048576

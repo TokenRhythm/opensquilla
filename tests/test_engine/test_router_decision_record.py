@@ -81,7 +81,8 @@ def _reset_hook_state():
 
 
 def _ctx(message: str = PROMPT_SENTINEL, session_key: str = "agent:main:main") -> TurnContext:
-    config = GatewayConfig()
+    # Persistence/history tests below inject the legacy classify() protocol.
+    config = GatewayConfig(squilla_router={"strategy": "legacy_v4_phase3"})
     config.squilla_router.rollout_phase = "full"
     return TurnContext(
         message=message,

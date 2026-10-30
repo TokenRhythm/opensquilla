@@ -577,6 +577,8 @@ class _UnavailableV4Strategy:
 
 def _strategy_cache_key(config: object) -> tuple:
     strategy_name = _strategy_name(config)
+    if strategy_name == "lightgbm_model":
+        return strategy_name, getattr(config, "lightgbm_model_dir", None)
     confidence = getattr(config, "confidence_threshold", 0.5)
     return (
         strategy_name,
@@ -588,14 +590,9 @@ def _strategy_cache_key(config: object) -> tuple:
 
 
 def _strategy_name(config: object) -> str:
-    configured = str(getattr(config, "strategy", "v4_phase3") or "v4_phase3")
-    if configured != "v4_phase3":
-        log.warning(
-            "squilla_router.removed_strategy_ignored",
-            strategy=configured,
-            using="v4_phase3",
-        )
-    return "v4_phase3"
+    if getattr(config, "strategy", "lightgbm_model") == "legacy_v4_phase3":
+        return "v4_phase3"
+    return "lightgbm_model"
 
 
 def _is_history_strategy(strategy_name: str) -> bool:
@@ -636,6 +633,15 @@ def _get_strategy(config: object) -> RouterStrategy:
             return _strategy
         if _strategy_key is not None and _strategy_key != key:
             _history_store.clear()
+
+        if _strategy_name(config) == "lightgbm_model":
+            from opensquilla.squilla_router.lightgbm_model import LightGBMRouterModel
+
+            # Integrity failures must not substitute an unrelated classifier.
+            strategy = LightGBMRouterModel(getattr(config, "lightgbm_model_dir", None))
+            _strategy = cast(RouterStrategy, strategy)
+            _strategy_key = key
+            return _strategy
 
         base_dir = getattr(config, "v4_bundle_dir", None)
 
@@ -743,12 +749,12 @@ def router_runtime_status() -> dict[str, Any]:
             "error": None,
         }
     source = str(getattr(strategy, "source", "") or "")
-    if source == "v4_phase3" and getattr(strategy, "_available", False):
+    if source in {"v4_phase3", "lightgbm_model"} and getattr(strategy, "_available", False):
         return {
             "initialized": True,
             "loaded": True,
             "code": None,
-            "strategy": "v4_phase3",
+            "strategy": source,
             "error": None,
         }
     error = getattr(strategy, "error", None)
@@ -1285,6 +1291,12 @@ async def finalize_squilla_router_capacity(
     """
 
     router_cfg = getattr(ctx.config, "squilla_router", None) if ctx.config else None
+    if ctx.metadata.get("router_tier_policy") == "model":
+        from opensquilla.engine.steps.model_router import validate_model_route_capacity
+
+        return validate_model_route_capacity(
+            ctx, allow_compaction_retry=allow_compaction_retry,
+        )
     if (
         not router_cfg
         or not getattr(router_cfg, "enabled", False)
@@ -2001,6 +2013,11 @@ async def apply_squilla_router(ctx: TurnContext) -> TurnContext:
     # reserved before any shortcut or classifier path so every persisted router
     # decision in the session receives one monotonic identity.
     routing_turn_index = _ensure_routing_turn_index(ctx)
+
+    if _strategy_name(router_cfg) == "lightgbm_model":
+        from opensquilla.engine.steps.model_router import apply_model_router
+
+        return await apply_model_router(ctx)
 
     # Capacity follows the actual semantic user input, never a shorter
     # process-local routing hint (for example a Goal objective snapshot).

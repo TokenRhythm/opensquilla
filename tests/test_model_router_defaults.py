@@ -43,7 +43,8 @@ def test_squilla_router_defaults_match_runtime_router_config() -> None:
     assert cfg.enabled is True
     assert cfg.auto_thinking is True
     assert cfg.rollout_phase == "full"
-    assert cfg.strategy == "v4_phase3"
+    assert cfg.strategy == "lightgbm_model"
+    assert cfg.tier_policy == "model"
     assert cfg.default_tier == "c1"
     assert cfg.confidence_threshold == 0.5
     assert cfg.confidence_high_tier_margin == 0.05
@@ -58,11 +59,11 @@ def test_squilla_router_defaults_match_runtime_router_config() -> None:
 
     assert cfg.tiers["c0"]["model"] == "qwen/qwen3.7-flash"
     assert cfg.tiers["c0"]["thinking_level"] == "high"
-    assert cfg.tiers["c1"]["model"] == "deepseek/deepseek-v4-flash-0731"
+    assert cfg.tiers["c1"]["model"] == "deepseek/deepseek-v4-flash"
     assert cfg.tiers["c1"]["thinking_level"] == "high"
-    assert cfg.tiers["c2"]["model"] == "deepseek/deepseek-v4-pro-0813"
+    assert cfg.tiers["c2"]["model"] == "deepseek/deepseek-v4-pro"
     assert cfg.tiers["c2"]["thinking_level"] == "high"
-    assert cfg.tiers["c3"]["model"] == "z-ai/glm-5.3"
+    assert cfg.tiers["c3"]["model"] == "moonshotai/kimi-k3"
     assert cfg.tiers["c3"]["thinking_level"] == "high"
     assert cfg.tiers["image_model"]["model"] == "moonshotai/kimi-k2.6"
     assert cfg.tiers["image_model"]["supports_image"] is True
@@ -198,9 +199,9 @@ def test_direct_legacy_openrouter_router_defaults_are_migrated(provider_id: str)
 
 TOKENRHYTHM_EXPECTED_TIER_MODELS = {
     "c0": "qwen3.7-flash",
-    "c1": "deepseek-flash",
+    "c1": "deepseek-v4-flash-0731",
     "c2": "deepseek-v4-pro-0813",
-    "c3": "glm-5.3",
+    "c3": "kimi-k3",
 }
 
 
@@ -300,9 +301,7 @@ def test_each_provider_profile_has_four_text_tiers_without_default_image_model()
         cfg = squilla_router_config_cls(tier_profile=profile)
         assert {"c0", "c1", "c2", "c3"}.issubset(cfg.tiers)
         assert "image_model" not in cfg.tiers
-        assert {cfg.tiers[tier]["provider"] for tier in ("c0", "c1", "c2", "c3")} == {
-            profile
-        }
+        assert {cfg.tiers[tier]["provider"] for tier in ("c0", "c1", "c2", "c3")} == {profile}
 
 
 def test_direct_provider_profiles_have_four_text_tiers_without_default_image_model() -> None:
@@ -312,9 +311,7 @@ def test_direct_provider_profiles_have_four_text_tiers_without_default_image_mod
         cfg = squilla_router_config_cls(tier_profile=profile)
         assert {"c0", "c1", "c2", "c3"}.issubset(cfg.tiers)
         assert "image_model" not in cfg.tiers
-        assert {cfg.tiers[tier]["provider"] for tier in ("c0", "c1", "c2", "c3")} == {
-            profile
-        }
+        assert {cfg.tiers[tier]["provider"] for tier in ("c0", "c1", "c2", "c3")} == {profile}
 
 
 def test_openai_profile_uses_streaming_compatible_models() -> None:
@@ -354,9 +351,7 @@ def test_moonshot_profile_uses_kimi_for_strong_tiers() -> None:
     assert cfg.tiers["c1"]["model"] == "kimi-k2.6"
     assert cfg.tiers["c2"]["model"] == "kimi-k2.6"
     assert cfg.tiers["c3"]["model"] == "kimi-k2.7-code"
-    assert all(
-        cfg.tiers[tier]["supports_image"] is True for tier in ("c0", "c1", "c2", "c3")
-    )
+    assert all(cfg.tiers[tier]["supports_image"] is True for tier in ("c0", "c1", "c2", "c3"))
 
 
 def test_volcengine_profile_uses_seed_2_capability_ladder() -> None:
@@ -447,7 +442,8 @@ def test_example_toml_enables_runtime_router_defaults() -> None:
     assert squilla_router["enabled"] is True
     assert squilla_router["auto_thinking"] is True
     assert squilla_router["rollout_phase"] == "full"
-    assert squilla_router["strategy"] == "v4_phase3"
+    assert squilla_router["strategy"] == "lightgbm_model"
+    assert squilla_router["tier_policy"] == "model"
     assert "cache_ttl_seconds" not in squilla_router
     assert squilla_router["default_tier"] == "c1"
     assert squilla_router["confidence_threshold"] == 0.5
@@ -467,10 +463,10 @@ def test_example_toml_enables_runtime_router_defaults() -> None:
         assert "thinking_level" not in tiers[name]
     assert tiers["c0"]["model"] == "qwen3.7-flash"
     assert tiers["c0"]["supports_image"] is False
-    assert tiers["c1"]["model"] == "deepseek-flash"
+    assert tiers["c1"]["model"] == "deepseek-v4-flash-0731"
     assert tiers["c2"]["model"] == "deepseek-v4-pro-0813"
     assert tiers["c2"]["supports_image"] is False
-    assert tiers["c3"]["model"] == "glm-5.3"
+    assert tiers["c3"]["model"] == "kimi-k3"
     assert tiers["c3"]["ensemble_enabled"] is False
     assert "ensemble_selection_mode" not in tiers["c3"]
     assert tiers["image_model"]["model"] == "kimi-k2.6"
@@ -493,12 +489,18 @@ def test_runtime_router_config_does_not_ship_unused_cost_fields() -> None:
     data = yaml.safe_load(text)
 
     assert data["tier_registry"]["S"] == ["qwen/qwen3.7-flash"]
-    assert data["tier_registry"]["M"] == ["deepseek/deepseek-v4-flash-0731"]
-    assert data["tier_registry"]["L"] == ["deepseek/deepseek-v4-pro-0813"]
-    assert data["tier_registry"]["XL"] == ["z-ai/glm-5.3"]
-    assert data["tier_explanations"]["L"]["model"] == "deepseek/deepseek-v4-pro-0813"
-    assert data["tier_explanations"]["XL"]["model"] == "z-ai/glm-5.3"
+    assert data["tier_registry"]["M"] == ["deepseek/deepseek-v4-flash"]
+    assert data["tier_registry"]["L"] == ["deepseek/deepseek-v4-pro"]
+    assert data["tier_registry"]["XL"] == ["moonshotai/kimi-k3"]
+    assert data["tier_explanations"]["L"]["model"] == "deepseek/deepseek-v4-pro"
+    assert data["tier_explanations"]["XL"]["model"] == "moonshotai/kimi-k3"
     assert "cost_ratios:" not in text
     assert "cost_matrix:" not in text
     assert "under_routing_multiplier" not in text
     assert "over_routing_multiplier" not in text
+
+
+def test_existing_strategy_settings_upgrade_but_explicit_legacy_remains_available():
+    cls = _squilla_router_config_cls()
+    assert cls(strategy="v4_phase3").strategy == "lightgbm_model"
+    assert cls(strategy="legacy_v4_phase3").strategy == "legacy_v4_phase3"

@@ -3,7 +3,7 @@ from __future__ import annotations
 import base64
 import json
 from collections.abc import AsyncIterator
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -47,6 +47,7 @@ class _TranscriptEntry:
     reasoning_content: str | None = None
     token_count: int | None = None
     assistant_replay: dict[str, Any] | None = None
+    session_id: str = ""
 
 
 @dataclass
@@ -59,6 +60,7 @@ class _FakeSessionManager:
     def __init__(self) -> None:
         self._nodes: dict[str, _SessionNode] = {}
         self._transcripts: dict[str, list[_TranscriptEntry]] = {}
+        self.storage = self
 
     async def create(self, session_key: str) -> _SessionNode:
         node = _SessionNode(session_key=session_key, session_id=f"id-{len(self._nodes) + 1}")
@@ -77,8 +79,30 @@ class _FakeSessionManager:
         self._transcripts.setdefault(session_key, []).append(entry)
         return entry
 
-    async def get_transcript(self, session_key: str) -> list[_TranscriptEntry]:
+    async def get_transcript(
+        self, session_key: str, *, expected_session_id: str | None = None,
+        expected_session_epoch: int | None = None,
+    ) -> list[_TranscriptEntry]:
+        node = self._nodes[session_key]
+        assert expected_session_id in (None, node.session_id)
+        assert expected_session_epoch in (None, 0)
         return list(self._transcripts.get(session_key, []))
+
+    get_canonical_transcript = get_transcript
+
+    async def get_model_router_transcript(
+        self, session_key: str, *, expected_session_id: str | None = None,
+        expected_session_epoch: int | None = None,
+    ) -> list[_TranscriptEntry]:
+        node = self._nodes[session_key]
+        assert expected_session_id in (None, node.session_id)
+        assert expected_session_epoch in (None, 0)
+        return [replace(row, session_id=node.session_id)
+                for row in await self.get_canonical_transcript(session_key)]
+
+    async def get_canonical_transcript_coverage(self, session_id: str) -> SimpleNamespace:
+        assert any(node.session_id == session_id for node in self._nodes.values())
+        return SimpleNamespace(canonical_complete=True)
 
     async def get_session(self, session_key: str) -> _SessionNode | None:
         return self._nodes.get(session_key)
@@ -943,7 +967,17 @@ async def test_current_image_and_one_archived_image_id_are_merged_and_exact() ->
 
 
 @pytest.mark.asyncio
-async def test_persisted_compacted_archive_rehydrates_explicit_attachment_id() -> None:
+async def test_persisted_compacted_archive_rehydrates_explicit_attachment_id(monkeypatch) -> None:
+    from opensquilla.engine.steps import squilla_router
+    from opensquilla.provider.selector import ModelSelector, ProviderConfig, SelectorConfig
+
+    # Exercise current model-policy admission on a proven vision deployment;
+    # this test owns archived-image hydration, not learned tier selection.
+    classifier = SimpleNamespace(predict=lambda _input: {
+        "intent_probabilities": {"new_task": 1.0, "continue": 0.0, "redo": 0.0},
+        "tier_probabilities": {"C0": 1.0, "C1": 0.0, "C2": 0.0, "C3": 0.0},
+    })
+    monkeypatch.setattr(squilla_router, "_get_strategy", lambda _config: classifier)
     storage = SessionStorage(":memory:")
     await storage.connect()
     try:
@@ -996,8 +1030,12 @@ async def test_persisted_compacted_archive_rehydrates_explicit_attachment_id() -
 
         config = GatewayConfig(llm={"provider": "openrouter"})
         config.squilla_router.vision_history_lookback_turns = 0
+        selector = ModelSelector(SelectorConfig(primary=ProviderConfig(
+            provider="openrouter", model=config.llm.model,
+            api_key="synthetic-offline", base_url="https://openrouter.ai/api/v1",
+        )))
         runner = TurnRunner(
-            provider_selector=MagicMock(),
+            provider_selector=selector,
             session_manager=manager,
             config=config,
         )
@@ -1007,13 +1045,15 @@ async def test_persisted_compacted_archive_rehydrates_explicit_attachment_id() -
             current_prompt,
             key,
             provider,
-            None,
+            selector,
             [],
             "system",
             [{"resourceRef": {"type": "attachment", "id": attachment_id}}],
             semantic_message=current_prompt,
+            bound_user_message_id=current_entry.message_id,
         )
-        assert returned_provider is provider
+        assert returned_provider.model == config.squilla_router.tiers["c0"]["model"]
+        assert turn.metadata["routed_tier"] == "c0"
         assert turn.metadata["image_intent_attachment_ids"] == [attachment_id]
         assert turn.metadata["image_context_has_images"] is True
         agent = Agent(
@@ -1266,7 +1306,10 @@ async def test_non_image_attachment_id_does_not_force_vision_route() -> None:
 async def test_image_followup_routes_vision_and_replays_inline_history_image() -> None:
     manager = _FakeSessionManager()
     key = "agent:main:image-followup-inline"
-    config = GatewayConfig(llm={"provider": "openrouter"})
+    config = GatewayConfig(
+        llm={"provider": "openrouter"},
+        squilla_router={"strategy": "legacy_v4_phase3"},
+    )
     runner = TurnRunner(provider_selector=MagicMock(), session_manager=manager, config=config)
     await manager.create(key)
     await manager.append_message(key, "user", _inline_image_envelope("Describe this image."))
@@ -1340,7 +1383,10 @@ async def test_image_context_fact_routes_without_an_auxiliary_semantic_call(
     has_image_context: bool,
     message: str,
 ) -> None:
-    config = GatewayConfig(llm={"provider": "openrouter"})
+    config = GatewayConfig(
+        llm={"provider": "openrouter"},
+        squilla_router={"strategy": "legacy_v4_phase3"},
+    )
     provider = _CapturingProvider()
     ctx = TurnContext(
         message=message,
@@ -1458,7 +1504,10 @@ async def test_default_sticky_window_keeps_third_followup_active() -> None:
 async def test_recent_image_context_survives_the_legacy_sticky_window() -> None:
     manager = _FakeSessionManager()
     key = "agent:main:image-followup-sticky-expired"
-    config = GatewayConfig(llm={"provider": "openrouter"})
+    config = GatewayConfig(
+        llm={"provider": "openrouter"},
+        squilla_router={"strategy": "legacy_v4_phase3"},
+    )
     config.squilla_router.vision_history_lookback_turns = 4
     config.squilla_router.vision_sticky_followup_turns = 1
     runner = TurnRunner(provider_selector=MagicMock(), session_manager=manager, config=config)

@@ -3326,7 +3326,7 @@ def _image_continuation_runtime(
 
     primary_model = "synthetic/text-small"
     image_model = "synthetic/image-large"
-    gateway = GatewayConfig()
+    gateway = GatewayConfig(squilla_router={"strategy": "legacy_v4_phase3"})
     gateway.llm.provider = "openrouter"
     gateway.llm.model = primary_model
     gateway.llm.api_key = "synthetic-key"

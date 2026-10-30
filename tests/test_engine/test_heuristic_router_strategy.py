@@ -94,7 +94,7 @@ def make_context(
     session_key: str = "agent:heuristic:test",
     attachments: list[dict] | None = None,
 ) -> TurnContext:
-    config = GatewayConfig()
+    config = GatewayConfig(squilla_router={"strategy": "legacy_v4_phase3"})
     config.squilla_router.rollout_phase = "full"
     return TurnContext(
         message=message,
@@ -472,7 +472,7 @@ def test_status_reports_loaded_v4_runtime(monkeypatch: pytest.MonkeyPatch) -> No
     import opensquilla.squilla_router.v4_phase3 as v4_phase3
 
     monkeypatch.setattr(v4_phase3, "V4Phase3Strategy", LoadedFakeV4Strategy)
-    config = GatewayConfig()
+    config = GatewayConfig(squilla_router={"strategy": "legacy_v4_phase3"})
     squilla_router_step.preload_strategy(config.squilla_router)
 
     status = router_runtime_status()
