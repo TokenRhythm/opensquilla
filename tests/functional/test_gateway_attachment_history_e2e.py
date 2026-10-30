@@ -223,6 +223,8 @@ def _configure_gateway(tmp_path: Path) -> GatewayConfig:
     config.workspace_dir = str(tmp_path / "workspace")
     Path(config.workspace_dir).mkdir()
     config.attachments.media_root = str(tmp_path / "media")
+    # These fixtures exercise the legacy vision/sticky routing contract.
+    config.squilla_router.strategy = "legacy_v4_phase3"
     config.squilla_router.enabled = True
     config.squilla_router.rollout_phase = "full"
     config.squilla_router.require_router_runtime = False
