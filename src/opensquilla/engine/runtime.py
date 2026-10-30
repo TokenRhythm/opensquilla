@@ -12105,8 +12105,12 @@ class TurnRunner:
             return {"history_capacity_estimate_complete": False} if include_capacity else {}
         entries = list(transcript or [])
         model_context: dict[str, Any] = {}
+        model_generation_reset = False
         if model_policy_active:
-            from opensquilla.session.model_router_state import build_model_router_context
+            from opensquilla.session.model_router_state import (
+                build_model_router_context,
+                model_generation_transcript,
+            )
 
             model_entries = await self._session_manager.get_model_router_transcript(
                 session_key,
@@ -12129,6 +12133,31 @@ class TurnRunner:
                 feature_entries=entries,
                 canonical_complete=canonical_complete,
             )
+            # Capacity and image facts must describe the same generation that
+            # _load_history will send. Keep classifier features above unchanged.
+            # Explicit New Task has not been staged yet at this boundary.
+            control = model_context.get("router_model_control_event")
+            router_cfg = getattr(self._turn_config(), "squilla_router", None)
+            if (
+                getattr(router_cfg, "rollout_phase", "full") != "observe"
+                and not model_context.get("router_model_decision")
+                and control in {"new", "new_task", "new-task", "create_task", "create-task"}
+            ):
+                current = next((
+                    row for row in reversed(model_entries)
+                    if row.role == "user" and (
+                        bound_user_message_id is None or row.message_id == bound_user_message_id
+                    )
+                ), None)
+                entries = [current] if current is not None else []
+                model_generation_reset = True
+            else:
+                generation = model_generation_transcript(
+                    model_entries, bound_user_message_id, include_current_staged=True,
+                )
+                if generation is not None:
+                    entries = generation
+                    model_generation_reset = True
         # When the turn is bound to a specific user message id (queued-sends
         # path), exclude the bound current prompt AND every later user entry
         # (still-queued future prompts persisted at ingress), mirroring
@@ -12161,6 +12190,7 @@ class TurnRunner:
                 bound_index=bound_index,
                 expected_session_id=expected_session_id,
                 expected_session_epoch=expected_session_epoch,
+                exclude_compaction_context=model_generation_reset,
             )
 
         user_texts: list[str] = []
