@@ -113,16 +113,18 @@ def test_invalid_api_key_exits_promptly_with_nonzero_status(tmp_path: Path) -> N
     assert env["OPENSQUILLA_TEST_PROFILE_LOCK_ROOT"] == "1"
     stack_dump_path = tmp_path / "agent-child-stacks.txt"
     stack_dump_path.touch()
-    # Keep diagnostics alive through interpreter shutdown, including non-daemon
-    # thread joins. A startup-only timer can miss the shorter post-response limit.
+    # Capture faults and the threads present when app() exits without an async
+    # frame walker racing code-object collection during normal imports.
     child_code = (
-        "import atexit, faulthandler\n"
-        f"stack_dump = open({str(stack_dump_path)!r}, 'w', encoding='utf-8')\n"
-        "faulthandler.dump_traceback_later(\n"
-        f"    {_POST_RESPONSE_EXIT_TIMEOUT_SECONDS / 2!r}, repeat=True, file=stack_dump)\n"
-        "atexit.register(faulthandler.cancel_dump_traceback_later)\n"
-        "from opensquilla.cli.main import app\n"
-        "app()\n"
+        "import faulthandler\n"
+        f"with open({str(stack_dump_path)!r}, 'w', encoding='utf-8') as stack_dump:\n"
+        "    faulthandler.enable(file=stack_dump)\n"
+        "    try:\n"
+        "        from opensquilla.cli.main import app\n"
+        "        app()\n"
+        "    finally:\n"
+        "        faulthandler.dump_traceback(file=stack_dump)\n"
+        "        faulthandler.disable()\n"
     )
     process = subprocess.Popen(
         [
@@ -143,9 +145,11 @@ def test_invalid_api_key_exits_promptly_with_nonzero_status(tmp_path: Path) -> N
 
     try:
         if not response_sent.wait(timeout=_REQUEST_START_TIMEOUT_SECONDS):
+            returncode_at_timeout = process.poll()
             stdout, stderr = _stop_process(process)
             pytest.fail(
                 "agent CLI did not reach the local provider within the startup limit\n"
+                f"return code before cleanup: {returncode_at_timeout!r}\n"
                 f"stdout:\n{stdout}\nstderr:\n{stderr}\n"
                 f"child stacks:\n{stack_dump_path.read_text(encoding='utf-8', errors='replace')}"
             )
