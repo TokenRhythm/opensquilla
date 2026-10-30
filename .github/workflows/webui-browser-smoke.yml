@@ -50,6 +50,9 @@ jobs:
       - name: Install Python dependencies
         run: uv sync --extra dev --frozen
 
+      - name: Prepare router assets
+        uses: ./.github/actions/prepare-router-assets
+
       - name: Install Playwright browser
         run: npx --yes playwright install chromium
 

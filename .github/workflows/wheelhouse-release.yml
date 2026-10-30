@@ -263,7 +263,7 @@ jobs:
 
       - name: Hydrate router assets
         shell: bash
-        run: git lfs pull --include="src/opensquilla/squilla_router/models/**"
+        run: git lfs pull --include="src/opensquilla/squilla_router/models/**,src/opensquilla/squilla_router/lightgbm_model/assets/**"
 
       - name: Verify router assets are hydrated
         shell: bash
@@ -293,6 +293,13 @@ jobs:
         uses: actions/setup-python@v5
         with:
           python-version: "3.12"
+
+      - name: Verify LightGBM router assets
+        shell: bash
+        run: |
+          if [[ -f src/opensquilla/squilla_router/lightgbm_model/model.py ]]; then
+            PYTHONPATH=src python -c "from opensquilla.squilla_router.lightgbm_model import validate_artifacts; print(validate_artifacts())"
+          fi
 
       - name: Set up Node.js for Web UI staging
         if: needs.build-control-ui.outputs.webui_mode == 'source-built'
@@ -472,12 +479,19 @@ jobs:
           path: ${{ needs.build-control-ui.outputs.webui_mode == 'source-built' && 'opensquilla-webui/dist/' || 'src/opensquilla/gateway/static/dist/' }}
 
       - name: Hydrate router assets
-        run: git lfs pull --include="src/opensquilla/squilla_router/models/**"
+        run: git lfs pull --include="src/opensquilla/squilla_router/models/**,src/opensquilla/squilla_router/lightgbm_model/assets/**"
 
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: "3.12"
+
+      - name: Verify LightGBM router assets
+        shell: bash
+        run: |
+          if [[ -f src/opensquilla/squilla_router/lightgbm_model/model.py ]]; then
+            PYTHONPATH=src python -c "from opensquilla.squilla_router.lightgbm_model import validate_artifacts; print(validate_artifacts())"
+          fi
 
       - name: Set up uv
         uses: astral-sh/setup-uv@v5
@@ -649,12 +663,19 @@ jobs:
 
       - name: Hydrate router assets
         shell: bash
-        run: git lfs pull --include="src/opensquilla/squilla_router/models/**"
+        run: git lfs pull --include="src/opensquilla/squilla_router/models/**,src/opensquilla/squilla_router/lightgbm_model/assets/**"
 
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: "3.12"
+
+      - name: Verify LightGBM router assets
+        shell: bash
+        run: |
+          if [[ -f src/opensquilla/squilla_router/lightgbm_model/model.py ]]; then
+            PYTHONPATH=src python -c "from opensquilla.squilla_router.lightgbm_model import validate_artifacts; print(validate_artifacts())"
+          fi
 
       - name: Set up uv
         uses: astral-sh/setup-uv@v5

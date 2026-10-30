@@ -55,11 +55,7 @@ jobs:
         uv sync --extra dev --extra recommended --extra mcp --frozen
     - name: Prepare router assets for Gateway probes
       if: ${{ matrix.probe != 'pty' }}
-      shell: bash
-      run: |
-        set -euo pipefail
-        git lfs pull --include="src/opensquilla/squilla_router/models/v4.2_phase3_inference/**,src/opensquilla/squilla_router/lightgbm_model/assets/**"
-        uv run --no-sync python -c "from opensquilla.squilla_router.lightgbm_model import validate_artifacts; print(validate_artifacts())"
+      uses: ./.github/actions/prepare-router-assets
     - name: Verify recommended PTY and managed execution on the native platform
       if: ${{ matrix.probe == 'pty' }}
       shell: bash

@@ -141,8 +141,11 @@ jobs:
           enable-cache: true
       - name: Hydrate router assets
         run: |
-          git lfs pull --include='src/opensquilla/squilla_router/models/**'
+          git lfs pull --include='src/opensquilla/squilla_router/models/**,src/opensquilla/squilla_router/lightgbm_model/assets/**'
           if ($LASTEXITCODE -ne 0) { throw 'Router LFS fetch failed' }
+          $env:PYTHONPATH = 'src'
+          python -c "from opensquilla.squilla_router.lightgbm_model import validate_artifacts; print(validate_artifacts())"
+          if ($LASTEXITCODE -ne 0) { throw 'Router artifact validation failed' }
       - name: Build and verify complete WebUI
         if: ${{ (inputs.frontend_artifact_name || '') == '' }}
         working-directory: opensquilla-webui

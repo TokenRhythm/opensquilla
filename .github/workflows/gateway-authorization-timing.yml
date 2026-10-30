@@ -49,6 +49,9 @@ jobs:
           enable-cache: true
       - name: Install identical comparison dependencies
         run: uv sync --extra dev --extra recommended --extra mcp --frozen
+
+      - name: Prepare router assets
+        uses: ./.github/actions/prepare-router-assets
       - name: Compare offline Gateway startup and Default first turn
         shell: bash
         env:
@@ -75,6 +78,15 @@ jobs:
           output = Path(os.environ["RUNNER_TEMP"]) / "gateway-timing" / "timing.json"
           subprocess.run(["git", "worktree", "add", "--detach", str(baseline), baseline_sha], check=True)
           try:
+              subprocess.run([
+                  "git", "-C", str(baseline), "lfs", "pull",
+                  "--include=src/opensquilla/squilla_router/models/**,src/opensquilla/squilla_router/lightgbm_model/assets/**",
+              ], check=True)
+              if (baseline / "src/opensquilla/squilla_router/lightgbm_model/model.py").is_file():
+                  subprocess.run([
+                      sys.executable, "-c",
+                      "from opensquilla.squilla_router.lightgbm_model import validate_artifacts; print(validate_artifacts())",
+                  ], cwd=baseline, env={**os.environ, "PYTHONPATH": str(baseline / "src")}, check=True)
               subprocess.run([
                   sys.executable, "scripts/compare_gateway_timing.py",
                   "--baseline-root", str(baseline), "--candidate-root", str(candidate),
