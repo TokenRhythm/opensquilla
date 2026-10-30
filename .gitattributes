@@ -32,4 +32,3 @@ src/opensquilla/squilla_router/lightgbm_model/assets/**/*.onnx filter=lfs diff=l
 src/opensquilla/squilla_router/lightgbm_model/assets/**/*.joblib filter=lfs diff=lfs merge=lfs -text
 src/opensquilla/squilla_router/lightgbm_model/assets/**/*.pkl filter=lfs diff=lfs merge=lfs -text
 src/opensquilla/squilla_router/lightgbm_model/assets/**/*.gz filter=lfs diff=lfs merge=lfs -text
-src/opensquilla/squilla_router/lightgbm_model/assets/**/tokenizer/**/*.json filter=lfs diff=lfs merge=lfs -text
