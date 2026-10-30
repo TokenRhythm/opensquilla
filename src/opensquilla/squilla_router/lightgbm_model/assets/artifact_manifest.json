@@ -83,8 +83,8 @@
     },
     {
       "path": "provenance.json",
-      "size_bytes": 2904,
-      "sha256": "7380151d446f4df05cba33587eb748203d86868469833bc8124719c6d2c70288"
+      "size_bytes": 2880,
+      "sha256": "ae676601dbb6b7df5fa672daeb0c40bf9ccc75180680a17efcaed656d3d82aa5"
     },
     {
       "path": "runtime_compatibility.json",

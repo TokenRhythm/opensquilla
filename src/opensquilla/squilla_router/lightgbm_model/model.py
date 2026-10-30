@@ -165,7 +165,7 @@ class LightGBMRouterModel:
         manifest, paths = _verified_artifacts(model_root)
         self._lock = threading.RLock()
         self._closed = False
-        self._feature_runtime = None
+        self._encoder = None
         try:
             import joblib
             import lightgbm as lgb
@@ -174,7 +174,8 @@ class LightGBMRouterModel:
             import sklearn
             import tokenizers
 
-            from ._vendor.features.runtime import BGEOnnxEncoder, LightGBMFeatureRuntime
+            from ._vendor.features.lightgbm380 import LightGBM380Featurizer
+            from ._vendor.features.runtime import BGEOnnxEncoder
 
             self._np = np
             references = manifest["models"] + manifest["preprocess"]
@@ -201,16 +202,17 @@ class LightGBMRouterModel:
                 tokenizer_path=encoder_paths["tokenizer"],
             )
             try:
-                self._feature_runtime = LightGBMFeatureRuntime(
+                self._featurizer = LightGBM380Featurizer(
                     embedder=encoder,
                     semantic_projector=_load_transformer(feature_root / "pca64.joblib"),
                     text_vectorizer=_load_transformer(feature_root / "tfidf_char_wb_2_4.joblib"),
                     character_projector=_load_transformer(feature_root / "svd100.joblib"),
                 )
-                self._feature_runtime._featurizer._fitted = True
+                self._featurizer._fitted = True
             except BaseException:
                 encoder.close()
                 raise
+            self._encoder = encoder
             self._models = {}
             self._temperatures = {}
             for target in ("intent", "tier"):
@@ -240,8 +242,8 @@ class LightGBMRouterModel:
                 },
             }
         except Exception as exc:
-            if self._feature_runtime is not None:
-                self._feature_runtime.close()
+            if self._encoder is not None:
+                self._encoder.close()
             raise LightGBMModelError(
                 "cannot load bundled LightGBM runtime; install recommended dependencies"
             ) from exc
@@ -252,7 +254,7 @@ class LightGBMRouterModel:
         if self._closed:
             raise LightGBMInferenceError("LightGBM router model is closed")
         canonical = RouterInput.model_validate(router_input).model_dump(mode="json")
-        features = self._feature_runtime.transform_row({"input": canonical})
+        features = self._featurizer.transform_row({"input": canonical})
         if features.shape != (380,) or not self._np.isfinite(features).all():
             raise LightGBMInferenceError("LightGBM feature contract was violated")
         return features
@@ -319,5 +321,5 @@ class LightGBMRouterModel:
     def close(self) -> None:
         with self._lock:
             if not self._closed:
-                self._feature_runtime.close()
+                self._encoder.close()
                 self._closed = True

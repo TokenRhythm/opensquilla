@@ -2,49 +2,21 @@
 
 from __future__ import annotations
 
-import json
 import os
-import sqlite3
 from concurrent.futures import ThreadPoolExecutor
 from collections.abc import Mapping, Sequence
 from hashlib import sha256
 from pathlib import Path
-from typing import Any
 
 import numpy as np
 
-from ..ids import canonical_json_bytes, sha256_file
-from .lightgbm380 import LightGBM380Featurizer
 from .text import SegmentKind, truncate_content_tokens
 
 
 PCA_DIM = 64
-TFIDF_MAX_FEATURES = 10_000
 SVD_DIM = 100
 BGE_MAX_CONTENT_TOKENS = 510
-_BGE_CACHE_SCHEMA = "bge_embedding_cache.v1"
 _BGE_CACHE_WRITE_BATCH = 256
-
-
-def _sklearn() -> tuple[Any, Any, Any, Any]:
-    try:
-        from sklearn.decomposition import PCA, TruncatedSVD
-        from sklearn.feature_extraction.text import TfidfVectorizer
-        from sklearn.preprocessing import StandardScaler
-    except ImportError as exc:  # pragma: no cover - exercised only in minimal installs
-        raise RuntimeError("scikit-learn is required for concrete feature runtimes") from exc
-    return PCA, TruncatedSVD, TfidfVectorizer, StandardScaler
-
-
-def _row_mapping(row: object) -> Mapping[str, object]:
-    if isinstance(row, Mapping):
-        return row
-    model_dump = getattr(row, "model_dump", None)
-    if callable(model_dump):
-        value = model_dump(mode="json")
-        if isinstance(value, Mapping):
-            return value
-    raise TypeError("feature rows must be mappings or Pydantic models")
 
 
 def _dense_2d(values: object, *, name: str) -> np.ndarray:
@@ -76,10 +48,6 @@ class SklearnPCA64Projector:
 
     output_dim = PCA_DIM
 
-    def __init__(self) -> None:
-        self.estimator: object | None = None
-        self.fitted_components = 0
-
     def transform(self, values: object) -> np.ndarray:
         if self.estimator is None:
             raise RuntimeError("PCA projector is not fitted")
@@ -89,15 +57,6 @@ class SklearnPCA64Projector:
 class SklearnCharTfidfVectorizer:
     """Frozen character ``char_wb`` TF-IDF configuration."""
 
-    def __init__(self) -> None:
-        _, _, TfidfVectorizer, _ = _sklearn()
-        self.estimator = TfidfVectorizer(
-            analyzer="char_wb",
-            ngram_range=(2, 4),
-            max_features=TFIDF_MAX_FEATURES,
-            dtype=np.float32,
-        )
-
     def transform(self, texts: Sequence[str]) -> object:
         return self.estimator.transform(list(texts))
 
@@ -105,11 +64,6 @@ class SklearnSVD100Projector:
     """TruncatedSVD fitted on train TF-IDF, with a fixed 100-column output."""
 
     output_dim = SVD_DIM
-
-    def __init__(self, *, random_state: int = 17) -> None:
-        self.random_state = random_state
-        self.estimator: object | None = None
-        self.fitted_components = 0
 
     def transform(self, values: object) -> np.ndarray:
         if self.estimator is None:
@@ -166,224 +120,6 @@ def _local_model_file(model_dir: Path, explicit: str | Path | None, candidates: 
     raise FileNotFoundError(f"none of {list(candidates)} exists under {model_dir}")
 
 
-def _stable_runtime_value(value: object) -> object:
-    if value is None or isinstance(value, (bool, int, float, str)):
-        return value
-    name = getattr(value, "name", None)
-    if isinstance(name, str) and name:
-        return name
-    return str(value)
-
-
-def _session_options_identity(options: object) -> dict[str, object]:
-    names = (
-        "intra_op_num_threads",
-        "inter_op_num_threads",
-        "execution_mode",
-        "execution_order",
-        "graph_optimization_level",
-        "enable_cpu_mem_arena",
-        "enable_mem_pattern",
-        "enable_mem_reuse",
-        "use_deterministic_compute",
-    )
-    return {
-        name: _stable_runtime_value(getattr(options, name))
-        for name in names
-        if hasattr(options, name)
-    }
-
-
-def _session_runtime_identity(
-    session: object,
-    *,
-    explicit: Mapping[str, object] | None,
-    ort_module: object | None = None,
-) -> dict[str, object]:
-    if explicit is not None:
-        required = {"onnxruntime_version", "providers", "session_options"}
-        missing = required - set(explicit)
-        providers = explicit.get("providers")
-        version = explicit.get("onnxruntime_version")
-        session_options = explicit.get("session_options")
-        if (
-            missing
-            or not isinstance(version, str)
-            or not version.strip()
-            or not isinstance(providers, Sequence)
-            or isinstance(providers, (str, bytes))
-            or not providers
-            or any(not isinstance(provider, str) or not provider for provider in providers)
-            or not isinstance(session_options, Mapping)
-        ):
-            raise ValueError(
-                "explicit ONNX session_identity requires onnxruntime_version, "
-                "non-empty providers, and session_options"
-            )
-        return json.loads(
-            canonical_json_bytes(
-                {
-                    "schema_version": "bge_onnx_runtime_identity.v1",
-                    "source": "explicit",
-                    "identity": dict(explicit),
-                }
-            ).decode("utf-8")
-        )
-
-    session_type = type(session)
-    if not session_type.__module__.startswith("onnxruntime."):
-        raise ValueError(
-            "custom ONNX sessions require an explicit stable session_identity"
-        )
-    if ort_module is None:
-        try:
-            import onnxruntime as ort_module
-        except ImportError as exc:  # pragma: no cover - optional runtime dependency
-            raise RuntimeError("onnxruntime is required to identify an ONNX session") from exc
-    get_providers = getattr(session, "get_providers", None)
-    get_session_options = getattr(session, "get_session_options", None)
-    if not callable(get_providers) or not callable(get_session_options):
-        raise ValueError(
-            "ONNX sessions must expose get_providers() and get_session_options()"
-        )
-    providers = [str(provider) for provider in get_providers()]
-    if not providers:
-        raise ValueError("ONNX session must expose at least one active provider")
-    get_provider_options = getattr(session, "get_provider_options", None)
-    raw_provider_options = get_provider_options() if callable(get_provider_options) else {}
-    provider_options: dict[str, object] = {}
-    if isinstance(raw_provider_options, Mapping):
-        for provider, options in raw_provider_options.items():
-            if isinstance(options, Mapping):
-                provider_options[str(provider)] = {
-                    str(name): _stable_runtime_value(value)
-                    for name, value in sorted(options.items(), key=lambda item: str(item[0]))
-                }
-            else:
-                provider_options[str(provider)] = _stable_runtime_value(options)
-    get_build_info = getattr(ort_module, "get_build_info", None)
-    build_info = get_build_info() if callable(get_build_info) else None
-    identity = {
-        "schema_version": "bge_onnx_runtime_identity.v1",
-        "source": "onnxruntime",
-        "onnxruntime_version": str(getattr(ort_module, "__version__", "unknown")),
-        "onnxruntime_build_info": str(build_info) if build_info is not None else None,
-        "session_type": f"{session_type.__module__}.{session_type.__qualname__}",
-        "providers": providers,
-        "provider_options": provider_options,
-        "session_options": _session_options_identity(get_session_options()),
-    }
-    return json.loads(canonical_json_bytes(identity).decode("utf-8"))
-
-
-class _BGEEmbeddingCache:
-    """Integrity-checked, content-addressed cache for normalized BGE rows."""
-
-    def __init__(self, path: str | Path, *, namespace: str) -> None:
-        self.path = Path(path).expanduser().resolve(strict=False)
-        if self.path.exists() and not self.path.is_file():
-            raise ValueError("BGE embedding cache path must be a SQLite file")
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        self.namespace = namespace
-        self.connection = sqlite3.connect(self.path, timeout=60.0)
-        self.connection.execute("PRAGMA journal_mode=WAL")
-        self.connection.execute("PRAGMA synchronous=FULL")
-        self.connection.execute("PRAGMA busy_timeout=60000")
-        self.connection.execute(
-            """
-            CREATE TABLE IF NOT EXISTS bge_embeddings (
-                namespace TEXT NOT NULL,
-                cache_key TEXT NOT NULL,
-                dimension INTEGER NOT NULL,
-                embedding BLOB NOT NULL,
-                embedding_sha256 TEXT NOT NULL,
-                PRIMARY KEY (namespace, cache_key)
-            ) WITHOUT ROWID
-            """
-        )
-        self.connection.commit()
-
-    @staticmethod
-    def _decode(
-        dimension: object,
-        payload: object,
-        payload_digest: object,
-    ) -> np.ndarray | None:
-        if (
-            not isinstance(dimension, int)
-            or dimension < 1
-            or not isinstance(payload, bytes)
-            or len(payload) != dimension * np.dtype("<f4").itemsize
-            or not isinstance(payload_digest, str)
-            or sha256(payload).hexdigest() != payload_digest
-        ):
-            return None
-        value = np.frombuffer(payload, dtype="<f4").astype(np.float32, copy=True)
-        if value.shape != (dimension,) or not np.isfinite(value).all():
-            return None
-        return value
-
-    def get_many(self, keys: Sequence[str]) -> dict[str, np.ndarray]:
-        unique = tuple(dict.fromkeys(keys))
-        result: dict[str, np.ndarray] = {}
-        invalid: list[str] = []
-        for start in range(0, len(unique), 500):
-            batch = unique[start : start + 500]
-            placeholders = ",".join("?" for _ in batch)
-            rows = self.connection.execute(
-                f"""
-                SELECT cache_key, dimension, embedding, embedding_sha256
-                FROM bge_embeddings
-                WHERE namespace = ? AND cache_key IN ({placeholders})
-                """,
-                (self.namespace, *batch),
-            )
-            for cache_key, dimension, payload, payload_digest in rows:
-                value = self._decode(dimension, payload, payload_digest)
-                if value is None:
-                    invalid.append(str(cache_key))
-                else:
-                    result[str(cache_key)] = value
-        if invalid:
-            with self.connection:
-                self.connection.executemany(
-                    "DELETE FROM bge_embeddings WHERE namespace = ? AND cache_key = ?",
-                    ((self.namespace, cache_key) for cache_key in invalid),
-                )
-        return result
-
-    def put_many(self, values: Mapping[str, np.ndarray]) -> None:
-        records = []
-        for cache_key, raw in values.items():
-            value = np.asarray(raw, dtype="<f4")
-            if value.ndim != 1 or not np.isfinite(value).all():
-                raise ValueError("BGE cache accepts only finite embedding rows")
-            payload = value.tobytes(order="C")
-            records.append(
-                (
-                    self.namespace,
-                    cache_key,
-                    int(value.shape[0]),
-                    payload,
-                    sha256(payload).hexdigest(),
-                )
-            )
-        if not records:
-            return
-        with self.connection:
-            self.connection.executemany(
-                """
-                INSERT OR REPLACE INTO bge_embeddings (
-                    namespace, cache_key, dimension, embedding, embedding_sha256
-                ) VALUES (?, ?, ?, ?, ?)
-                """,
-                records,
-            )
-
-    def close(self) -> None:
-        self.connection.close()
-
-
 class BGEOnnxEncoder:
     """Local-only BGE ONNX encoder using CLS pooling and L2 normalization."""
 
@@ -395,12 +131,10 @@ class BGEOnnxEncoder:
         model_path: str | Path | None = None,
         tokenizer: object | None = None,
         session: object | None = None,
-        session_identity: Mapping[str, object] | None = None,
         providers: Sequence[str] = ("CPUExecutionProvider",),
         max_content_tokens: int = BGE_MAX_CONTENT_TOKENS,
         batch_size: int = 1,
         workers: int = 1,
-        embedding_cache: str | Path | None = None,
     ) -> None:
         self.model_dir = Path(model_dir).expanduser().resolve()
         if not self.model_dir.is_dir():
@@ -429,17 +163,11 @@ class BGEOnnxEncoder:
             except ImportError as exc:  # pragma: no cover - optional runtime dependency
                 raise RuntimeError("tokenizers is required to load local tokenizer.json") from exc
             tokenizer = Tokenizer.from_file(str(self.tokenizer_path))
-        ort_module: object | None = None
         if session is None:
-            if session_identity is not None:
-                raise ValueError(
-                    "session_identity is only valid when injecting a custom session"
-                )
             try:
                 import onnxruntime as ort
             except ImportError as exc:  # pragma: no cover - optional runtime dependency
                 raise RuntimeError("onnxruntime is required to run the local BGE model") from exc
-            ort_module = ort
             try:
                 intra_threads = int(os.environ.get("ROUTER_ORT_INTRA_OP_THREADS", "1"))
                 inter_threads = int(os.environ.get("ROUTER_ORT_INTER_OP_THREADS", "1"))
@@ -459,96 +187,18 @@ class BGEOnnxEncoder:
             )
         self.tokenizer = tokenizer
         self.session = session
-        self.inference_runtime_identity = _session_runtime_identity(
-            session,
-            explicit=session_identity,
-            ort_module=ort_module,
-        )
         self.cls_token_id = _special_token_id(tokenizer, "cls", "[CLS]")
         self.sep_token_id = _special_token_id(tokenizer, "sep", "[SEP]")
         self.pad_token_id = _special_token_id(tokenizer, "pad", "[PAD]")
-        self.postprocess_identity = {
-            "schema_version": "bge_postprocess_identity.v1",
-            "numpy_version": np.__version__,
-            "hidden_cast": "float32",
-            "pooling": "cls",
-            "normalization": "numpy.linalg.norm_l2_float32",
-        }
         self._memory_cache: dict[str, np.ndarray] = {}
-        cache_namespace = sha256(
-            canonical_json_bytes(
-                {
-                    "schema_version": _BGE_CACHE_SCHEMA,
-                    "model_sha256": sha256_file(self.model_path),
-                    "input_width": BGE_MAX_CONTENT_TOKENS + 2,
-                    "input_dtype": "int64",
-                    "pad_token_id": self.pad_token_id,
-                    "inference_runtime": self.inference_runtime_identity,
-                    "postprocess_runtime": self.postprocess_identity,
-                }
-            )
-        ).hexdigest()
-        self._embedding_cache = (
-            _BGEEmbeddingCache(embedding_cache, namespace=cache_namespace)
-            if embedding_cache is not None
-            else None
-        )
         self._cache_hits = 0
         self._cache_misses = 0
         self._closed = False
 
-    def metadata(self) -> dict[str, object]:
-        return {
-            "type": "bge_onnx",
-            "model_file": self.model_path.relative_to(self.model_dir).as_posix(),
-            "model_sha256": sha256_file(self.model_path),
-            "tokenizer_file": self.tokenizer_path.relative_to(self.model_dir).as_posix(),
-            "tokenizer_sha256": sha256_file(self.tokenizer_path),
-            "pooling": "cls",
-            "normalization": "l2",
-            "max_content_tokens": self.max_content_tokens,
-            "batch_size": self.batch_size,
-            "inference_runtime": self.inference_runtime_identity,
-            "postprocess_runtime": self.postprocess_identity,
-            "segment_truncation": {
-                "current_request": "head_tail_3_to_1",
-                "recent_history": "tail",
-                "previous_answer": "head_tail_1_to_1",
-            },
-        }
-
-    def serving_asset_files(self) -> dict[str, Path]:
-        """Return the exact local files needed to reproduce BGE inference."""
-
-        return {
-            "onnx_model": self.model_path,
-            "tokenizer": self.tokenizer_path,
-        }
-
-    @property
-    def cache_stats(self) -> dict[str, int]:
-        return {
-            "hits": self._cache_hits,
-            "misses": self._cache_misses,
-            "memory_entries": len(self._memory_cache),
-        }
-
     def close(self) -> None:
         if self._closed:
             return
-        if self._embedding_cache is not None:
-            self._embedding_cache.close()
-            self._embedding_cache = None
         self._closed = True
-
-    def __enter__(self) -> "BGEOnnxEncoder":
-        if self._closed:
-            raise RuntimeError("BGE encoder is closed")
-        return self
-
-    def __exit__(self, exc_type: object, exc: object, traceback: object) -> None:
-        del exc_type, exc, traceback
-        self.close()
 
     def _input_specs(self) -> dict[str, object]:
         get_inputs = getattr(self.session, "get_inputs", None)
@@ -645,16 +295,6 @@ class BGEOnnxEncoder:
             else:
                 existing[1].append(index)
 
-        if self._embedding_cache is not None and pending:
-            persisted = self._embedding_cache.get_many(tuple(pending))
-            for cache_key, cached in persisted.items():
-                sequence, indices = pending.pop(cache_key)
-                del sequence
-                self._memory_cache[cache_key] = cached
-                for index in indices:
-                    results[index] = cached
-                self._cache_hits += len(indices)
-
         misses = list(pending.items())
         executor = (
             ThreadPoolExecutor(max_workers=self.workers, thread_name_prefix="bge-onnx")
@@ -690,15 +330,11 @@ class BGEOnnxEncoder:
                     out=np.zeros_like(pooled),
                     where=norms > 0,
                 ).astype(np.float32, copy=False)
-                cache_batch: dict[str, np.ndarray] = {}
                 for item_index, (cache_key, (_, indices)) in enumerate(items):
                     value = normalized[item_index]
-                    cache_batch[cache_key] = value
                     self._memory_cache[cache_key] = value
                     for index in indices:
                         results[index] = value
-                if self._embedding_cache is not None:
-                    self._embedding_cache.put_many(cache_batch)
                 self._cache_hits += sum(len(indices) - 1 for _, (_, indices) in items)
                 self._cache_misses += len(items)
         finally:
@@ -711,45 +347,3 @@ class BGEOnnxEncoder:
         if normalized.shape[0] != len(batch) or not np.isfinite(normalized).all():
             raise ValueError("BGE output has invalid rows or non-finite values")
         return normalized.astype(np.float32, copy=False)
-
-
-class LightGBMFeatureRuntime:
-    """Concrete BGE/PCA + TF-IDF/SVD implementation of the 380 contract."""
-
-    schema_version = "lightgbm380_runtime.v1"
-
-    def __init__(
-        self,
-        *,
-        embedder: object,
-        semantic_projector: object | None = None,
-        text_vectorizer: object | None = None,
-        character_projector: object | None = None,
-    ) -> None:
-        self.embedder = embedder
-        self.semantic_projector = semantic_projector or SklearnPCA64Projector()
-        self.text_vectorizer = text_vectorizer or SklearnCharTfidfVectorizer()
-        self.character_projector = character_projector or SklearnSVD100Projector()
-        self._featurizer = LightGBM380Featurizer(
-            embedder=self.embedder,
-            semantic_projector=self.semantic_projector,
-            text_vectorizer=self.text_vectorizer,
-            character_projector=self.character_projector,
-        )
-        self._closed = False
-
-    def _ensure_open(self) -> None:
-        if self._closed:
-            raise RuntimeError("LightGBM feature runtime is closed")
-
-    def close(self) -> None:
-        if self._closed:
-            return
-        close = getattr(self.embedder, "close", None)
-        if callable(close):
-            close()
-        self._closed = True
-
-    def transform_row(self, row: object) -> np.ndarray:
-        self._ensure_open()
-        return self._featurizer.transform_row(_row_mapping(row))

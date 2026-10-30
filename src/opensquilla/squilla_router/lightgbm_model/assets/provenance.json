@@ -9,10 +9,6 @@
       "sha256": "sha256:b0b6a879e6e8fffae69ecb138c381851a2e7b74c2a5fc769d986b91fd9609d6e"
     },
     {
-      "path": "src/router_training/errors.py",
-      "sha256": "sha256:673d1de1f94093ff1cef4402e085c31e66b2468c06190b7f8a312b8e8e0506de"
-    },
-    {
       "path": "src/router_training/features/__init__.py",
       "sha256": "sha256:03845e09ae6c2f74e8cdd6d3ca1adde4429ab4876f3402c75e7676a26fc9ff57"
     },
@@ -37,15 +33,11 @@
       "sha256": "sha256:c6fe801a56806aefc1c9bdbce29cdff8b36d5a49142d8682954488860e3a7885"
     },
     {
-      "path": "src/router_training/ids.py",
-      "sha256": "sha256:c74827ac66be51f05e24bfa7dc1e8856ed26f4c550eba2f7adbf3e8b1a692ba4"
-    },
-    {
       "path": "src/router_training/training/common.py",
       "sha256": "sha256:b6db10f1f12ad6308e3a5d0d74292a49c2b224a9d7be18256302b5f940a57f6e"
     }
   ],
   "source_license": "LicenseRef-Proprietary (original pyproject.toml; no LICENSE file in frozen snapshot)",
-  "changes": "Vendored inference subset extracted from feature modules, ids.py and errors.py. Training, artifact export/loading, BERT, registry CLI, unused identity helpers and unused batch transforms removed; imports and module/class descriptions trimmed. All retained function and method definitions remain verbatim, including the complete BGEOnnxEncoder. RouterInput/ContractModel and four calibration functions extracted verbatim. Loader resolves original artifact paths from a static manifest and remaps only the three frozen joblib wrapper class names; transforms and model bytes unchanged. Training run manifests/metrics omitted from inference package.",
+  "changes": "Vendored inference subset extracted from feature modules. Training, artifact export/loading, BERT, registry CLI, unused batch transforms, training-only transformer constructors, the redundant feature-runtime wrapper and unused encoder inspection/context-manager methods removed. The unused SQLite embedding cache and dedicated identity helpers removed; encoder construction, close and encode specialize the original memory-cache path by deleting unused persistence branches. Tokenization, ONNX execution, batching, ordering and normalization unchanged. Other retained function and method definitions remain verbatim. RouterInput/ContractModel and four calibration functions extracted verbatim. Loader resolves original artifact paths from a static manifest and remaps only the three frozen joblib wrapper class names; transforms and model bytes unchanged. Training run manifests/metrics omitted from inference package.",
   "source_files_description": "Paths and SHA-256 hashes identify complete original upstream files, not the local inference extracts."
 }

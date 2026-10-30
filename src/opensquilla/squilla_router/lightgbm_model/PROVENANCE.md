@@ -7,12 +7,17 @@ This package contains the exact LightGBM pair selected by the 2026-10-20 model-p
 
 `assets/provenance.json` records the upstream source paths and original file
 hashes; these identify the source snapshot, not checksums of the local extracts.
-`_vendor/` retains only the inference subset: training, artifact export/loading,
-BERT, registry CLI, unused identity helpers, and unused batch transforms were
-removed. Retained function and method definitions are verbatim; imports and
-module/class descriptions were trimmed. `features/text.py`, `features/numeric.py`,
-and the complete `BGEOnnxEncoder` definition are unchanged. `input_contract.py`
-and `calibration.py` also contain verbatim extracted definitions.
+`_vendor/` retains only the inference subset. Training, artifact export/loading,
+BERT, registry CLI, unused batch transforms, training-only transformer
+constructors, and unused encoder inspection/context-manager methods were removed.
+The local loader owns the encoder and featurizer directly, without the redundant
+feature-runtime wrapper. The unused SQLite embedding cache and its identity
+helpers were removed; encoder construction, close, and encode retain the
+original memory-cache path with only the unused persistence branches removed.
+Tokenization, ONNX execution, batching, ordering, and normalization are unchanged.
+Other retained function/method definitions are verbatim; imports and module/class
+descriptions were trimmed. `features/text.py`, `features/numeric.py`,
+`input_contract.py`, and `calibration.py` retain the original extracted definitions.
 The original training package declares `LicenseRef-Proprietary`; that declaration
 and its original package metadata are retained in `assets/upstream-pyproject.toml`.
 The frozen snapshot contains no separate license file. These source files retain
