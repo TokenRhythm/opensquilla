@@ -9,31 +9,6 @@ workflow downloads release assets from GitHub, verifies `SHA256SUMS`, then
 uploads version-scoped assets, moving installer aliases, and strict JSON
 channel manifests used by update clients.
 
-## Windows UAT test installers
-
-The `Windows UAT Test Installer` workflow also mirrors its checked Actions
-artifact to the existing bucket. This uses the same repository variables and
-secrets described below and needs `ListObjects`, `PutObject`, `GetObject`,
-`DeleteObject` and the multipart-upload permissions used by the release mirror
-on `<prefix>/test/windows/`. The default destination is:
-
-```text
-releases/test/windows/<github-run-id>-<run-attempt>/OpenSquilla-<version>-test-<timestamp>-win-x64.exe
-```
-
-The installer and its `.sha256` file are uploaded with ossutil's default CRC64
-verification. The job checks the anonymous installer size and checksum file,
-then writes domestic download links to its summary. It does not publish a
-Release or change `latest/`, `channels/` or versioned release assets.
-
-After a successful upload, the job deletes objects older than 14 days only
-under `<prefix>/test/windows/`. Cleanup failures produce a warning without
-hiding working download links. Cleanup runs with subsequent successful uploads,
-not on a schedule; the final build remains until another upload or manual
-cleanup. If bucket versioning is enabled, this removes visible objects but old
-versions still require an OSS lifecycle rule to reclaim storage. The workflow
-does not change bucket lifecycle or versioning settings.
-
 ## Repository transfer boundary
 
 New releases are sourced from the canonical GitHub repository

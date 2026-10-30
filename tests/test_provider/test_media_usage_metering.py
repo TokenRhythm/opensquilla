@@ -629,6 +629,148 @@ async def test_delivered_video_status_refreshes_pending_bill_without_regeneratio
         await storage.close()
 
 
+@pytest.mark.parametrize(
+    "account,base",
+    [
+        pytest.param(True, "https://tokenrhythm.studio/v1", id="account-official-base"),
+        pytest.param(True, "https://old-provider.invalid/v1", id="account-stale-custom-base"),
+        pytest.param(False, "https://tokenrhythm.studio/v1", id="manual-key"),
+    ],
+)
+async def test_delivered_video_billing_uses_original_account_transport(
+    tmp_path, monkeypatch, account, base
+):
+    from opensquilla import desktop_account as bridge
+    from opensquilla.gateway.config import VideoGenerationConfig
+    from opensquilla.provider.media_jobs import credential_fingerprint
+    from opensquilla.provider.tokenrhythm_video_generation import generate_tokenrhythm_video
+    from opensquilla.provider.video_generation_credentials import VideoGenerationCredential
+    from opensquilla.tools.builtin import media
+    from opensquilla.tools.types import CallerKind, ToolContext, current_tool_context
+
+    key = "os_local_" + "x" * 43 if account else "synthetic-manual-key"
+    job, session = "delayed-bill-job", "webchat:original-owner"
+    authority = ("https://tokenrhythm.studio", "synthetic-account") if account else None
+    cached_payload = json.dumps({"status": "ok", "job_id": job})
+    requests = []
+    polls = 0
+    original_client = httpx.AsyncClient
+
+    def handler(request):
+        nonlocal polls
+        # Account leases may reach only the desktop proxy. A plain HTTP client
+        # must not send them directly to either the official or a stale host.
+        assert request.url.host == ("127.0.0.1" if account else "tokenrhythm.studio")
+        assert request.url.scheme == ("http" if account else "https")
+        assert request.headers["host"] == (
+            "127.0.0.1:12345" if account else "tokenrhythm.studio"
+        )
+        assert request.headers["authorization"] == f"Bearer {key}"
+        requests.append((request.method, request.url.path))
+        if request.method == "POST":
+            assert request.url.path == "/v1/videos/generations"
+            return httpx.Response(202, json={"id": job, "status": "queued"})
+        assert request.method == "GET" and request.url.path == f"/v1/videos/{job}"
+        polls += 1
+        return httpx.Response(
+            200,
+            json={
+                "id": job,
+                "status": "success",
+                "billing": {
+                    "pending": polls == 1,
+                    "total_cost_cny": "1.1" if polls == 1 else "1.15",
+                },
+                "usage": {"output_seconds": 2},
+                "result": {"url": "https://media.example.invalid/synthetic.mp4"},
+            },
+        )
+
+    def client(**kwargs):
+        # Keep AccountProxyTransport intact; mock only its underlying network
+        # transport and the default transport used for a manual API key.
+        kwargs.setdefault("transport", httpx.MockTransport(handler))
+        kwargs["trust_env"] = False
+        return original_client(**kwargs)
+
+    monkeypatch.setattr(httpx, "AsyncClient", client)
+    monkeypatch.setattr(httpx, "AsyncHTTPTransport", lambda **kwargs: httpx.MockTransport(handler))
+    if account:
+        monkeypatch.setitem(bridge._leases, key, "http://127.0.0.1:12345")
+    monkeypatch.setattr(media, "_video_job_sessions", {})
+    config = VideoGenerationConfig(
+        enabled=True,
+        provider="tokenrhythm",
+        primary="synthetic-video",
+        providers={"tokenrhythm": {"base_url": base}},
+    )
+    credential = VideoGenerationCredential(
+        available=True, api_key=key, account_authority=authority
+    )
+    monkeypatch.setattr(media, "_video_request_config", lambda: (config, credential))
+
+    async def download(**kwargs):
+        kwargs["output_path"].write_bytes(b"synthetic-offline-video")
+        return kwargs["output_path"].stat().st_size
+
+    def unexpected_adapter(_provider):
+        raise AssertionError("A delivered video must not be generated or downloaded again")
+
+    monkeypatch.setattr("opensquilla.provider.video_download.download_video_url", download)
+    monkeypatch.setattr(media, "_video_adapter", unexpected_adapter)
+    storage = SessionStorage(str(tmp_path / "account-delayed-bill.db"))
+    await storage.connect()
+    token = current_tool_context.set(ToolContext(caller_kind=CallerKind.WEB, session_key=session))
+    try:
+        with bind_usage_accounting_scope(scope(SessionUsageEventSink(storage), "original-owner")):
+            result = await generate_tokenrhythm_video(
+                base_url=base,
+                api_key=key,
+                model="synthetic-video",
+                prompt="synthetic fixture",
+                duration=2,
+                aspect_ratio="16:9",
+                resolution="720p",
+                output_path=tmp_path / "synthetic.mp4",
+            )
+            assert result.output_path.is_file()
+            [event] = await storage.query_usage_events(None, None)
+            [pending] = await storage.query_usage_settlements([event.event_id])
+            assert (pending["authority"], pending["status"], pending["native_amount"]) == (
+                "unknown", "pending", "1.1"
+            )
+            media._video_job_sessions[job] = media._VideoJobReceipt(
+                session_key=session,
+                credential_fingerprint="" if account else credential_fingerprint(key),
+                account_authority=authority,
+                provider="tokenrhythm",
+                model="synthetic-video",
+                base_url=base,
+                native_job_id=job,
+                completed_payload=cached_payload,
+            )
+        with bind_usage_accounting_scope(scope(SessionUsageEventSink(storage), "later-turn")):
+            assert await media.video_status(job) == cached_payload
+            [final] = await storage.query_usage_settlements([event.event_id])
+            assert (final["authority"], final["status"], final["native_amount"]) == (
+                "provider_confirmed", "final", "1.15"
+            )
+            revisions = await storage.query_usage_settlements([event.event_id], history=True)
+            assert await media.video_status(job) == cached_payload
+        assert event.session_id == "original-owner"
+        assert len(await storage.query_usage_events(None, None)) == 1
+        assert len(revisions) == 3
+        assert await storage.query_usage_settlements([event.event_id], history=True) == revisions
+        assert requests == [
+            ("POST", "/v1/videos/generations"),
+            ("GET", f"/v1/videos/{job}"),
+            ("GET", f"/v1/videos/{job}"),
+        ]
+    finally:
+        current_tool_context.reset(token)
+        await storage.close()
+
+
 def test_catalog_quote_does_not_override_provider_estimate():
     from opensquilla.provider.media_pricing import media_settlement
     from opensquilla.usage_metering import UsageSettlementRevision

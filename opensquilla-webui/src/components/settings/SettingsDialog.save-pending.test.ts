@@ -867,6 +867,35 @@ describe('SettingsDialog keyboard focus loop', () => {
 })
 
 describe('SettingsDialog exit protection', () => {
+  it.each(['docked', 'collapsed'])('restores the visible account trigger after its %s menu item unmounts', async (layout) => {
+    const controls = mockCatalog()
+    controls.saveAllPending.value = false
+    controls.hasUnsavedChanges.value = false
+    catalogApi.dirtySections.value = []
+    const sidebar = document.createElement('div')
+    sidebar.className = 'sidebar-foot'
+    sidebar.innerHTML = '<button data-testid="sidebar-account-trigger">Account</button>'
+    const dockedTrigger = sidebar.querySelector<HTMLButtonElement>('button')!
+    const collapsedTrigger = document.createElement('button')
+    collapsedTrigger.dataset.testid = 'sidebar-account-trigger'
+    const opener = document.createElement('button')
+    opener.dataset.testid = 'sidebar-toggle-collapsed'
+    opener.style.display = 'none'
+    const menuItem = document.createElement('button')
+    menuItem.textContent = 'Settings'
+    document.body.append(sidebar, collapsedTrigger, opener, menuItem)
+    if (layout === 'collapsed') sidebar.setAttribute('inert', '')
+    else collapsedTrigger.hidden = true
+    menuItem.focus()
+    await mountDialog()
+    menuItem.remove()
+
+    document.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true }))
+    await nextTick()
+
+    expect(document.activeElement).toBe(layout === 'collapsed' ? collapsedTrigger : dockedTrigger)
+  })
+
   it.each(['inert', 'hidden', 'cold'])('restores the sidebar opener when the Settings entry is %s', async (state) => {
     const controls = mockCatalog()
     controls.saveAllPending.value = false

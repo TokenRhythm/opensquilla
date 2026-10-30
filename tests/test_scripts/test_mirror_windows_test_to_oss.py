@@ -76,10 +76,10 @@ def test_mirrors_checked_artifact_and_only_prunes_old_test_objects(mirror_env):
     ]
     assert (
         "https://test-bucket.oss-cn-beijing.aliyuncs.com/releases/test/windows/12345-2/"
-        in summary.read_text()
+        in summary.read_text(encoding="utf-8")
     )
-    assert "abc123" in summary.read_text()
-    assert "test-secret" not in summary.read_text()
+    assert "abc123" in summary.read_text(encoding="utf-8")
+    assert "test-secret" not in summary.read_text(encoding="utf-8")
 
 
 def test_rejects_wrong_sha256_before_upload(mirror_env):
@@ -150,13 +150,15 @@ def test_cleanup_failure_preserves_download_links_and_reports_warning(
     monkeypatch.setattr(module.subprocess, "run", run)
     module.mirror(assets)
     assert len(calls) == 2
-    assert "下载安装包" in summary.read_text()
-    assert "storage may accumulate" in summary.read_text()
+    assert "下载安装包" in summary.read_text(encoding="utf-8")
+    assert "storage may accumulate" in summary.read_text(encoding="utf-8")
     assert "::warning::" in capsys.readouterr().out
 
 
 def test_workflow_only_mirrors_successful_build_and_keeps_credentials_in_upload_step():
-    workflow = yaml.safe_load(Path(".github/workflows/windows-test-installer.yml").read_text())
+    workflow = yaml.safe_load(
+        Path(".github/workflows/windows-test-installer.yml").read_text(encoding="utf-8")
+    )
     job = workflow["jobs"]["mirror-to-oss"]
     assert job["needs"] == "build"
     assert job["if"] == "github.repository == 'TokenRhythm/opensquilla'"

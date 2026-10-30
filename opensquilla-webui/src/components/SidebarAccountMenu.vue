@@ -28,6 +28,7 @@ function keydown(event: KeyboardEvent) {
   items[next]?.focus()
 }
 function navigate(section: string) { close(); void router.push(`/settings/${section}`) }
+function openSettings() { close(true); emit('settings') }
 async function login() { navigate('account'); await account.action('login').catch(() => {}) }
 function requestLogout() { close(true); logoutOpen.value = true }
 onMounted(() => { void account.init(); document.addEventListener('pointerdown', outside) })
@@ -36,14 +37,14 @@ onUnmounted(() => document.removeEventListener('pointerdown', outside))
 
 <template>
   <div ref="root" class="sidebar-account" :class="{ 'is-collapsed': collapsed }">
-    <button ref="trigger" class="sidebar-fn-item" type="button" :aria-label="account.loggedIn ? account.name : t('account.loginSettings')" :title="account.loggedIn ? account.name : t('account.loginSettings')" aria-haspopup="menu" :aria-expanded="open" @click="toggle" @keydown.down.prevent="toggle">
+    <button ref="trigger" class="sidebar-fn-item" data-testid="sidebar-account-trigger" type="button" :aria-label="account.loggedIn ? account.name : t('account.loginSettings')" :title="account.loggedIn ? account.name : t('account.loginSettings')" aria-haspopup="menu" :aria-expanded="open" @click="toggle" @keydown.down.prevent="toggle">
       <span class="sidebar-account__avatar" aria-hidden="true"><template v-if="account.loggedIn">{{ account.initial }}</template><Icon v-else name="user" :size="17" /></span>
       <span class="sidebar-fn-label sidebar-account__name">{{ account.loggedIn ? account.name : t('account.loginSettings') }}</span>
       <Icon class="sidebar-fn-label" name="chevronDown" :size="14" />
     </button>
     <div v-if="open" class="sidebar-account__menu" role="menu" :aria-label="t('account.title')" @keydown="keydown">
       <button v-if="!account.loggedIn" role="menuitem" :disabled="account.busy" @click="login">{{ t('account.login') }}</button>
-      <button role="menuitem" @click="close(); emit('settings')">{{ t('chrome.settings') }}</button>
+      <button role="menuitem" data-testid="sidebar-account-settings" @click="openSettings">{{ t('chrome.settings') }}</button>
       <button v-if="account.loggedIn" role="menuitem" :disabled="account.busy" @click="requestLogout">{{ t('account.logout') }}</button>
     </div>
     <AccountLogoutDialog :open="logoutOpen" @close="logoutOpen = false" />

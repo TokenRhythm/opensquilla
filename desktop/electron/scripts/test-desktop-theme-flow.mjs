@@ -9,6 +9,7 @@ import {
   canAcceptWindowsElectronShutdownFallback,
   closeElectronWithDeadline,
   desktopShutdownEvidenceSince,
+  requestElectronQuitWithConfirmation,
 } from './e2e-shutdown-helpers.mjs'
 
 const scriptDir = dirname(fileURLToPath(import.meta.url))
@@ -225,11 +226,17 @@ try {
   // Exercise the same SPA navigation path as an operator. A hard page.goto()
   // can race a still-settling draft ChatView canonicalization on slower
   // Windows runners and be replaced by /chat/new even though the renderer is
-  // healthy; clicking the permanent settings control also proves the shell is
-  // still interactive before testing the theme panel.
-  const settingsButton = page.locator('button.sidebar-fn-item[data-icon="settings"]')
-  await settingsButton.waitFor({ state: 'visible', timeout: 20_000 })
-  await settingsButton.click()
+  // healthy; opening Settings through the shell also proves it is interactive.
+  // Account-capable clients place Settings inside the account menu; clients
+  // without that capability retain the direct footer entry.
+  const settingsEntry = page.locator(
+    '[data-testid="sidebar-account-trigger"]:visible, '
+    + 'button.sidebar-fn-item[data-icon="settings"]:visible',
+  ).first()
+  await settingsEntry.waitFor({ state: 'visible', timeout: 20_000 })
+  const accountMenu = await settingsEntry.getAttribute('data-testid') === 'sidebar-account-trigger'
+  await settingsEntry.click()
+  if (accountMenu) await page.getByTestId('sidebar-account-settings').click()
   await page.waitForURL(url => url.pathname.includes('/settings'), {
     timeout: 20_000,
   })
@@ -285,9 +292,8 @@ try {
   })
 
   // The native renderer can finish these local theme checks while its owned
-  // Gateway is still starting. Wait for the verified connection before the
-  // ordinary idle app.close(); otherwise Quit correctly asks about unknown
-  // activity after Playwright has already disposed its main-process channel.
+  // Gateway is still starting. Wait for the verified connection before cleanup;
+  // a later unavailable activity probe still follows the normal quit dialog.
   await waitFor(async () => {
     const connection = await page.evaluate(() => window.opensquillaDesktop?.getGatewayConnection?.())
     return connection?.status === 'ready' && /^[0-9a-f]{64}$/.test(connection.authToken ?? '')
@@ -335,6 +341,9 @@ try {
       app: desktopApp,
       phase: 'theme-final-shutdown',
       timeoutMs: ELECTRON_SHUTDOWN_TIMEOUT_MS,
+      requestClose: options => requestElectronQuitWithConfirmation(desktopApp, {
+        ...options, requireConfirmation: false,
+      }),
       diagnostics: async () => {
         const log = await readFile(desktopLogPath, 'utf8').catch(() => null)
         if (log === null) return { logReadFailed: true }

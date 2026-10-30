@@ -76,6 +76,7 @@ function harness({ exited = false, platform = 'darwin', complete = true } = {}) 
     DesktopQuitBudget, DESKTOP_QUIT_TERMINATION_MS,
     appExitPhase: 'running', isQuitting: false, updateApplying: false, gatewayStoppingProcesses: new Set([child]),
     gatewayProcess: child, gatewayState: { owned: true }, stopAndJoinLifecycleProcesses,
+    gatewayProcessDiagnostics: new WeakMap(),
     restartAllowed: true, transitionGatewayConnection: () => order.push('profile-error'),
     cancelGatewayUnexpectedExitRestart() {}, desktopStartupLog() {},
     stopGateway() { assert.fail('this synthetic join begins after root exit') },

@@ -335,7 +335,8 @@ def test_desktop_explicit_exit_cannot_be_converted_back_to_window_hiding() -> No
     assert "setAppExitPhase('draining'" in before_quit
     assert "setAppExitPhase('committed'" in before_quit
     failure = _section(main_ts, "function showDesktopQuitFailure", "app.on('before-quit'")
-    assert "showDesktopQuitFailure()" in before_quit
+    assert "showDesktopQuitFailure(" in before_quit
+    assert "isQuitting = true" in failure
     assert "setAppExitPhase('failed'" in failure
     assert "setAppExitPhase('running'" not in failure
     assert "if (systemSessionEnding)" in before_quit
@@ -1401,10 +1402,16 @@ def test_reset_desktop_settings_forces_onboarding_before_gateway_reuse() -> None
     assert "inspectDesktopCleanup('reset-current-settings')" in cleanup_reset
     assert "desktopCleanupPreviews.consume(" in cleanup_reset
     assert "applyApprovedDesktopCleanup(preview" in cleanup_reset
-    assert "await waitForDesktopWriterOperations(1)" in cleanup_apply
-    assert "await stopOwnedGatewayAndWait()" in cleanup_apply
-    assert "runDesktopCleanupCli(active, 'cleanup-inspect'" in cleanup_apply
-    assert "runDesktopCleanupCli(active, 'cleanup-apply'" in cleanup_apply
+    drain = re.search(r"await\s+Promise\.all\(\[(.*?)\]\)", cleanup_apply, re.DOTALL)
+    assert drain is not None
+    assert "waitForDesktopWriterOperations(1)" in drain.group(1)
+    assert "accountPause.wait(" in drain.group(1)
+    admission = cleanup_apply.index("desktopWriters.tryBeginExclusive(")
+    pause = cleanup_apply.index("accountPause = pauseAccountsForMaintenance(")
+    stop = cleanup_apply.index("await stopOwnedGatewayAndWait()")
+    inspect = cleanup_apply.index("runDesktopCleanupCli(active, 'cleanup-inspect'")
+    apply = cleanup_apply.index("runDesktopCleanupCli(active, 'cleanup-apply'")
+    assert admission < pause < drain.start() < drain.end() < stop < inspect < apply
     assert "report.mode === 'reset-current-settings'" in cleanup_apply
     assert "forceOnboardingOnNextStartup = true" in cleanup_apply
     assert "clearReusableGatewayState()" in cleanup_apply
@@ -1584,8 +1591,22 @@ def test_desktop_onboarding_is_owned_nonmodal_child_of_main_window() -> None:
 def test_desktop_onboarding_defaults_to_tokenrhythm_with_trusted_registration_cta() -> None:
     main_ts = _read("desktop/electron/src/main.ts")
     html = _section(main_ts, "function onboardingHtml", "async function runOnboarding")
+    environment = _read("desktop/electron/src/tokenrhythm-environment.ts")
+    run = _section(main_ts, "async function runOnboarding", "async function pathExists")
 
-    assert "const TOKENRHYTHM_REGISTER_URL = 'https://tokenrhythm.studio/register'" in main_ts
+    assert "DEFAULT_TOKENRHYTHM_ORIGIN = 'https://tokenrhythm.studio'" in environment
+    assert "return accountOrigin(origin)" in environment
+    assert "const tokenrhythmAccountOrigin = resolveAccountOrigin(" in main_ts
+    assert "new URL('/register', tokenrhythmAccountOrigin).href" in main_ts
+    external_link = _section(run, "window.webContents.setWindowOpenHandler", "// The wizard")
+    assert "if (url === TOKENRHYTHM_REGISTER_URL)" in external_link
+    assert "shell.openExternal(TOKENRHYTHM_REGISTER_URL)" in external_link
+    assert "return { action: 'deny' }" in external_link
+    navigation = _section(run, "const guardOnboardingNavigation", "// Rebuild the app menu")
+    assert navigation.index("event.preventDefault()") < navigation.index(
+        "if (targetUrl === TOKENRHYTHM_REGISTER_URL)"
+    )
+    assert "shell.openExternal(TOKENRHYTHM_REGISTER_URL)" in navigation
     assert '<input id="provider" type="hidden" value="tokenrhythm" />' in html
     assert 'id="tokenrhythmRegister"' in html
     assert 'href="${TOKENRHYTHM_REGISTER_URL}"' in html
@@ -3287,9 +3308,9 @@ def test_desktop_quit_joins_children_already_stopping_for_other_lifecycles() -> 
     before_quit = _section(main_ts, "app.on('before-quit'", "function shutdownFromSignal")
 
     assert "const gatewayStoppingProcesses = new Set" in main_ts
-    assert stop.index("trackStoppingGatewayProcess(child)") < stop.index(
-        "gatewayProcess = null"
-    )
+    stopping_call = re.search(r"\btrackStoppingGatewayProcess\(\s*child\s*[,)]", stop)
+    assert stopping_call is not None
+    assert stopping_call.start() < stop.index("gatewayProcess = null")
     assert "requestOwnedGatewayShutdown(child, url)" in stop
     assert "requestGatewayShutdown(url)" not in stop
     assert "const children = new Set(gatewayStoppingProcesses)" in main_ts
@@ -3378,11 +3399,12 @@ def test_desktop_quit_failure_is_fail_closed_and_retryable() -> None:
     before_quit = _section(main_ts, "app.on('before-quit'", "function shutdownFromSignal")
 
     assert "quitUnconfirmedProcessTrees.size === 0" in before_quit
+    assert "accountsClosed && results.every(Boolean)" in before_quit
     assert "if (exited)" in before_quit
     assert before_quit.index("if (exited)") < before_quit.index("app.exit(0)")
     failed_drain = _section(before_quit, "// Fail closed while", "return\n  }")
     assert "quitGatewayDrainPromise = null" in failed_drain
-    assert "showDesktopQuitFailure()" in failed_drain
+    assert "showDesktopQuitFailure(accountShutdownFailed)" in failed_drain
     failed = _section(main_ts, "function showDesktopQuitFailure", "app.on('before-quit'")
     assert "isQuitting = true" in failed
     assert "setAppExitPhase('failed'" in failed
@@ -3477,6 +3499,13 @@ def test_desktop_e2e_flows_keep_bounded_shutdown_and_fail_closed_log_reads() -> 
     )
     assert "await app.close()" not in profile_import_flow
     assert "app.close().catch(() => {})" not in profile_import_flow
+    for flow in (profile_flow, profile_import_flow):
+        profile_close = _section(flow, "async function closeActiveApp(", "\ntry {")
+        assert (
+            "requestClose: options => requestElectronQuitWithConfirmation(targetApp, {"
+            in profile_close
+        )
+        assert "...options, requireConfirmation: false," in profile_close
     for flow in (window_flow, theme_flow):
         assert "const ELECTRON_SHUTDOWN_TIMEOUT_MS = 15_000" in flow
         assert "closeElectronWithDeadline" in flow
@@ -3484,6 +3513,12 @@ def test_desktop_e2e_flows_keep_bounded_shutdown_and_fail_closed_log_reads() -> 
         assert "canAcceptWindowsElectronShutdownFallback" in flow
         assert "flowSucceeded && shutdownError" in flow
         assert ".close().catch(() => {})" not in flow
+        final_shutdown = flow[flow.rindex("\n} finally {"):]
+        assert (
+            "requestClose: options => requestElectronQuitWithConfirmation(desktopApp, {"
+            in final_shutdown
+        )
+        assert "...options, requireConfirmation: false," in final_shutdown
 
 
 def test_desktop_shutdown_diagnostics_report_file_cleanup_errors_without_masking_exit() -> None:
@@ -3982,13 +4017,17 @@ def test_complete_profile_import_holds_exclusive_writer_admission_through_reconc
         "ipcMain.handle('desktop:migration:last-result'",
     )
     assert "desktopWriters.tryBeginExclusive" in settings_run
-    assert "await waitForDesktopWriterOperations(1)" in settings_run
+    drain = re.search(r"await\s+Promise\.all\(\[(.*?)\]\)", settings_run, re.DOTALL)
+    assert drain is not None
+    assert "waitForDesktopWriterOperations(1)" in drain.group(1)
+    assert "accountPause.wait(" in drain.group(1)
     assert "exclusive.finish()" in settings_run
     assert "desktopWriters.reopen(exclusive.admissionToken)" in settings_run
-    assert settings_run.index("tryBeginExclusive") < settings_run.index("'--apply'")
-    assert settings_run.index("'--apply'") < settings_run.index("exclusive.finish()")
+    assert settings_run.index("tryBeginExclusive") < drain.start()
+    assert drain.end() < settings_run.index("'--apply'")
+    reconcile = settings_run.index("reconcileImportedDesktopCredential(intent, true)")
+    assert settings_run.index("'--apply'") < reconcile < settings_run.index("exclusive.finish()")
 
-    assert "reconcileImportedDesktopCredential(intent, true)" in settings_run
     save_credential = _section(
         main_ts,
         "async function saveDesktopCredential",
@@ -4048,9 +4087,16 @@ def test_settings_import_reconciles_or_prompts_for_imported_provider() -> None:
     assert "pendingProviderSetup," in onboarding
     assert "onboardingMigrationCandidates" not in onboarding
     assert "desktopSecretStoragePolicyBackend() === 'safeStorage'" in prepare
-    assert prepare.index("desktopSecretStoragePolicyBackend() === 'safeStorage'") < prepare.index(
-        "if (!pendingProviderSetup && existing && isConnectionReady(existing))"
+    reuse = prepare.index(
+        "if (!pendingProviderSetup && existing && credentialReadable "
+        "&& isConnectionReady(existing))"
     )
+    assert "existing?.encryption !== 'safeStorage'" in prepare
+    assert prepare.index("const credentialReadable =") < reuse
+    assert prepare.index("desktopSecretStoragePolicyBackend() === 'safeStorage'") < prepare.index(
+        "'keychain_unavailable'"
+    )
+    assert prepare.index("'keychain_unavailable'") < reuse
 
     reconcile = _section(
         main_ts,

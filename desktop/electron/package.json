@@ -1,6 +1,6 @@
 {
   "name": "@opensquilla/desktop-electron",
-  "version": "0.5.8",
+  "version": "0.5.7",
   "private": true,
   "description": "Electron desktop shell for the OpenSquilla Control UI.",
   "repository": {
@@ -121,7 +121,13 @@
   },
   "overrides": {
     "global-agent@3.0.0": {
-      "roarr": "3.3.0"
+      "roarr": {
+        ".": "3.3.0",
+        "fast-json-stringify": "5.16.1"
+      }
+    },
+    "fast-json-stringify@5.16.1": {
+      "fast-uri": "3.1.9"
     }
   },
   "build": {

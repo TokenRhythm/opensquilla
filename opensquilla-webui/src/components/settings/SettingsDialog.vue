@@ -807,6 +807,7 @@ function usableInvoker(): HTMLElement | null {
 function restoreSettingsFocus() {
   const targets = [
     usableInvoker(),
+    ...document.querySelectorAll<HTMLElement>('[data-testid="sidebar-account-trigger"]'),
     document.querySelector<HTMLElement>('.sidebar-foot button[data-icon="settings"]'),
     document.querySelector<HTMLElement>('[data-testid="sidebar-toggle-collapsed"]'),
   ]

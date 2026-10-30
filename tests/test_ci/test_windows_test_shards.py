@@ -668,6 +668,7 @@ def test_telemetry_process_probes_are_explicitly_serial(function_name: str) -> N
     "test_close_drains_native_before_reconnect",
     "test_close_probe_rejects_broken_resource_contracts",
     "test_close_probe_watchdog_terminates_noncooperative_close",
+    "test_concurrent_close_is_serial_and_cancellation_keeps_physical_ownership",
 ])
 def test_recovery_close_probes_are_explicitly_serial(function_name: str) -> None:
     assert "pytest.mark.ci_serial" in _function_decorators(
@@ -678,7 +679,7 @@ def test_recovery_close_probes_are_explicitly_serial(function_name: str) -> None
 @pytest.mark.ci_serial
 @pytest.mark.parametrize(("target", "serial_count"), [
     ("tests/test_telemetry/test_client_runtime.py", 5),
-    ("tests/test_session/test_recovery_reads.py", 9),
+    ("tests/test_session/test_recovery_reads.py", 11),
     ("tests/test_gateway/test_native_attachment_import.py", 3),
     ("tests/test_observability/test_http_client.py", 2),
     ("tests/test_recovery/test_runtime_writer_guard.py", 3),

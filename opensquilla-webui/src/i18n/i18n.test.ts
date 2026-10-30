@@ -505,7 +505,10 @@ describe('catalog parity', () => {
   it('no zh-Hans value is left as the English source', () => {
     const enFlat = flatten(en as Record<string, unknown>)
     const zhFlat = flatten(zhHans as Record<string, unknown>)
-    const intentionalEnglishTerms = new Set(['chat.routerFx.ensembleTokens'])
+    const intentionalEnglishTerms = new Set([
+      'chat.routerFx.ensembleTokens',
+      'account.manualKey', // TokenRhythm · API Key is a product/credential label.
+    ])
     const leaked = Object.keys(enFlat).filter(
       (k) =>
         typeof zhFlat[k] === 'string'
