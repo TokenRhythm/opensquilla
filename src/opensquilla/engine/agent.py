@@ -7332,6 +7332,26 @@ class Agent:
                             self._provider_call_tool_result_retrieval_available = (
                                 previous_call_retrieval
                             )
+                        # A quality upgrade must not commit when this call is
+                        # already forbidden by the turn's execution budget.
+                        terminal_error = (
+                            _turn_llm_call_budget_error(turn_llm_calls + 1) or _turn_budget_error()
+                        )
+                        if terminal_error is not None:
+                            self._write_turn_call_log(
+                                "turn_policy_decision",
+                                action=("stop"),
+                                reason=terminal_error.message,
+                                code=terminal_error.code,
+                                sent_llm_calls=turn_llm_calls,
+                                attempted_llm_call=turn_llm_calls + 1,
+                                iteration=iterations,
+                                attempt=_call_attempt,
+                            )
+                            yield self._transition(AgentState.ERROR)
+                            yield terminal_error
+                            break
+
                         if pending_model_quality_retry is not None:
                             if selector_projects_images:
                                 # Bind this iteration's barrier before candidate
@@ -7545,23 +7565,6 @@ class Agent:
                             attempt=_call_attempt,
                             sanitize=request_sanitize_result,
                         )
-
-                        next_call_budget_error = _turn_llm_call_budget_error(turn_llm_calls + 1)
-                        terminal_error = next_call_budget_error
-                        if terminal_error is not None:
-                            self._write_turn_call_log(
-                                "turn_policy_decision",
-                                action=("stop"),
-                                reason=terminal_error.message,
-                                code=terminal_error.code,
-                                sent_llm_calls=turn_llm_calls,
-                                attempted_llm_call=turn_llm_calls + 1,
-                                iteration=iterations,
-                                attempt=_call_attempt,
-                            )
-                            yield self._transition(AgentState.ERROR)
-                            yield terminal_error
-                            break
 
                         call_chat_cfg = chat_cfg
                         if tool_failure_finalization_pending:

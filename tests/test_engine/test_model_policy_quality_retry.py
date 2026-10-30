@@ -557,3 +557,160 @@ async def test_quality_retry_projects_the_same_physical_leg_as_dispatch(
     events = [event async for event in wrapper.chat(messages, config=admitted_config)]
     assert events
     assert dispatched == [(admitted_messages, admitted_config)]
+
+
+async def test_quality_retry_uses_compacted_request_instead_of_original_history(
+    execution, monkeypatch,
+) -> None:
+    import opensquilla.engine.model_router_quality as quality
+    from opensquilla.engine.runtime import _SelectorFallbackProvider
+    from opensquilla.engine.steps.model_router import ModelRouteError, validate_model_route_capacity
+
+    e = execution
+    e.turn.config.llm.thinking = "off"
+    e.turn.config.llm.max_tokens = 1024
+    e.turn.config.squilla_router.auto_thinking = False
+    e.turn.config.squilla_router.tiers["c1"]["model"] = "openai/gpt-4o"
+    # The original history fits C0's window, but exceeds C1's smaller window.
+    # Agent now holds the admitted compacted view, not these entry-time estimates.
+    e.turn.metadata.update(
+        routing_history_capacity_estimated_tokens=150_000,
+        routing_history_capacity_message_count=100,
+        routing_history_capacity_estimate_complete=True,
+    )
+    validate_model_route_capacity(e.turn, tier="c0")
+    with pytest.raises(ModelRouteError, match="cannot fit"):
+        validate_model_route_capacity(e.turn, tier="c1")
+    provider = _QualityProvider([_tool_stream(1), _final_stream()])
+    wrapper = _SelectorFallbackProvider(provider, e.selector, e.turn.metadata)
+    agent = _agent(provider)
+    agent.provider = wrapper
+    agent.config.metadata = e.turn.metadata
+    agent.config.model_id = e.turn.model
+    agent.config.provider_id = "openrouter"
+    agent.config.thinking = False
+    agent.config.max_tokens = 1024
+    agent.set_history([Message(role="user", content="Compacted previous task summary.")])
+    projected = []
+    dispatched = []
+    project = quality.project_provider_final_request
+
+    def capture(candidate, messages, tools, config):
+        projection = project(candidate, messages, tools, config)
+        assert projection is not None and projection.fits
+        projected.append(projection.payload)
+        return projection
+
+    async def candidate_chat(candidate, messages, tools=None, config=None):
+        rows = await e.manager.get_model_router_transcript(e.node.session_key)
+        assert rows[0].turn_context["router_model_decision"]["state"]["tier"] == "c1"
+        projection = project(candidate, messages, tools, config)
+        assert projection is not None and projection.fits
+        dispatched.append(projection.payload)
+        for event in _final_stream():
+            yield event
+
+    monkeypatch.setattr(quality, "project_provider_final_request", capture)
+    monkeypatch.setattr(type(e.provider), "chat", candidate_chat)
+    events = [event async for event in agent.run_turn("hello")]
+
+    assert len(provider.calls) == 1
+    assert len(dispatched) == 1
+    assert dispatched == projected
+    assert e.selector.current_config.model == "openai/gpt-4o"
+    assert e.turn.metadata["router_model_decision"]["quality_retry"]["used"] is True
+    assert any(event.kind == "done" and event.text == "done" for event in events)
+
+
+@pytest.mark.parametrize("call_limit", [1, 2])
+async def test_quality_retry_checks_call_budget_before_durable_upgrade(
+    execution, monkeypatch, call_limit,
+) -> None:
+    from opensquilla.engine.runtime import _SelectorFallbackProvider
+
+    e = execution
+    e.turn.config.llm.thinking = "off"
+    e.turn.config.squilla_router.auto_thinking = False
+    before = copy.deepcopy(e.turn.metadata["router_model_decision"])
+    advance = AsyncMock(wraps=e.manager.advance_model_router_quality_retry)
+    monkeypatch.setattr(e.manager, "advance_model_router_quality_retry", advance)
+    provider = _QualityProvider([_tool_stream(1), _final_stream()])
+    wrapper = _SelectorFallbackProvider(provider, e.selector, e.turn.metadata)
+    agent = _agent(provider)
+    agent.provider = wrapper
+    agent.config.metadata = e.turn.metadata
+    agent.config.model_id = e.turn.model
+    agent.config.provider_id = "openrouter"
+    agent.config.thinking = False
+    agent.config.max_turn_llm_calls = call_limit
+    dispatched = []
+
+    async def candidate_chat(candidate, messages, tools=None, config=None):
+        rows = await e.manager.get_model_router_transcript(e.node.session_key)
+        assert rows[0].turn_context["router_model_decision"]["state"]["tier"] == "c1"
+        dispatched.append(messages)
+        for event in _final_stream():
+            yield event
+
+    monkeypatch.setattr(type(e.provider), "chat", candidate_chat)
+    events = [event async for event in agent.run_turn("hello")]
+
+    assert len(provider.calls) == 1
+    rows = await e.manager.get_model_router_transcript(e.node.session_key)
+    durable = rows[0].turn_context["router_model_decision"]
+    if call_limit == 1:
+        advance.assert_not_awaited()
+        assert not dispatched
+        assert durable == before == e.turn.metadata["router_model_decision"]
+        assert e.selector.current_config.model == e.turn.model == "qwen/qwen3.7-flash"
+        assert wrapper._provider is provider
+        assert any(
+            event.kind == "error" and event.code == "turn_llm_call_budget_exceeded"
+            for event in events
+        )
+    else:
+        advance.assert_awaited_once()
+        assert len(dispatched) == 1
+        assert durable["state"]["tier"] == "c1"
+        assert durable["quality_retry"]["used"] is True
+        assert any(event.kind == "done" and event.text == "done" for event in events)
+
+
+@pytest.mark.parametrize("window_kind", ["unknown", "authority_limit"])
+async def test_quality_retry_retains_deployment_capacity_boundaries(
+    execution, monkeypatch, window_kind,
+) -> None:
+    from types import SimpleNamespace
+
+    import opensquilla.engine.model_router_quality as quality
+    from opensquilla.engine.runtime import _SelectorFallbackProvider
+
+    e = execution
+    e.turn.config.llm.thinking = "off"
+    e.turn.config.llm.max_tokens = 1024
+    e.turn.config.squilla_router.auto_thinking = False
+    before = copy.deepcopy(e.turn.metadata["router_model_decision"])
+    if window_kind == "unknown":
+        monkeypatch.setattr(
+            quality, "resolve_effective_context_window", lambda *a, **k: (128_000, "default"),
+        )
+    else:
+        monkeypatch.setattr(
+            quality.shared_catalog(), "resolve_deployment_limits", lambda *a, **k: SimpleNamespace(
+                context_window=4096, max_output_tokens=1024, max_output_tokens_known=True,
+            ),
+        )
+    advance = AsyncMock(wraps=e.manager.advance_model_router_quality_retry)
+    monkeypatch.setattr(e.manager, "advance_model_router_quality_retry", advance)
+    wrapper = _SelectorFallbackProvider(e.provider, e.selector, e.turn.metadata)
+    updates = await wrapper.prepare_quality_retry(
+        reason="validation_failure", scope_id="capacity-boundary", remaining_budget=1,
+        messages=[Message(role="user", content="large current request " * 3000)],
+        chat_config=ChatConfig(max_tokens=1024, thinking=False), tools=[],
+    )
+
+    assert updates is None
+    advance.assert_not_awaited()
+    assert e.selector.current_config.model == e.turn.model == "qwen/qwen3.7-flash"
+    rows = await e.manager.get_model_router_transcript(e.node.session_key)
+    assert rows[0].turn_context["router_model_decision"] == before

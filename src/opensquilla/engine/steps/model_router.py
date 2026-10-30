@@ -212,14 +212,13 @@ async def apply_model_router(ctx: TurnContext) -> TurnContext:
     return ctx
 
 
-def validate_model_route_capacity(
+def validate_model_route_capabilities(
     ctx: TurnContext,
     *,
     tier: str | None = None,
     thinking_mode: str | None = None,
-    allow_compaction_retry: bool = False,
 ) -> TurnContext:
-    """Check the selected deployment without any semantic tier substitution."""
+    """Check deployment capabilities independently of historical size estimates."""
     if ctx.metadata.get("routing_applied") is not True:
         return ctx
     from opensquilla.engine.steps import squilla_router as common
@@ -262,6 +261,25 @@ def validate_model_route_capacity(
         raise ModelRouteError(f"Selected tier {selected} does not support reasoning")
     if ctx.tool_defs and not capabilities.supports_tools:
         raise ModelRouteError(f"Selected tier {selected} does not support tool calls")
+    return ctx
+
+
+def validate_model_route_capacity(
+    ctx: TurnContext,
+    *,
+    tier: str | None = None,
+    thinking_mode: str | None = None,
+    allow_compaction_retry: bool = False,
+) -> TurnContext:
+    """Check the selected deployment without any semantic tier substitution."""
+    validate_model_route_capabilities(ctx, tier=tier, thinking_mode=thinking_mode)
+    if ctx.metadata.get("routing_applied") is not True:
+        return ctx
+    from opensquilla.engine.steps import squilla_router as common
+
+    config = ctx.config.squilla_router
+    selected = tier or ctx.metadata.get("routed_tier")
+    assert isinstance(selected, str)  # Validated by the capability gate above.
 
     def assess(turn: TurnContext):
         assessments = common._capacity_tier_assessments(

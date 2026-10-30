@@ -95,7 +95,7 @@ class ModelRouterQualityRetry:
         )
         from opensquilla.engine.routing.policy import budget_gate
         from opensquilla.engine.steps import squilla_router as common
-        from opensquilla.engine.steps.model_router import validate_model_route_capacity
+        from opensquilla.engine.steps.model_router import validate_model_route_capabilities
 
         budget_cfg = router_cfg.budget
         if budget_cfg.limit_usd and budget_cfg.action != "off":
@@ -140,7 +140,11 @@ class ModelRouterQualityRetry:
         if budget_gate(target, valid_tiers=list(router_cfg.tiers), budget=budget).tier != target:
             return None
         try:
-            validate_model_route_capacity(candidate_turn, tier=target, thinking_mode=thinking_mode)
+            # The original TurnContext predates request-window compaction. Only
+            # capability facts survive here; prove capacity from the final payload below.
+            validate_model_route_capabilities(
+                candidate_turn, tier=target, thinking_mode=thinking_mode,
+            )
         except (RuntimeError, ValueError):
             return None
         candidate_selector = self.selector.clone()
@@ -194,6 +198,18 @@ class ModelRouterQualityRetry:
             user_override=llm.max_tokens,
             provider=provider_id,
         )
+        if window_source not in {"catalog", "config", "override"}:
+            return None
+        # Retain the selected authority's limits without reusing the old
+        # transcript estimate that may have been compacted for this request.
+        deployment_limits = catalog.resolve_deployment_limits(
+            model, provider=provider_id, api_key=deployment.api_key,
+            base_url=deployment.base_url, proxy=deployment.proxy,
+            logical_max_tokens_override=llm.max_tokens,
+        )
+        window = min(window, deployment_limits.context_window)
+        if deployment_limits.max_output_tokens_known:
+            maximum = min(maximum, deployment_limits.max_output_tokens)
         vision_support = catalog.resolve_deployment_vision_support(
             model,
             provider=provider_id,
