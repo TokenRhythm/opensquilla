@@ -3274,6 +3274,10 @@ def test_macos_recovery_runs_native_contracts_and_cannot_wash_failures_green() -
     }
     assert "if" not in setup_node
     assert job["steps"].index(setup_node) < job["steps"].index(test_step)
+    assert "tests/test_lightgbm_router_model.py" in test_step["run"]
+    preflight = next(step for step in job["steps"]
+                     if step.get("name") == "Preflight offline test environment")
+    assert "platform.machine().lower() in {'arm64', 'aarch64'}" in preflight["run"]
     assert "tests/test_recovery" in test_step["run"]
     assert "tests/test_migration/test_opensquilla_home_migration.py" in test_step["run"]
     assert "tests/test_desktop/test_electron_startup_contract.py" in test_step["run"]

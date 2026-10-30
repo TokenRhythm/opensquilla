@@ -56,7 +56,8 @@
     "tests/test_provider_ensemble.py",
     "tests/test_scripts/test_verify_webui_artifact.py",
     "tests/test_scripts/test_stage_webui_artifact.py",
-    "tests/test_packaging/test_webui_build_contract.py"
+    "tests/test_packaging/test_webui_build_contract.py",
+    "tests/test_lightgbm_router_model.py"
   ],
   "baseline_suites": [
     "dependency-audit",
@@ -543,7 +544,9 @@
         "tests/test_provider_ensemble.py",
         "tests/test_scripts/test_verify_webui_artifact.py",
         "tests/test_scripts/test_stage_webui_artifact.py",
-        "tests/test_packaging/test_webui_build_contract.py"
+        "tests/test_packaging/test_webui_build_contract.py",
+        "src/opensquilla/squilla_router/lightgbm_model/**",
+        "tests/test_lightgbm_router_model.py"
       ]
     },
     "release-packaging": {

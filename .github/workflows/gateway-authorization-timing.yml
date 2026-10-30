@@ -14,7 +14,7 @@ name: Gateway authorization timing
   workflow_dispatch:
     inputs:
       baseline_sha:
-        description: Full baseline commit SHA with identical dependency inputs
+        description: Full baseline commit SHA (uses its own frozen dependency environment)
         required: true
         type: string
 
@@ -47,7 +47,7 @@ jobs:
         with:
           version: "0.12.15"
           enable-cache: true
-      - name: Install identical comparison dependencies
+      - name: Install candidate comparison dependencies
         run: uv sync --extra dev --extra recommended --extra mcp --frozen
 
       - name: Prepare router assets
@@ -88,15 +88,22 @@ jobs:
                       "from opensquilla.squilla_router.lightgbm_model import validate_artifacts; print(validate_artifacts())",
                   ], cwd=baseline, env={**os.environ, "PYTHONPATH": str(baseline / "src")}, check=True)
               subprocess.run([
+                  "uv", "sync", "--project", str(baseline),
+                  "--python", sys._base_executable,
+                  "--extra", "dev", "--extra", "recommended", "--extra", "mcp", "--frozen",
+              ], env={**os.environ, "UV_PROJECT_ENVIRONMENT": str(baseline / ".venv")}, check=True)
+              baseline_python = baseline / ".venv" / ("Scripts/python.exe" if os.name == "nt" else "bin/python")
+              subprocess.run([
                   sys.executable, "scripts/compare_gateway_timing.py",
                   "--baseline-root", str(baseline), "--candidate-root", str(candidate),
                   "--baseline-sha", baseline_sha, "--candidate-sha", candidate_sha,
+                  "--baseline-python", str(baseline_python),
                   "--samples", "3", "--output", str(output),
               ], check=True)
               report = json.loads(output.read_text(encoding="utf-8"))
               with Path(os.environ["GITHUB_STEP_SUMMARY"]).open("a", encoding="utf-8") as summary:
                   summary.write("## Offline Gateway timing — " + os.environ["TIMING_PLATFORM"] + "\n\n")
-                  summary.write("Three alternating samples per source; offline provider, not model TTFT.\n\n")
+                  summary.write("Three alternating samples per source; same Python version, each source uses its own frozen dependencies. Includes dependency changes; offline provider, not model TTFT.\n\n")
                   summary.write("| Metric | Baseline median (ms) | Candidate median (ms) | Ratio |\n")
                   summary.write("| --- | ---: | ---: | ---: |\n")
                   for metric, ratio in report["candidate_over_baseline"].items():

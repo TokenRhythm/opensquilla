@@ -1400,7 +1400,11 @@ jobs:
           if [[ -f "$baseline_dir/src/opensquilla/squilla_router/lightgbm_model/model.py" ]]; then
             PYTHONPATH="$baseline_dir/src" python -c "from opensquilla.squilla_router.lightgbm_model import validate_artifacts; print(validate_artifacts())"
           fi
+          comparison_python="$(uv run --no-sync python -c 'import sys; print(sys._base_executable)')"
+          UV_PROJECT_ENVIRONMENT="$baseline_dir/.venv" uv sync --project "$baseline_dir" \
+            --python "$comparison_python" --extra dev --extra recommended --extra mcp --frozen
           uv run --no-sync python scripts/compare_gateway_timing.py \
+            --baseline-python "$baseline_dir/.venv/bin/python" \
             --baseline-root "$baseline_dir" --candidate-root "$GITHUB_WORKSPACE" \
             --baseline-sha "$TIMING_BASE" --candidate-sha "$(git rev-parse HEAD)" \
             --samples 3 --output "$RUNNER_TEMP/gateway-timing.json"
@@ -2172,6 +2176,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+          uv run python -c "import platform; print('router test architecture:', platform.machine()); assert platform.machine().lower() in {'arm64', 'aarch64'}, 'Router parity must run on Apple Silicon'"
           uv run python -c "import pathlib, subprocess, sys, opensquilla; print('cwd:', pathlib.Path.cwd().resolve()); print('git:', subprocess.check_output(['git', 'rev-parse', '--show-toplevel', 'HEAD'], text=True).strip()); print('python:', sys.executable); print('package:', pathlib.Path(opensquilla.__file__).resolve())"
           uv run pytest \
             tests/test_sandbox/test_trusted_sandbox_execution.py \
@@ -2186,6 +2191,7 @@ jobs:
         run: |
           set -euo pipefail
           pytest_args=(
+            tests/test_lightgbm_router_model.py
             tests/test_recovery
             tests/test_migration/test_opensquilla_home_migration.py
             tests/test_desktop/test_electron_startup_contract.py
