@@ -9,6 +9,10 @@ import { _electron as electron } from 'playwright'
 import { desktopRouterConfigTomlLines } from '../dist/desktop-router-config.js'
 import { DESKTOP_GATEWAY_STARTUP_TIMEOUT_MS } from '../dist/gateway-lifecycle.js'
 import { parse, stringify } from 'smol-toml'
+import {
+  closeElectronWithDeadline,
+  requestElectronQuitWithConfirmation,
+} from './e2e-shutdown-helpers.mjs'
 
 const scriptDir = dirname(fileURLToPath(import.meta.url))
 const packageRoot = resolve(scriptDir, '..')
@@ -1221,6 +1225,7 @@ const observeRenderer = (candidate) => {
 }
 for (const candidate of app.windows()) observeRenderer(candidate)
 app.on('window', observeRenderer)
+let providerClientFailed = false
 
 try {
   const page = await setupWindow(app)
@@ -1623,12 +1628,12 @@ try {
   assert.equal(successfulProbeServer.requests.length, 0,
     'saving complete, untested configuration must not make a provider request')
 
-  const readyConnection = await waitFor(async () => {
-    const connection = await desktopPage.evaluate(
-      () => window.opensquillaDesktop?.getGatewayConnection?.(),
-    )
-    return connection?.status === 'ready' ? connection : null
-  }, 'ready Desktop Gateway descriptor')
+  assert.equal(await readyDesktopWindow(app), desktopPage,
+    'Gateway readiness must preserve the original local Desktop renderer')
+  const readyConnection = await desktopPage.evaluate(
+    () => window.opensquillaDesktop?.getGatewayConnection?.(),
+  )
+  assert.equal(readyConnection?.status, 'ready')
   assert.match(readyConnection.httpUrl, /^http:\/\/127\.0\.0\.1:\d+$/)
   assert.equal(
     readyConnection.wsUrl,
@@ -1816,11 +1821,29 @@ try {
     screenshotPath: screenshotPath || null,
   }, null, 2))
 } catch (error) {
+  providerClientFailed = true
   await reportOnboardingFailure(app, 'provider-client', error)
   throw error
 } finally {
-  await app.close().catch(() => {})
+  const shutdown = await closeElectronWithDeadline({
+    app,
+    phase: 'onboarding-provider-client',
+    requestClose: options => requestElectronQuitWithConfirmation(app, {
+      ...options, requireConfirmation: false,
+    }),
+    diagnostics: async () => {
+      const readLog = async name => redactDiagnosticText((
+        await readFile(join(userDataDir, 'logs', name), 'utf8').catch(() => '<log unavailable>')
+      ).slice(-24_000))
+      const [desktopLogTail, gatewayLogTail] = await Promise.all([
+        readLog('desktop.log'), readLog('gateway.log'),
+      ])
+      return { desktopLogTail, gatewayLogTail }
+    },
+  })
   await successfulProbeServer.close().catch(() => {})
   await rm(userDataRoot, { recursive: true, force: true }).catch(() => {})
+  // The helper reports cleanup failures; keep an earlier assertion primary.
+  if (!shutdown.closed && !providerClientFailed) throw shutdown.error
 }
 console.log('PASS onboarding provider-client')
