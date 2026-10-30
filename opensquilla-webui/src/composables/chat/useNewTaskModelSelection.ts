@@ -1,6 +1,6 @@
 import { computed, getCurrentScope, onScopeDispose, ref, shallowRef, watch, type Ref } from 'vue'
 import type { ModelCatalog, ModelCatalogResult, ModelDescriptor, ProviderListError } from '@/modules/providerConfiguration'
-import type { ModelRoutingMode } from '@/types/modelRouting'
+import { isModelRoutingMode, type ModelRoutingMode } from '@/types/modelRouting'
 
 export interface NewTaskModelSelection {
   model: string
@@ -16,7 +16,8 @@ type SelectionStorage = Pick<Storage, 'getItem' | 'setItem' | 'removeItem'>
 
 interface SavedSelection {
   sessionKey: string
-  selection: NewTaskModelSelection
+  selection: NewTaskModelSelection | null
+  routingMode?: ModelRoutingMode
 }
 
 export interface UseNewTaskModelSelectionOptions {
@@ -36,6 +37,8 @@ export interface UseNewTaskModelSelectionOptions {
    */
   autoRefresh?: boolean
   storage?: SelectionStorage | null
+  /** Seeds a fresh draft only; a recovered or manually edited draft keeps its pin. */
+  initialSelection?: () => NewTaskModelSelection | null
 }
 
 function validSelection(value: unknown): value is NewTaskModelSelection {
@@ -51,19 +54,34 @@ function browserStorage(): SelectionStorage | null {
   try { return typeof localStorage === 'undefined' ? null : localStorage } catch { return null }
 }
 
-/** Owns one draft model pin; existing routing and send owners keep their protocols. */
-export function useNewTaskModelSelection(options: UseNewTaskModelSelectionOptions) {
-  const storage = options.storage === undefined ? browserStorage() : options.storage
-  const saved = shallowRef<SavedSelection | null>(null)
+function readSavedSelection(storage: SelectionStorage | null): SavedSelection | null {
   try {
     const raw: unknown = JSON.parse(storage?.getItem(STORAGE_KEY) || 'null')
-    if (raw && typeof raw === 'object') {
-      const record = raw as Partial<SavedSelection>
-      if (typeof record.sessionKey === 'string' && validSelection(record.selection)) {
-        saved.value = { sessionKey: record.sessionKey, selection: { ...record.selection } }
-      }
+    if (!raw || typeof raw !== 'object') return null
+    const record = raw as Partial<SavedSelection>
+    if (typeof record.sessionKey !== 'string' || (record.selection !== null && !validSelection(record.selection))) return null
+    // A legacy explicit pin establishes direct mode. A legacy null marker
+    // does not distinguish Default from router/ensemble, so do not guess.
+    const routingMode = isModelRoutingMode(record.routingMode)
+      ? record.routingMode : record.selection ? 'off' : undefined
+    return {
+      sessionKey: record.sessionKey,
+      selection: record.selection && (!routingMode || routingMode === 'off') ? { ...record.selection } : null,
+      ...(routingMode ? { routingMode } : {}),
     }
-  } catch { /* A corrupt or unavailable recovery record cannot block the composer. */ }
+  } catch { return null }
+}
+
+/** Read before routing/bootstrap initializes a recovered draft's mode. */
+export function readDraftRoutingMode(sessionKey: string, storage?: SelectionStorage | null): ModelRoutingMode | null {
+  const saved = readSavedSelection(storage === undefined ? browserStorage() : storage)
+  return saved?.sessionKey === sessionKey ? saved.routingMode ?? null : null
+}
+
+/** Owns one draft model pin and mode; existing routing and send owners keep their protocols. */
+export function useNewTaskModelSelection(options: UseNewTaskModelSelectionOptions) {
+  const storage = options.storage === undefined ? browserStorage() : options.storage
+  const saved = shallowRef<SavedSelection | null>(readSavedSelection(storage))
 
   const models = shallowRef<readonly ModelDescriptor[]>([])
   const providerErrors = shallowRef<readonly ProviderListError[]>([])
@@ -104,12 +122,18 @@ export function useNewTaskModelSelection(options: UseNewTaskModelSelectionOption
   function select(next: NewTaskModelSelection | null): boolean {
     if (!options.isDraft() || options.busy.value) return false
     // Gateway default remains an explicit escape from a model/routing conflict.
-    if (next === null) { selectionOperation += 1; persist(null); return true }
+    if (next === null) {
+      selectionOperation += 1
+      // A deliberate Default choice belongs to this draft too. Keep a null
+      // recovery marker so remounting cannot reapply a remembered model pin.
+      persist({ sessionKey: options.sessionKey.value, selection: null, routingMode: options.routingMode.value })
+      return true
+    }
     if (disabledReason.value || !validSelection(next)) return false
     // Discovery may omit a saved or manually configured model. Admission is
     // authoritative; catalog membership must not discard the user's pin.
     selectionOperation += 1
-    persist({ sessionKey: options.sessionKey.value, selection: { ...next } })
+    persist({ sessionKey: options.sessionKey.value, selection: { ...next }, routingMode: 'off' })
     return true
   }
 
@@ -129,7 +153,12 @@ export function useNewTaskModelSelection(options: UseNewTaskModelSelectionOption
     if (updated && operation === selectionOperation
       && wasDraft && options.isDraft() && key === options.sessionKey.value
       && epoch === options.connectionEpoch?.value
-      && mode !== 'off' && options.routingMode.value === mode) select(null)
+      && options.routingMode.value === mode) {
+      if (mode !== 'off') select(null)
+      else if (!options.busy.value) persist({
+        sessionKey: key, selection: selection.value ? { ...selection.value } : null, routingMode: mode,
+      })
+    }
     return updated
   }
 
@@ -158,7 +187,7 @@ export function useNewTaskModelSelection(options: UseNewTaskModelSelectionOption
 
   function restore(next: NewTaskModelSelection | null) {
     if (!options.isDraft() || !next || !validSelection(next) || selection.value) return
-    persist({ sessionKey: options.sessionKey.value, selection: { ...next } })
+    persist({ sessionKey: options.sessionKey.value, selection: { ...next }, routingMode: 'off' })
   }
 
   function invalidateCatalog() {
@@ -225,10 +254,15 @@ export function useNewTaskModelSelection(options: UseNewTaskModelSelectionOption
 
   watch([options.sessionKey, options.isDraft], () => { selectionOperation += 1 }, { flush: 'sync' })
   watch([options.sessionKey, options.isDraft], ([key, draft]) => {
-    if (!saved.value || !key) return
+    if (!key) return
     // Switching to an existing task leaves the one recoverable draft intact.
     // A new draft replaces it; acceptance retires the current draft pin.
-    if ((draft && saved.value.sessionKey !== key) || (!draft && saved.value.sessionKey === key)) persist(null)
+    if (saved.value && ((draft && saved.value.sessionKey !== key)
+      || (!draft && saved.value.sessionKey === key))) persist(null)
+    if (draft && saved.value?.sessionKey !== key) {
+      const initial = options.initialSelection?.()
+      if (validSelection(initial)) persist({ sessionKey: key, selection: { ...initial }, routingMode: 'off' })
+    }
   }, { immediate: true })
   watch([catalogAvailable, () => options.connectionEpoch?.value], () => {
     invalidateCatalog()
