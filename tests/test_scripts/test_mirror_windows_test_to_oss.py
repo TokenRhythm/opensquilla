@@ -91,6 +91,21 @@ def test_rejects_wrong_sha256_before_upload(mirror_env):
     assert not summary.exists()
 
 
+def test_mirrors_production_test_installer_in_the_test_prefix(mirror_env):
+    module, assets, _, remote, summary = mirror_env
+    installer = next(assets.glob("*.exe"))
+    old_checksum = installer.with_suffix(".exe.sha256")
+    installer = installer.rename(assets / installer.name.replace("-test-", "-test-production-"))
+    old_checksum.unlink()
+    digest = hashlib.sha256(installer.read_bytes()).hexdigest()
+    installer.with_suffix(".exe.sha256").write_text(f"{digest}  {installer.name}\n")
+    module.mirror(assets)
+    assert len(remote) == 2
+    assert all(key.startswith("oss://test-bucket/releases/test/windows/12345-2/") for key in remote)
+    assert installer.name in summary.read_text(encoding="utf-8")
+    assert "生产环境" in summary.read_text(encoding="utf-8")
+
+
 @pytest.mark.parametrize(
     ("key", "value"),
     [
@@ -151,7 +166,14 @@ def test_workflow_only_mirrors_successful_build_and_keeps_credentials_in_upload_
         for step in job["steps"]
         if step.get("uses", "").startswith("actions/download-artifact@")
     )
-    assert download["with"]["name"] == "windows-uat-test-installer"
+    assert download["with"]["name"] == "${{ needs.build.outputs.artifact_name }}"
+    build = workflow["jobs"]["build"]
+    assert build["outputs"]["artifact_name"] == "${{ steps.target.outputs.artifact_name }}"
+    artifact_upload = next(
+        step for step in build["steps"] if step.get("uses", "").startswith("actions/upload-artifact@")
+    )
+    assert artifact_upload["with"]["name"] == "${{ steps.target.outputs.artifact_name }}"
+    assert "test-windows-production-" in build["env"]["OPENSQUILLA_TEST_ENVIRONMENT"]
     upload = job["steps"][-1]
     assert "mirror-windows-test-to-oss.py" in upload["run"]
     assert "secrets.ALIYUN_OSS_ACCESS_KEY_SECRET" in upload["env"]["OSS_ACCESS_KEY_SECRET"]

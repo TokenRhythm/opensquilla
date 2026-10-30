@@ -206,13 +206,25 @@ user data directory, including conversation history and preferences. Ordinary
 packaging keeps the production origin. The explicit runtime
 `OPENSQUILLA_TOKENRHYTHM_ORIGIN` override remains available.
 
+For a test installer that uses production login, account and account-backed model
+requests, run `npm run dist:local:test -- --production`. It embeds
+`https://tokenrhythm.studio`, adds `test-production-YYYYMMDD-HHMMSS` to the installer
+filename and writes artifacts under `dist/desktop-electron/test/production/`.
+With verified, matching Gateway and WebUI artifacts already built, use
+`npm run dist:local:test:prepared -- --production`. The application keeps its
+existing version and identity; production account credentials are isolated from
+UAT by origin, so production requires its own login.
+
 After a matching successful Gateway build, use
 `npm run dist:local:test:prepared` to rebuild only the desktop shell and installer.
 Windows test packaging runs on Windows, targets x64 NSIS and is unsigned.
-The `Windows UAT Test Installer` workflow builds the same package on Windows
+The `Windows Test Installer` workflow builds the same package on Windows
 when a `test-windows-*` tag is pushed. It uploads `windows-uat-test-installer`
 without creating a GitHub Release or accessing the release signing environment.
-Manual dispatch is also available once the workflow is on the default branch.
+Use a `test-windows-production-*` tag for a production-origin test installer;
+its artifact is `windows-production-test-installer`. Other `test-windows-*`
+tags retain UAT. Manual dispatch also offers an `account_environment` choice
+once the workflow is on the default branch.
 After building, a small Linux job mirrors the installer and its SHA256 file to
 the existing OSS bucket under `releases/test/windows/<run-id>-<attempt>/`
 (respecting `ALIYUN_OSS_PREFIX`). Its job summary includes verified public

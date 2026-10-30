@@ -1,4 +1,4 @@
-"""Mirror one checked Windows UAT artifact, without touching release channels."""
+"""Mirror one checked Windows test artifact, without touching release channels."""
 
 from __future__ import annotations
 
@@ -42,13 +42,13 @@ def mirror(assets_dir: Path) -> None:
 
     installers = list(assets_dir.glob("OpenSquilla-*-test-*-win-x64.exe"))
     if len(installers) != 1:
-        raise ValueError("Expected exactly one Windows UAT installer")
+        raise ValueError("Expected exactly one Windows test installer")
     installer = installers[0]
     if not re.fullmatch(
-        r"OpenSquilla-[0-9A-Za-z.+-]+-test-[0-9]{8}-[0-9]{6}-win-x64[.]exe",
+        r"OpenSquilla-[0-9A-Za-z.+-]+-test-(?:production-)?[0-9]{8}-[0-9]{6}-win-x64[.]exe",
         installer.name,
     ):
-        raise ValueError("Unsafe Windows UAT installer filename")
+        raise ValueError("Unsafe Windows test installer filename")
     checksum = installer.with_suffix(".exe.sha256")
     files = (installer, checksum)
     if set(assets_dir.iterdir()) != set(files) or any(
@@ -59,7 +59,7 @@ def mirror(assets_dir: Path) -> None:
         digest = hashlib.file_digest(source, "sha256").hexdigest()
     expected_checksum = f"{digest}  {installer.name}"
     if checksum.read_text(encoding="utf-8-sig").strip() != expected_checksum:
-        raise ValueError("Windows UAT installer SHA256 mismatch")
+        raise ValueError("Windows test installer SHA256 mismatch")
 
     endpoint = os.environ.get("OSS_ENDPOINT", "")
     endpoint_host = urlsplit(endpoint if "://" in endpoint else f"https://{endpoint}").hostname
@@ -99,8 +99,9 @@ def mirror(assets_dir: Path) -> None:
     with urlopen(public_root + checksum.name, timeout=30) as response:
         if response.read(4096).decode("utf-8-sig").strip() != expected_checksum:
             raise ValueError("Public OSS SHA256 file mismatch")
+    environment = "生产环境" if "-test-production-" in installer.name else "UAT"
     summary = (
-        "\n### Windows UAT 国内下载\n\n"
+        f"\n### Windows {environment} 测试包国内下载\n\n"
         f"- [下载安装包]({public_root}{installer.name})\n"
         f"- [SHA256 校验文件]({public_root}{checksum.name})\n"
         f"- SHA256: `{digest}`\n"

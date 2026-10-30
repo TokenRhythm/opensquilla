@@ -9,7 +9,7 @@ const packageRoot = resolve(dirname(scriptPath), '..')
 const packageVersion = JSON.parse(readFileSync(join(packageRoot, 'package.json'), 'utf8')).version
 const testOutputDirectory = resolve(packageRoot, '../../dist/desktop-electron/test')
 
-export function createLocalTestBuildConfig(now = new Date()) {
+export function createLocalTestBuildConfig(now = new Date(), { production = false } = {}) {
   const parts = new Intl.DateTimeFormat('en-GB', {
     timeZone: 'Asia/Shanghai', year: 'numeric', month: '2-digit', day: '2-digit',
     hour: '2-digit', minute: '2-digit', second: '2-digit', hourCycle: 'h23',
@@ -17,11 +17,11 @@ export function createLocalTestBuildConfig(now = new Date()) {
   const part = type => parts.find(item => item.type === type).value
   const stamp = `${part('year')}${part('month')}${part('day')}-${part('hour')}${part('minute')}${part('second')}`
   return {
-    directories: { output: testOutputDirectory },
-    artifactName: `OpenSquilla-\${version}-test-${stamp}-\${os}-\${arch}.\${ext}`,
+    directories: { output: production ? join(testOutputDirectory, 'production') : testOutputDirectory },
+    artifactName: `OpenSquilla-\${version}-test-${production ? 'production-' : ''}${stamp}-\${os}-\${arch}.\${ext}`,
     extraMetadata: {
       version: packageVersion,
-      opensquillaTokenRhythmOrigin: 'https://gpt.tokenrhythm.studio',
+      opensquillaTokenRhythmOrigin: production ? 'https://tokenrhythm.studio' : 'https://gpt.tokenrhythm.studio',
     },
   }
 }
@@ -30,10 +30,11 @@ export function parseLocalBuildArgs(args) {
   const [mode, ...flags] = args
   if (!['pack', 'dist'].includes(mode)
     || new Set(flags).size !== flags.length
-    || flags.some(flag => !['--prepared', '--test'].includes(flag))) {
-    throw new Error('Usage: node scripts/build-local.mjs pack|dist [--prepared] [--test]')
+    || flags.some(flag => !['--prepared', '--test', '--production'].includes(flag))
+    || (flags.includes('--production') && !flags.includes('--test'))) {
+    throw new Error('Usage: node scripts/build-local.mjs pack|dist [--prepared] [--test [--production]]')
   }
-  return { mode, prepared: flags.includes('--prepared'), test: flags.includes('--test') }
+  return { mode, prepared: flags.includes('--prepared'), test: flags.includes('--test'), production: flags.includes('--production') }
 }
 
 function runNpmScript(script, env = process.env) {
@@ -134,10 +135,11 @@ async function buildLocalWindowsTest(mode, overrides) {
   }))
 }
 
-export async function runLocalBuild({ mode, prepared, test = false }, {
+export async function runLocalBuild({ mode, prepared, test = false, production = false }, {
   platform = process.platform, runScript = runNpmScript, buildMac = buildLocalMac,
   buildWindowsTest = buildLocalWindowsTest,
 } = {}) {
+  if (production && !test) throw new Error('Production test packaging requires --test')
   if (platform !== 'darwin' && !test) {
     await runScript(`${mode}${prepared ? ':prepared' : ''}`)
     return
@@ -149,13 +151,13 @@ export async function runLocalBuild({ mode, prepared, test = false }, {
   }
   await runScript('build')
   await runScript('verify:prepared')
-  const overrides = test ? createLocalTestBuildConfig() : {}
+  const overrides = test ? createLocalTestBuildConfig(new Date(), { production }) : {}
   if (test) console.log(`Local test package: ${overrides.artifactName}; app version: ${overrides.extraMetadata.version}; account/API origin: ${overrides.extraMetadata.opensquillaTokenRhythmOrigin}`)
   if (platform === 'win32') await buildWindowsTest(mode, overrides)
   else await buildMac(mode, overrides)
   await runScript('verify:package', test
     ? {
-      ...process.env, OPEN_SQUILLA_PACKAGE_OUTPUT: testOutputDirectory,
+      ...process.env, OPEN_SQUILLA_PACKAGE_OUTPUT: overrides.directories.output,
       OPENSQUILLA_EXPECT_PACKAGE_VERSION: overrides.extraMetadata.version,
       OPENSQUILLA_EXPECT_ACCOUNT_ORIGIN: overrides.extraMetadata.opensquillaTokenRhythmOrigin,
     }

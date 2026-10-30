@@ -12,13 +12,42 @@ import {
 const packageVersion = JSON.parse(readFileSync(new URL('../package.json', import.meta.url), 'utf8')).version
 
 test('local CLI accepts only a packaging target and optional prepared mode', () => {
-  assert.deepEqual(parseLocalBuildArgs(['pack']), { mode: 'pack', prepared: false, test: false })
-  assert.deepEqual(parseLocalBuildArgs(['dist', '--prepared']), { mode: 'dist', prepared: true, test: false })
-  assert.deepEqual(parseLocalBuildArgs(['dist', '--test', '--prepared']), { mode: 'dist', prepared: true, test: true })
-  for (const args of [[], ['release'], ['pack', '--unsigned'], ['dist', '--prepared', '--prepared']]) {
+  assert.deepEqual(parseLocalBuildArgs(['pack']), { mode: 'pack', prepared: false, test: false, production: false })
+  assert.deepEqual(parseLocalBuildArgs(['dist', '--prepared']), { mode: 'dist', prepared: true, test: false, production: false })
+  assert.deepEqual(parseLocalBuildArgs(['dist', '--test', '--prepared']), { mode: 'dist', prepared: true, test: true, production: false })
+  assert.deepEqual(parseLocalBuildArgs(['dist', '--test', '--production']), { mode: 'dist', prepared: false, test: true, production: true })
+  for (const args of [[], ['release'], ['pack', '--unsigned'], ['dist', '--prepared', '--prepared'], ['dist', '--production']]) {
     assert.throws(() => parseLocalBuildArgs(args), /Usage:/)
   }
 })
+
+for (const platform of ['darwin', 'win32']) {
+  test(`${platform} production test packages embed production and verify their separate output`, async () => {
+    const calls = []
+    const verifyBuild = async (mode, config) => {
+      assert.equal(mode, 'dist')
+      assert.equal(config.extraMetadata.opensquillaTokenRhythmOrigin, 'https://tokenrhythm.studio')
+      assert.equal(config.extraMetadata.version, packageVersion)
+      assert.match(config.artifactName, /-test-production-\d{8}-\d{6}-/)
+      assert.ok(config.directories.output.replaceAll('\\', '/').endsWith('/test/production'))
+      calls.push('package')
+    }
+    await runLocalBuild({ mode: 'dist', prepared: true, test: true, production: true }, {
+      platform,
+      buildMac: verifyBuild,
+      buildWindowsTest: verifyBuild,
+      runScript: async (script, env) => {
+        calls.push(script)
+        if (script === 'verify:package') {
+          assert.equal(env.OPENSQUILLA_EXPECT_ACCOUNT_ORIGIN, 'https://tokenrhythm.studio')
+          assert.equal(env.OPENSQUILLA_EXPECT_PACKAGE_VERSION, packageVersion)
+          assert.ok(env.OPEN_SQUILLA_PACKAGE_OUTPUT.replaceAll('\\', '/').endsWith('/test/production'))
+        }
+      },
+    })
+    assert.deepEqual(calls, ['build', 'verify:prepared', 'package', 'verify:package'])
+  })
+}
 
 test('test packages keep app identity and version, stamping only the installer filename', () => {
   const config = createLocalTestBuildConfig(new Date('2026-10-26T07:02:03Z'))
