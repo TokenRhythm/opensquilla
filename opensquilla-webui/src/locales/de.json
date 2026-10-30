@@ -1517,7 +1517,7 @@
       "resetSaved": "Empfohlene Stufen von {provider} gespeichert; Modus unverändert.",
       "title": "Modellrouting",
       "desc": "Lege fest, wie Modelle für jede Anfrage ausgewählt werden.",
-      "newSessionDefault": "Dies ist die Vorgabe für neue Chats. Bestehende Chats behalten ihren eigenen Routing-Modus.",
+      "newSessionDefault": "Neue Chats übernehmen den zuletzt manuell gewählten Modus, bei festem Modell auch das gewählte Modell und den Anbieter. Ohne gespeicherte Auswahl gilt die aktuelle Konfiguration. Bestehende Chats behalten ihre eigene Auswahl.",
       "modeTitle": "Modellnutzung auswählen",
       "providerFirstTitle": "Zuerst einen Modelldienst hinzufügen",
       "providerFirst": "Modell-Routing benötigt mindestens einen gespeicherten Anbieter.",

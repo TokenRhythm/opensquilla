@@ -849,8 +849,9 @@ import { useLocalPathDraft } from '@/composables/chat/useLocalPathDraft'
 import { useChatElevatedMode } from '@/composables/chat/useChatElevatedMode'
 import { useChatFeatureToggles } from '@/composables/chat/useChatFeatureToggles'
 import { useChatSessionRouting } from '@/composables/chat/useChatSessionRouting'
+import { useLastManualChatSelection, type LastManualChatSelection } from '@/composables/chat/useLastManualChatSelection'
 import { useStableStopControl } from '@/composables/chat/useStableStopControl'
-import { useNewTaskModelSelection, type NewTaskModelSelection } from '@/composables/chat/useNewTaskModelSelection'
+import { readDraftRoutingMode, useNewTaskModelSelection, type NewTaskModelSelection } from '@/composables/chat/useNewTaskModelSelection'
 import { SESSION_ROUTING_KEY, type SessionRouting } from '@/modules/sessionRouting'
 import { USAGE_REPORTING_KEY, type UsageReporting } from '@/modules/usageReporting'
 import SkillLoadStatus from '@/components/chat/SkillLoadStatus.vue'
@@ -2342,12 +2343,29 @@ const sessionRoutingAvailable = computed(() => {
     && gatewayAccess.isAuthenticated
     && sessionRouting.available()
 })
+const lastManualChatSelection = useLastManualChatSelection({
+  ...(props.embedded ? { storage: props.draftStorage ?? null } : {}),
+})
+let draftInitialSelection: { key: string; selection: LastManualChatSelection | null } | null = null
+function manualSelectionForNewDraft(): LastManualChatSelection | null {
+  if (!isDraftSurface()) return null
+  if (draftInitialSelection?.key !== sessionKey.value) {
+    // Read once per new draft so its mode and pin come from the same manual
+    // selection, including a later choice in another tab or mounted composer.
+    draftInitialSelection = { key: sessionKey.value, selection: lastManualChatSelection.readLatest() }
+  }
+  return draftInitialSelection.selection
+}
 const chatSessionRouting = useChatSessionRouting({
   routing: sessionRouting,
   sessionKey,
   connectionEpoch: computed(() => gatewayAccess.subscriptionEpoch),
   modelSelectionCapable: computed(() => gatewayAccess.sessionsRoutingModelSelection && sessionRoutingAvailable.value),
   globalMode: globalModelRoutingMode,
+  recoveredDraftMode: () => readDraftRoutingMode(
+    sessionKey.value, props.embedded ? props.draftStorage ?? null : undefined,
+  ),
+  lastManualMode: () => manualSelectionForNewDraft()?.mode ?? null,
   globalImageInputAdmission,
   globalImageInputAdmissionReason,
   capabilitiesByMode: modelRoutingCapabilitiesByMode,
@@ -2369,6 +2387,10 @@ const {
 } = chatSessionRouting
 const newTaskModel = useNewTaskModelSelection({
   ...(props.embedded ? { storage: props.draftStorage ?? null } : {}),
+  initialSelection: () => {
+    const selection = manualSelectionForNewDraft()
+    return selection?.mode === 'off' ? selection.model : null
+  },
   catalog: injectedProviderConfiguration,
   catalogAvailable: computed(() => gatewayAccess.isAvailable && gatewayAccess.isAuthenticated
     && (gatewayAccess.chatSendInitialModel || chatSessionRouting.modelSelectionSupported.value)),
@@ -2412,8 +2434,8 @@ watch(
   ([selection, available]) => {
     // A recovered draft pin was an explicit single-model choice. Reapply its
     // local strategy before sending, without changing the gateway default.
-    if (selection && available && isProvisionalDraftSession() && initialRoutingMode.value === null) {
-      void chatSessionRouting.setMode('off')
+    if (selection && available && isProvisionalDraftSession()) {
+      void chatSessionRouting.restoreDraftModelMode()
     }
   },
   { immediate: true },
@@ -5471,18 +5493,50 @@ function runComposerSandboxSetupInBackground(): void {
   composerSandboxSetupOpen.value = false
 }
 
+let manualSelectionOperation = 0
+let rememberedManualSelectionOperation = 0
+
+async function applyManualComposerSelection(
+  mode: ModelRoutingMode,
+  apply: () => Promise<boolean>,
+  expectedModel?: NewTaskModelSelection | null,
+) {
+  const operation = ++manualSelectionOperation
+  const key = sessionKey.value
+  const epoch = gatewayAccess.subscriptionEpoch
+  const wasDraft = isProvisionalDraftSession()
+  // Reserve the choice order before the RPC, across all views sharing storage.
+  const token = await lastManualChatSelection.beginSelection()
+  if (operation !== manualSelectionOperation || key !== sessionKey.value
+    || epoch !== gatewayAccess.subscriptionEpoch || wasDraft !== isProvisionalDraftSession()) return
+  const updated = await apply()
+  // Only an applied picker action can update the next-chat preference. An
+  // async response must not capture another session or a later picker action.
+  if (!updated || operation < rememberedManualSelectionOperation || key !== sessionKey.value
+    || epoch !== gatewayAccess.subscriptionEpoch || wasDraft !== isProvisionalDraftSession()
+    || modelRoutingMode.value !== mode) return
+  const model = composerModelSelection.value
+  if (expectedModel !== undefined && (model?.model !== expectedModel?.model
+    || model?.provider !== expectedModel?.provider)) return
+  rememberedManualSelectionOperation = operation
+  await lastManualChatSelection.remember({
+    mode,
+    model: mode === 'off' && model?.provider
+      ? { model: model.model, provider: model.provider } : null,
+  }, token)
+}
+
 async function setComposerSessionRoutingMode(mode: ModelRoutingMode) {
   if (preparingHostSession.value || goalBusy.value) return
-  await newTaskModel.selectRoutingMode(mode, chatSessionRouting.setMode)
+  await applyManualComposerSelection(mode, () => newTaskModel.selectRoutingMode(mode, chatSessionRouting.setMode))
 }
 
 async function setComposerModel(selection: NewTaskModelSelection | null) {
   if (goalBusy.value || composerModelDisabledReason.value === 'busy') return
-  if (isProvisionalDraftSession()) {
-    await newTaskModel.selectWithRouting(selection, chatSessionRouting.setMode)
-  } else {
-    await chatSessionRouting.setModel(selection)
-  }
+  const target = selection ? { ...selection } : null
+  await applyManualComposerSelection('off', () => isProvisionalDraftSession()
+    ? newTaskModel.selectWithRouting(target, chatSessionRouting.setMode)
+    : chatSessionRouting.setModel(target), target)
 }
 
 async function refreshComposerModels() {

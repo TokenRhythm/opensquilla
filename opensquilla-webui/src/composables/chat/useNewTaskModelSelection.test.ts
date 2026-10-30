@@ -2,7 +2,11 @@ import { effectScope, nextTick, ref } from 'vue'
 import { describe, expect, it, vi } from 'vitest'
 import type { ModelCatalogResult, ModelDescriptor } from '@/modules/providerConfiguration'
 import type { ModelRoutingMode } from '@/types/modelRouting'
-import { useNewTaskModelSelection } from './useNewTaskModelSelection'
+import { readDraftRoutingMode, useNewTaskModelSelection, type NewTaskModelSelection } from './useNewTaskModelSelection'
+import { useChatSessionRouting } from './useChatSessionRouting'
+import { useLastManualChatSelection } from './useLastManualChatSelection'
+import type { SessionRouting } from '@/modules/sessionRouting'
+import { modelRoutingModeToGateway } from '@/types/modelRouting'
 
 const MODEL: ModelDescriptor = {
   id: 'test-model', name: 'Test model', provider: 'test-provider', contextWindow: 1000,
@@ -18,7 +22,7 @@ function memoryStorage() {
     removeItem: (key: string) => { values.delete(key) },
   }
 }
-function harness(input: { catalogAvailable?: boolean; capable?: boolean; autoRefresh?: boolean; storage?: ReturnType<typeof memoryStorage>; list?: () => Promise<ModelCatalogResult> } = {}) {
+function harness(input: { catalogAvailable?: boolean; capable?: boolean; autoRefresh?: boolean; storage?: ReturnType<typeof memoryStorage>; initialSelection?: () => NewTaskModelSelection | null; list?: () => Promise<ModelCatalogResult> } = {}) {
   const sessionKey = ref('agent:main:webchat:one')
   const draft = ref(true)
   const capable = ref(input.capable ?? true)
@@ -33,11 +37,188 @@ function harness(input: { catalogAvailable?: boolean; capable?: boolean; autoRef
     catalog: { list }, sessionKey, isDraft: () => draft.value,
     capable, catalogAvailable, routingMode, busy, connectionEpoch, storage,
     autoRefresh: input.autoRefresh,
+    initialSelection: input.initialSelection,
   }))!
   return { api, list, sessionKey, draft, capable, catalogAvailable, routingMode, busy, connectionEpoch, storage, scope }
 }
 
 describe('new-task model selection', () => {
+  it.each(['off', 'squilla_router', 'llm_ensemble'] as const)(
+    'recovers a draft with explicit %s mode after another session changes the new-chat preference', async chosenMode => {
+      const storage = memoryStorage()
+      const preference = useLastManualChatSelection({ storage })
+      await preference.remember({ mode: 'off', model: PIN })
+      const key = 'agent:main:webchat:recover-mode'
+      const mount = (connected: boolean) => {
+        const scope = effectScope()
+        const api = scope.run(() => {
+          const sessionKey = ref(key)
+          const available = ref(connected)
+          const draft = ref(true)
+          const routing = useChatSessionRouting({
+            routing: { get: vi.fn(), set: vi.fn() } as unknown as SessionRouting,
+            sessionKey, globalMode: ref('off'), available,
+            lastManualMode: () => preference.readLatest()?.mode ?? null,
+            recoveredDraftMode: () => readDraftRoutingMode(sessionKey.value, storage),
+            globalImageInputAdmission: ref('unknown'), globalImageInputAdmissionReason: ref('unknown'),
+            capabilitiesByMode: ref(null), isStreaming: ref(false), isDraft: () => draft.value,
+            notifyError: vi.fn(),
+          })
+          const models = useNewTaskModelSelection({
+            catalog: { list: vi.fn(async () => ({ models: [], errors: [] })) },
+            sessionKey, isDraft: () => draft.value, capable: available,
+            routingMode: routing.mode, busy: ref(false), storage, autoRefresh: false,
+            initialSelection: () => {
+              const latest = preference.readLatest()
+              return latest?.mode === 'off' ? latest.model : null
+            },
+          })
+          return { routing, models, available, draft, sessionKey }
+        })!
+        return { scope, ...api }
+      }
+      const first = mount(true)
+      if (chosenMode === 'off') {
+        expect(await first.models.selectWithRouting(null, first.routing.setMode)).toBe(true)
+      } else {
+        expect(await first.models.selectRoutingMode(chosenMode, first.routing.setMode)).toBe(true)
+      }
+      expect(first.models.selection.value).toBeNull()
+      first.scope.stop()
+
+      // A successful picker action in an existing session changes only the
+      // preference. It does not replace the recoverable draft's record.
+      const laterMode = chosenMode === 'off' ? 'llm_ensemble' : 'off'
+      await preference.remember({ mode: laterMode, model: laterMode === 'off' ? PIN : null })
+      const restored = mount(false)
+      expect(restored.routing.mode.value).toBe(chosenMode)
+      expect(restored.models.selection.value).toBeNull()
+      expect(restored.routing.applyBootstrap({ mode: modelRoutingModeToGateway(laterMode), revision: 0 })).toBe(false)
+      restored.available.value = true
+      await nextTick()
+      expect(restored.routing.initialRoutingMode.value).toBe(modelRoutingModeToGateway(chosenMode))
+      expect(await restored.routing.restoreDraftModelMode()).toBe(false)
+      expect(restored.routing.mode.value).toBe(chosenMode)
+      expect(preference.readLatest()?.mode).toBe(laterMode)
+
+      // A genuinely new draft still takes the latest explicit selection.
+      restored.sessionKey.value = 'agent:main:webchat:fresh-mode'
+      await nextTick()
+      expect(restored.routing.mode.value).toBe(laterMode)
+      expect(restored.models.selection.value).toEqual(laterMode === 'off' ? PIN : null)
+      restored.draft.value = false
+      await nextTick()
+      expect(readDraftRoutingMode(restored.sessionKey.value, storage)).toBeNull()
+      restored.scope.stop()
+    },
+  )
+
+  it('reads recovery modes by draft key without guessing legacy null selections', () => {
+    const storage = memoryStorage()
+    const key = 'agent:main:webchat:recovery'
+    storage.setItem('opensquilla.chat.new-task-model', JSON.stringify({ sessionKey: key, selection: null }))
+    expect(readDraftRoutingMode(key, storage)).toBeNull()
+    storage.setItem('opensquilla.chat.new-task-model', JSON.stringify({ sessionKey: key, selection: PIN }))
+    expect(readDraftRoutingMode(key, storage)).toBe('off')
+    expect(readDraftRoutingMode('agent:main:webchat:other', storage)).toBeNull()
+    storage.setItem('opensquilla.chat.new-task-model', '{broken')
+    expect(readDraftRoutingMode(key, storage)).toBeNull()
+    expect(readDraftRoutingMode(key, null)).toBeNull()
+    expect(readDraftRoutingMode(key, { ...storage, getItem: () => { throw new Error('unavailable') } })).toBeNull()
+  })
+
+  it('records switching back to direct mode while keeping the current model pin', async () => {
+    const h = harness({ autoRefresh: false })
+    h.api.select(PIN)
+    expect(await h.api.selectRoutingMode('squilla_router', async mode => { h.routingMode.value = mode; return true })).toBe(true)
+    expect(readDraftRoutingMode(h.sessionKey.value, h.storage)).toBe('squilla_router')
+    expect(await h.api.selectRoutingMode('off', async mode => { h.routingMode.value = mode; return true })).toBe(true)
+    expect(readDraftRoutingMode(h.sessionKey.value, h.storage)).toBe('off')
+    expect(h.api.selection.value).toBeNull()
+    h.api.select(PIN)
+    expect(await h.api.selectRoutingMode('off', async () => true)).toBe(true)
+    expect(h.api.selection.value).toEqual(PIN)
+    expect(readDraftRoutingMode(h.sessionKey.value, h.storage)).toBe('off')
+    h.scope.stop()
+  })
+
+  it('seeds each new draft with the latest manually selected model and provider', async () => {
+    let remembered = { ...PIN }
+    const h = harness({ initialSelection: () => remembered, autoRefresh: false })
+    expect(h.api.initialModel.value).toBe(PIN.model)
+    expect(h.api.initialProvider.value).toBe(PIN.provider)
+
+    remembered = { model: 'another-model', provider: 'another-provider' }
+    await nextTick()
+    expect(h.api.selection.value).toEqual(PIN)
+    h.sessionKey.value = 'agent:main:webchat:next'
+    await nextTick()
+    expect(h.api.selection.value).toEqual(remembered)
+    remembered.model = 'later-mutation'
+    expect(h.api.initialModel.value).toBe('another-model')
+    expect(h.list).not.toHaveBeenCalled()
+    h.scope.stop()
+  })
+
+  it('preserves a recovered draft pin over the latest manual selection', () => {
+    const storage = memoryStorage()
+    const first = harness({ storage, autoRefresh: false })
+    first.api.select(PIN)
+    first.scope.stop()
+    const restored = harness({
+      storage, autoRefresh: false,
+      initialSelection: () => ({ model: 'other-model', provider: 'other-provider' }),
+    })
+    expect(restored.api.selection.value).toEqual(PIN)
+    restored.scope.stop()
+  })
+
+  it('does not reapply the remembered model over a manual default choice on reconnect', async () => {
+    const h = harness({ initialSelection: () => PIN, autoRefresh: false })
+    expect(h.api.select(null)).toBe(true)
+    h.connectionEpoch.value += 1
+    await nextTick()
+    expect(h.api.selection.value).toBeNull()
+    expect(h.api.initialModel.value).toBeNull()
+    h.scope.stop()
+  })
+
+  it('reads a new default only after an existing session becomes a fresh draft', async () => {
+    const initialSelection = vi.fn(() => PIN)
+    const h = harness({ initialSelection, autoRefresh: false })
+    h.draft.value = false
+    h.sessionKey.value = 'agent:main:webchat:history'
+    await nextTick()
+    initialSelection.mockClear()
+    expect(h.api.selection.value).toBeNull()
+    h.sessionKey.value = 'agent:main:webchat:next'
+    expect(initialSelection).not.toHaveBeenCalled()
+    h.draft.value = true
+    await nextTick()
+    expect(initialSelection).toHaveBeenCalledOnce()
+    expect(h.api.selection.value).toEqual(PIN)
+    h.scope.stop()
+  })
+
+  it('recovers a manual Default choice instead of reapplying the remembered pin', () => {
+    const storage = memoryStorage()
+    const first = harness({ storage, initialSelection: () => PIN, autoRefresh: false })
+    expect(first.api.select(null)).toBe(true)
+    first.scope.stop()
+    const restored = harness({ storage, initialSelection: () => PIN, autoRefresh: false })
+    expect(restored.api.selection.value).toBeNull()
+    expect(restored.api.initialModel.value).toBeNull()
+    restored.scope.stop()
+  })
+
+  it('keeps configured-default behavior when no remembered model is available', () => {
+    const h = harness({ initialSelection: () => null, autoRefresh: false })
+    expect(h.api.selection.value).toBeNull()
+    expect(h.api.initialModel.value).toBeNull()
+    expect(h.api.initialProvider.value).toBeNull()
+    h.scope.stop()
+  })
+
   it('does not discover provider models until the explicit picker refresh', async () => {
     const h = harness({ catalogAvailable: true, autoRefresh: false })
     await nextTick()

@@ -1517,7 +1517,7 @@
       "resetSaved": "Niveaux recommandés de {provider} enregistrés ; mode inchangé.",
       "title": "Routage des modèles",
       "desc": "Choisissez comment le modèle est sélectionné pour chaque requête.",
-      "newSessionDefault": "C’est la valeur par défaut des nouveaux chats. Les chats existants conservent leur propre mode de routage.",
+      "newSessionDefault": "Les nouveaux chats reprennent le dernier mode sélectionné manuellement, ainsi que le modèle et le fournisseur choisis en mode modèle fixe. Sans sélection enregistrée, la configuration actuelle est utilisée. Les chats existants conservent leurs propres choix.",
       "modeTitle": "Choisir l’utilisation des modèles",
       "providerFirstTitle": "Ajouter d’abord un service de modèles",
       "providerFirst": "Le routage de modèles nécessite au moins un fournisseur enregistré.",

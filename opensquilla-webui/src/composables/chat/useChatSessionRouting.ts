@@ -16,6 +16,13 @@ export interface UseChatSessionRoutingOptions {
   routing: SessionRouting
   sessionKey: Ref<string>
   globalMode: Readonly<Ref<ModelRoutingMode>>
+  /**
+   * The last mode manually selected in any chat in this client. It is only used to
+   * initialize drafts; durable sessions always hydrate their own snapshot.
+   */
+  lastManualMode?: () => ModelRoutingMode | null
+  /** A recovered draft keeps its own explicit mode ahead of new-chat defaults. */
+  recoveredDraftMode?: () => ModelRoutingMode | null
   globalImageInputAdmission: Readonly<Ref<ImageInputAdmission>>
   globalImageInputAdmissionReason: Readonly<Ref<string>>
   capabilitiesByMode: Readonly<Ref<ModelRoutingCapabilitiesByMode | null>>
@@ -114,14 +121,14 @@ export function useChatSessionRouting(options: UseChatSessionRoutingOptions) {
   let mutationOwner: symbol | null = null
   let mutationController: AbortController | null = null
   let disposed = false
-  const draftModeSelected = ref(false)
+  const draftModeSource = ref<'remembered' | 'selected' | 'recovered' | null>(null)
 
   const isAvailable = () => !disposed && (options.available?.value ?? true)
   const controlBusy = computed(() => (
     busy.value || (options.isDraft() && options.isStreaming.value)
   ))
   const initialRoutingMode = computed<GatewayModelRoutingMode | null>(() => (
-    isAvailable() && options.isDraft() && draftModeSelected.value
+    isAvailable() && options.isDraft() && draftModeSource.value !== null
       ? modelRoutingModeToGateway(mode.value)
       : null
   ))
@@ -148,8 +155,10 @@ export function useChatSessionRouting(options: UseChatSessionRoutingOptions) {
     mutationController?.abort()
     mutationController = null
     mutationOwner = null
-    draftModeSelected.value = false
-    mode.value = options.globalMode.value
+    const recoveredMode = options.isDraft() ? options.recoveredDraftMode?.() ?? null : null
+    const rememberedMode = options.isDraft() && recoveredMode === null ? options.lastManualMode?.() ?? null : null
+    draftModeSource.value = recoveredMode !== null ? 'recovered' : rememberedMode !== null ? 'remembered' : null
+    mode.value = recoveredMode ?? rememberedMode ?? options.globalMode.value
     revision.value = 0
     busy.value = false
     modeAppliesNextTurn.value = false
@@ -218,7 +227,7 @@ export function useChatSessionRouting(options: UseChatSessionRoutingOptions) {
       if (options.isStreaming.value) return false
       mode.value = nextMode
       revision.value = 0
-      draftModeSelected.value = true
+      draftModeSource.value = 'selected'
       modeAppliesNextTurn.value = false
       return true
     }
@@ -302,6 +311,13 @@ export function useChatSessionRouting(options: UseChatSessionRoutingOptions) {
     return updateSelection(nextMode)
   }
 
+  function restoreDraftModelMode(): Promise<boolean> {
+    // A recovered model pin belongs to this draft and outranks a remembered
+    // default. A later explicit mode choice must still win on reconnect.
+    if (!options.isDraft() || draftModeSource.value === 'selected' || draftModeSource.value === 'recovered') return Promise.resolve(false)
+    return updateSelection('off')
+  }
+
   function setModel(selection: SessionModelSelection | null): Promise<boolean> {
     if (selection && ![selection.model, selection.provider].every(value => (
       typeof value === 'string' && value.length > 0 && value.length <= 512
@@ -316,7 +332,7 @@ export function useChatSessionRouting(options: UseChatSessionRoutingOptions) {
     // A draft selection is the value that will be atomically persisted with
     // its first turn. A late global/default bootstrap is not authoritative for
     // that user choice.
-    if (options.isDraft() && draftModeSelected.value) return false
+    if (options.isDraft() && draftModeSource.value !== null) return false
     return applySnapshot(snapshot)
   }
 
@@ -336,7 +352,14 @@ export function useChatSessionRouting(options: UseChatSessionRoutingOptions) {
     reset()
   }, { flush: 'sync', immediate: true })
   watch([options.sessionKey, options.isDraft], ([key, draft], [previousKey, wasDraft]) => {
-    if (key !== previousKey || draft || !wasDraft) return
+    if (key !== previousKey || draft === wasDraft) return
+    if (draft) {
+      // Starting a new task sets its key before marking it as a draft. The
+      // key watcher can therefore still see the previous durable session;
+      // initialize the new-chat default when the draft intent arrives.
+      reset()
+      return
+    }
     // First-send acceptance materializes a draft under the same key. Its
     // provisional default snapshot is not the newly created session, even
     // when both carry revision zero. Retire that snapshot before the durable
@@ -348,7 +371,7 @@ export function useChatSessionRouting(options: UseChatSessionRoutingOptions) {
   watch(options.globalMode, nextMode => {
     // Drafts have no durable session setting yet. Their first send captures
     // the current global default unless the user chose one of the three modes.
-    if (options.isDraft() && !busy.value && !draftModeSelected.value) mode.value = nextMode
+    if (options.isDraft() && !busy.value && draftModeSource.value === null) mode.value = nextMode
   })
   if (options.available) {
     watch(options.available, () => {
@@ -404,6 +427,7 @@ export function useChatSessionRouting(options: UseChatSessionRoutingOptions) {
     load,
     reset,
     setMode,
+    restoreDraftModelMode,
     setModel,
     subscribe,
   }
