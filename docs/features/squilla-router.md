@@ -21,8 +21,11 @@ It is not required. OpenSquilla can also run in direct single-model mode.
 
 ## Base Model and Memory
 
-Routing loads the packaged base model, or the explicit `squilla_router.v4_bundle_dir`
-path. Router self-learning and its feedback submission API have been removed. On upgrade,
+Routing defaults to the packaged intent and tier LightGBM classifiers with
+`strategy = "lightgbm_model"` and `tier_policy = "model"`. An explicit
+`squilla_router.lightgbm_model_dir` must contain the same verified model bundle.
+`squilla_router.v4_bundle_dir` applies only to the explicit `legacy_v4_phase3`
+strategy. Router self-learning and its feedback submission API have been removed. On upgrade,
 the obsolete `squilla_router.self_learning` settings are discarded automatically;
 credentials, model tiers, explicit model paths, and Dream settings are preserved.
 A failed automatic config backup or rewrite does not prevent loading the migrated
@@ -30,8 +33,9 @@ settings in memory. Explicit save failures still report an error.
 
 Historical learned-model pointers, samples, and training directories are left in
 place and are no longer read. Model choices may therefore differ from a previously
-personalized model. Routing diagnostics, manual model selection, calibration, and
-immediate complaint escalation remain available.
+personalized model. Routing diagnostics and manual model selection remain available.
+The model policy handles a classified correction or explicit Redo as a one-tier
+advance within the current task.
 
 Chat thumbs up/down rate the answer independently of routing. Selections are kept
 only for the current page and reset on reload; they are not submitted or used for
@@ -40,6 +44,46 @@ training. Clicking the selected thumb again clears it.
 Memory Dream runs independently. Saving its enabled state or schedule reconciles
 its scheduled jobs; if that cannot take effect live, settings report that a restart
 is required. Dream's preview and memory-writing behavior are unchanged.
+
+## Upgrading to the Model Policy
+
+Saved `strategy = "v4_phase3"` configurations now load as `lightgbm_model`.
+An omitted strategy also selects the new default. An explicitly disabled router
+stays disabled. Check custom ladders and budget expectations before enabling the
+new path; the following behavior changes apply even to an existing V4 configuration:
+
+- A new task uses the tier classifier. Continue keeps the last admitted tier;
+  Redo advances it by one, capped at C3. Explicit New Task starts a new context
+  generation. The two classifiers and their preprocessing run locally.
+- Confidence, probability-margin, difficulty, continuity, and initial budget-cap
+  heuristics do not rewrite the selected tier. In particular, the existing router
+  budget configuration does not demote or cap the initial model-policy choice.
+  A quality retry still checks the current budget before advancing.
+- Each tier executes one configured model. The model policy does not enter C3
+  Ensemble or silently select another tier/provider when credentials, image
+  support, or request capacity fail admission. The turn fails with that admission
+  error. Choose compatible models for every tier that can receive image requests.
+- Reasoning capability is required only when the effective request enables
+  thinking. Explicit `llm.thinking = "off"` remains authoritative, including
+  with `squilla_router.auto_thinking = false`.
+- A validation failure or repeated tool calls without progress can request one
+  quality upgrade. The complete target request must pass admission before its
+  tier is committed. Quality and transport retries share a maximum of three
+  additional provider calls, further bounded by `max_provider_retries`.
+- Missing or invalid model assets fail closed. Source checkouts must hydrate
+  Git LFS model weights before starting the Gateway. Packaged builds validate
+  the same frozen asset hashes.
+
+To retain the prior routing behavior while reviewing this migration, explicitly set:
+
+```toml
+[squilla_router]
+strategy = "legacy_v4_phase3"
+```
+
+To turn off routing altogether, use `enabled = false` in that section. Direct and
+explicit Ensemble modes retain their own configuration; the single-model rule
+above describes the new model-policy router.
 
 ## Enable Routing
 
@@ -66,9 +110,9 @@ OpenRouter and TokenRhythm use the following recommended single-model tiers:
 | Tier | OpenRouter | TokenRhythm |
 | --- | --- | --- |
 | C0 | `qwen/qwen3.7-flash` | `qwen3.7-flash` |
-| C1 | `deepseek/deepseek-v4-flash-0731` | `deepseek-flash` |
-| C2 | `deepseek/deepseek-v4-pro-0813` | `deepseek-v4-pro-0813` |
-| C3 | `z-ai/glm-5.3` | `glm-5.3` |
+| C1 | `deepseek/deepseek-v4-flash` | `deepseek-v4-flash-0731` |
+| C2 | `deepseek/deepseek-v4-pro` | `deepseek-v4-pro-0813` |
+| C3 | `moonshotai/kimi-k3` | `kimi-k3` |
 
 The TokenRhythm ladder leaves tier `thinking_level` unset. Direct
 requests without an explicit thinking setting preserve the provider default;
@@ -99,6 +143,10 @@ Loading saved settings, switching the primary provider, or re-enabling routing
 without submitting tier selections does not enable cross-provider execution.
 Existing primary-switch and legacy-router conflict checks still apply. Dormant
 single-model settings under a static C3 fusion plan do not enable it either.
+
+### Legacy V4 Deployment Behavior
+
+The following fusion and image-fallback behavior applies to `legacy_v4_phase3`.
 
 C3 can optionally use the shared multi-model fusion plan configured under
 `llm_ensemble`. Enabling fusion on C3 makes it use that plan instead of its
@@ -136,6 +184,8 @@ tool effects. Projection never deletes the canonical attachment, so switching
 back to a vision-capable model can recover earlier images after history
 compression.
 
+### Direct Mode
+
 Disable routing and use the configured provider/model directly:
 
 ```sh
@@ -166,11 +216,11 @@ Zhipu, and compatible provider tiers exposed by the local catalog.
 Depending on configuration, SquillaRouter may influence:
 
 - selected model tier;
-- direct model fallback;
+- direct model fallback in the legacy V4 strategy;
 - reasoning level;
 - response policy;
-- image-capable model selection;
-- cache-continuity safeguards for recent higher-tier turns.
+- image-capability admission, or image-capable tier selection in legacy V4;
+- cache-continuity safeguards for recent higher-tier turns in legacy V4.
 
 The exact decision is available through runtime metadata and diagnostics
 surfaces. Turn on diagnostics when you need to understand why a turn was routed
@@ -248,8 +298,10 @@ If routing does not appear to work:
    opensquilla doctor
    ```
 
-3. If SquillaRouter optional dependencies are missing, OpenSquilla can still run
-   with direct single-model routing. On Windows, ONNX Runtime may require the
+3. The model policy fails closed on missing dependencies or invalid assets.
+   Install the recommended dependencies and restore the model resources, or
+   explicitly disable routing to use direct single-model execution.
+   On Windows, ONNX Runtime may require the
    Visual C++ Redistributable. On macOS terminal installs, LightGBM may require
    `libomp` from Homebrew:
 
