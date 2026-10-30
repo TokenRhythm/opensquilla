@@ -362,15 +362,6 @@ def build_model_router_context(
         and i >= feature_bound_index
         and getattr(row, "role", None) == "user"
     } - {""}
-    # The preceding reply may land after this input was queued. Causal IDs,
-    # rather than its physical row position, distinguish it from future turns.
-    prior_replies = [
-        (i, row)
-        for i, row in enumerate(feature_rows)
-        if getattr(row, "role", None) in {"assistant", "system"}
-        and (not _turn_id(row) or _turn_id(row) not in excluded_turns)
-        and (_turn_id(row) or feature_bound_index is None or i < feature_bound_index)
-    ]
 
     def text(row: Any) -> str:
         return visible_router_text(str(getattr(row, "role", "")), getattr(row, "content", None))
@@ -408,15 +399,20 @@ def build_model_router_context(
             ),
             -1,
         )
-        prior_replies = [
-            (i, row)
-            for i, row in prior_replies
-            if i > previous_index and (not _turn_id(row) or _turn_id(row) == previous_turn_id)
-        ]
-    answer = next(
-        (row for _, row in reversed(prior_replies) if getattr(row, "role", None) == "assistant"),
-        None,
-    )
+    # The preceding reply may land after this input was queued. Causal IDs,
+    # rather than its physical row position, distinguish it from future turns.
+    answer = None
+    for i in reversed(range(len(feature_rows))):
+        row = feature_rows[i]
+        turn_id = _turn_id(row)
+        if (
+            getattr(row, "role", None) == "assistant"
+            and turn_id not in excluded_turns
+            and (turn_id or feature_bound_index is None or i < feature_bound_index)
+            and (not state_rows or i > previous_index and turn_id in {"", previous_turn_id})
+        ):
+            answer = row
+            break
     usage = _mapping(getattr(answer, "turn_usage", None)) if answer is not None else {}
     outcome = "unknown"
     execution_succeeded = False

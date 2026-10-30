@@ -7690,8 +7690,8 @@ class TurnRunner:
                     # this request-local window, including its summary.
                     turn.metadata["router_model_capacity_retry_pending"] = False
                 else:
-                    await self._readmit_model_router_capacity(
-                        turn, RouterHistoryReplayRequest(
+                    await self._readmit_attachment_capacity(
+                        turn, cloned_selector, RouterHistoryReplayRequest(
                             exclude_last_user=history_has_persisted_user,
                             bound_user_message_id=bound_user_message_id,
                             transcript_snapshot=transcript_snapshot,
@@ -11664,28 +11664,6 @@ class TurnRunner:
             raise RuntimeError("Model routing state admission lost its version fence")
         turn.metadata["router_model_decision"] = committed
 
-    async def _readmit_model_router_capacity(
-        self, turn: TurnContext, request: RouterHistoryReplayRequest, *,
-        initial_provider_config: Any,
-    ) -> None:
-        from opensquilla.engine.steps.model_router import validate_model_route_capacity
-
-        if request.transcript_snapshot is not None:
-            request.transcript_snapshot.invalidate()
-        measured = await self._router_history_capacity_for_request(
-            turn.session_key, request, max_history_turns=0,
-            preserve_image_attachments=True,
-            reachable_provider_kinds=self._route_capacity_provider_kinds(
-                turn, initial_provider_config=initial_provider_config,
-            ),
-        )
-        for key in ("history_capacity_estimated_tokens", "history_capacity_message_count",
-                    "history_capacity_estimate_complete"):
-            turn.metadata[f"routing_{key}"] = measured.get(
-                key, False if key.endswith("complete") else 0,
-            )
-        validate_model_route_capacity(turn)
-
     async def _readmit_attachment_capacity(
         self,
         turn: TurnContext,
@@ -11702,6 +11680,7 @@ class TurnRunner:
         from opensquilla.engine.selector_override import require_current_selector_capacity
         from opensquilla.engine.steps.squilla_router import finalize_squilla_router_capacity
 
+        model_policy = turn.metadata.get("router_tier_policy") == "model"
         if request.transcript_snapshot is not None:
             request.transcript_snapshot.invalidate()
         history_capacity = await self._router_history_capacity_for_request(
@@ -11709,7 +11688,8 @@ class TurnRunner:
             request,
             max_history_turns=0,
             preserve_image_attachments=(
-                turn.metadata.get("image_route_reason") in {"current_turn", "history_context"}
+                model_policy
+                or turn.metadata.get("image_route_reason") in {"current_turn", "history_context"}
             ),
             reachable_provider_kinds=self._route_capacity_provider_kinds(
                 turn, initial_provider_config=initial_provider_config,
@@ -11727,10 +11707,11 @@ class TurnRunner:
             ),
         })
         await finalize_squilla_router_capacity(turn, retry_after_compaction=True)
-        require_current_selector_capacity(
-            selector, turn.metadata,
-            reason="Attachment request did not pass capacity admission after compaction.",
-        )
+        if not model_policy:
+            require_current_selector_capacity(
+                selector, turn.metadata,
+                reason="Attachment request did not pass capacity admission after compaction.",
+            )
 
     async def _router_history_capacity_for_request(
         self,
