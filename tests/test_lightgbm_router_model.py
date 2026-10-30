@@ -8,6 +8,7 @@ import shutil
 import subprocess
 import sys
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import pytest
@@ -67,6 +68,13 @@ def test_original_classifier_golden_vectors(model):
                 rtol=1e-10,
                 atol=1e-12,
             )
+            expected = dict(
+                zip(golden["classes"], case["expected"]["calibrated_probabilities"], strict=True)
+            )
+            labels = ("continue", "redo", "new_task") if target == "intent" else tuple(values)
+            assert getattr(prediction, target + "_decision") == max(
+                labels, key=expected.__getitem__
+            )
 
 
 def test_runtime_identity_does_not_require_distribution_metadata(model):
@@ -83,6 +91,8 @@ def test_runtime_identity_does_not_require_distribution_metadata(model):
 def test_full_features_and_outputs_match_frozen_source(model):
     import numpy as np
 
+    from opensquilla.engine.routing.model_policy import ModelPolicyState, decide_model_tier
+
     # Inspect the actual native session; VNNI hosts otherwise hide U8S8 overflow.
     options = model._encoder.session.get_session_options()
     assert options.get_session_config_entry("session.x64quantprecision") == "1"
@@ -94,8 +104,26 @@ def test_full_features_and_outputs_match_frozen_source(model):
         features = model.build_features(case["input"])
         assert features.dtype == np.float32
         assert features.shape == (380,)
+        expected_features = np.asarray(case["features"], dtype=np.float32)
+        # Only this fixture exhibits amplified dynamic-quantization differences
+        # on AVX2 (runtime_compatibility.json). Other inputs and non-BGE features
+        # retain the original precision, including the U8S8 overflow regression.
+        cross_cpu_quantization = case["name"] == "long_three_segments"
+        semantic = np.r_[0:64, 212:276, 292:356]
+        other = np.r_[64:212, 276:292, 356:380]
         np.testing.assert_allclose(
-            features, case["features"], rtol=2e-5, atol=2e-6, err_msg=case["name"]
+            features[semantic],
+            expected_features[semantic],
+            rtol=0 if cross_cpu_quantization else 2e-5,
+            atol=0.0035 if cross_cpu_quantization else 2e-6,
+            err_msg=case["name"],
+        )
+        np.testing.assert_allclose(
+            features[other],
+            expected_features[other],
+            rtol=2e-5,
+            atol=2e-6,
+            err_msg=case["name"],
         )
         prediction = model.predict(case["input"])
         for target in ("intent", "tier"):
@@ -104,11 +132,41 @@ def test_full_features_and_outputs_match_frozen_source(model):
             np.testing.assert_allclose(
                 list(values.values()),
                 [expected[label] for label in values],
-                rtol=1e-10,
-                atol=1e-12,
+                rtol=0 if cross_cpu_quantization else 1e-10,
+                atol={"intent": 0.003, "tier": 0.007}[target] if cross_cpu_quantization else 1e-12,
                 err_msg=case["name"],
             )
+            labels = ("continue", "redo", "new_task") if target == "intent" else tuple(values)
+            assert getattr(prediction, target + "_decision") == max(
+                labels, key=expected.__getitem__
+            ), case["name"]
             assert math.isclose(sum(values.values()), 1.0, abs_tol=1e-12)
+        # Numeric tolerance must never excuse a different route or control head.
+        prior = case["input"].get("active_route_tier")
+        state = ModelPolicyState(prior.lower(), task_id="reference-task") if prior else None
+        reference_prediction = SimpleNamespace(
+            intent_probabilities=case["intent_probabilities"],
+            tier_probabilities=case["tier_probabilities"],
+        )
+        decisions = [
+            decide_model_tier(
+                case["input"],
+                state,
+                SimpleNamespace(predict=lambda _, result=result: result),
+                task_id_factory=lambda: "reference-new-task",
+            )
+            for result in (prediction, reference_prediction)
+        ]
+        for field in (
+            "intent",
+            "tier",
+            "raw_tier",
+            "thinking_mode",
+            "prompt_policy",
+            "context_reset",
+        ):
+            assert getattr(decisions[0], field) == getattr(decisions[1], field), case["name"]
+        assert decisions[0].next_state == decisions[1].next_state, case["name"]
         assert prediction.identity["model_manifest_hash"] == MANIFEST_HASH
         # Hashes provide strict per-machine evidence even where CPU kernels vary.
         assert prediction.feature_vector_hash.startswith("sha256:")

@@ -88,8 +88,8 @@
     },
     {
       "path": "runtime_compatibility.json",
-      "size_bytes": 4116,
-      "sha256": "1c841c230414e86918ebab5efec3a2a18ce731e59c264abf416e608bd87cdd3c"
+      "size_bytes": 6405,
+      "sha256": "7a3b8195329b6f4e2c240dbfbc5388b96c1cc56c8e7403790caad73f9bed9925"
     },
     {
       "path": "source_parity_cases.json",
