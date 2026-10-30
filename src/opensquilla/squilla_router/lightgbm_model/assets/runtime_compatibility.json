@@ -1,0 +1,77 @@
+{
+  "runtime_versions": {
+    "numpy": "2.5.3",
+    "lightgbm": "4.7.0",
+    "onnxruntime": "1.24.4",
+    "tokenizers": "0.23.2",
+    "scikit-learn": "1.8.0",
+    "joblib": "1.6.0"
+  },
+  "warnings": [],
+  "cases": [
+    {
+      "name": "cold_start_zh",
+      "feature_max_abs": 0.0,
+      "feature_hash_equal": true,
+      "probability_max_abs": {
+        "intent": 0.0,
+        "tier": 0.0
+      }
+    },
+    {
+      "name": "code_debug",
+      "feature_max_abs": 0.0,
+      "feature_hash_equal": true,
+      "probability_max_abs": {
+        "intent": 0.0,
+        "tier": 0.0
+      }
+    },
+    {
+      "name": "continue_with_history",
+      "feature_max_abs": 0.0,
+      "feature_hash_equal": true,
+      "probability_max_abs": {
+        "intent": 0.0,
+        "tier": 0.0
+      }
+    },
+    {
+      "name": "redo",
+      "feature_max_abs": 0.0,
+      "feature_hash_equal": true,
+      "probability_max_abs": {
+        "intent": 0.0,
+        "tier": 0.0
+      }
+    },
+    {
+      "name": "long_three_segments",
+      "feature_max_abs": 0.0,
+      "feature_hash_equal": true,
+      "probability_max_abs": {
+        "intent": 0.0,
+        "tier": 0.0
+      }
+    },
+    {
+      "name": "unicode_normalization",
+      "feature_max_abs": 0.0,
+      "feature_hash_equal": true,
+      "probability_max_abs": {
+        "intent": 0.0,
+        "tier": 0.0
+      }
+    }
+  ],
+  "golden": {
+    "intent": {
+      "cases": 8,
+      "max_abs": 1.1102230246251565e-16
+    },
+    "tier": {
+      "cases": 8,
+      "max_abs": 2.220446049250313e-16
+    }
+  }
+}

@@ -1,0 +1,96 @@
+{
+  "schema_version": "opensquilla_lightgbm_inference.v1",
+  "source_manifest_hash": "sha256:29fb79337458c4f35d3e0d1148fbdb1175c20069a5fa8ee6441633b0e2eee357",
+  "artifacts": [
+    {
+      "source_path": "models/router/router-lightgbm-99d6ff75-d444135-a1/bundles/intent.json",
+      "path": "bundles/intent.json",
+      "encoding": "identity"
+    },
+    {
+      "source_path": "models/router/router-lightgbm-99d6ff75-d444135-a1/bundles/tier.json",
+      "path": "bundles/tier.json",
+      "encoding": "identity"
+    },
+    {
+      "source_path": "models/router-training/runs/lgbm-99d6ff75-d444135-a1/intent/calibration.json",
+      "path": "intent/calibration.json",
+      "encoding": "identity"
+    },
+    {
+      "source_path": "models/router-training/runs/lgbm-99d6ff75-d444135-a1/intent/golden_vectors.json",
+      "path": "intent/golden_vectors.json",
+      "encoding": "identity"
+    },
+    {
+      "source_path": "models/router-training/runs/lgbm-99d6ff75-d444135-a1/intent/model.txt",
+      "path": "intent/model.txt.gz",
+      "encoding": "gzip"
+    },
+    {
+      "source_path": "models/router-training/runs/lgbm-99d6ff75-d444135-a1/tier/calibration.json",
+      "path": "tier/calibration.json",
+      "encoding": "identity"
+    },
+    {
+      "source_path": "models/router-training/runs/lgbm-99d6ff75-d444135-a1/tier/golden_vectors.json",
+      "path": "tier/golden_vectors.json",
+      "encoding": "identity"
+    },
+    {
+      "source_path": "models/router-training/runs/lgbm-99d6ff75-d444135-a1/tier/model.txt",
+      "path": "tier/model.txt.gz",
+      "encoding": "gzip"
+    },
+    {
+      "source_path": "models/router-training/runs/lgbm-99d6ff75-d444135-a1/preprocess/sha256:8a636e81171255a0b09e242ab2ddef178363abc6c230d95604aec153fc4f825c/preprocess_copy_manifest.json",
+      "path": "preprocess/preprocess_copy_manifest.json",
+      "encoding": "identity"
+    },
+    {
+      "source_path": "models/router-training/runs/lgbm-99d6ff75-d444135-a1/preprocess/sha256:8a636e81171255a0b09e242ab2ddef178363abc6c230d95604aec153fc4f825c/feature/artifacts/bge/onnx_model/sha256/87847793fac866d65b19cee2e73a6b2a2446a1262ab0911b1dbf9b3e9399ef9d.onnx",
+      "path": "preprocess/feature/artifacts/bge/onnx_model/sha256/87847793fac866d65b19cee2e73a6b2a2446a1262ab0911b1dbf9b3e9399ef9d.onnx",
+      "encoding": "identity"
+    },
+    {
+      "source_path": "models/router-training/runs/lgbm-99d6ff75-d444135-a1/preprocess/sha256:8a636e81171255a0b09e242ab2ddef178363abc6c230d95604aec153fc4f825c/feature/artifacts/bge/tokenizer/sha256/48cea5d44424912a6fd1ea647bf4fe50b55ab8b1e5879c3275f80e339e8fae26.json",
+      "path": "preprocess/feature/artifacts/bge/tokenizer/sha256/48cea5d44424912a6fd1ea647bf4fe50b55ab8b1e5879c3275f80e339e8fae26.json",
+      "encoding": "identity"
+    },
+    {
+      "source_path": "models/router-training/runs/lgbm-99d6ff75-d444135-a1/preprocess/sha256:8a636e81171255a0b09e242ab2ddef178363abc6c230d95604aec153fc4f825c/feature/artifacts/feature_recipe.json",
+      "path": "preprocess/feature/artifacts/feature_recipe.json",
+      "encoding": "identity"
+    },
+    {
+      "source_path": "models/router-training/runs/lgbm-99d6ff75-d444135-a1/preprocess/sha256:8a636e81171255a0b09e242ab2ddef178363abc6c230d95604aec153fc4f825c/feature/artifacts/feature_registry.json",
+      "path": "preprocess/feature/artifacts/feature_registry.json",
+      "encoding": "identity"
+    },
+    {
+      "source_path": "models/router-training/runs/lgbm-99d6ff75-d444135-a1/preprocess/sha256:8a636e81171255a0b09e242ab2ddef178363abc6c230d95604aec153fc4f825c/feature/artifacts/pca64.joblib",
+      "path": "preprocess/feature/artifacts/pca64.joblib",
+      "encoding": "identity"
+    },
+    {
+      "source_path": "models/router-training/runs/lgbm-99d6ff75-d444135-a1/preprocess/sha256:8a636e81171255a0b09e242ab2ddef178363abc6c230d95604aec153fc4f825c/feature/artifacts/runtime_manifest.json",
+      "path": "preprocess/feature/artifacts/runtime_manifest.json",
+      "encoding": "identity"
+    },
+    {
+      "source_path": "models/router-training/runs/lgbm-99d6ff75-d444135-a1/preprocess/sha256:8a636e81171255a0b09e242ab2ddef178363abc6c230d95604aec153fc4f825c/feature/artifacts/svd100.joblib",
+      "path": "preprocess/feature/artifacts/svd100.joblib",
+      "encoding": "identity"
+    },
+    {
+      "source_path": "models/router-training/runs/lgbm-99d6ff75-d444135-a1/preprocess/sha256:8a636e81171255a0b09e242ab2ddef178363abc6c230d95604aec153fc4f825c/feature/artifacts/tfidf_char_wb_2_4.joblib",
+      "path": "preprocess/feature/artifacts/tfidf_char_wb_2_4.joblib",
+      "encoding": "identity"
+    },
+    {
+      "source_path": "models/router-training/runs/lgbm-99d6ff75-d444135-a1/preprocess/sha256:8a636e81171255a0b09e242ab2ddef178363abc6c230d95604aec153fc4f825c/feature_manifest.json",
+      "path": "preprocess/feature_manifest.json",
+      "encoding": "identity"
+    }
+  ]
+}

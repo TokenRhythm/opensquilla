@@ -1,0 +1,70 @@
+[build-system]
+requires = ["setuptools>=69", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "router-training-system"
+version = "0.1.0"
+description = "Versioned data, feature, training, evaluation, and model-registry pipeline for router classifiers"
+readme = "README.md"
+requires-python = ">=3.11"
+license = "LicenseRef-Proprietary"
+authors = [{name = "Router Training Team"}]
+dependencies = [
+  "pydantic>=2.7,<3",
+  "jsonschema>=4.22,<5",
+  "PyYAML>=6.0,<7",
+  "typer>=0.12,<1",
+  "numpy>=1.26,<3",
+  "pyarrow>=16,<24",
+  "scikit-learn>=1.5,<2",
+  "joblib>=1.4,<2",
+]
+
+[project.optional-dependencies]
+features = [
+  "onnxruntime>=1.23,<2",
+  "tokenizers>=0.21,<1",
+]
+lightgbm = [
+  "lightgbm>=4.6,<5",
+  "onnxruntime>=1.23,<2",
+  "tokenizers>=0.21,<1",
+]
+bert = [
+  "torch>=2.3,<3",
+  "transformers>=4.55,<5",
+  "tokenizers>=0.21,<1",
+  "onnxruntime>=1.23,<2",
+  "onnx>=1.18,<2",
+]
+serving = [
+  "lightgbm>=4.6,<5",
+  "onnxruntime>=1.23,<2",
+  "tokenizers>=0.21,<1",
+]
+dev = [
+  "pytest>=8.2,<10",
+  "ruff>=0.12,<1",
+]
+
+[project.scripts]
+routerctl = "router_training.cli:app"
+routermeasure = "router_training.serving_worker:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+"router_training.resources" = ["*.json"]
+
+[tool.pytest.ini_options]
+addopts = "-q"
+testpaths = ["tests"]
+
+[tool.ruff]
+target-version = "py311"
+line-length = 100
+
+[tool.ruff.lint]
+select = ["E4", "E7", "E9", "F"]

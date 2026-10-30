@@ -1,0 +1,125 @@
+{
+  "schema_version": 1,
+  "files": [
+    {
+      "path": "bundles/intent.json",
+      "size_bytes": 5331,
+      "sha256": "12f9706ba34fb681008d19a9fd0a9cdb871af47215a4cf7f3aa085557cc5bb2f"
+    },
+    {
+      "path": "bundles/tier.json",
+      "size_bytes": 5308,
+      "sha256": "7a4d0dd5617559d912488866aea4c311ba6dfec64608bcfe866c48477e1e5650"
+    },
+    {
+      "path": "inference_manifest.json",
+      "size_bytes": 4888,
+      "sha256": "67be6856d3a70c97c5483700761a054014ed0283f1bd13ba67aed74059c25bb5"
+    },
+    {
+      "path": "intent/calibration.json",
+      "size_bytes": 116,
+      "sha256": "fd4e2361aa56276eb2d0ca5b3990e510dc77e255310fbb38a4f3f691140bd781"
+    },
+    {
+      "path": "intent/golden_vectors.json",
+      "size_bytes": 44966,
+      "sha256": "958a84d20e6107e465df5427cc199d774ec95e44eb4bd6d4db13857b74645eca"
+    },
+    {
+      "path": "intent/model.txt.gz",
+      "size_bytes": 7290131,
+      "sha256": "f82821f91e20a8536a1b7cb88c494b4659e26bcc9e1ef47b354a7728830bf482"
+    },
+    {
+      "path": "model_manifest.json",
+      "size_bytes": 7010,
+      "sha256": "29fb79337458c4f35d3e0d1148fbdb1175c20069a5fa8ee6441633b0e2eee357"
+    },
+    {
+      "path": "preprocess/feature/artifacts/bge/onnx_model/sha256/87847793fac866d65b19cee2e73a6b2a2446a1262ab0911b1dbf9b3e9399ef9d.onnx",
+      "size_bytes": 23902398,
+      "sha256": "87847793fac866d65b19cee2e73a6b2a2446a1262ab0911b1dbf9b3e9399ef9d"
+    },
+    {
+      "path": "preprocess/feature/artifacts/bge/tokenizer/sha256/48cea5d44424912a6fd1ea647bf4fe50b55ab8b1e5879c3275f80e339e8fae26.json",
+      "size_bytes": 439125,
+      "sha256": "48cea5d44424912a6fd1ea647bf4fe50b55ab8b1e5879c3275f80e339e8fae26"
+    },
+    {
+      "path": "preprocess/feature/artifacts/feature_recipe.json",
+      "size_bytes": 2249,
+      "sha256": "c3e88bec2caec485d0d74f13d5654404c6b35f2a891564f1460fb6d32ae6d55d"
+    },
+    {
+      "path": "preprocess/feature/artifacts/feature_registry.json",
+      "size_bytes": 17937,
+      "sha256": "e72fa3d58e23392484e60d69e771840ae4239d4d0976d326af8d3462a26c5e17"
+    },
+    {
+      "path": "preprocess/feature/artifacts/pca64.joblib",
+      "size_bytes": 135471,
+      "sha256": "86dafb29f5fe068b4908db09e7dd4bb75a907cce9826d7c4648660dda16b78b4"
+    },
+    {
+      "path": "preprocess/feature/artifacts/runtime_manifest.json",
+      "size_bytes": 2887,
+      "sha256": "2cfd622f10674cf336f3bac46f65ae21c9694933abbab0ec42bf8e324321523c"
+    },
+    {
+      "path": "preprocess/feature/artifacts/svd100.joblib",
+      "size_bytes": 4002047,
+      "sha256": "76ecc02ff3dfa290a7433a5bb3fcdbe0a03945239d5bfff9cc4e5a1c6b6f30dc"
+    },
+    {
+      "path": "preprocess/feature/artifacts/tfidf_char_wb_2_4.joblib",
+      "size_bytes": 298451,
+      "sha256": "95c8546d13686519c07c0387687e5146727e9eef822b4114ec629153a85f1312"
+    },
+    {
+      "path": "preprocess/feature_manifest.json",
+      "size_bytes": 4879,
+      "sha256": "a2b66a973653464652d9a7ffd0da25a384b5bf8fa0f11dbe8a3b0c3d1205d5eb"
+    },
+    {
+      "path": "preprocess/preprocess_copy_manifest.json",
+      "size_bytes": 5140,
+      "sha256": "907a9b6f2ebdfad491fc98b3df13d4e8575077e581919e7c81f5a90847dde299"
+    },
+    {
+      "path": "provenance.json",
+      "size_bytes": 2480,
+      "sha256": "51b0ab2c9cbc867ff9883b4d9fb29c156561999d47e898e4d7fd3f9380f21c9e"
+    },
+    {
+      "path": "runtime_compatibility.json",
+      "size_bytes": 1549,
+      "sha256": "94eb805ab095a2ae592a1d40409bf36f25483d00e0bf1ae43c9e99b6133187b8"
+    },
+    {
+      "path": "source_parity_cases.json",
+      "size_bytes": 87745,
+      "sha256": "781fc332e8de0c338ee99e90a7c37ae7ac37f489044ed986b07808bf636f26a0"
+    },
+    {
+      "path": "tier/calibration.json",
+      "size_bytes": 113,
+      "sha256": "422c930f7293464fef377f7992f08040ac086c67b161a0e0b12a05458f759c51"
+    },
+    {
+      "path": "tier/golden_vectors.json",
+      "size_bytes": 45147,
+      "sha256": "6d98be540e1d008882623ea3d4b210dc556824d6da1a8c6838451828fc843691"
+    },
+    {
+      "path": "tier/model.txt.gz",
+      "size_bytes": 12238618,
+      "sha256": "60858e46ec2ddd090a5fa7a19cbb8011e71f944740f4b4033845c67764526b15"
+    },
+    {
+      "path": "upstream-pyproject.toml",
+      "size_bytes": 1444,
+      "sha256": "55f36bb2fcd47dce832b40868054dfa6e72b527911c60d08840031da955fd845"
+    }
+  ]
+}

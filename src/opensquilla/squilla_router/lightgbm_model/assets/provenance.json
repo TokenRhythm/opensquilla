@@ -1,0 +1,50 @@
+{
+  "source_snapshot": "/home/codex/code/AutoEval-Factory-worktrees/tier-policy-ablation-20261020/tmp/aef-routing-vendor/tier-policy-ablation-20261020/router-training-a34e5ae",
+  "training_code_digest": "git:d4441356584423be07361495e55b488c95c5db43",
+  "model_set_id": "router-lightgbm-99d6ff75-d444135-a1",
+  "manifest_hash": "sha256:29fb79337458c4f35d3e0d1148fbdb1175c20069a5fa8ee6441633b0e2eee357",
+  "source_files": [
+    {
+      "path": "src/router_training/contracts.py",
+      "sha256": "sha256:b0b6a879e6e8fffae69ecb138c381851a2e7b74c2a5fc769d986b91fd9609d6e"
+    },
+    {
+      "path": "src/router_training/errors.py",
+      "sha256": "sha256:673d1de1f94093ff1cef4402e085c31e66b2468c06190b7f8a312b8e8e0506de"
+    },
+    {
+      "path": "src/router_training/features/__init__.py",
+      "sha256": "sha256:03845e09ae6c2f74e8cdd6d3ca1adde4429ab4876f3402c75e7676a26fc9ff57"
+    },
+    {
+      "path": "src/router_training/features/lightgbm380.py",
+      "sha256": "sha256:89588d0008e093b383188ed4c3ab944c436fadfeaba2814bece6d6ddbeb4831e"
+    },
+    {
+      "path": "src/router_training/features/numeric.py",
+      "sha256": "sha256:ef327f463ce9851bb4c326aacf00b23f85f9268f47699f75703a67400a52a306"
+    },
+    {
+      "path": "src/router_training/features/registry.py",
+      "sha256": "sha256:12da54112196ea054831fe76b206c138aad40673c9b38314f7243900d529d8d1"
+    },
+    {
+      "path": "src/router_training/features/runtime.py",
+      "sha256": "sha256:821b8b0b24849373ff99f3fb9f1623761e787877e2057492f27f00f511ba4b5b"
+    },
+    {
+      "path": "src/router_training/features/text.py",
+      "sha256": "sha256:c6fe801a56806aefc1c9bdbce29cdff8b36d5a49142d8682954488860e3a7885"
+    },
+    {
+      "path": "src/router_training/ids.py",
+      "sha256": "sha256:c74827ac66be51f05e24bfa7dc1e8856ed26f4c550eba2f7adbf3e8b1a692ba4"
+    },
+    {
+      "path": "src/router_training/training/common.py",
+      "sha256": "sha256:b6db10f1f12ad6308e3a5d0d74292a49c2b224a9d7be18256302b5f940a57f6e"
+    }
+  ],
+  "source_license": "LicenseRef-Proprietary (original pyproject.toml; no LICENSE file in frozen snapshot)",
+  "changes": "Feature modules, ids.py and errors.py copied verbatim. RouterInput/ContractModel and four calibration functions extracted verbatim. Loader resolves original artifact paths from a static manifest and remaps only the three frozen joblib wrapper class names; transforms and model bytes unchanged. Training run manifests/metrics omitted from inference package."
+}
