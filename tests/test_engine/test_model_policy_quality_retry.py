@@ -247,6 +247,9 @@ async def test_quality_retry_large_transient_context_does_not_commit_or_activate
         projected.append((copy.deepcopy(messages), result, small))
         assert config.thinking is False
         assert config.thinking_budget_tokens == 0
+        # This tool failure crossed the barrier since the preceding physical
+        # request; preview must already see the current iteration's policy.
+        assert wrapper._image_probe_forbidden is True
         return result
 
     monkeypatch.setattr(quality, "project_provider_final_request", capture)
@@ -480,8 +483,9 @@ async def test_local_preflight_repair_keeps_first_dispatch_with_zero_retry_budge
     assert not any(event.kind == "error" for event in events)
 
 
+@pytest.mark.parametrize("vision_support", ["supported", "unsupported", "unknown"])
 async def test_quality_retry_projects_the_same_physical_leg_as_dispatch(
-    execution, monkeypatch,
+    execution, monkeypatch, vision_support,
 ) -> None:
     import opensquilla.engine.model_router_quality as quality
     from opensquilla.engine.model_policy_recovery import ModelPolicyRecovery
@@ -490,6 +494,18 @@ async def test_quality_retry_projects_the_same_physical_leg_as_dispatch(
 
     e = execution
     wrapper = _SelectorFallbackProvider(e.provider, e.selector, e.turn.metadata)
+    from opensquilla.provider.image_projection import ImageMarkerState
+
+    # A forced marker on the old deployment must not carry over to a new
+    # vision-capable candidate, while the turn-wide unknown-probe barrier must.
+    wrapper.configure_image_request_projection(
+        force_marker=True, marker_state=ImageMarkerState.NOT_ANALYZED,
+        forbid_unknown_probe=True, reason="configured_marker_fallback",
+    )
+    monkeypatch.setattr(
+        quality.shared_catalog(), "resolve_deployment_vision_support",
+        lambda *a, **k: vision_support,
+    )
     provider_type = type(e.provider)
     monkeypatch.setattr(
         provider_type, "requires_complete_reasoning_history", lambda *a, **k: True,
@@ -532,11 +548,12 @@ async def test_quality_retry_projects_the_same_physical_leg_as_dispatch(
     admitted_messages, admitted_config = projected[0]
     assert admitted_messages != messages
     assert "Recorded conversation context" in str(admitted_messages)
-    assert not any(
+    has_images = any(
         isinstance(block, ContentBlockImage)
         for message in admitted_messages if isinstance(message.content, list)
         for block in message.content
     )
+    assert has_images is (vision_support == "supported")
     events = [event async for event in wrapper.chat(messages, config=admitted_config)]
     assert events
     assert dispatched == [(admitted_messages, admitted_config)]

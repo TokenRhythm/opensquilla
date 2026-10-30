@@ -7333,6 +7333,22 @@ class Agent:
                                 previous_call_retrieval
                             )
                         if pending_model_quality_retry is not None:
+                            if selector_projects_images:
+                                # Bind this iteration's barrier before candidate
+                                # preview; marker forcing remains deployment-bound.
+                                selector_image_provider.configure_image_request_projection(
+                                    force_marker=(
+                                        image_projection_forced
+                                        and selector_image_provider.active_deployment_config()
+                                        == image_projection_forced_deployment
+                                    ),
+                                    marker_state=image_projection_marker_state,
+                                    forbid_unknown_probe=turn_image_retry_barrier_crossed,
+                                    reason=(
+                                        str(self.config.metadata.get("image_input_reason") or "")
+                                        or None
+                                    ),
+                                )
                             reason = pending_model_quality_retry
                             pending_model_quality_retry = None
                             # Admit the fully assembled next request, including
