@@ -55,7 +55,9 @@ def test_original_classifier_golden_vectors(model):
     import numpy as np
 
     for target in ("intent", "tier"):
-        golden = json.loads((default_model_root() / target / "golden_vectors.json").read_text())
+        golden = json.loads(
+            (default_model_root() / target / "golden_vectors.json").read_text(encoding="utf-8")
+        )
         for case in golden["cases"]:
             prediction = model.predict_features(case["features"])
             values = getattr(prediction, target + "_probabilities")
@@ -81,7 +83,9 @@ def test_runtime_identity_does_not_require_distribution_metadata(model):
 def test_full_features_and_outputs_match_frozen_source(model):
     import numpy as np
 
-    reference = json.loads((default_model_root() / "source_parity_cases.json").read_text())
+    reference = json.loads(
+        (default_model_root() / "source_parity_cases.json").read_text(encoding="utf-8")
+    )
     for case in reference["cases"]:
         features = model.build_features(case["input"])
         assert features.dtype == np.float32
@@ -153,3 +157,26 @@ def test_truncated_compressed_model_fails_closed(tmp_path: Path):
     with pytest.raises(LightGBMModelError) as caught:
         validate_artifacts(tmp_path)
     assert caught.value.fail_closed
+
+
+def test_native_model_loads_from_deep_install_path_with_non_utf8_locale(tmp_path, monkeypatch):
+    # Match the installed Gateway's long prefix while keeping resource names short.
+    root = tmp_path / ("installed-gateway-" + "x" * max(1, 145 - len(str(tmp_path)))) / "assets"
+    shutil.copytree(default_model_root(), root)
+    original_read_text = Path.read_text
+    reads = []
+
+    def legacy_read_text(path, encoding=None, errors=None):
+        if path.is_relative_to(root):
+            reads.append((path.name, encoding))
+        return original_read_text(path, encoding=encoding or "cp1252", errors=errors)
+
+    monkeypatch.setattr(Path, "read_text", legacy_read_text)
+    runtime = LightGBMRouterModel(root)
+    try:
+        prediction = runtime.predict({"current_request": "你好，请解释一下什么是二分查找。"})
+        assert prediction.tier_decision == "C0"
+        assert reads and all(encoding == "utf-8" for _, encoding in reads)
+        assert len(str(root / "preprocess/feature/artifacts/bge/model.onnx")) > 200
+    finally:
+        runtime.close()

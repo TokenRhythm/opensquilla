@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import math
+from typing import Any, cast
 import re
 from collections import Counter
 from collections.abc import Mapping, Sequence
@@ -89,7 +90,7 @@ def _as_nonnegative(value: object) -> float:
     if isinstance(value, bool):
         return 0.0
     try:
-        number = float(value or 0.0)
+        number = float(cast(Any, value or 0.0))
     except (TypeError, ValueError):
         return 0.0
     return number if math.isfinite(number) and number > 0 else 0.0
@@ -178,7 +179,7 @@ def _finite_number(value: object, default: float = 0.0) -> float:
     if isinstance(value, bool):
         return default
     try:
-        number = float(value)
+        number = float(cast(Any, value))
     except (TypeError, ValueError):
         return default
     return number if math.isfinite(number) else default
@@ -306,7 +307,7 @@ def extract_context5(row: Mapping[str, object]) -> np.ndarray:
         raise TypeError("input.context must be a mapping or null")
     estimated = raw_context.get("context_tokens_est")
     if estimated is None:
-        history_chars = sum(len(canonicalize_text(value)) for value in (payload.get("history_user") or []))
+        history_chars = sum(len(canonicalize_text(value)) for value in cast(Sequence[object], payload.get("history_user") or []))
         estimated_tokens = (
             len(segments.current_request) + history_chars + len(segments.previous_answer)
         ) // 4

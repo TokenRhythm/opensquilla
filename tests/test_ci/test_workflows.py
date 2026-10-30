@@ -3332,7 +3332,18 @@ def test_native_desktop_cells_run_source_and_frozen_mcp_probes() -> None:
         "Build production Docker image and verify MCP"
     ))
     assert container["if"] == "${{ matrix.probe == 'docker' }}"
-    assert 'git lfs pull --include="src/opensquilla/squilla_router/models/' in container["run"]
+    assets = next(step for step in steps if step.get("name") == (
+        "Prepare router assets for Gateway probes"
+    ))
+    assert assets["if"] == "${{ matrix.probe != 'pty' }}"
+    assert "set -euo pipefail" in assets["run"]
+    assert 'git lfs pull --include="src/opensquilla/squilla_router/models/' in assets["run"]
+    assert "src/opensquilla/squilla_router/lightgbm_model/assets/**" in assets["run"]
+    assert "validate_artifacts()" in assets["run"]
+    assert assets["run"].index("git lfs pull") < assets["run"].index("validate_artifacts()")
+    for gateway_probe in (source, frozen, container):
+        assert steps.index(assets) < steps.index(gateway_probe)
+    assert "continue-on-error" not in assets
     assert "docker build --file Dockerfile" in container["run"]
     assert "docker run --rm -i --entrypoint python" in container["run"]
     assert "readonly" in container["run"]

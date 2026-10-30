@@ -1098,7 +1098,7 @@ def test_router_preflight_rejects_escaping_manifest_path(tmp_path: Path) -> None
 
     module, model_root, _, _ = _lightgbm_preflight_fixture(tmp_path)
     manifest = model_root.parent / "lightgbm_model" / "assets" / "artifact_manifest.json"
-    data = json.loads(manifest.read_text())
+    data = json.loads(manifest.read_text(encoding="utf-8"))
     data["files"][0]["path"] = "../outside.json"
     manifest.write_text(json.dumps(data))
     with pytest.raises(SystemExit, match="Invalid LightGBM artifact manifest"):

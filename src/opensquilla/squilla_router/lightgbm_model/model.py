@@ -21,6 +21,9 @@ FEATURE_SCHEMA_VERSION = "lightgbm_380.v1"
 INTENT_LABELS = ("new_task", "continue", "redo")
 TIER_LABELS = ("C0", "C1", "C2", "C3")
 _EXCLUDED_TYPES = frozenset({"run_manifest", "training_metrics"})
+# Keep installed paths below Windows installer limits; source manifests retain
+# the original content-addressed names and every asset's pinned digest.
+_ENCODER_ASSETS = {"onnx_model": "bge/model.onnx", "tokenizer": "bge/tokenizer.json"}
 
 
 class LightGBMModelError(RuntimeError):
@@ -77,6 +80,8 @@ def _verified_artifacts(model_root: str | Path | None) -> tuple[dict[str, Any], 
                 local = "bundles/" + source.name
             else:
                 local = source.parent.name + "/" + source.name
+            if local.startswith("preprocess/feature/artifacts/bge/"):
+                local = "preprocess/feature/artifacts/" + _ENCODER_ASSETS[source.parent.parent.name]
             compressed = ref["artifact_type"] == "lightgbm_model"
             if compressed:
                 local += ".gz"
@@ -87,9 +92,7 @@ def _verified_artifacts(model_root: str | Path | None) -> tuple[dict[str, Any], 
             else:
                 payload = path.read_bytes()
             if len(payload) != ref["size"] or _hash(payload) != ref["sha256"]:
-                raise LightGBMModelError(
-                    f"bundled LightGBM artifact hash mismatch: {local}"
-                )
+                raise LightGBMModelError(f"bundled LightGBM artifact hash mismatch: {local}")
             paths[ref["path"]] = path
         return manifest, paths
     except LightGBMModelError:
@@ -191,9 +194,11 @@ class LightGBMRouterModel:
                 return matches[0]
 
             feature_root = one("transformer_manifest").parent
-            runtime_manifest = json.loads((feature_root / "runtime_manifest.json").read_text())
+            runtime_manifest = json.loads(
+                (feature_root / "runtime_manifest.json").read_text(encoding="utf-8")
+            )
             encoder_paths = {
-                item["role"]: feature_root / item["path"]
+                item["role"]: feature_root / _ENCODER_ASSETS[item["role"]]
                 for item in runtime_manifest["encoder_assets"]
             }
             encoder = BGEOnnxEncoder(
@@ -220,7 +225,9 @@ class LightGBMRouterModel:
                 with gzip.open(model_file, "rt", encoding="utf-8") as handle:
                     text = handle.read()
                 self._models[target] = lgb.Booster(model_str=text)
-                calibration = json.loads(one("temperature_calibration", target).read_text())
+                calibration = json.loads(
+                    one("temperature_calibration", target).read_text(encoding="utf-8")
+                )
                 self._temperatures[target] = calibration["temperature"]
             self.identity = {
                 "model_set_id": MODEL_SET_ID,
@@ -321,5 +328,6 @@ class LightGBMRouterModel:
     def close(self) -> None:
         with self._lock:
             if not self._closed:
+                assert self._encoder is not None
                 self._encoder.close()
                 self._closed = True

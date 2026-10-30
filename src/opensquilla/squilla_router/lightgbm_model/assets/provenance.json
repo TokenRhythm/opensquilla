@@ -1,5 +1,5 @@
 {
-  "source_snapshot": "/home/codex/code/AutoEval-Factory-worktrees/tier-policy-ablation-20261020/tmp/aef-routing-vendor/tier-policy-ablation-20261020/router-training-a34e5ae",
+  "source_snapshot": "tier-policy-ablation-20261020/router-training-a34e5ae",
   "training_code_digest": "git:d4441356584423be07361495e55b488c95c5db43",
   "model_set_id": "router-lightgbm-99d6ff75-d444135-a1",
   "manifest_hash": "sha256:29fb79337458c4f35d3e0d1148fbdb1175c20069a5fa8ee6441633b0e2eee357",
@@ -38,6 +38,6 @@
     }
   ],
   "source_license": "LicenseRef-Proprietary (original pyproject.toml; no LICENSE file in frozen snapshot)",
-  "changes": "Vendored inference subset extracted from feature modules. Training, artifact export/loading, BERT, registry CLI, unused batch transforms, training-only transformer constructors, the redundant feature-runtime wrapper and unused encoder inspection/context-manager methods removed. The unused SQLite embedding cache and dedicated identity helpers removed; encoder construction, close and encode specialize the original memory-cache path by deleting unused persistence branches. Tokenization, ONNX execution, batching, ordering and normalization unchanged. Other retained function and method definitions remain verbatim. RouterInput/ContractModel and four calibration functions extracted verbatim. Loader resolves original artifact paths from a static manifest and remaps only the three frozen joblib wrapper class names; transforms and model bytes unchanged. Training run manifests/metrics omitted from inference package.",
+  "changes": "Vendored inference subset extracted from feature modules. Training, artifact export/loading, BERT, registry CLI, unused batch transforms, training-only transformer constructors, the redundant feature-runtime wrapper and unused encoder inspection/context-manager methods removed. The unused SQLite embedding cache and dedicated identity helpers removed; encoder construction, close and encode specialize the original memory-cache path by deleting unused persistence branches. Tokenization, ONNX execution, batching, ordering and normalization unchanged. Other retained function and method definitions preserve their original arithmetic; type-only annotations and casts were added for static checks. RouterInput/ContractModel and calibration arithmetic were extracted from the recorded upstream files. Loader resolves original artifact paths from a static manifest and remaps only the three frozen joblib wrapper class names; transforms and model bytes unchanged. BGE model and tokenizer use short installed filenames to avoid Windows packaged path-length failures; the original source manifests and hashes are unchanged. Training run manifests/metrics omitted from inference package.",
   "source_files_description": "Paths and SHA-256 hashes identify complete original upstream files, not the local inference extracts."
 }

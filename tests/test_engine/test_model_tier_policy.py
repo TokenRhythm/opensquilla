@@ -153,7 +153,9 @@ def project(decision):
 
 # FROZEN_EXPECTED
 FROZEN_EXPECTED = json.loads(
-    (Path(__file__).parent / "goldens" / "model_tier_policy_reference.json").read_text()
+    (Path(__file__).parent / "goldens" / "model_tier_policy_reference.json").read_text(
+        encoding="utf-8"
+    )
 )
 
 
@@ -270,3 +272,25 @@ def test_replay_rejects_rehashed_semantic_tampering(mutation):
     ).hexdigest()
     with pytest.raises(ValueError):
         ModelPolicyDecision.from_dict(payload)
+
+
+@pytest.mark.parametrize("default_encoding", ["cp1252", "gbk"])
+def test_rules_load_utf8_when_platform_default_is_not_utf8(monkeypatch, default_encoding):
+    import yaml
+
+    from opensquilla.engine.routing import model_policy
+
+    rules_path = model_policy.default_bundle_dir() / "router.runtime.yaml"
+    expected = yaml.safe_load(rules_path.read_text(encoding="utf-8"))
+    original_read_text = Path.read_text
+
+    def platform_read_text(path, encoding=None, errors=None):
+        return original_read_text(path, encoding=encoding or default_encoding, errors=errors)
+
+    model_policy._rules.cache_clear()
+    try:
+        with monkeypatch.context() as context:
+            context.setattr(Path, "read_text", platform_read_text)
+            assert model_policy._rules()["flag_rules"] == expected["flag_rules"]
+    finally:
+        model_policy._rules.cache_clear()

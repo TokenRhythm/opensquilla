@@ -15,9 +15,9 @@ feature-runtime wrapper. The unused SQLite embedding cache and its identity
 helpers were removed; encoder construction, close, and encode retain the
 original memory-cache path with only the unused persistence branches removed.
 Tokenization, ONNX execution, batching, ordering, and normalization are unchanged.
-Other retained function/method definitions are verbatim; imports and module/class
-descriptions were trimmed. `features/text.py`, `features/numeric.py`,
-`input_contract.py`, and `calibration.py` retain the original extracted definitions.
+Other retained function/method definitions preserve the original arithmetic;
+imports, module/class descriptions, and type-only annotations/casts were adjusted.
+`features/text.py` and `input_contract.py` retain the original extracted definitions.
 The original training package declares `LicenseRef-Proprietary`; that declaration
 and its original package metadata are retained in `assets/upstream-pyproject.toml`.
 The frozen snapshot contains no separate license file. These source files retain
@@ -28,7 +28,10 @@ original manifest and the selected inference closure before native model loading
 or pickle deserialization. The two model text files are distributed as gzip;
 verification hashes the decompressed original bytes. The encoder, tokenizer,
 three joblib transformers, calibration files, bundles, and feature metadata are
-unchanged. Training run manifests and training metrics remain referenced in the
+unchanged. The two BGE files use short installed names (`bge/model.onnx` and
+`bge/tokenizer.json`) to avoid the Windows packaged path length that caused a
+resource-read failure; their original paths and hashes remain in the source
+manifests. Training run manifests and training metrics remain referenced in the
 original manifest but are omitted from the inference distribution.
 
 The 380 float32 features are current-request BGE/PCA64, current-request

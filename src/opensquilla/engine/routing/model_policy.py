@@ -62,7 +62,9 @@ def _hash(value: Any) -> str:
 def _rules() -> dict[str, Any]:
     # These four sections and controller.py are identical to the frozen source;
     # the bundle's deployment registry and tier-changing thresholds are unused.
-    data = yaml.safe_load((default_bundle_dir() / "router.runtime.yaml").read_text())
+    data = yaml.safe_load(
+        (default_bundle_dir() / "router.runtime.yaml").read_text(encoding="utf-8")
+    )
     return {section: copy.deepcopy(data.get(section, {})) for section in _RULE_SECTIONS}
 
 
@@ -487,16 +489,21 @@ def decide_model_tier(
         raw_tier = tier_audit.final
     final_tier = held_tier or raw_tier
     reset = intent_audit.source == "rule" and intent == "new_task"
+    if intent == "new_task":
+        task_id = task_id_factory() if task_id_factory else uuid.uuid4().hex
+        turn_count = 1
+        task_start_input_message_id = input_message_id
+    else:
+        assert state is not None  # Reuse is only selected for an active task above.
+        task_id = state.task_id
+        turn_count = state.turn_count + 1
+        task_start_input_message_id = state.task_start_input_message_id
     next_state = ModelPolicyState(
         tier=final_tier,
-        task_id=(task_id_factory() if task_id_factory else uuid.uuid4().hex)
-        if intent == "new_task"
-        else state.task_id,
-        turn_count=1 if intent == "new_task" else state.turn_count + 1,
+        task_id=task_id,
+        turn_count=turn_count,
         version=state.version + 1 if state is not None else 1,
-        task_start_input_message_id=input_message_id
-        if intent == "new_task"
-        else state.task_start_input_message_id,
+        task_start_input_message_id=task_start_input_message_id,
         generation_start_input_message_id=input_message_id
         if reset
         else state.generation_start_input_message_id

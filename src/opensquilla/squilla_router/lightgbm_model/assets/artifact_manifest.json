@@ -32,12 +32,12 @@
       "sha256": "29fb79337458c4f35d3e0d1148fbdb1175c20069a5fa8ee6441633b0e2eee357"
     },
     {
-      "path": "preprocess/feature/artifacts/bge/onnx_model/sha256/87847793fac866d65b19cee2e73a6b2a2446a1262ab0911b1dbf9b3e9399ef9d.onnx",
+      "path": "preprocess/feature/artifacts/bge/model.onnx",
       "size_bytes": 23902398,
       "sha256": "87847793fac866d65b19cee2e73a6b2a2446a1262ab0911b1dbf9b3e9399ef9d"
     },
     {
-      "path": "preprocess/feature/artifacts/bge/tokenizer/sha256/48cea5d44424912a6fd1ea647bf4fe50b55ab8b1e5879c3275f80e339e8fae26.json",
+      "path": "preprocess/feature/artifacts/bge/tokenizer.json",
       "size_bytes": 439125,
       "sha256": "48cea5d44424912a6fd1ea647bf4fe50b55ab8b1e5879c3275f80e339e8fae26"
     },
@@ -83,8 +83,8 @@
     },
     {
       "path": "provenance.json",
-      "size_bytes": 2880,
-      "sha256": "ae676601dbb6b7df5fa672daeb0c40bf9ccc75180680a17efcaed656d3d82aa5"
+      "size_bytes": 3047,
+      "sha256": "883ff3ad86f4fa3dac8f1f7f9bf567631daffb7ba40b24be81a5e1c374b09c1e"
     },
     {
       "path": "runtime_compatibility.json",

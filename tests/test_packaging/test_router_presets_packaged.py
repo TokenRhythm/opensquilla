@@ -76,6 +76,23 @@ def test_wheel_contains_complete_verified_lightgbm_bundle(isolated_core_wheel: P
         } <= names
         asset_prefix = f"{prefix}/assets"
         manifest = json.loads(wheel.read(f"{asset_prefix}/artifact_manifest.json"))
+        from pathlib import PureWindowsPath
+
+        # The real NSIS Gateway prefix previously made hashed encoder paths 289
+        # characters and the smoke probe failed to read them. Keep the packaged
+        # layout below MAX_PATH without relying on installer or runtime opt-in.
+        installed = (
+            PureWindowsPath(
+                "D:/a/opensquilla/opensquilla/dist/desktop-electron/win-unpacked/resources"
+                "/runtime/gateway/opensquilla-gateway/_internal"
+            )
+            / asset_prefix
+        )
+        assert {
+            "preprocess/feature/artifacts/bge/model.onnx",
+            "preprocess/feature/artifacts/bge/tokenizer.json",
+        } <= {record["path"] for record in manifest["files"]}
+        assert all(len(str(installed / record["path"])) < 260 for record in manifest["files"])
         for record in manifest["files"]:
             path = f"{asset_prefix}/{record['path']}"
             assert path in names, f"missing model artifact: {path}"
@@ -88,9 +105,11 @@ def test_wheel_contains_complete_verified_lightgbm_bundle(isolated_core_wheel: P
         )
         source = json.loads(original)
         for target in ("intent", "tier"):
-            reference = next(ref for ref in source["models"] if (
-                ref["artifact_type"] == "lightgbm_model" and f"/{target}/" in ref["path"]
-            ))
+            reference = next(
+                ref
+                for ref in source["models"]
+                if (ref["artifact_type"] == "lightgbm_model" and f"/{target}/" in ref["path"])
+            )
             decoded = gzip.decompress(wheel.read(f"{asset_prefix}/{target}/model.txt.gz"))
             assert len(decoded) == reference["size"]
             assert "sha256:" + hashlib.sha256(decoded).hexdigest() == reference["sha256"]

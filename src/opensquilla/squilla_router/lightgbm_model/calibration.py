@@ -1,5 +1,6 @@
 """Exact temperature calibration arithmetic extracted from training/common.py."""
 import math
+from typing import cast
 
 import numpy as np
 
@@ -19,7 +20,7 @@ def _as_logits(values: object) -> np.ndarray:
 
 def _log_softmax(logits: np.ndarray) -> np.ndarray:
     shifted = logits - np.max(logits, axis=1, keepdims=True)
-    return shifted - np.log(np.exp(shifted).sum(axis=1, keepdims=True))
+    return cast(np.ndarray, shifted - np.log(np.exp(shifted).sum(axis=1, keepdims=True)))
 
 def probabilities_to_logits(probabilities: object) -> np.ndarray:
     values = np.asarray(probabilities, dtype=np.float64)
@@ -31,10 +32,10 @@ def probabilities_to_logits(probabilities: object) -> np.ndarray:
     if np.any(row_sums <= 0):
         raise TrainingError("each probability row must have positive mass")
     normalized = values / row_sums
-    return np.log(np.clip(normalized, 1e-12, 1.0))
+    return cast(np.ndarray, np.log(np.clip(normalized, 1e-12, 1.0)))
 
 def apply_temperature(logits: object, temperature: float) -> np.ndarray:
     matrix = _as_logits(logits)
     if not math.isfinite(temperature) or temperature <= 0.0:
         raise TrainingError("temperature must be finite and positive")
-    return np.exp(_log_softmax(matrix / temperature))
+    return cast(np.ndarray, np.exp(_log_softmax(matrix / temperature)))

@@ -7,6 +7,7 @@ from concurrent.futures import ThreadPoolExecutor
 from collections.abc import Mapping, Sequence
 from hashlib import sha256
 from pathlib import Path
+from typing import Any
 
 import numpy as np
 
@@ -47,6 +48,7 @@ class SklearnPCA64Projector:
     """PCA fitted on train embeddings, with a fixed 64-column output."""
 
     output_dim = PCA_DIM
+    estimator: Any  # Restored from the frozen joblib state.
 
     def transform(self, values: object) -> np.ndarray:
         if self.estimator is None:
@@ -57,6 +59,8 @@ class SklearnPCA64Projector:
 class SklearnCharTfidfVectorizer:
     """Frozen character ``char_wb`` TF-IDF configuration."""
 
+    estimator: Any  # Restored from the frozen joblib state.
+
     def transform(self, texts: Sequence[str]) -> object:
         return self.estimator.transform(list(texts))
 
@@ -64,6 +68,7 @@ class SklearnSVD100Projector:
     """TruncatedSVD fitted on train TF-IDF, with a fixed 100-column output."""
 
     output_dim = SVD_DIM
+    estimator: Any  # Restored from the frozen joblib state.
 
     def transform(self, values: object) -> np.ndarray:
         if self.estimator is None:
@@ -186,7 +191,7 @@ class BGEOnnxEncoder:
                 providers=list(providers),
             )
         self.tokenizer = tokenizer
-        self.session = session
+        self.session: Any = session
         self.cls_token_id = _special_token_id(tokenizer, "cls", "[CLS]")
         self.sep_token_id = _special_token_id(tokenizer, "sep", "[SEP]")
         self.pad_token_id = _special_token_id(tokenizer, "pad", "[PAD]")
