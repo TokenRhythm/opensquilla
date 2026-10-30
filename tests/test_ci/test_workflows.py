@@ -4137,12 +4137,14 @@ def test_gateway_jobs_prepare_router_assets_before_execution(workflow, job_id, c
     assert not assets.get("if") and not assets.get("continue-on-error")
 
 
-def test_router_asset_action_hydrates_and_verifies_without_native_dependencies():
+def test_router_asset_action_verifies_assets_and_prepares_native_dependencies():
     action = yaml.safe_load(
         Path(".github/actions/prepare-router-assets/action.yml").read_text(encoding="utf-8")
     )
     assert action["runs"]["using"] == "composite"
-    step, = action["runs"]["steps"]
+    step, native = action["runs"]["steps"]
+    assert native["if"] == "${{ runner.os == 'macOS' }}"
+    assert native["run"] == "brew install libomp"
     assert step["shell"] == "bash"
     assert step["working-directory"] == "${{ github.workspace }}"
     assert "set -euo pipefail" in step["run"]

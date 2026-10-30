@@ -493,6 +493,9 @@ jobs:
             PYTHONPATH=src python -c "from opensquilla.squilla_router.lightgbm_model import validate_artifacts; print(validate_artifacts())"
           fi
 
+      - name: Install macOS router runtime library
+        run: brew install libomp
+
       - name: Set up uv
         uses: astral-sh/setup-uv@v5
         with:

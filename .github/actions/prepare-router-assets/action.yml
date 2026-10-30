@@ -1,5 +1,5 @@
 name: Prepare router assets
-description: Hydrate and verify the local model bundle before Gateway startup or packaging.
+description: Prepare verified model assets and native dependencies before Gateway startup or packaging.
 runs:
   using: composite
   steps:
@@ -10,3 +10,7 @@ runs:
         set -euo pipefail
         git lfs pull --include="src/opensquilla/squilla_router/models/**,src/opensquilla/squilla_router/lightgbm_model/assets/**"
         PYTHONPATH=src python -c "from opensquilla.squilla_router.lightgbm_model import validate_artifacts; print(validate_artifacts())"
+    - name: Install macOS router runtime library
+      if: ${{ runner.os == 'macOS' }}
+      shell: bash
+      run: brew install libomp
