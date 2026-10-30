@@ -185,6 +185,9 @@ class BGEOnnxEncoder:
             options.inter_op_num_threads = inter_threads
             options.execution_mode = ort.ExecutionMode.ORT_SEQUENTIAL
             options.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
+            # U8S8 kernels saturate on x64 without VNNI; ORT's precision mode
+            # avoids that integer overflow without changing the frozen model bytes.
+            options.add_session_config_entry("session.x64quantprecision", "1")
             session = ort.InferenceSession(
                 str(self.model_path),
                 sess_options=options,

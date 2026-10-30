@@ -83,6 +83,10 @@ def test_runtime_identity_does_not_require_distribution_metadata(model):
 def test_full_features_and_outputs_match_frozen_source(model):
     import numpy as np
 
+    # Inspect the actual native session; VNNI hosts otherwise hide U8S8 overflow.
+    options = model._encoder.session.get_session_options()
+    assert options.get_session_config_entry("session.x64quantprecision") == "1"
+
     reference = json.loads(
         (default_model_root() / "source_parity_cases.json").read_text(encoding="utf-8")
     )
