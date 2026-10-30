@@ -573,6 +573,10 @@ def test_runner_saturated_subprocess_contracts_are_marked_ci_serial() -> None:
     ("test_file", "function_name"),
     [
         (
+            "tests/test_cli/test_agent_invalid_api_key_process.py",
+            "test_invalid_api_key_exits_promptly_with_nonzero_status",
+        ),
+        (
             "tests/test_tools/test_shell_blocking_launch.py",
             "test_slow_native_launch_preserves_loop_and_ownership",
         ),
