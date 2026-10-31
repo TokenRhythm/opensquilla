@@ -416,5 +416,5 @@ async def test_image_tool_result_reports_when_the_model_receives_no_image(
         for message in requests[2]
         if isinstance(message.content, list)
         for block in message.content
-    )
+    ) is not image_expected
     assert not any(event.kind == "error" for event in followup)

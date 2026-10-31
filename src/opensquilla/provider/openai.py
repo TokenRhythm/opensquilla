@@ -81,6 +81,7 @@ from .recovery_origin import transport_recovery_origin
 from .request_proof import (
     ProviderRequestBudgetExceededError,
     fit_payload_generation_budget,
+    local_budget_rejection_event,
     project_final_request_payload,
     protected_tool_result_indexes,
     prove_provider_payload_from_env,
@@ -3915,10 +3916,7 @@ class OpenAIProvider:
         if budget_decision.action == "budget_limited":
             proof = budget_decision.proof or {}
             log.warning("provider.request_budget_exhausted", **proof)
-            yield ErrorEvent(
-                message=json.dumps(proof, ensure_ascii=False, sort_keys=True),
-                code="provider_request_budget_exhausted",
-            )
+            yield local_budget_rejection_event(proof)
             return
         if budget_decision.action == "invalid_request":
             log.warning("provider.request_serialization_failed")
@@ -3943,10 +3941,7 @@ class OpenAIProvider:
         except ProviderRequestBudgetExceededError as exc:
             exc.proof.update(generation_budget_proof)
             log.warning("provider.request_budget_exhausted", **exc.proof)
-            yield ErrorEvent(
-                message=json.dumps(exc.proof, ensure_ascii=False, sort_keys=True),
-                code="provider_request_budget_exhausted",
-            )
+            yield local_budget_rejection_event(exc.proof)
             return
         retained_replay_units = _retained_reasoning_replay_units(
             payload,

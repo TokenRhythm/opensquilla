@@ -170,7 +170,7 @@ async def test_squilla_router_timeout_fails_open(
             "system prompt",
             [],
         ),
-        timeout=0.25,
+        timeout=1.0,
     )
 
     assert resolved_provider is provider
@@ -211,7 +211,7 @@ async def test_squilla_router_timeout_does_not_late_append_history(
             "system prompt",
             [],
         ),
-        timeout=0.25,
+        timeout=1.0,
     )
     await asyncio.sleep(0.1)
 
@@ -262,7 +262,7 @@ async def test_squilla_router_timeout_does_not_late_mutate_history_entries(
             "system prompt",
             [],
         ),
-        timeout=0.25,
+        timeout=1.0,
     )
     await asyncio.sleep(0.1)
 

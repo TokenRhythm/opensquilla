@@ -74,6 +74,8 @@ class ProviderFailureKind(StrEnum):
     PROVIDER_OVERLOADED = "provider_overloaded"
     AUTH_INVALID = "auth_invalid"
     CONTEXT_OVERFLOW = "context_overflow"
+    PAYLOAD_TOO_LARGE = "payload_too_large"
+    WIRE_PAYLOAD_TOO_LARGE = "wire_payload_too_large"
     UNSUPPORTED_FEATURE = "unsupported_feature"
     INSUFFICIENT_CREDITS = "insufficient_credits"
     USAGE_LIMIT = "usage_limit"
@@ -221,6 +223,30 @@ def _is_input_length_range_error(signal: FailureSignal) -> bool:
     )) and not bool(re.search(
         r"\bempty\b|\binput length\s*(?:is|:|=)\s*(?:0|zero)\b", signal.text,
     ))
+
+
+def _is_local_wire_budget_exhausted(status_code: int | None, raw_code: str, message: str) -> bool:
+    """Use only a bounded local proof, never arbitrary upstream size prose."""
+    if status_code is not None or raw_code != "provider_request_budget_exhausted":
+        return False
+    if not isinstance(message, str) or len(message) > 65_536:
+        return False
+    try:
+        proof = json.loads(message)
+    except ValueError:
+        return False
+    if not isinstance(proof, dict):
+        return False
+    used = proof.get("wire_json_bytes")
+    limit = proof.get("wire_body_max_bytes")
+    return (
+        proof.get("wire_byte_budget_exhausted") is True
+        and proof.get("fits_wire_byte_budget") is False
+        and type(used) is int
+        and type(limit) is int
+        and limit > 0
+        and used > limit
+    )
 
 
 def _is_anthropic_missing_model(signal: FailureSignal) -> bool:
@@ -508,6 +534,29 @@ def classify_provider_error(
 ) -> ProviderFailureKind:
     """Classify a provider error into a stable runtime failure kind."""
 
+    normalized_code = (raw_code or "").strip().lower()
+    # A provider's explicit token-window code is stronger evidence than the
+    # transport status. A bare 413, however, only proves a request-size
+    # rejection; compacting token history or retrying another model blindly
+    # could resend the same oversized body.
+    if normalized_code in {
+        "context_length_exceeded",
+        "context_window_exceeded",
+        "context_overflow",
+    }:
+        return ProviderFailureKind.CONTEXT_OVERFLOW
+    if _is_local_wire_budget_exhausted(status_code, normalized_code, message):
+        return ProviderFailureKind.WIRE_PAYLOAD_TOO_LARGE
+    if status_code == 413 or normalized_code in {
+        "413",
+        "payload_too_large",
+        "request_entity_too_large",
+        "request_too_large",
+        "body_too_large",
+        "content_too_large",
+    }:
+        return ProviderFailureKind.PAYLOAD_TOO_LARGE
+
     # Explicit business codes win over contradictory HTTP envelopes/prose.
     structured_kind = {
         "account_request_uncertain": ProviderFailureKind.BAD_REQUEST,
@@ -521,14 +570,14 @@ def classify_provider_error(
         "rate_limit_error": ProviderFailureKind.RATE_LIMITED,
         "invalid_api_key": ProviderFailureKind.AUTH_INVALID,
         "authentication_error": ProviderFailureKind.AUTH_INVALID,
-    }.get((raw_code or "").strip().lower())
+    }.get(normalized_code)
     if structured_kind is not None:
         return structured_kind
     provider = (provider_name or "").lower()
     family = _failure_family(provider)
     signal = FailureSignal(
         status_code=status_code,
-        raw_code=(raw_code or "").strip().lower(),
+        raw_code=normalized_code,
         message=message or "",
         text=_joined(status_code, raw_code, message),
     )

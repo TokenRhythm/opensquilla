@@ -49,9 +49,11 @@ from opensquilla.provider import (
 from opensquilla.provider.model_catalog import ModelCatalog
 from opensquilla.provider.openai import OpenAIProvider
 from opensquilla.provider.protocol import IMAGE_INPUT_UNSUPPORTED_CODE
+from opensquilla.provider.request_proof import local_budget_rejection_event
 from opensquilla.provider.selector import ModelSelector, ProviderConfig, SelectorConfig
 from opensquilla.provider.types import (
     ContentBlockImage,
+    ContentBlockText,
     ContentBlockToolResult,
     ContentBlockToolUse,
 )
@@ -2636,8 +2638,10 @@ async def test_invalid_response_fallback_skips_text_leg_for_vision_fallback() ->
     ]
 
 
-async def test_local_admission_failure_escalates_to_larger_authorized_leg(
+@pytest.mark.parametrize("wire_rejection", [False, True])
+async def test_local_admission_only_escalates_context_budget_to_larger_leg(
     monkeypatch: Any,
+    wire_rejection: bool,
 ) -> None:
     class _AdmissionProvider:
         provider_name = "openai"
@@ -2650,10 +2654,17 @@ async def test_local_admission_failure_escalates_to_larger_authorized_leg(
         async def chat(self, messages, tools=None, config=None):
             del messages, tools, config
             if not self.fits:
-                yield ErrorEvent(
-                    message='{"reason":"provider_request_budget_exhausted"}',
-                    code="provider_request_budget_exhausted",
+                proof = (
+                    {
+                        "wire_byte_budget_exhausted": True,
+                        "fits_wire_byte_budget": False,
+                        "wire_json_bytes": 101,
+                        "wire_body_max_bytes": 100,
+                    }
+                    if wire_rejection
+                    else {"fits": False, "fits_char_budget": False, "proof_budget": 1}
                 )
+                yield local_budget_rejection_event(proof)
                 return
             self.network_calls += 1
             yield TextDeltaEvent(text="fallback answer")
@@ -2717,10 +2728,14 @@ async def test_local_admission_failure_escalates_to_larger_authorized_leg(
     ]
 
     assert selector.primary.network_calls == 0
-    assert selector.fallback.network_calls == 1
-    assert any(isinstance(event, TextDeltaEvent) for event in events)
-    assert metadata["executed_model"] == "large-model"
-    assert metadata["router_fallback_reason"] == "local_admission_escalation"
+    if wire_rejection:
+        assert selector.fallback.network_calls == 0
+        assert any(isinstance(event, ErrorEvent) for event in events)
+    else:
+        assert selector.fallback.network_calls == 1
+        assert any(isinstance(event, TextDeltaEvent) for event in events)
+        assert metadata["executed_model"] == "large-model"
+        assert metadata["router_fallback_reason"] == "local_admission_escalation"
 
 
 async def test_local_admission_skips_larger_fallback_with_explicit_tool_denial(
@@ -3321,6 +3336,7 @@ def _image_continuation_runtime(
     automatic: bool = True,
     vision_support: str = "supported",
     target_provider: str = "openrouter",
+    image_context_length: int = 96_000,
 ) -> SimpleNamespace:
     """Exercise real selection and routing with credential-free physical legs."""
 
@@ -3349,7 +3365,7 @@ def _image_continuation_runtime(
         },
         {
             "id": image_model,
-            "context_length": 96_000,
+            "context_length": image_context_length,
             "top_provider": {"max_completion_tokens": 16_000},
             "supported_parameters": ["tools"],
             **({"architecture": {"input_modalities": ["text", "image"]}}
@@ -3722,3 +3738,84 @@ async def test_downloaded_image_runs_through_dispatch_and_main_model_capability(
         assert runtime.metadata["image_input_output_count"] == 0
         assert runtime.metadata["image_input_marker_count"] == 1
     assert context.tool_result_media == {}
+
+
+@pytest.mark.asyncio
+async def test_twelve_tool_frames_use_bounded_capacity_for_vision_route(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from opensquilla.engine.history import HistoryReplayProjection, project_history_replay_capacity
+
+    runtime = _image_continuation_runtime(monkeypatch, image_context_length=24_000)
+    runtime.primary._streams = [[
+        ToolUseStartEvent(tool_use_id="frames", tool_name="observe"),
+        ToolUseEndEvent(tool_use_id="frames", tool_name="observe", arguments={}),
+        DoneEvent(stop_reason="tool_use"),
+    ]]
+    context = ToolContext(is_owner=True)
+    frames = [
+        b64encode(image_bytes(color=f"#{index:02x}{index:02x}{index:02x}")).decode("ascii")
+        for index in range(12)
+    ]
+
+    async def load_frames(call: Any) -> ToolResult:
+        context.tool_result_media[call.tool_use_id] = [
+            {"mime": "image/png", "data": data, "attachment_id": f"frame-{index}"}
+            for index, data in enumerate(frames)
+        ]
+        return ToolResult(
+            tool_use_id=call.tool_use_id,
+            tool_name=call.tool_name,
+            content="Twelve synthetic frames loaded",
+        )
+
+    agent = Agent(
+        provider=runtime.wrapper,
+        config=AgentConfig(
+            model_id="synthetic/text-small",
+            max_iterations=2,
+            max_provider_retries=0,
+            model_vision_support="unsupported",
+            model_capabilities=ModelCapabilities(supports_vision=False, supports_tools=True),
+        ),
+        tool_context=context,
+        tool_handler=load_frames,
+        tool_definitions=[ToolDefinition(
+            name="observe",
+            description="Load synthetic frames.",
+            input_schema=ToolInputSchema(properties={}),
+        )],
+    )
+
+    events = [event async for event in agent.run_turn("Inspect the frames.")]
+
+    assert not [event for event in events if event.kind == "error"], events
+    assert any(event.kind == "done" for event in events)
+    assert len(runtime.primary.calls) == 1
+    assert runtime.wrapper.active_deployment_config().model == runtime.image_model
+    call = runtime.built[-1].calls[0]
+    sent_frames = [
+        block.data
+        for message in call["messages"]
+        if isinstance(message.content, list)
+        for block in message.content
+        if isinstance(block, ContentBlockImage)
+    ]
+    assert sent_frames == frames[-4:]
+    assert any(
+        "8 images omitted by recency or size limits" in block.text
+        for message in call["messages"]
+        if isinstance(message.content, list)
+        for block in message.content
+        if isinstance(block, ContentBlockText)
+    )
+    canonical_history = agent.history_snapshot()
+    assert project_history_replay_capacity(
+        HistoryReplayProjection(messages=tuple(canonical_history)),
+    ).estimated_tokens > 8_000
+    assert sum(
+        isinstance(block, ContentBlockImage)
+        for message in canonical_history
+        if isinstance(message.content, list)
+        for block in message.content
+    ) == 12

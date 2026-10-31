@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import json
+
 import pytest
 import structlog
 
@@ -62,6 +64,56 @@ def test_provider_request_budget_exhausted_is_context_overflow() -> None:
         )
         is ProviderFailureKind.CONTEXT_OVERFLOW
     )
+
+
+@pytest.mark.parametrize("provider_name", ["openai", "anthropic", "ollama", "unknown-provider"])
+def test_http_413_is_request_size_rejection_without_retry_or_model_hop(
+    provider_name: str,
+) -> None:
+    kind = classify_provider_error(
+        provider_name, 413, raw_code="413", message="input exceeds maximum body size"
+    )
+    assert kind is ProviderFailureKind.PAYLOAD_TOO_LARGE
+    assert decide_recovery_action(kind) is ProviderRecoveryAction.SURFACE
+    assert FallbackPolicy().should_retry(kind, attempt=0) is False
+
+
+@pytest.mark.parametrize("raw_code", ["context_length_exceeded", "context_window_exceeded"])
+def test_explicit_token_window_code_on_413_keeps_context_recovery(raw_code: str) -> None:
+    kind = classify_provider_error("openai", 413, raw_code=raw_code)
+    assert kind is ProviderFailureKind.CONTEXT_OVERFLOW
+    assert decide_recovery_action(kind) is ProviderRecoveryAction.COMPACT_AND_RETRY
+
+
+def test_local_wire_budget_proof_surfaces_without_context_compaction() -> None:
+    proof = {
+        "fallback_reason": "provider_request_budget_exhausted",
+        "wire_byte_budget_exhausted": True,
+        "fits_wire_byte_budget": False,
+        "wire_json_bytes": 900,
+        "wire_body_max_bytes": 800,
+    }
+    kind = classify_provider_error(
+        "openai", None, "provider_request_budget_exhausted", json.dumps(proof)
+    )
+    assert kind is ProviderFailureKind.WIRE_PAYLOAD_TOO_LARGE
+    assert decide_recovery_action(kind) is ProviderRecoveryAction.SURFACE
+    assert FallbackPolicy().should_retry(kind, attempt=0) is False
+
+
+@pytest.mark.parametrize("proof", [
+    {"wire_byte_budget_exhausted": "true"},
+    {"wire_byte_budget_exhausted": True},
+    {"wire_byte_budget_exhausted": True, "fits_wire_byte_budget": False,
+     "wire_json_bytes": 500, "wire_body_max_bytes": 800},
+])
+def test_incomplete_wire_proof_preserves_legacy_context_classification(
+    proof: dict[str, object],
+) -> None:
+    proof["fallback_reason"] = "provider_request_budget_exhausted"
+    assert classify_provider_error(
+        "openai", None, "provider_request_budget_exhausted", json.dumps(proof)
+    ) is ProviderFailureKind.CONTEXT_OVERFLOW
 
 
 @pytest.mark.parametrize("provider_name", ["ensemble", "openrouter"])

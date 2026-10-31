@@ -8,7 +8,10 @@ import pytest
 from opensquilla.session.models import AgentTaskStatus
 from opensquilla.session.terminal_reply import (
     CONTEXT_PAYLOAD_TOO_LARGE_MESSAGES,
+    PROVIDER_PAYLOAD_TOO_LARGE_CODE,
+    PROVIDER_WIRE_PAYLOAD_TOO_LARGE_CODE,
     build_terminal_reply,
+    is_context_payload_too_large,
     safe_provider_failure_code,
     safe_provider_failure_message,
     sanitize_agent_error,
@@ -478,3 +481,34 @@ def test_safe_provider_failure_message_is_allowlisted() -> None:
         "PRIVATE_PROVIDER_CODE_BODY",
         "rate_limited",
     ) == "provider_rate_limited"
+
+
+def test_request_size_rejections_have_distinct_safe_codes_and_guidance() -> None:
+    assert safe_provider_failure_code("413", "payload_too_large") == (
+        PROVIDER_PAYLOAD_TOO_LARGE_CODE
+    )
+    assert safe_provider_failure_code(
+        PROVIDER_WIRE_PAYLOAD_TOO_LARGE_CODE, "wire_payload_too_large"
+    ) == PROVIDER_WIRE_PAYLOAD_TOO_LARGE_CODE
+    assert safe_provider_failure_code(
+        "provider_request_budget_exhausted", "wire_payload_too_large"
+    ) == PROVIDER_WIRE_PAYLOAD_TOO_LARGE_CODE
+    assert safe_provider_failure_code(
+        PROVIDER_WIRE_PAYLOAD_TOO_LARGE_CODE, "unknown"
+    ) == "provider_error"
+    assert safe_provider_failure_message("wire_payload_too_large").startswith("OpenSquilla")
+    assert safe_provider_failure_code("413", "context_overflow") == "413"
+
+    for code in (PROVIDER_PAYLOAD_TOO_LARGE_CODE, PROVIDER_WIRE_PAYLOAD_TOO_LARGE_CODE):
+        payload = {
+            "status": "failed",
+            "error_class": code,
+            "error_message": "private upstream body",
+            "terminal_message": "private upstream body",
+        }
+        expected = build_terminal_reply(payload)
+        assert "private upstream body" not in expected
+        assert "large" in expected or "size" in expected
+        assert "context window" not in expected
+        assert is_context_payload_too_large(payload) is False
+        assert sanitize_agent_error(payload) == (code, expected)

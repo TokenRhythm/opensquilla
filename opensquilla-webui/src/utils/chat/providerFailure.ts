@@ -1,6 +1,7 @@
 /** Stable public taxonomy only; never infer a provider cause from prose or HTTP codes. */
 const FAILURE_KINDS = new Set([
-  'rate_limited', 'provider_overloaded', 'auth_invalid', 'context_overflow',
+  'rate_limited', 'provider_overloaded', 'auth_invalid', 'context_overflow', 'payload_too_large',
+  'wire_payload_too_large',
   'unsupported_feature', 'insufficient_credits', 'usage_limit', 'usage_limit_reached', 'model_not_found', 'transport_transient',
   'policy_refusal', 'empty_response', 'malformed_response', 'bad_request',
 ])
@@ -17,6 +18,7 @@ export function diagnosticErrorId(value: unknown): string | undefined {
 const SPECIAL_TERMINALS = new Set([
   'timeout', 'llm_timeout', 'iteration_timeout', 'stream_idle_timeout', 'provider_output_truncated',
   'provider_request_too_large', 'provider_request_budget_exhausted', 'current_turn_context_exhausted',
+  'provider_payload_too_large', 'provider_wire_payload_too_large',
   'model_repetition_loop_detected', 'tool_run_budget_exhausted', 'llm_budget_exhausted',
   'turn_llm_call_budget_exceeded', 'turn_input_token_budget_exceeded',
   'turn_output_token_budget_exceeded', 'turn_billed_cost_budget_exceeded', 'max_iterations',

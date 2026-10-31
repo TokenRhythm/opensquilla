@@ -374,6 +374,33 @@ async def mark_usage_call_unknown(
         )
 
 
+async def mark_usage_call_not_sent(
+    scope: UsageAccountingScope,
+    call: UsageCallStart,
+) -> None:
+    """Close a reserved call rejected by a trusted adapter before HTTP dispatch."""
+
+    mark_not_sent = getattr(scope.sink, "mark_not_sent", None)
+    if not callable(mark_not_sent):
+        # External sinks implementing the original three-method contract keep
+        # their conservative unknown outcome until they support this terminal.
+        await mark_usage_call_unknown(scope, call, "cancelled_before_provider_request")
+        return
+    terminal_task = asyncio.create_task(mark_not_sent(call))
+    try:
+        await asyncio.shield(terminal_task)
+    except asyncio.CancelledError:
+        with contextlib.suppress(Exception):
+            await terminal_task
+        raise
+    except Exception as exc:  # noqa: BLE001 - preserve the local rejection
+        log.warning(
+            "usage_accounting.mark_not_sent_failed",
+            event_id=call.event_id,
+            error=str(exc),
+        )
+
+
 def _consume_usage_task_result(task: asyncio.Future[Any]) -> None:
     """Consume a detached terminal-write result after bounded cancellation."""
 
@@ -480,7 +507,14 @@ async def account_provider_stream(
                 unknown_reason = provider_error_usage_reason(
                     getattr(event, "code", None)
                 )
-                if has_known_provider_usage_receipt(event) and not terminal:
+                if (
+                    getattr(event, "_opensquilla_request_not_dispatched", False) is True
+                    and not terminal
+                    and not has_known_provider_usage_receipt(event)
+                ):
+                    terminal = True
+                    await mark_usage_call_not_sent(scope, call)
+                elif has_known_provider_usage_receipt(event) and not terminal:
                     terminal = True
                     await finalize_usage_call(scope, call, event)
             yield event
@@ -1049,6 +1083,7 @@ __all__ = [
     "finalize_usage_call",
     "has_known_provider_usage_receipt",
     "mark_usage_call_unknown",
+    "mark_usage_call_not_sent",
     "normalize_provider_usage",
     "provider_accounts_physical_usage",
     "start_usage_call",

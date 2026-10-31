@@ -408,6 +408,24 @@ class SessionUsageEventSink:
             )
             raise
 
+    async def mark_not_sent(self, call: UsageCallStart) -> None:
+        """Close a reserved call that the local adapter never dispatched."""
+
+        completed_at_ms = max(call.started_at_ms, time.time_ns() // 1_000_000)
+        try:
+            record = await self._storage.mark_usage_event_not_sent(
+                call.event_id,
+                completed_at_ms=completed_at_ms,
+            )
+            await self._notify_goal_usage(record)
+        except Exception:
+            self._schedule_retry(
+                self._retry_not_sent(call.event_id, completed_at_ms),
+                event_id=call.event_id,
+                operation="mark_not_sent",
+            )
+            raise
+
     def _schedule_retry(
         self,
         coroutine: Any,
@@ -476,6 +494,20 @@ class SessionUsageEventSink:
             except Exception:  # noqa: BLE001 - bounded retry; recovery handles residue.
                 continue
         log.warning("usage.ledger_unknown_retry_exhausted", event_id=event_id)
+
+    async def _retry_not_sent(self, event_id: str, completed_at_ms: int) -> None:
+        for delay in self._retry_delays:
+            await asyncio.sleep(delay)
+            try:
+                record = await self._storage.mark_usage_event_not_sent(
+                    event_id,
+                    completed_at_ms=completed_at_ms,
+                )
+                await self._notify_goal_usage(record)
+                return
+            except Exception:  # noqa: BLE001 - bounded retry; recovery handles residue.
+                continue
+        log.warning("usage.ledger_not_sent_retry_exhausted", event_id=event_id)
 
     async def close(self, *, drain_timeout: float | None = None) -> None:
         tasks = tuple(self._tasks)
