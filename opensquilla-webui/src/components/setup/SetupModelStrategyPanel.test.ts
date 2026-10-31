@@ -2002,7 +2002,7 @@ describe('saved routing summary and recommended recovery', () => {
   })
 
   it.each([
-    ['follow_primary', 'Recommended · follows primary provider'],
+    ['follow_primary', 'Saved recommended tiers'],
     ['legacy', 'Existing tiers · follow behavior unspecified'],
   ])('shows %s ownership independently of the enabled state', async (binding, label) => {
     const { app, el } = await mountPanel({ routingSummary: { ...summary, binding, enabled: true, hasUnsavedChanges: true, crossProviderEnabled: true } })

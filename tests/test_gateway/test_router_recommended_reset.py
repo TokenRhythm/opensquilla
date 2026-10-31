@@ -73,7 +73,8 @@ def test_reset_preserves_strategy_and_ensemble_and_uses_inline_tokenrhythm(activ
     assert candidate.llm_ensemble.model_dump() == before_ensemble
     before_router = config.squilla_router.model_dump()
     after_router = candidate.squilla_router.model_dump()
-    for field in ("tiers", "tier_profile", "preset_binding"):
+    assert candidate.squilla_router.recommendation_revision
+    for field in ("tiers", "tier_profile", "preset_binding", "recommendation_revision"):
         before_router.pop(field)
         after_router.pop(field)
     if activate:
@@ -121,10 +122,13 @@ async def test_reset_cross_provider_ladder_uses_saved_primary_after_reload(
     )
     restored = GatewayConfig(**tomllib.loads(path.read_text(encoding="utf-8")))
     assert restored.llm.model_dump() == before_llm
-    assert restored.squilla_router.tiers == get_preset(primary).tier_defaults()
-    assert restored.squilla_router.tier_profile == (
-        primary if get_preset(primary).persistable else None
-    )
+    from opensquilla.onboarding.recommendation_policy import current_recommendation_rows
+    from opensquilla.provider.recommendations import get_recommendation
+
+    expected = get_recommendation(config, primary, "router")
+    assert current_recommendation_rows(restored, primary, "router") == expected["rows"]
+    assert restored.squilla_router.recommendation_revision == expected["revision"]
+    assert restored.squilla_router.tier_profile is None
     assert restored.squilla_router.enabled is True
     assert restored.squilla_router.cross_provider_tiers is True
     assert restored.squilla_router.default_tier == "c2"

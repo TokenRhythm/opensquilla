@@ -213,6 +213,9 @@ def load_config(
         cfg = GatewayConfig()
         _mark_env_absorbed_runtime_secrets(cfg, None)
         cfg.config_path = str(target)
+        from opensquilla.onboarding.recommendation_policy import initialize_new_recommendations
+
+        initialize_new_recommendations(cfg)
         _remember_load_baseline(cfg)
         return cfg
     with target_io.open("rb") as fh:

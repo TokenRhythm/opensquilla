@@ -4858,6 +4858,13 @@ async def start_gateway_server(
     except Exception:
         log.debug("gateway.update_check_skipped", exc_info=True)
 
+    try:
+        from opensquilla.provider.recommendations import start_background_recommendation_refresh
+
+        start_background_recommendation_refresh(config=config)
+    except Exception:
+        log.debug("gateway.recommendation_refresh_skipped", exc_info=True)
+
     # ── Reusable service initialization via build_services ───────────
     try:
         # Frozen runtime modules are extracted on first import. Load only the

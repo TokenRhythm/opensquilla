@@ -174,9 +174,12 @@
             <SetupModelStrategyPanel
               v-else-if="section === 'modelStrategy'"
               :panel="modelStrategyPanel"
-              :routing-mode-busy="modelStrategyRoutingBusy || providerPanel.busy"
+              :routing-mode-busy="modelStrategyRoutingBusy || providerPanel.busy || recommendationSaving"
+              :router-recommendation="routerRecommendation"
+              :ensemble-recommendation="ensembleRecommendation"
               @update-strategy="setModelStrategy"
               @reset-recommended-router="resetRecommendedRouter"
+              @reset-recommended-ensemble="resetRecommendedEnsemble"
               @update-fixed-provider="setFixedProvider"
               @update-fixed-model="setFixedModel"
               @update-llm-thinking="updateModelStrategyThinking"
@@ -246,6 +249,7 @@
       </Transition>
     </div>
   </Teleport>
+  <SetupRecommendationDialog :preview="recommendationPreview || null" :saving="recommendationSaving || false" @cancel="closeRecommendationPreview" @confirm="applyRecommendation" />
 </template>
 
 <script setup lang="ts">
@@ -258,6 +262,7 @@ import LoadingSpinner from '@/components/LoadingSpinner.vue'
 import SetupProviderPanel from '@/components/setup/SetupProviderPanel.vue'
 import SetupModelCapacity from '@/components/setup/SetupModelCapacity.vue'
 import SetupModelStrategyPanel from '@/components/setup/SetupModelStrategyPanel.vue'
+import SetupRecommendationDialog from '@/components/setup/SetupRecommendationDialog.vue'
 import SetupCapabilitiesPanel from '@/components/setup/SetupCapabilitiesPanel.vue'
 import VideoGenerationSettings from '@/components/setup/VideoGenerationSettings.vue'
 import SettingsAppearancePanel from '@/components/settings/SettingsAppearancePanel.vue'
@@ -327,6 +332,13 @@ const {
   setProviderImageGenerationOptIn,
   setModelStrategy,
   resetRecommendedRouter,
+  resetRecommendedEnsemble,
+  routerRecommendation,
+  ensembleRecommendation,
+  recommendationPreview,
+  recommendationSaving,
+  closeRecommendationPreview,
+  applyRecommendation,
   setFixedProvider,
   setFixedModel,
   setRouterDefaultTier,
@@ -510,13 +522,14 @@ const hasPendingSettingsWrite = computed(() => (
   || providerSavePending.value
   || primaryMutationPending.value
   || modelStrategyRoutingBusy.value
+  || recommendationSaving.value
   || closeSavePending.value
   || settingsSavePending.value
   || settingsDiscardPending.value
 ))
 const settingsInteractionLocked = computed(() => (
   saveAllPending.value || closeSavePending.value || primaryMutationPending.value || sandboxLeavePending.value
-  || settingsSavePending.value || settingsDiscardPending.value || videoBusy.value
+  || settingsSavePending.value || settingsDiscardPending.value || videoBusy.value || recommendationSaving.value
 ))
 // A routing-mode write must not claim that unrelated manual drafts are saving.
 const settingsFormLocked = computed(() => settingsInteractionLocked.value || modelStrategyRoutingBusy.value)

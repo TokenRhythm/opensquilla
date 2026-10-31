@@ -82,6 +82,8 @@ function mockCatalog() {
     }),
     privacyPanel: ref({}),
     memoryPanel: ref({ autoCapture: true }),
+    recommendationPreview: ref(null), recommendationSaving: ref(false),
+    routerRecommendation: ref(undefined), ensembleRecommendation: ref(undefined),
     modelStrategyPanel: ref({}),
     channelsPanel: ref({}),
     capabilitiesPanel: ref({}),
