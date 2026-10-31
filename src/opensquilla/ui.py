@@ -21,13 +21,22 @@ class _DynamicStream:
 
     def write(self, data: str) -> int:
         try:
-            written = self._stream.write(data)
-        except UnicodeEncodeError:
-            written = self._stream.write(_replace_unencodable(data, self._stream))
+            try:
+                written = self._stream.write(data)
+            except UnicodeEncodeError:
+                written = self._stream.write(_replace_unencodable(data, self._stream))
+        except OSError:
+            # The reader may close the pipe early (`| head`). A closed stdout is a
+            # normal end of output, not a crash: report the write as accepted so the
+            # process can exit without a traceback.
+            return len(data)
         return len(data) if written is None else int(written)
 
     def flush(self) -> None:
-        self._stream.flush()
+        try:
+            self._stream.flush()
+        except OSError:
+            pass
 
     def __getattr__(self, name: str):
         return getattr(self._stream, name)
