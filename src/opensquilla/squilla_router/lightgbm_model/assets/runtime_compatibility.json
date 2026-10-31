@@ -1,0 +1,305 @@
+{
+  "runtime_versions": {
+    "numpy": "2.5.3",
+    "lightgbm": "4.7.0",
+    "onnxruntime": "1.24.4",
+    "tokenizers": "0.23.2",
+    "scikit-learn": "1.8.0",
+    "joblib": "1.6.0"
+  },
+  "warnings": [],
+  "cases": [
+    {
+      "name": "cold_start_zh",
+      "feature_max_abs": 0.0,
+      "feature_hash_equal": true,
+      "probability_max_abs": {
+        "intent": 0.0,
+        "tier": 0.0
+      }
+    },
+    {
+      "name": "code_debug",
+      "feature_max_abs": 0.0,
+      "feature_hash_equal": true,
+      "probability_max_abs": {
+        "intent": 0.0,
+        "tier": 0.0
+      }
+    },
+    {
+      "name": "continue_with_history",
+      "feature_max_abs": 0.0,
+      "feature_hash_equal": true,
+      "probability_max_abs": {
+        "intent": 0.0,
+        "tier": 0.0
+      }
+    },
+    {
+      "name": "redo",
+      "feature_max_abs": 0.0,
+      "feature_hash_equal": true,
+      "probability_max_abs": {
+        "intent": 0.0,
+        "tier": 0.0
+      }
+    },
+    {
+      "name": "long_three_segments",
+      "feature_max_abs": 0.0,
+      "feature_hash_equal": true,
+      "probability_max_abs": {
+        "intent": 0.0,
+        "tier": 0.0
+      }
+    },
+    {
+      "name": "unicode_normalization",
+      "feature_max_abs": 0.0,
+      "feature_hash_equal": true,
+      "probability_max_abs": {
+        "intent": 0.0,
+        "tier": 0.0
+      }
+    }
+  ],
+  "golden": {
+    "intent": {
+      "cases": 8,
+      "max_abs": 1.1102230246251565e-16
+    },
+    "tier": {
+      "cases": 8,
+      "max_abs": 2.220446049250313e-16
+    }
+  },
+  "cpu_validation": {
+    "host": "Intel Xeon 6982P-C",
+    "method": "The same pinned CPUExecutionProvider ran native and with CPUID capability masking in isolated processes. Masking VNNI/AMX retained AVX-512; masking AVX-512/VNNI/AMX selected AVX2. No source weights or golden values were changed.",
+    "session_config": {
+      "session.x64quantprecision": "1"
+    },
+    "native_avx512_vnni": {
+      "cases": 6,
+      "feature_hashes_equal": true,
+      "probability_max_abs": 0.0
+    },
+    "avx512_without_vnni": {
+      "cases": 6,
+      "feature_hashes_equal": true,
+      "probability_max_abs": 0.0
+    },
+    "avx2_without_vnni": {
+      "other_cases": 5,
+      "other_feature_max_abs": 2.086162567138672e-07,
+      "other_probability_max_abs": 1.1102230246251565e-16,
+      "feature_max_abs": 0.0033130943775177,
+      "intent_probability_max_abs": 0.002630628685639236,
+      "tier_probability_max_abs": 0.006423068679724642,
+      "cause": "Floating-point CPU kernel differences cross DynamicQuantizeLinear half-integer rounding boundaries. Explicit U8U8 weights reproduce the same remaining difference, excluding a missed signed-weight conversion.",
+      "first_quantization_difference": {
+        "segment": 0,
+        "node": "/encoder/layer.1/attention/self/Reshape_3_output_0_quantized",
+        "index": [
+          0,
+          342,
+          83
+        ],
+        "native": {
+          "float_input": 0.814724862575531,
+          "scale": 0.018308423459529877,
+          "zero_point": 125,
+          "input_div_scale_float32": 44.5,
+          "quantized": 169
+        },
+        "avx2": {
+          "float_input": 0.8147250413894653,
+          "scale": 0.018308419734239578,
+          "zero_point": 125,
+          "input_div_scale_float32": 44.50001907348633,
+          "quantized": 170
+        },
+        "input_abs_difference": 1.7881393432617188e-07
+      },
+      "largest_difference_case": "long_three_segments",
+      "source_case_labels": {
+        "cases": 6,
+        "intent_labels_equal": true,
+        "tier_labels_equal": true,
+        "policy_decisions_equal": true
+      },
+      "classifier_golden_labels": {
+        "cases": 16,
+        "expected_head_labels_equal": true,
+        "native_both_head_labels_equal": true,
+        "probability_max_abs": 2.220446049250313e-16
+      }
+    },
+    "original_ci_failure": {
+      "case": "cold_start_zh",
+      "tier_probability_max_abs_without_precision_mode": 0.019415810857340232,
+      "avx2_probability_max_abs_with_precision_mode": 0.0,
+      "diagnosis": "All four CI probabilities reproduced exactly without precision mode. ONNX Runtime documents saturating U8S8 kernels on x64 without VNNI; precision mode performs an equivalent unsigned-weight conversion to avoid this overflow."
+    },
+    "onnxruntime_reference": "https://github.com/microsoft/onnxruntime/blob/v1.24.4/include/onnxruntime/core/session/onnxruntime_session_options_config_keys.h#L157-L161",
+    "fixture_acceptance": {
+      "scope": "For x86, only long_three_segments uses the wider numerical bounds below. The other five source inputs retain their original strict bounds. ARM64-specific evidence and bounds are recorded separately below. All six always require exact labels and policy decisions; these are not bounds on arbitrary inputs or unmeasured CPU/runtime combinations.",
+      "semantic_feature_indices": [
+        [
+          0,
+          64
+        ],
+        [
+          212,
+          276
+        ],
+        [
+          292,
+          356
+        ]
+      ],
+      "semantic_feature_absolute_tolerance": 0.0035,
+      "other_feature_relative_tolerance": 2e-05,
+      "other_feature_absolute_tolerance": 2e-06,
+      "intent_probability_absolute_tolerance": 0.003,
+      "tier_probability_absolute_tolerance": 0.007,
+      "probability_relative_tolerance": 0,
+      "exact_checks": [
+        "intent_argmax",
+        "tier_argmax",
+        "policy_intent",
+        "policy_tier",
+        "policy_raw_tier",
+        "thinking_mode",
+        "prompt_policy",
+        "context_reset",
+        "next_state"
+      ],
+      "fixed_feature_classifier_golden": {
+        "cases": 16,
+        "relative_tolerance": 1e-10,
+        "absolute_tolerance": 1e-12
+      },
+      "rationale": "The long_three_segments bounds round its measured AVX2 maxima (semantic features 0.0033130944, intent probability 0.0026306287, tier probability 0.0064230687) upward modestly. All other fixtures, non-BGE features, and standalone classifier checks retain their original precision. Learned asset hashes and all original golden values remain pinned.",
+      "wider_bounds_case": "long_three_segments",
+      "other_five_full_pipeline_fixtures": {
+        "feature_relative_tolerance": 2e-05,
+        "feature_absolute_tolerance": 2e-06,
+        "probability_relative_tolerance": 1e-10,
+        "probability_absolute_tolerance": 1e-12
+      }
+    },
+    "apple_arm64": {
+      "host": "Apple M5",
+      "platform": "macOS-26.5.2-arm64-arm-64bit",
+      "machine": "arm64",
+      "method": "Native arm64 Python and CPUExecutionProvider with the same pinned runtime versions; no Rosetta. The full model test file passed on this host, native x86 AVX-512/VNNI, and CPUID-masked AVX2. Original source fixtures and learned bytes are unchanged.",
+      "session_config": {
+        "optimization.disable_specified_optimizers": "MatMulIntegerToFloatFusion;GeluFusionL2"
+      },
+      "original_fused_graph_tier_probability_max_abs": 0.09544998406404825,
+      "configured_tier_probability_max_abs": 0.0028238415033203235,
+      "cases": [
+        {
+          "name": "cold_start_zh",
+          "semantic_feature_max_abs": 5.960464477539063e-08,
+          "other_feature_max_abs": 1.4901161193847656e-08,
+          "intent_probability_max_abs": 0.0,
+          "tier_probability_max_abs": 0.0
+        },
+        {
+          "name": "code_debug",
+          "semantic_feature_max_abs": 0.00639711320400238,
+          "other_feature_max_abs": 2.9802322387695312e-08,
+          "intent_probability_max_abs": 0.0006391705050320384,
+          "tier_probability_max_abs": 0.0017489577329584949
+        },
+        {
+          "name": "continue_with_history",
+          "semantic_feature_max_abs": 5.21540641784668e-08,
+          "other_feature_max_abs": 7.450580596923828e-09,
+          "intent_probability_max_abs": 1.1102230246251565e-16,
+          "tier_probability_max_abs": 0.0
+        },
+        {
+          "name": "redo",
+          "semantic_feature_max_abs": 5.960464477539063e-08,
+          "other_feature_max_abs": 7.450580596923828e-09,
+          "intent_probability_max_abs": 0.0,
+          "tier_probability_max_abs": 0.0
+        },
+        {
+          "name": "long_three_segments",
+          "semantic_feature_max_abs": 0.00606517493724823,
+          "other_feature_max_abs": 1.862645149230957e-09,
+          "intent_probability_max_abs": 0.0014951235274058838,
+          "tier_probability_max_abs": 0.0028238415033203235
+        },
+        {
+          "name": "unicode_normalization",
+          "semantic_feature_max_abs": 5.21540641784668e-08,
+          "other_feature_max_abs": 2.9802322387695312e-08,
+          "intent_probability_max_abs": 1.1102230246251565e-16,
+          "tier_probability_max_abs": 0.0
+        }
+      ],
+      "source_case_labels": {
+        "cases": 6,
+        "intent_labels_equal": true,
+        "tier_labels_equal": true,
+        "policy_decisions_equal": true
+      },
+      "classifier_golden": {
+        "intent": {
+          "cases": 8,
+          "max_abs": 1.1102230246251565e-16
+        },
+        "tier": {
+          "cases": 8,
+          "max_abs": 2.220446049250313e-16
+        }
+      },
+      "first_quantization_difference": {
+        "case": "code_debug",
+        "graph": "ORT_ENABLE_BASIC with original weights and intermediate outputs",
+        "node": "/encoder/layer.1/attention/self/Reshape_3_output_0_quantized",
+        "index": [
+          0,
+          380,
+          221
+        ],
+        "input_abs_difference": 1.4901161193847656e-08,
+        "quantized_mismatch_count": 1,
+        "x86_64": {
+          "float_input": 0.19614535570144653,
+          "scale": 0.02064688131213188,
+          "zero_point": 142,
+          "input_div_scale_float32": 9.499999046325684,
+          "quantized": 151
+        },
+        "arm64": {
+          "float_input": 0.19614537060260773,
+          "scale": 0.02064688131213188,
+          "zero_point": 142,
+          "input_div_scale_float32": 9.5,
+          "quantized": 152
+        }
+      },
+      "fixture_acceptance": {
+        "code_debug": {
+          "semantic_feature_absolute_tolerance": 0.0065,
+          "intent_probability_absolute_tolerance": 0.00065,
+          "tier_probability_absolute_tolerance": 0.0018
+        },
+        "long_three_segments": {
+          "semantic_feature_absolute_tolerance": 0.0062,
+          "intent_probability_absolute_tolerance": 0.003,
+          "tier_probability_absolute_tolerance": 0.007
+        },
+        "scope": "Only arm64/aarch64 and these two frozen inputs use these bounds. Non-BGE features, four other inputs, and all fixed-feature classifier checks retain their strict precision; all six require identical classifier labels, full policy decisions and next states. No accuracy guarantee for arbitrary inputs or unmeasured ARM kernels."
+      },
+      "optimizer_name_reference": "https://github.com/microsoft/onnxruntime/blob/v1.24.4/onnxruntime/core/optimizer/gelu_fusion.h#L20-L27"
+    }
+  }
+}

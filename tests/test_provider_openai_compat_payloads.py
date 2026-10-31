@@ -246,7 +246,7 @@ def test_tokenrhythm_recommended_c1_keeps_neutral_request_dialect(monkeypatch: A
         model_capabilities=catalog.get_capabilities(model, provider_name="tokenrhythm"),
     ))
     payload = captured["payload"]
-    assert payload["model"] == "deepseek-flash"
+    assert payload["model"] == "deepseek-v4-flash-0731"
     assert payload["max_tokens"] == 384_000
     assert "thinking" not in payload
     assert "reasoning_effort" not in payload

@@ -326,6 +326,7 @@ class _TurnRunnerPipelineExecutionAdapter(PipelineExecutionPort):
             "prev_assistant_text": request.prev_assistant_text,
             "prev_assistant_usage": request.prev_assistant_usage,
             "history_user_texts": request.history_user_texts,
+            "model_router_context": request.model_router_context,
             "history_capacity_estimated_tokens": (
                 request.history_capacity_estimated_tokens
             ),

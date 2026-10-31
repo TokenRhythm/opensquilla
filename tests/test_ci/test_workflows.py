@@ -165,6 +165,7 @@ def test_ci_preparation_helpers_are_bound_by_the_existing_trust_policy() -> None
     policy = json.loads(Path(".github/ci/trust-policy.v1.json").read_text(encoding="utf-8"))
     assert {
         ".github/actions/download-required-artifact/action.yml",
+        ".github/actions/prepare-router-assets/action.yml",
         ".github/scripts/prepare-electron.mjs",
     } <= set(policy["merge_critical_inputs"])
 
@@ -3273,6 +3274,10 @@ def test_macos_recovery_runs_native_contracts_and_cannot_wash_failures_green() -
     }
     assert "if" not in setup_node
     assert job["steps"].index(setup_node) < job["steps"].index(test_step)
+    assert "tests/test_lightgbm_router_model.py" in test_step["run"]
+    preflight = next(step for step in job["steps"]
+                     if step.get("name") == "Preflight offline test environment")
+    assert "platform.machine().lower() in {'arm64', 'aarch64'}" in preflight["run"]
     assert "tests/test_recovery" in test_step["run"]
     assert "tests/test_migration/test_opensquilla_home_migration.py" in test_step["run"]
     assert "tests/test_desktop/test_electron_startup_contract.py" in test_step["run"]
@@ -3332,7 +3337,14 @@ def test_native_desktop_cells_run_source_and_frozen_mcp_probes() -> None:
         "Build production Docker image and verify MCP"
     ))
     assert container["if"] == "${{ matrix.probe == 'docker' }}"
-    assert 'git lfs pull --include="src/opensquilla/squilla_router/models/' in container["run"]
+    assets = next(step for step in steps if step.get("name") == (
+        "Prepare router assets for Gateway probes"
+    ))
+    assert assets["if"] == "${{ matrix.probe != 'pty' }}"
+    assert assets["uses"] == "./.github/actions/prepare-router-assets"
+    for gateway_probe in (source, frozen, container):
+        assert steps.index(assets) < steps.index(gateway_probe)
+    assert "continue-on-error" not in assets
     assert "docker build --file Dockerfile" in container["run"]
     assert "docker run --rm -i --entrypoint python" in container["run"]
     assert "readonly" in container["run"]
@@ -4094,3 +4106,85 @@ def test_offline_runner_uses_explicit_platform_ownership(job_name, platform):
     commands = [s["run"] for s in steps if "windows_test_shards.py run" in s.get("run", "")]
     assert len(commands) == 1
     assert f"--platform {platform}" in commands[0]
+
+
+@pytest.mark.parametrize("workflow,job_id,consumer", [
+    ("ci.yml", "webui-chat-recovery",
+     "Run production-dist chat and Goal recovery browser contracts"),
+    ("ci.yml", "webui-capacity", "Run production-dist renderer capacity contracts"),
+    ("ci.yml", "ubuntu-quality", "Test targeted PR suite"),
+    ("ci.yml", "ubuntu-full", "Test Ubuntu full shard"),
+    ("ci.yml", "windows-full", "Test Windows shard"),
+    ("ci.yml", "windows-bundle", "Test bundle partition"),
+    ("ci.yml", "macos-recovery", "Test native profile recovery contracts"),
+    ("ci.yml", "desktop-recovery-e2e",
+     "Run cross-platform production-dist browser session hang contract"),
+    ("ci.yml", "skill-hub", "Run offline Community Skill contracts"),
+    ("ci.yml", "release-packaging", "Run release packaging contract tests"),
+    ("ci.yml", "main-canary", "Run offline gateway and provider canary"),
+    ("webui-browser-smoke.yml", "webui-browser-smoke", "Run Web UI browser smoke"),
+    ("live-release-e2e.yml", "live-release-e2e", "Run gateway LLM e2e"),
+    ("gateway-authorization-timing.yml", "timing",
+     "Compare offline Gateway startup and Default first turn"),
+])
+def test_gateway_jobs_prepare_router_assets_before_execution(workflow, job_id, consumer):
+    steps = _workflow(workflow)["jobs"][job_id]["steps"]
+    assets = next(s for s in steps if s.get("uses") == "./.github/actions/prepare-router-assets")
+    execute = next(s for s in steps if s.get("name") == consumer)
+    python = next(s for s in steps if s.get("uses") == "actions/setup-python@v5")
+    checkout = next(s for s in steps if s.get("uses") == "actions/checkout@v4")
+    assert steps.index(checkout) < steps.index(python) < steps.index(assets) < steps.index(execute)
+    assert not assets.get("if") and not assets.get("continue-on-error")
+
+
+def test_router_asset_action_verifies_assets_and_prepares_native_dependencies():
+    action = yaml.safe_load(
+        Path(".github/actions/prepare-router-assets/action.yml").read_text(encoding="utf-8")
+    )
+    assert action["runs"]["using"] == "composite"
+    step, native = action["runs"]["steps"]
+    assert native["if"] == "${{ runner.os == 'macOS' }}"
+    assert native["run"] == "brew install libomp"
+    assert step["shell"] == "bash"
+    assert step["working-directory"] == "${{ github.workspace }}"
+    assert "set -euo pipefail" in step["run"]
+    assert "src/opensquilla/squilla_router/models/**" in step["run"]
+    assert "src/opensquilla/squilla_router/lightgbm_model/assets/**" in step["run"]
+    assert step["run"].index("git lfs pull") < step["run"].index("validate_artifacts()")
+    assert "PYTHONPATH=src python" in step["run"]
+    assert "LightGBMRouterModel()" not in step["run"]
+    assert not step.get("continue-on-error")
+
+
+@pytest.mark.parametrize("workflow,job_id", [
+    ("docker-image.yml", "build-and-publish"),
+    ("wheelhouse-release.yml", "build-release-assets"),
+    ("wheelhouse-release.yml", "build-desktop-macos"),
+    ("wheelhouse-release.yml", "build-desktop-windows"),
+    ("windows-nsis-upgrade-regression.yml", "build"),
+])
+def test_packagers_hydrate_and_validate_the_new_model(workflow, job_id):
+    steps = _workflow(workflow)["jobs"][job_id]["steps"]
+    hydrate = next(s for s in steps if "git lfs pull" in s.get("run", ""))
+    validate = next(s for s in steps if "validate_artifacts()" in s.get("run", ""))
+    assert "lightgbm_model/assets/**" in hydrate["run"]
+    assert steps.index(hydrate) <= steps.index(validate)
+    if workflow == "wheelhouse-release.yml":
+        # A release may check out a historical tag that predates the new bundle/action.
+        assert ("if [[ -f src/opensquilla/squilla_router/lightgbm_model/model.py ]]"
+                in validate["run"])
+        assert not any(s.get("uses") == "./.github/actions/prepare-router-assets" for s in steps)
+
+
+def test_gateway_timing_hydrates_both_independent_source_trees():
+    for workflow, job_id in [
+        ("ci.yml", "ubuntu-quality"), ("gateway-authorization-timing.yml", "timing"),
+    ]:
+        steps = _workflow(workflow)["jobs"][job_id]["steps"]
+        compare = next(s for s in steps if s.get("name") ==
+                       "Compare offline Gateway startup and Default first turn")
+        run = compare["run"]
+        assert "git archive" not in run
+        assert "lightgbm_model/assets/**" in run
+        assert "validate_artifacts()" in run
+        assert run.index("validate_artifacts()") < run.index("scripts/compare_gateway_timing.py")

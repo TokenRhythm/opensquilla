@@ -189,6 +189,8 @@ class GatewayTurnAdmissionAdapter:
             "initial_model",
             "initialProvider",
             "initial_provider",
+            "routerControlEvent",
+            "router_control_event",
         ):
             if name in params:
                 extra[name] = params[name]

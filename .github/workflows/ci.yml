@@ -908,6 +908,9 @@ jobs:
       - name: Install Gateway dependencies
         run: uv sync --frozen
 
+      - name: Prepare router assets
+        uses: ./.github/actions/prepare-router-assets
+
       - name: Validate renderer capacity inventory
         id: capacity-inventory
         # Pure WebUI plans do not select Python shards. Run the existing
@@ -1068,6 +1071,9 @@ jobs:
 
       - name: Install Gateway dependencies
         run: uv sync --frozen
+
+      - name: Prepare router assets
+        uses: ./.github/actions/prepare-router-assets
 
       - name: Validate renderer capacity inventory
         id: capacity-inventory
@@ -1367,6 +1373,9 @@ jobs:
         shell: bash
         run: uv sync --extra dev --extra recommended --extra mcp --frozen
 
+      - name: Prepare router assets
+        uses: ./.github/actions/prepare-router-assets
+
       - name: Lint
         shell: bash
         run: uv run ruff check src tests
@@ -1385,11 +1394,17 @@ jobs:
           [[ "$TIMING_BASE" =~ ^[0-9a-f]{40}$ ]] || { echo "Expected a full baseline commit SHA" >&2; exit 2; }
           git fetch --no-tags --depth=1 origin "$TIMING_BASE"
           baseline_dir="$(mktemp -d "$(dirname "$GITHUB_WORKSPACE")/gateway-timing-baseline.XXXXXX")"
-          trap 'rm -rf "$baseline_dir"' EXIT
-          git archive "$TIMING_BASE" > "$RUNNER_TEMP/gateway-timing-baseline.tar"
-          git get-tar-commit-id < "$RUNNER_TEMP/gateway-timing-baseline.tar" > "$baseline_dir/.gateway-timing-source-sha"
-          tar -xf "$RUNNER_TEMP/gateway-timing-baseline.tar" -C "$baseline_dir"
+          git worktree add --detach "$baseline_dir" "$TIMING_BASE"
+          trap 'git worktree remove --force "$baseline_dir"' EXIT
+          git -C "$baseline_dir" lfs pull --include="src/opensquilla/squilla_router/models/**,src/opensquilla/squilla_router/lightgbm_model/assets/**"
+          if [[ -f "$baseline_dir/src/opensquilla/squilla_router/lightgbm_model/model.py" ]]; then
+            PYTHONPATH="$baseline_dir/src" python -c "from opensquilla.squilla_router.lightgbm_model import validate_artifacts; print(validate_artifacts())"
+          fi
+          comparison_python="$(uv run --no-sync python -c 'import sys; print(sys._base_executable)')"
+          UV_PROJECT_ENVIRONMENT="$baseline_dir/.venv" uv sync --project "$baseline_dir" \
+            --python "$comparison_python" --extra dev --extra recommended --extra mcp --frozen
           uv run --no-sync python scripts/compare_gateway_timing.py \
+            --baseline-python "$baseline_dir/.venv/bin/python" \
             --baseline-root "$baseline_dir" --candidate-root "$GITHUB_WORKSPACE" \
             --baseline-sha "$TIMING_BASE" --candidate-sha "$(git rev-parse HEAD)" \
             --samples 3 --output "$RUNNER_TEMP/gateway-timing.json"
@@ -1506,6 +1521,9 @@ jobs:
       - name: Install dependencies
         shell: bash
         run: uv sync --extra dev --extra recommended --extra mcp --frozen
+
+      - name: Prepare router assets
+        uses: ./.github/actions/prepare-router-assets
 
       - name: Preflight offline test environment
         shell: bash
@@ -1740,6 +1758,9 @@ jobs:
       - name: Install dependencies
         shell: bash
         run: uv sync --extra dev --extra recommended --extra mcp --frozen
+
+      - name: Prepare router assets
+        uses: ./.github/actions/prepare-router-assets
 
       - name: Record tool versions
         shell: bash
@@ -2013,6 +2034,9 @@ jobs:
       - name: Install dependencies
         shell: bash
         run: uv sync --extra dev --extra recommended --extra mcp --frozen
+
+      - name: Prepare router assets
+        uses: ./.github/actions/prepare-router-assets
       - name: Test bundle partition
         shell: bash
         run: |
@@ -2145,10 +2169,14 @@ jobs:
         shell: bash
         run: uv sync --extra dev --extra recommended --extra mcp --frozen
 
+      - name: Prepare router assets
+        uses: ./.github/actions/prepare-router-assets
+
       - name: Preflight offline test environment
         shell: bash
         run: |
           set -euo pipefail
+          uv run python -c "import platform; print('router test architecture:', platform.machine()); assert platform.machine().lower() in {'arm64', 'aarch64'}, 'Router parity must run on Apple Silicon'"
           uv run python -c "import pathlib, subprocess, sys, opensquilla; print('cwd:', pathlib.Path.cwd().resolve()); print('git:', subprocess.check_output(['git', 'rev-parse', '--show-toplevel', 'HEAD'], text=True).strip()); print('python:', sys.executable); print('package:', pathlib.Path(opensquilla.__file__).resolve())"
           uv run pytest \
             tests/test_sandbox/test_trusted_sandbox_execution.py \
@@ -2163,6 +2191,7 @@ jobs:
         run: |
           set -euo pipefail
           pytest_args=(
+            tests/test_lightgbm_router_model.py
             tests/test_recovery
             tests/test_migration/test_opensquilla_home_migration.py
             tests/test_desktop/test_electron_startup_contract.py
@@ -2354,6 +2383,9 @@ jobs:
       - name: Install Python dependencies
         shell: bash
         run: uv sync --extra dev --extra recommended --extra mcp --frozen
+
+      - name: Prepare router assets
+        uses: ./.github/actions/prepare-router-assets
 
       - name: Install Desktop dependencies
         working-directory: desktop/electron
@@ -3047,6 +3079,9 @@ jobs:
       - name: Install test dependencies
         run: uv sync --extra dev --extra recommended --frozen
 
+      - name: Prepare router assets
+        uses: ./.github/actions/prepare-router-assets
+
       - name: Run offline Community Skill contracts
         shell: bash
         env:
@@ -3137,6 +3172,9 @@ jobs:
       - name: Install dependencies
         shell: bash
         run: uv sync --extra dev --extra recommended --extra mcp --frozen
+
+      - name: Prepare router assets
+        uses: ./.github/actions/prepare-router-assets
 
       - name: Run release packaging contract tests
         shell: bash
@@ -3232,6 +3270,9 @@ jobs:
 
       - name: Install locked development dependencies
         run: uv sync --extra dev --extra recommended --extra mcp --frozen
+
+      - name: Prepare router assets
+        uses: ./.github/actions/prepare-router-assets
 
       - name: Build production WebUI artifact
         if: ${{ github.event_name == 'push' }}

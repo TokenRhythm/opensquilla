@@ -388,6 +388,7 @@ def _write_config(
     turn_hard_deadline_seconds: float = LIVE_TURN_HARD_DEADLINE_SECONDS,
     llm_context_window_tokens: int | None = None,
     model_supports_vision_override: str | None = None,
+    router_strategy: str = "model",
 ) -> None:
     tier_override_toml = _render_tier_overrides(tier_overrides)
     llm_thinking_toml = (
@@ -473,7 +474,7 @@ max_tokens = {max_tokens}
 enabled = true
 auto_thinking = true
 rollout_phase = "full"
-strategy = "v4_phase3"
+strategy = "{router_strategy}"
 {tier_profile_toml}
 default_tier = "{default_tier}"
 confidence_threshold = 0.5
@@ -1667,6 +1668,8 @@ def _run_tokenrhythm_attachment_capacity_in_temp(
         model_supports_vision_override=(
             str(tiers["c2"]["model"]) if synthetic_vision_capability_override else None
         ),
+        # This gate verifies the legacy image floor and image_route decision evidence.
+        router_strategy="legacy_v4_phase3",
     )
     port = _free_port()
     provider_spec = get_provider_spec(ATTACHMENT_CAPACITY_PROVIDER)

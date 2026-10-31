@@ -71,7 +71,7 @@ BASE_ROUTER_KNOBS: dict[str, Any] = {
     "enabled": True,
     "auto_thinking": True,
     "rollout_phase": "full",
-    "strategy": "v4_phase3",
+    "strategy": "legacy_v4_phase3",
     "tier_profile": None,
     "cross_provider_tiers": False,
     "default_tier": "c1",
@@ -695,7 +695,7 @@ def run_case(case: Case) -> dict:
     sr._strategy = None
     sr._strategy_key = None
 
-    config = GatewayConfig()
+    config = GatewayConfig(squilla_router={"strategy": "legacy_v4_phase3"})
     config.llm.provider = case.llm_provider
     config.llm.model = case.llm_model
     for key, value in {**BASE_ROUTER_KNOBS, **case.router}.items():

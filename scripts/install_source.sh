@@ -150,6 +150,9 @@ check_squilla_router_assets() {
     local model_root="${source_root}/src/opensquilla/squilla_router/models"
     local pointer_line="version https://git-lfs.github.com/spec/v1"
     local required=(
+        "${source_root}/src/opensquilla/squilla_router/lightgbm_model/assets/artifact_manifest.json"
+        "${source_root}/src/opensquilla/squilla_router/lightgbm_model/assets/intent/model.txt.gz"
+        "${source_root}/src/opensquilla/squilla_router/lightgbm_model/assets/tier/model.txt.gz"
         "${model_root}/v4.2_phase3_inference/lgbm_main.bin"
         "${model_root}/v4.2_phase3_inference/router.runtime.yaml"
         "${model_root}/v4.2_phase3_inference/mlp/model.onnx"
@@ -181,7 +184,7 @@ check_squilla_router_assets() {
             echo "install_source.sh: Git LFS pointer files detected: ${pointers[*]}" >&2
         fi
         echo 'install_source.sh: run `git lfs install` once, then:' >&2
-        echo 'install_source.sh:   git lfs pull --include="src/opensquilla/squilla_router/models/**"' >&2
+        echo 'install_source.sh:   git lfs pull --include="src/opensquilla/squilla_router/models/**,src/opensquilla/squilla_router/lightgbm_model/assets/**"' >&2
         echo 'install_source.sh: or retry with OPENSQUILLA_INSTALL_PROFILE=core for the minimal runtime.' >&2
         if [[ "${mode}" == "warn" ]]; then
             return 0

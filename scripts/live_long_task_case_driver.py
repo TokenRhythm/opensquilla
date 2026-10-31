@@ -530,7 +530,9 @@ def render_gateway_config(
         f"cross_provider_tiers = {'true' if is_fallback else 'false'}",
         'tier_provider_mismatch = "veto"',
         'rollout_phase = "full"',
-        'strategy = "v4_phase3"',
+        # Fallback is a legacy-router acceptance scenario; the default model
+        # policy deliberately rejects fallback and has independent regression coverage.
+        f'strategy = "{"legacy_v4_phase3" if is_fallback else "model"}"',
         'default_tier = "c0"',
         "require_router_runtime = false",
     ]

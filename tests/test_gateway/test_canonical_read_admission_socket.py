@@ -344,7 +344,10 @@ async def test_ordinary_history_does_not_compete_with_admitted_metadata(
 ):
     case = read_socket_case
     modern = await case.client()
-    cli = GatewayClient(request_timeout_s=2)
+    # The still-held metadata gate proves independence. Allow SQLite worker
+    # scheduling within a watchdog shorter than the gate's ten-second bound.
+    read_timeout_s = 5
+    cli = GatewayClient(request_timeout_s=read_timeout_s)
     await cli.connect(case.url)
     case.gate.operation = "list_recent_agent_tasks"
     _, metadata = await modern.read(HYDRATE)
@@ -360,7 +363,7 @@ async def test_ordinary_history_does_not_compete_with_admitted_metadata(
             # recovery budget, as do other ordinary in-process callers.
             history = await asyncio.wait_for(read_chat_history_v4(
                 {"sessionKey": KEY}, RpcContext(conn_id="_http", session_manager=case.manager),
-            ), 2)
+            ), read_timeout_s)
         assert len(history["messages"]) == 1
         assert history["canonical_available"]
         assert not metadata.done() and not case.release.is_set()

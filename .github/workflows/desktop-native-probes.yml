@@ -53,6 +53,9 @@ jobs:
         mkdir -p "${RUNNER_TEMP}/desktop-native"
         printf 'CI_REPORT_DIR=%s\n' "${RUNNER_TEMP}/desktop-native" >> "${GITHUB_ENV}"
         uv sync --extra dev --extra recommended --extra mcp --frozen
+    - name: Prepare router assets for Gateway probes
+      if: ${{ matrix.probe != 'pty' }}
+      uses: ./.github/actions/prepare-router-assets
     - name: Verify recommended PTY and managed execution on the native platform
       if: ${{ matrix.probe == 'pty' }}
       shell: bash
@@ -112,7 +115,6 @@ jobs:
       shell: bash
       run: |
         set -euo pipefail
-        git lfs pull --include="src/opensquilla/squilla_router/models/v4.2_phase3_inference/**"
         mcp_image="opensquilla-mcp-ci:${GITHUB_SHA}"
         docker build --file Dockerfile --tag "${mcp_image}" . \
           2>&1 | tee "${CI_REPORT_DIR}/mcp-docker-build.log"

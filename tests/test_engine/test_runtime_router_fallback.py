@@ -115,7 +115,9 @@ class _MutatingHistoryStrategy:
 
 def _config_with_router_timeout() -> GatewayConfig:
     return GatewayConfig(
-        squilla_router=SquillaRouterConfig(routing_timeout_seconds=0.01)
+        squilla_router=SquillaRouterConfig(
+            strategy="legacy_v4_phase3", routing_timeout_seconds=0.01,
+        )
     )
 
 
@@ -482,7 +484,9 @@ async def test_cold_session_router_prepares_accepted_config_before_classificatio
     monkeypatch.setattr(runtime_module, "asyncio", SimpleNamespace(
         **(vars(asyncio) | {"wait_for": classification_wait_for}),
     ))
-    config = GatewayConfig(squilla_router={"enabled": False, "routing_timeout_seconds": 5})
+    config = GatewayConfig(squilla_router={
+        "strategy": "legacy_v4_phase3", "enabled": False, "routing_timeout_seconds": 5,
+    })
     accepted = capture_model_routing_config(config, session_mode="router")
 
     class ReadyStrategy:
@@ -687,3 +691,18 @@ async def test_pipeline_budget_refresh_awaits_exact_owner_and_preserves_known_sp
     )
     assert turn.metadata["session_billed_cost_usd"] == (2.0 if refresh_fails else 3.0)
     assert turn.metadata["session_total_cost_usd"] == (2.0 if refresh_fails else 3.0)
+
+
+@pytest.mark.asyncio
+async def test_model_router_timeout_fails_closed_without_provider_execution(monkeypatch):
+    async def slow_router(ctx):
+        await asyncio.sleep(1)
+        return ctx
+
+    monkeypatch.setattr("opensquilla.engine.steps.apply_squilla_router", slow_router)
+    runner = TurnRunner(provider_selector=None, config=GatewayConfig(
+        squilla_router={"routing_timeout_seconds": 0.01},
+    ))
+    with pytest.raises(TimeoutError, match="squilla router timed out"):
+        await runner._run_pipeline("request", "agent:main:timeout", _Provider(), None,
+                                   [], "system", [])

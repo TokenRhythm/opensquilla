@@ -145,7 +145,7 @@ async def test_attachment_materialization_threads_into_sanitized_pipeline_metada
 ) -> None:
     captured: dict[str, Any] = {}
 
-    async def fake_run_pipeline(ctx, steps):  # noqa: ANN001, ARG001
+    async def fake_run_pipeline(ctx, steps, **kwargs):  # noqa: ANN001, ARG001
         captured["metadata"] = ctx.metadata
         return ctx
 
@@ -194,7 +194,7 @@ async def test_run_pipeline_seeds_turn_context_with_normalization_metadata(
 ) -> None:
     captured: dict[str, Any] = {}
 
-    async def fake_run_pipeline(ctx, steps):  # noqa: ANN001, ARG001
+    async def fake_run_pipeline(ctx, steps, **kwargs):  # noqa: ANN001, ARG001
         captured["metadata"] = ctx.metadata
         return ctx
 
@@ -232,7 +232,7 @@ async def test_run_pipeline_ignores_non_positive_material_token_metadata(
 ) -> None:
     captured: dict[str, Any] = {}
 
-    async def fake_run_pipeline(ctx, steps):  # noqa: ANN001, ARG001
+    async def fake_run_pipeline(ctx, steps, **kwargs):  # noqa: ANN001, ARG001
         captured["metadata"] = ctx.metadata
         return ctx
 

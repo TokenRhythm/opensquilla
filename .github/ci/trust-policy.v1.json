@@ -2,6 +2,7 @@
   "schema_version": 1,
   "merge_critical_inputs": [
     ".github/actions/download-required-artifact/action.yml",
+    ".github/actions/prepare-router-assets/action.yml",
     ".github/ci/dependency-audit.v1.json",
     ".github/ci/suites.v1.json",
     ".github/ci/trust-policy.v1.json",

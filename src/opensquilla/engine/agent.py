@@ -6277,6 +6277,44 @@ class Agent:
         self._compaction_request_context = self.build_compaction_request_context(
             thinking_prompt
         )
+        from opensquilla.engine.model_policy_recovery import (
+            ModelPolicyRecovery,
+            effective_write_count,
+            validation_failure,
+        )
+
+        model_policy_recovery = ModelPolicyRecovery(self.config)
+        pending_model_quality_retry: str | None = None
+
+        async def _try_model_quality_retry(
+            reason: str, messages: list[Message], tools: list[ToolDefinition] | None,
+        ) -> bool:
+            nonlocal chat_cfg, thinking_enabled, thinking_budget
+            updates = await model_policy_recovery.prepare(
+                self.provider, reason, messages, chat_config=chat_cfg, tools=tools,
+            )
+            if updates is None:
+                return False
+            # Callback has preflighted and durably committed the effective tier.
+            # Keep this turn's messages and provider wrapper across the handoff.
+            for name, value in updates.items():
+                setattr(self.config, name, value)
+            thinking_enabled, thinking_budget = self.config.resolve_thinking(prompt=thinking_prompt)
+            chat_cfg = self._provider_admission_chat_config(
+                thinking_prompt,
+                context_window_tokens=self.config.context_window_tokens,
+                max_output_tokens=self.config.max_tokens,
+            )
+            self._compaction_request_context = self.build_compaction_request_context(
+                thinking_prompt
+            )
+            self._write_turn_call_log(
+                "model_policy_quality_retry", action="apply", reason=reason,
+                model=self.config.model_id, provider=self.config.provider_id,
+                budget=model_policy_recovery.budget, used=model_policy_recovery.used,
+            )
+            return True
+
         _log = structlog.get_logger("opensquilla.engine.agent")
 
         def _positive_float(value: Any) -> float | None:
@@ -7055,6 +7093,7 @@ class Agent:
                 stream_recovery_used = False
                 _connection_wait_attempt = 0
                 _call_attempt = 0
+                dispatch_evidence: RetryAfterDispatchEvidence | None = None
                 _retry_policy = _ProviderRetryPolicy.from_provider_budget(
                     _fallback.max_retries,
                     length_capped_continuations=self.config.length_capped_continuations,
@@ -7293,6 +7332,51 @@ class Agent:
                             self._provider_call_tool_result_retrieval_available = (
                                 previous_call_retrieval
                             )
+                        # A quality upgrade must not commit when this call is
+                        # already forbidden by the turn's execution budget.
+                        terminal_error = (
+                            _turn_llm_call_budget_error(turn_llm_calls + 1) or _turn_budget_error()
+                        )
+                        if terminal_error is not None:
+                            self._write_turn_call_log(
+                                "turn_policy_decision",
+                                action=("stop"),
+                                reason=terminal_error.message,
+                                code=terminal_error.code,
+                                sent_llm_calls=turn_llm_calls,
+                                attempted_llm_call=turn_llm_calls + 1,
+                                iteration=iterations,
+                                attempt=_call_attempt,
+                            )
+                            yield self._transition(AgentState.ERROR)
+                            yield terminal_error
+                            break
+
+                        if pending_model_quality_retry is not None:
+                            if selector_projects_images:
+                                # Bind this iteration's barrier before candidate
+                                # preview; marker forcing remains deployment-bound.
+                                selector_image_provider.configure_image_request_projection(
+                                    force_marker=(
+                                        image_projection_forced
+                                        and selector_image_provider.active_deployment_config()
+                                        == image_projection_forced_deployment
+                                    ),
+                                    marker_state=image_projection_marker_state,
+                                    forbid_unknown_probe=turn_image_retry_barrier_crossed,
+                                    reason=(
+                                        str(self.config.metadata.get("image_input_reason") or "")
+                                        or None
+                                    ),
+                                )
+                            reason = pending_model_quality_retry
+                            pending_model_quality_retry = None
+                            # Admit the fully assembled next request, including
+                            # transient context and provider-view transformations,
+                            # before committing or activating the higher tier.
+                            await _try_model_quality_retry(
+                                reason, request_messages, provider_tools_for_call,
+                            )
                         # Project only this physical request. ``turn_messages`` and
                         # ``request_turn_messages`` remain image-bearing canonical
                         # views so a later vision-capable turn can recover the
@@ -7481,23 +7565,6 @@ class Agent:
                             attempt=_call_attempt,
                             sanitize=request_sanitize_result,
                         )
-
-                        next_call_budget_error = _turn_llm_call_budget_error(turn_llm_calls + 1)
-                        terminal_error = next_call_budget_error
-                        if terminal_error is not None:
-                            self._write_turn_call_log(
-                                "turn_policy_decision",
-                                action=("stop"),
-                                reason=terminal_error.message,
-                                code=terminal_error.code,
-                                sent_llm_calls=turn_llm_calls,
-                                attempted_llm_call=turn_llm_calls + 1,
-                                iteration=iterations,
-                                attempt=_call_attempt,
-                            )
-                            yield self._transition(AgentState.ERROR)
-                            yield terminal_error
-                            break
 
                         call_chat_cfg = chat_cfg
                         if tool_failure_finalization_pending:
@@ -7888,6 +7955,22 @@ class Agent:
                             attempt=_call_attempt, messages=request_messages,
                             tools=provider_tools_for_call, config=call_chat_cfg,
                         )
+                    # Preparation can loop before any provider stream is opened.
+                    # Only a prior dispatch consumes an additional-call allowance;
+                    # explicit local cooling is likewise not a physical attempt.
+                    retry_dispatch = dispatch_evidence is not None and (
+                        dispatch_evidence.physical_started or not dispatch_evidence.cooling_observed
+                    )
+                    if retry_dispatch and not model_policy_recovery.reserve_transport_retry():
+                        terminal_error = ErrorEvent(
+                            message="Provider retry exhausted the shared additional-call budget.",
+                            code="provider_retry_budget_exhausted",
+                            no_prior_provider_dispatch=False,
+                            replay_safe=False,
+                        )
+                        yield self._transition(AgentState.ERROR)
+                        yield terminal_error
+                        break
                     turn_llm_calls += 1
                     cache_prompt_snapshot = None
                     if self._session_key:
@@ -12175,6 +12258,37 @@ class Agent:
                     yield terminal_error
                     break
 
+                repeat_message = model_policy_recovery.repeated_call_message(
+                    tool_calls, effective_write_count(self._workspace_write_records())
+                )
+                if repeat_message is not None:
+                    # The duplicate was fully received but is never dispatched;
+                    # discard its buffered tool UI events and avoid an orphaned
+                    # assistant tool-use row in the canonical transcript.
+                    if self._execution_context is not None:
+                        self._execution_context.drop_pending_tool_buffers("model_policy_no_progress")
+                    for preview in discard_tool_previews():
+                        yield preview
+                    if response_text:
+                        turn_messages.append(Message(
+                            role="assistant", content=response_text,
+                            reasoning_content=iter_reasoning_content,
+                        ))
+                    turn_messages.append(Message(role="user", content=repeat_message))
+                    runtime_recovery_scaffolding_pending = True
+                    self.config.metadata["repeated_tool_call_recoveries"] = (
+                        self.config.metadata.get("repeated_tool_call_recoveries", 0) + 1
+                    )
+                    pending_model_quality_retry = "no_progress"
+                    yield WarningEvent(
+                        code="repeated_tool_call_recovery",
+                        message=(
+                            "Runtime skipped a repeated identical tool call and "
+                            "asked for a different approach."
+                        ),
+                    )
+                    continue
+
                 # Tool events are transactional with the provider attempt. The
                 # final classification has already established that a DoneEvent
                 # was received and that every tool sequence was closed and
@@ -13375,6 +13489,9 @@ class Agent:
                         iteration=iterations,
                         tool_use_ids=sorted(preflight_tool_results),
                     )
+                model_policy_recovery.observe_results(tool_calls, executed_results)
+                if not turn_yielded and validation_failure(executed_results):
+                    pending_model_quality_retry = "validation_failure"
                 if turn_yielded:
                     break
                 if tool_failure_recovery.exhausted:

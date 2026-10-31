@@ -17715,6 +17715,188 @@ class SessionStorage:
                 removed = cur.rowcount or 0
         return removed > 0
 
+    async def _read_model_router_record(
+        self, conn: Any, session_id: str, message_id: str,
+    ) -> tuple[dict[str, Any] | None, bool]:
+        """Read one accepted input across the active and compacted transcripts."""
+        from opensquilla.session.model_router_state import MODEL_DECISION_KEY
+
+        record = None
+        matched = False
+        for table in ("transcript_entries", "compacted_transcript_entries"):
+            async with conn.execute(
+                f"SELECT turn_context FROM {table} "
+                "WHERE session_id=? AND message_id=? AND role='user'",
+                (session_id, message_id),
+            ) as cur:
+                row = await cur.fetchone()
+            if row is None:
+                continue
+            matched = True
+            candidate = json.loads(row[0]).get(MODEL_DECISION_KEY) if row[0] else None
+            if isinstance(candidate, dict):
+                if record is not None and record != candidate:
+                    raise RuntimeError("Canonical model router decisions disagree")
+                record = candidate
+        return record, matched
+
+    async def _latest_model_router_version(self, conn: Any, session_id: str) -> int | None:
+        latest_version = None
+        for table in ("transcript_entries", "compacted_transcript_entries"):
+            async with conn.execute(
+                "SELECT MAX(json_extract(turn_context, "
+                "'$.router_model_decision.state.version')) "
+                f"FROM {table} WHERE session_id=? AND role='user' "
+                "AND json_extract(turn_context, "
+                "'$.router_model_decision.state_committed')=1 "
+                "AND json_extract(turn_context, "
+                "'$.router_model_decision.status')='admitted'",
+                (session_id,),
+            ) as cur:
+                latest = await cur.fetchone()
+            if latest is not None and latest[0] is not None:
+                latest_version = max(latest_version or 0, int(latest[0]))
+        return latest_version
+
+    async def _write_model_router_record(
+        self, conn: Any, session_id: str, message_id: str, record: dict[str, Any],
+    ) -> None:
+        from opensquilla.session.model_router_state import MODEL_DECISION_KEY
+
+        encoded = json.dumps(record, allow_nan=False)
+        for table in ("transcript_entries", "compacted_transcript_entries"):
+            await conn.execute(
+                f"UPDATE {table} SET turn_context="
+                "json_set(COALESCE(turn_context, '{}'), ?, json(?)) "
+                "WHERE session_id=? AND message_id=? AND role='user'",
+                (f"$.{MODEL_DECISION_KEY}", encoded, session_id, message_id),
+            )
+
+    async def stage_model_router_decision(
+        self,
+        session_key: str,
+        message_id: str,
+        decision: dict[str, Any],
+        *,
+        expected_session_id: str,
+        expected_epoch: int,
+    ) -> dict[str, Any]:
+        """Persist classification without advancing the admitted task state."""
+        staged: dict[str, Any] = json.loads(json.dumps(decision, allow_nan=False))
+        staged.update(status="staged", state_committed=False)
+        staged.setdefault("decided_at_ms", _now_ms())
+        async with self._write_transaction("stage_model_router_decision") as conn:
+            if not await _matches_session_owner_on_conn(
+                conn, session_key=session_key, session_id=expected_session_id,
+                session_epoch=expected_epoch,
+            ):
+                await self._raise_stale_epoch(
+                    conn, session_key=session_key, expected_epoch=expected_epoch,
+                    expected_session_id=expected_session_id,
+                )
+            committed, matched = await self._read_model_router_record(
+                conn, expected_session_id, message_id,
+            )
+            if not matched:
+                raise RuntimeError("Model router decision has no accepted user transcript row")
+            if committed is not None:
+                return committed
+            await self._write_model_router_record(conn, expected_session_id, message_id, staged)
+        return staged
+
+    async def admit_model_router_decision(
+        self,
+        session_key: str,
+        message_id: str,
+        *,
+        expected_session_id: str,
+        expected_epoch: int,
+        expected_previous_version: int | None,
+    ) -> dict[str, Any] | None:
+        """Admit a staged route only if its prior admitted task state is unchanged."""
+        if expected_previous_version is not None and (
+            type(expected_previous_version) is not int or expected_previous_version < 1
+        ):
+            raise ValueError("Previous model router version must be positive or absent")
+        async with self._write_transaction("admit_model_router_decision") as conn:
+            if not await _matches_session_owner_on_conn(
+                conn, session_key=session_key, session_id=expected_session_id,
+                session_epoch=expected_epoch,
+            ):
+                await self._raise_stale_epoch(
+                    conn, session_key=session_key, expected_epoch=expected_epoch,
+                    expected_session_id=expected_session_id,
+                )
+            record, _ = await self._read_model_router_record(conn, expected_session_id, message_id)
+            latest_version = await self._latest_model_router_version(conn, expected_session_id)
+            if record is None:
+                raise RuntimeError("Model router admission has no staged decision")
+            if record.get("status") == "admitted" and record.get("state_committed") is True:
+                return record
+            if record.get("status") != "staged" or record.get("state_committed") is not False:
+                raise RuntimeError("Model router decision has invalid admission state")
+            state = record.get("state") or {}
+            proposed_version = state.get("version")
+            if (
+                type(proposed_version) is not int
+                or proposed_version != (expected_previous_version or 0) + 1
+            ):
+                raise RuntimeError("Model router proposed version does not follow prior state")
+            if latest_version != expected_previous_version:
+                return None
+            record.update(
+                status="admitted", state_committed=True,
+                state_version_before=expected_previous_version, admitted_at_ms=_now_ms(),
+            )
+            await self._write_model_router_record(conn, expected_session_id, message_id, record)
+        return record
+
+    async def advance_model_router_quality_retry(
+        self, session_key: str, message_id: str, *, expected_session_id: str,
+        expected_epoch: int, expected_version: int, target_tier: str,
+        reason: str, scope_id: str, execution_update: dict[str, Any],
+    ) -> dict[str, Any] | None:
+        """CAS one effective retry tier without rewriting the original model audit."""
+        if (
+            reason not in {"validation_failure", "no_progress"}
+            or execution_update.get("tier") != target_tier
+        ):
+            return None
+        async with self._write_transaction("advance_model_router_quality_retry") as conn:
+            if not await _matches_session_owner_on_conn(
+                conn, session_key=session_key, session_id=expected_session_id,
+                session_epoch=expected_epoch,
+            ):
+                await self._raise_stale_epoch(
+                    conn, session_key=session_key, expected_epoch=expected_epoch,
+                    expected_session_id=expected_session_id,
+                )
+            record, _ = await self._read_model_router_record(conn, expected_session_id, message_id)
+            latest_version = await self._latest_model_router_version(conn, expected_session_id)
+            if latest_version is not None and latest_version > expected_version:
+                return None
+            if record is None:
+                raise RuntimeError("Quality retry has no durable model routing decision")
+            if record.get("status") != "admitted" or record.get("state_committed") is not True:
+                return None
+            state = record.get("state") or {}
+            old_tier = state.get("tier")
+            tiers = ("c0", "c1", "c2", "c3")
+            if (
+                state.get("version") != expected_version
+                or record.get("quality_retry", {}).get("used")
+                or old_tier not in tiers or old_tier == "c3"
+                or target_tier != tiers[tiers.index(old_tier) + 1]
+            ):
+                return None
+            record["state"] = {**state, "tier": target_tier, "version": expected_version + 1}
+            record["quality_retry"] = {"used": True, "reason": reason, "scope_id": scope_id,
+                                       "from_tier": old_tier, "to_tier": target_tier}
+            record["execution_update"] = dict(execution_update)
+            record["updated_at_ms"] = _now_ms()
+            await self._write_model_router_record(conn, expected_session_id, message_id, record)
+        return record
+
     async def update_transcript_turn_context(
         self,
         session_key: str,
@@ -17732,9 +17914,20 @@ class SessionStorage:
         async with self._write_transaction("update_transcript_turn_context") as conn:
             for table in ("transcript_entries", "compacted_transcript_entries"):
                 async with conn.execute(
-                    f"UPDATE {table} SET turn_context = ? "
+                    f"UPDATE {table} SET turn_context = CASE "
+                    "WHEN json_type(turn_context, '$.router_model_control_event') = 'text' "
+                    "THEN json_set(CASE "
+                    "WHEN json_type(turn_context, '$.router_model_decision') = 'object' "
+                    "THEN json_set(?, '$.router_model_decision', "
+                    "json_extract(turn_context, '$.router_model_decision')) ELSE ? END, "
+                    "'$.router_model_control_event', "
+                    "json_extract(turn_context, '$.router_model_control_event')) "
+                    "ELSE CASE "
+                    "WHEN json_type(turn_context, '$.router_model_decision') = 'object' "
+                    "THEN json_set(?, '$.router_model_decision', "
+                    "json_extract(turn_context, '$.router_model_decision')) ELSE ? END END "
                     "WHERE session_key = ? AND message_id = ?",
-                    (encoded, session_key, message_id),
+                    (encoded, encoded, encoded, encoded, session_key, message_id),
                 ) as cur:
                     changed += cur.rowcount or 0
         return changed > 0

@@ -1346,7 +1346,9 @@ class SquillaRouterConfig(BaseSettings):
     enabled: bool = True
     auto_thinking: bool = True
     rollout_phase: str = "full"  # "observe" | "prompt_only" | "full"
-    strategy: str = "v4_phase3"
+    strategy: str = "lightgbm_model"
+    tier_policy: Literal["model"] = "model"
+    lightgbm_model_dir: str | None = None
     tier_profile: str | None = None
     # Explicit ownership for the router ladder.  ``follow_primary`` means
     # OpenSquilla owns the ladder and may replace it with the active
@@ -1424,6 +1426,13 @@ class SquillaRouterConfig(BaseSettings):
     vision_followup_gate_max_output_tokens: int = Field(default=512, ge=16)
     vision_followup_gate_fallback_recent_turns: int = Field(default=2, ge=0)
     vision_followup_gate_unknown_policy: str = "image_if_recent"
+
+    @field_validator("strategy", mode="before")
+    @classmethod
+    def _normalize_router_strategy(cls, value: Any) -> str:
+        # Existing installations saved v4_phase3 explicitly. Upgrade them to
+        # the intent-led pair; retain an explicit legacy mode for diagnostics.
+        return "legacy_v4_phase3" if value == "legacy_v4_phase3" else "lightgbm_model"
 
     @field_validator("visual_mode", mode="before")
     @classmethod

@@ -40,6 +40,7 @@ _FINGERPRINT_FIELDS: tuple[tuple[str, tuple[str, ...]], ...] = (
     ),
     ("initial_model", ("initialModel", "initial_model")),
     ("initial_provider", ("initialProvider", "initial_provider")),
+    ("router_control_event", ("routerControlEvent", "router_control_event")),
     ("fork_before_message_id", ("forkBeforeMessageId", "fork_before_message_id")),
     ("queue_mode", ("queueMode", "queue_mode")),
     ("no_memory_capture", ("noMemoryCapture", "no_memory_capture")),

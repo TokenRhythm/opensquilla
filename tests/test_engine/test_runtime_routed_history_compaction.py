@@ -88,6 +88,7 @@ async def test_small_route_preserves_old_task_facts_before_final_projection(
     config.compaction.enabled = True
     config.preflight_compact_ratio = 0.8
     config.squilla_router = SquillaRouterConfig(
+        strategy="legacy_v4_phase3",
         enabled=True, cross_provider_tiers=True, preset_binding="custom",
         tiers={
             f"c{index}": {

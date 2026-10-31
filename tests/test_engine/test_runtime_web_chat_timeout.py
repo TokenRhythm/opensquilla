@@ -168,7 +168,7 @@ async def test_web_chat_runtime_timeout_reaches_agent_config(
     runner = TurnRunner(
         provider_selector=selector,
         session_manager=session_manager,
-        config=GatewayConfig(**config_kwargs),
+        config=GatewayConfig(squilla_router={"enabled": False}, **config_kwargs),
     )
 
     async for _ in runner.run(

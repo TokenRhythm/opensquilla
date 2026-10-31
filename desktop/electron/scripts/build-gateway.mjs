@@ -23,6 +23,7 @@ const caRuntimeHookPath = join(scriptDir, 'pyinstaller_runtime_hooks', 'ensure_c
 const controlUiDistDir = join(repoRoot, 'opensquilla-webui', 'dist')
 const controlUiVerifier = join(repoRoot, 'opensquilla-webui', 'scripts', 'verify-dist.mjs')
 const routerBundleDir = join(repoRoot, 'src', 'opensquilla', 'squilla_router', 'models', 'v4.2_phase3_inference')
+const lightgbmModelDir = join(repoRoot, 'src', 'opensquilla', 'squilla_router', 'lightgbm_model', 'assets')
 // The V4 router ships its implementation as a copied runtime_src tree and
 // imports it only after validating the bundle.  PyInstaller cannot resolve
 // that delayed `src.router.*` import from the normal repository search path;
@@ -320,6 +321,7 @@ function recordStage(stage, started) {
 assertControlUiArtifactReady()
 assertRouterAssetsReady()
 assertRouterIntegrity(routerBundleDir)
+assertRouterIntegrity(lightgbmModelDir)
 const buildInputs = gatewayInputs(repoRoot)
 
 rmSync(runtimeGatewayDir, { recursive: true, force: true })
@@ -457,6 +459,8 @@ const args = [
   caRuntimeHookPath,
   '--add-data',
   `${join(tokenizerCacheDir, tokenizerCacheKey)}${addDataSeparator}tiktoken-cache`,
+  '--add-data',
+  `${lightgbmModelDir}${addDataSeparator}opensquilla/squilla_router/lightgbm_model/assets`,
   '--add-data',
   `${join(repoRoot, 'migrations')}${addDataSeparator}opensquilla/_migrations`,
   '--add-data',

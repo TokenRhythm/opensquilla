@@ -182,7 +182,11 @@ class _Strategy:
 
 
 def _config() -> GatewayConfig:
-    return GatewayConfig(llm={"provider": "openrouter", "model": _MODEL})
+    # These fixtures exercise legacy best-effort snapshot/retry semantics.
+    return GatewayConfig(
+        llm={"provider": "openrouter", "model": _MODEL},
+        squilla_router={"strategy": "legacy_v4_phase3"},
+    )
 
 
 def _tool_context() -> ToolContext:
@@ -720,6 +724,7 @@ async def test_provider_retry_reuses_loaded_transcript_snapshot(
         session_manager=manager,
         config=GatewayConfig(
             llm={"provider": "openrouter", "model": _MODEL},
+            squilla_router={"strategy": "legacy_v4_phase3"},
             agent_max_provider_retries=1,
         ),
     )
@@ -952,6 +957,7 @@ async def test_router_control_replay_uses_fresh_turn_snapshot(
     config = GatewayConfig(
         llm={"provider": "openrouter", "model": _MODEL},
         squilla_router=SquillaRouterConfig(
+            strategy="legacy_v4_phase3",
             enabled=True,
             rollout_phase="full",
             require_router_runtime=False,
