@@ -102,18 +102,18 @@
     "test:live-html-browser": "node --test scripts/test-live-html-business.mjs"
   },
   "dependencies": {
-    "electron-updater": "^6.6.2",
-    "playwright-core": "1.64.0",
-    "smol-toml": "1.9.0"
+    "electron-updater": "^6.8.11",
+    "playwright-core": "1.64.1",
+    "smol-toml": "1.9.1"
   },
   "devDependencies": {
-    "@types/node": "^26.6.4",
+    "@types/node": "^26.6.5",
     "@typescript/typescript6": "6.0.2",
-    "electron": "^42.11.16",
-    "electron-builder": "^26.15.3",
+    "electron": "^42.11.18",
+    "electron-builder": "^26.18.0",
     "gsap": "^3.15.0",
     "lottie-web": "^5.13.0",
-    "playwright": "~1.64.0",
+    "playwright": "~1.64.1",
     "typescript": "7.0.2",
     "ws": "^8.22.0"
   },
