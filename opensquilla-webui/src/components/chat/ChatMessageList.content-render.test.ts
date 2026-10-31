@@ -358,3 +358,43 @@ describe('automatic content through the real assistant renderer', () => {
     expect([...host.querySelectorAll('.assistant-answer .msg-ai-text')].every(answer => answer.textContent === body)).toBe(true)
   })
 })
+
+it.each(['loaded', 'closed', 'replaced'])('hydrates the independent incomplete reasoning summary (%s)', async mode => {
+  const reasoning = 'Committed reasoning 🙂 '.repeat(3000)
+  let release!: () => void
+  const fetcher = vi.spyOn(globalThis, 'fetch').mockImplementation(() =>
+    new Promise(resolve => { release = () => resolve(new Response(JSON.stringify({
+      message_id: 'answer', role: 'assistant', reasoning_content: reasoning,
+      tool_calls: [{ type: 'text', text: 'Final answer', presentation: 'answer' }],
+    }))) }),
+  )
+  const { host, canonical } = await mount([], [{
+    role: 'assistant', text: 'Final answer', messageId: 'answer', ts: 1, previewComplete: true,
+    contentRef: { ...message().contentRef!, revision: 'r1' }, contentRevision: 'r1',
+    historyPayloadPreview: { detailsTruncated: true },
+    reasoning: { text: reasoning.slice(0, 30), seconds: 0 },
+    tool_calls: [{ type: 'text', text: 'Final answer', presentation: 'answer' }],
+    activitySnapshotIncomplete: true,
+  }])
+  const summary = host.querySelector<HTMLDetailsElement>('.assistant-reasoning-summary')!
+  expect(summary).not.toBeNull()
+  expect(fetcher).not.toHaveBeenCalled()
+  summary.querySelector<HTMLElement>('summary')!.click()
+  await vi.waitFor(() => expect(fetcher).toHaveBeenCalledOnce())
+  expect(host.querySelector('.assistant-activity__summary')?.getAttribute('aria-expanded')).toBe('false')
+  if (mode === 'closed') summary.querySelector<HTMLElement>('summary')!.click()
+  if (mode === 'replaced') canonical.value = []
+  await nextTick()
+  release()
+  for (let index = 0; index < 16; index++) { await Promise.resolve(); await nextTick() }
+  expect(fetcher).toHaveBeenCalledOnce()
+  if (mode === 'replaced') {
+    expect(host.querySelector('.assistant-reasoning-summary')).toBeNull()
+  } else if (mode === 'closed') {
+    expect(canonical.value[0]?.reasoning?.text).toBe(reasoning.slice(0, 30))
+  } else {
+    expect(canonical.value[0]?.reasoning?.text).toBe(reasoning)
+    expect(summary.querySelector('.thinking-block__body')?.textContent).toBe(reasoning)
+    expect(canonical.value[0]?.historyPayloadPreview?.detailsTruncated).toBe(false)
+  }
+})

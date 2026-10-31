@@ -44,8 +44,10 @@ def fixed_material(kind: str):
     parts = {"system": "Keep the task's rules.", "tools": "Read the designated record.",
              "user": "Report the designated record without changing anything."}
     for part in parts if kind == "combined" else [kind]:
-        parts[part] = f"{part} begin " + ("fact " if kind == "combined" else "invariant ") * (
-            12000 if kind == "combined" else 34000
+        # Fit 128K with either BPE or the conservative character estimator,
+        # while still exceeding 32K after the output reservation.
+        parts[part] = f"{part} begin " + "fact " * (
+            10000 if kind == "combined" else 34000
         ) + f" {part} end"
     tools = [ToolDefinition(
         name="lookup", description=parts["tools"],

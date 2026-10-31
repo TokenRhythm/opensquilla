@@ -12,6 +12,7 @@ export interface WindowsProcessTreeTerminationOptions {
   readonly pid: number
   readonly timeoutMs: number
   readonly fallback: () => void
+  readonly signal?: AbortSignal
   readonly onFailure?: (failure: WindowsProcessTreeTerminationFailure) => void
   readonly spawnProcess?: typeof spawn
 }
@@ -26,10 +27,25 @@ export interface WindowsProcessTreeTerminationOptions {
 export function terminateWindowsProcessTree(
   options: WindowsProcessTreeTerminationOptions,
 ): Promise<boolean> {
+  if (options.signal?.aborted) return Promise.resolve(false)
   return new Promise(resolve => {
     let settled = false
     let timer: NodeJS.Timeout | null = null
     let killer: ChildProcess
+    let exited = false
+
+    const stopHelper = (): void => {
+      if (exited || killer.exitCode !== null || killer.signalCode !== null) return
+      try { killer.kill('SIGKILL') } catch {
+        // Only this operation's still-live helper handle may be signaled.
+      }
+    }
+    const cancelled = (): void => {
+      // Cancellation stops our helper, not an old target PID. The caller owns
+      // any separately verified direct-child fallback at application exit.
+      finish(false)
+      stopHelper()
+    }
 
     const finish = (
       success: boolean,
@@ -38,6 +54,7 @@ export function terminateWindowsProcessTree(
       if (settled) return
       settled = true
       if (timer) clearTimeout(timer)
+      options.signal?.removeEventListener('abort', cancelled)
       if (!success && failure) {
         try {
           options.onFailure?.({ pid: options.pid, ...failure })
@@ -78,6 +95,7 @@ export function terminateWindowsProcessTree(
       })
     })
     killer.once('exit', (code, signal) => {
+      exited = true
       finish(code === 0, code === 0 ? null : {
         timedOut: false,
         exitCode: code,
@@ -92,11 +110,9 @@ export function terminateWindowsProcessTree(
         signal: killer.signalCode,
         error: `taskkill exceeded ${options.timeoutMs}ms`,
       })
-      try {
-        killer.kill('SIGKILL')
-      } catch {
-        // The direct-child fallback above is the final ownership boundary.
-      }
+      stopHelper()
     }, options.timeoutMs)
+    options.signal?.addEventListener('abort', cancelled, { once: true })
+    if (options.signal?.aborted) cancelled()
   })
 }

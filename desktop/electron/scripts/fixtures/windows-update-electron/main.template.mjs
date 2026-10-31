@@ -50,6 +50,7 @@ let quitConfirmationWantsExit = false
 const desktopQuitConfirmation = new DesktopQuitConfirmation()
 const gatewayProcessCleanupContexts = new Map()
 const gatewayProcessCleanupOperations = new WeakMap()
+const gatewayProcessTreeTerminations = new Map()
 const quitUnconfirmedProcessTrees = new Set()
 const systemSessionEnding = false
 let windowsTray = {}

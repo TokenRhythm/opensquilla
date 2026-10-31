@@ -16,14 +16,16 @@ from opensquilla.skills.io_worker import check_staging_cancelled, run_staging_wo
 from tests.test_skills.test_hub_management_service import FakeImmutableSource
 
 
-# Keep this real-worker integration contract outside the xdist pool. Its entry
-# guard also includes install preparation; serial scheduling cannot bound that I/O.
+# Keep this real-worker integration contract outside the xdist pool. Install
+# preparation has a separate guard from the scanner responsiveness assertions.
 @pytest.mark.ci_serial
 @pytest.mark.asyncio
 async def test_scan_keeps_status_responsive_and_cancel_waits_for_cleanup(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     loop = asyncio.get_running_loop()
+    scan_ready = asyncio.Event()
+    release_scan = asyncio.Event()
     entered = asyncio.Event()
     exited = threading.Event()
     main_thread = threading.get_ident()
@@ -34,6 +36,11 @@ async def test_scan_keeps_status_responsive_and_cancel_waits_for_cleanup(
         nonlocal last_progress_requested
         last_progress_requested = phase
         await report_progress(phase, **counts)
+        if phase == "scanning":
+            # Cold SQLite receipts and staging preparation are setup costs.
+            # Start the scanner-entry guard only after that real work settles.
+            scan_ready.set()
+            await release_scan.wait()
 
     monkeypatch.setattr(management, "report_install_progress_async", observed_progress)
 
@@ -86,18 +93,30 @@ async def test_scan_keeps_status_responsive_and_cancel_waits_for_cleanup(
         return state
 
     task = asyncio.create_task(operations.run("owner", operation_id, {}, install))
+    bootstrap_waiter = asyncio.create_task(scan_ready.wait())
     entry_waiter = asyncio.create_task(entered.wait())
     failure: BaseException | None = None
     try:
-        await asyncio.wait({entry_waiter, task}, timeout=3, return_when=asyncio.FIRST_COMPLETED)
+        await asyncio.wait(
+            {bootstrap_waiter, task}, timeout=30, return_when=asyncio.FIRST_COMPLETED,
+        )
+        if scan_ready.is_set():
+            release_scan.set()
+            await asyncio.wait(
+                {entry_waiter, task}, timeout=3, return_when=asyncio.FIRST_COMPLETED,
+            )
         if not entered.is_set():
             install_finished = task.done()
             reason = (
-                "install finished before scanning" if install_finished else "scan entry exceeded 3s"
+                "install finished before scanning" if install_finished else (
+                    "scan entry exceeded 3s" if scan_ready.is_set()
+                    else "install preparation exceeded 30s"
+                )
             )
             details: dict[str, object] = {
                 "install": task_state(task),
                 "last_progress_requested": last_progress_requested,
+                "scan_ready": scan_ready.is_set(),
                 "install_waiter_done": install_finished,
                 "scanner_exited": exited.is_set(),
             }
@@ -137,8 +156,10 @@ async def test_scan_keeps_status_responsive_and_cancel_waits_for_cleanup(
     finally:
         cleanup_errors: list[BaseException] = []
         try:
+            release_scan.set()
+            bootstrap_waiter.cancel()
             entry_waiter.cancel()
-            await asyncio.gather(entry_waiter, return_exceptions=True)
+            await asyncio.gather(bootstrap_waiter, entry_waiter, return_exceptions=True)
         except BaseException as exc:
             cleanup_errors.append(exc)
         try:

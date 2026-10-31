@@ -1,4 +1,11 @@
 {
+  "desktopRuntime": {
+    "starting": "Démarrage d’OpenSquilla…",
+    "startFailed": "OpenSquilla n’a pas pu démarrer.",
+    "sandboxUpgradeIncomplete": "La mise à niveau des paramètres du bac à sable est incomplète. Vous pouvez continuer à utiliser l’application. Consultez le journal et réessayez après un redémarrage.",
+    "retry": "Réessayer",
+    "showLog": "Afficher le journal"
+  },
   "visualize": {
     "runtimeError": "Ce canevas n’a pas pu s’exécuter",
     "runtimeErrorHint": "Son code a rencontré une erreur. Demandez une correction à l’IA ou relancez cette version.",
@@ -130,6 +137,7 @@
     "unavailable": "Le fichier source est indisponible. Les aperçus et téléchargements existants sont inchangés.", "failed": "L’opération sur le fichier a échoué."
   },
   "workspaces": {
+    "catalogUnavailable": "La liste des projets est indisponible.",
     "openDirectory": "Ouvrir dans le gestionnaire de fichiers",
     "copyDirectoryPath": "Copier le chemin du dossier du projet",
     "openDirectoryFailed": "Impossible d’ouvrir le dossier du projet. Réessayez.",
@@ -1510,7 +1518,7 @@
       "resetSaved": "Niveaux recommandés de {provider} enregistrés ; mode inchangé.",
       "title": "Routage des modèles",
       "desc": "Choisissez comment le modèle est sélectionné pour chaque requête.",
-      "newSessionDefault": "C’est la valeur par défaut des nouveaux chats. Les chats existants conservent leur propre mode de routage.",
+      "newSessionDefault": "Les nouveaux chats reprennent le dernier mode sélectionné manuellement, ainsi que le modèle et le fournisseur choisis en mode modèle fixe. Sans sélection enregistrée, la configuration actuelle est utilisée. Les chats existants conservent leurs propres choix.",
       "modeTitle": "Choisir l’utilisation des modèles",
       "providerFirstTitle": "Ajouter d’abord un service de modèles",
       "providerFirst": "Le routage de modèles nécessite au moins un fournisseur enregistré.",
@@ -4297,7 +4305,9 @@
       "stale": "Toujours en cours — aucun signal récent",
       "liveStep": "étape {n}",
       "phaseElapsed": "Étape actuelle : {duration}",
-      "recordIncomplete": "L’historique d’activité est incomplet ; affichage de la vue compatible."
+      "recordIncomplete": "L’historique d’activité est incomplet ; affichage de la vue compatible.",
+      "reasoningOrderUnavailable": "Résumé du raisonnement · ordre non enregistré",
+      "eventsOrderUnavailable": "Événements du modèle · ordre par rapport à la conversation indisponible"
     },
     "missingCitationSources": "Certaines citations ne correspondent à aucune source disponible : {citations}",
     "suggestedTasks": "Tâches suggérées",

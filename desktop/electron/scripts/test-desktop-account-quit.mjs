@@ -64,6 +64,7 @@ for (const signal of [false, true]) {
     const h = harness({ signal })
     h.quit()
     assert.ok(h.events.includes('prevented'))
+    await new Promise(resolve => setImmediate(resolve))
     assert.ok(h.events.includes('account-close'))
     assert.ok(h.events.includes('proxy-close'))
     await new Promise(resolve => setImmediate(resolve))
@@ -105,4 +106,87 @@ test('failed account persistence prevents exit and a recovered close can be retr
   await h.env.quitGatewayDrainPromise
   await new Promise(resolve => setImmediate(resolve))
   assert.ok(h.events.includes('exit:0'))
+})
+
+for (const target of ['account', 'proxy']) {
+  for (const synchronous of [false, true]) {
+    test(`${target} close ${synchronous ? 'throw' : 'rejection'} keeps account shutdown retryable`, async () => {
+      const h = harness()
+      h.accountDrain.resolve()
+      const entry = h.env.desktopAccounts.get('profile')
+      entry[target].close = () => {
+        if (synchronous) throw new Error('synthetic account close failure')
+        return Promise.reject(new Error('synthetic account close failure'))
+      }
+      h.quit()
+      await h.env.quitGatewayDrainPromise
+      await new Promise(resolve => setImmediate(resolve))
+      assert.equal(h.events.includes('exit:0'), false)
+      assert.equal(h.env.quitGatewayDrainPromise, null)
+      assert.deepEqual(h.errors, [{ title: 'quit.accountFailed', detail: 'quit.accountFailedDetail' }])
+      entry[target].close = async () => {}
+      h.quit()
+      await h.env.quitGatewayDrainPromise
+      await new Promise(resolve => setImmediate(resolve))
+      assert.ok(h.events.includes('exit:0'))
+    })
+  }
+}
+
+function failedGateway(h, { hangs = false } = {}) {
+  const child = { pid: 12345 }
+  h.env.gatewayProcess = child
+  h.env.gatewayState.owned = true
+  h.env.hasGatewayProcessExited = () => false
+  h.env.liveLifecycleOwnedGatewayProcesses = () => [child]
+  h.env.quitOwnedGateway = () => {
+    h.events.push('gateway-close')
+    return hangs ? new Promise(() => {}) : Promise.resolve(false)
+  }
+  h.env.forceOwnedGatewayForQuit = value => {
+    assert.equal(value, child)
+    h.events.push('gateway-force')
+  }
+}
+
+test('ordinary Quit cannot force exit while account persistence is unfinished', async () => {
+  const h = harness({ budgetMs: 30 })
+  failedGateway(h)
+  h.quit()
+  await h.env.quitGatewayDrainPromise
+  await new Promise(resolve => setImmediate(resolve))
+  assert.ok(h.events.includes('gateway-close'))
+  assert.equal(h.events.includes('gateway-force'), false)
+  assert.equal(h.events.includes('exit:0'), false)
+  assert.deepEqual(h.errors, [{ title: 'quit.accountFailed', detail: 'quit.accountFailedDetail' }])
+  h.accountDrain.resolve()
+  h.quit()
+  await h.env.quitGatewayDrainPromise
+  await new Promise(resolve => setImmediate(resolve))
+  assert.ok(h.events.includes('gateway-force'), 'settled account writes preserve bounded ordinary Quit')
+  assert.ok(h.events.includes('exit:0'))
+})
+
+test('ordinary Quit still forces a hung Gateway once account persistence has settled', async () => {
+  const h = harness({ budgetMs: 30 })
+  failedGateway(h, { hangs: true })
+  h.accountDrain.resolve()
+  h.quit()
+  await h.env.quitGatewayDrainPromise
+  await new Promise(resolve => setImmediate(resolve))
+  assert.ok(h.events.includes('gateway-force'))
+  assert.ok(h.events.includes('exit:0'))
+  assert.deepEqual(h.errors, [])
+})
+
+test('ordinary Quit with an exhausted budget and no account does not report account failure', async () => {
+  const h = harness({ budgetMs: 0 })
+  h.env.desktopAccounts.clear()
+  failedGateway(h, { hangs: true })
+  h.quit()
+  await h.env.quitGatewayDrainPromise
+  await new Promise(resolve => setImmediate(resolve))
+  assert.ok(h.events.includes('gateway-force'))
+  assert.ok(h.events.includes('exit:0'))
+  assert.deepEqual(h.errors, [])
 })

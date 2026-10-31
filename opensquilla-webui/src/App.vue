@@ -103,6 +103,7 @@
       :contract-debug-enabled="contractDebugEnabled"
       :can-manage-projects="gatewayAccess.canManageProjectWorkspaces"
       :can-create-projects="gatewayAccess.canChooseProject"
+      :project-catalog-state="sidebarProjectCatalogState"
       @select="switchToSession"
       @refresh="loadSidebarData"
       @load-more="loadMoreSessions"
@@ -474,6 +475,7 @@ import { APPROVAL_CENTER_KEY, type ApprovalEvent, type ApprovalItem, type Approv
 import {
   arrangeSidebarSections,
   useSessions,
+  useSidebarProjectDisplay,
   type SessionItem,
   type SessionListLoadResult,
   type SidebarSection,
@@ -1248,13 +1250,23 @@ const sidebarPinnedSessionKeys = ref<string[]>(readStoredSessionKeys(SIDEBAR_PIN
 // Collapsible family sections (Chats / Channels / Automations). Row titles and
 // agent names are resolved here so the raw-session-id scrub and the display-name
 // lookup stay in App.vue; subagents indent under their parent via the helper.
+const sidebarProjectDisplay = useSidebarProjectDisplay({
+  scope: () => gatewayAccess.presentationScope ?? null,
+  catalog: () => gatewayAccess.canManageProjectWorkspaces && projectWorkspaces.hasLoaded.value
+    ? projectWorkspaces.workspaces.value : null,
+  unavailable: () => gatewayAccess.projectCatalogAvailability === 'unavailable'
+    || gatewayAccess.connectionBlocked === true,
+})
+const sidebarProjectCatalogState = computed(() => sidebarProjectDisplay.value.kind === 'canonical'
+  ? 'ready'
+  : projectWorkspaces.error.value || gatewayAccess.projectCatalogAvailability === 'unavailable'
+    || gatewayAccess.availability === 'unavailable'
+    ? 'unavailable' : 'loading')
 const sidebarSections = computed((): SidebarSection[] => {
   const byKey = new Map(sidebarSessionItems.value.map(item => [item.key, item]))
   return arrangeSidebarSections(
     sidebarSessionItems.value,
-    gatewayAccess.canManageProjectWorkspaces && projectWorkspaces.hasLoaded.value
-      ? projectWorkspaces.workspaces.value
-      : undefined,
+    sidebarProjectDisplay.value,
     sidebarSessionOrder.value,
     sidebarPinnedSessionKeys.value,
   ).map(section => ({

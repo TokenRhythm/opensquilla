@@ -1,4 +1,11 @@
 {
+  "desktopRuntime": {
+    "starting": "OpenSquilla を起動中…",
+    "startFailed": "OpenSquilla を起動できませんでした。",
+    "sandboxUpgradeIncomplete": "サンドボックス設定の更新が完了していません。引き続き利用できます。ログを確認し、再起動後に再試行してください。",
+    "retry": "再試行",
+    "showLog": "ログを表示"
+  },
   "visualize": {
     "runtimeError": "キャンバスの実行中にエラーが発生しました",
     "runtimeErrorHint": "コードに問題が発生しました。AI に修復を依頼するか、このバージョンを再実行できます。",
@@ -130,6 +137,7 @@
     "unavailable": "現在のソースファイルを利用できません。既存のプレビューとダウンロードは変更されません。", "failed": "ファイル操作に失敗しました。"
   },
   "workspaces": {
+    "catalogUnavailable": "プロジェクト一覧を利用できません。",
     "openDirectory": "ファイルマネージャーで開く",
     "copyDirectoryPath": "プロジェクトのフォルダーパスをコピー",
     "openDirectoryFailed": "プロジェクトのフォルダーを開けませんでした。再試行してください。",
@@ -1510,7 +1518,7 @@
       "resetSaved": "{provider} の推奨階層を保存しました。現在のモードは変更されません。",
       "title": "モデルルーティング",
       "desc": "リクエストごとのモデルの選び方を設定します。",
-      "newSessionDefault": "これは新しいチャットの既定値です。既存のチャットはそれぞれのルーティングモードを維持します。",
+      "newSessionDefault": "新しいチャットでは、最後に手動で選択したモードを引き継ぎます。固定モデルの場合は、選択したモデルとプロバイダーも引き継ぎます。記録がない場合は現在の設定を使用します。既存のチャットはそれぞれの選択を維持します。",
       "modeTitle": "モデルの使い方を選択",
       "providerFirstTitle": "最初にモデルサービスを追加",
       "providerFirst": "モデルルーティングには保存済みプロバイダーが少なくとも 1 つ必要です。",
@@ -4297,7 +4305,9 @@
       "stale": "処理を継続中 — 最近の信号はありません",
       "liveStep": "ステップ {n}",
       "phaseElapsed": "現在のステップ：{duration}",
-      "recordIncomplete": "アクティビティ記録が不完全なため、互換履歴ビューを表示しています。"
+      "recordIncomplete": "アクティビティ記録が不完全なため、互換履歴ビューを表示しています。",
+      "reasoningOrderUnavailable": "思考の要約 · 順序は記録されていません",
+      "eventsOrderUnavailable": "モデルイベント · 会話記録との前後関係は不明です"
     },
     "missingCitationSources": "一部の引用に対応する参照元がありません：{citations}",
     "suggestedTasks": "おすすめのタスク",

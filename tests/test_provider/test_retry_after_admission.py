@@ -7,6 +7,7 @@ import json
 import math
 import time
 from dataclasses import dataclass, field, replace
+from types import SimpleNamespace
 from typing import Any
 
 import httpx
@@ -22,7 +23,7 @@ from opensquilla.engine.usage_accounting import (
     UsageExecutionContext,
     bind_usage_accounting_scope,
 )
-from opensquilla.provider import retry_after
+from opensquilla.provider import ensemble, retry_after
 from opensquilla.provider.ensemble import (
     EnsembleMemberConfig,
     EnsembleProvider,
@@ -600,8 +601,11 @@ async def test_selector_overload_cooldown_uses_independent_fallback(
     )
 
 
-async def test_ensemble_lifecycle_gate_excludes_provider_timeout_and_start(cooling):
+async def test_ensemble_lifecycle_gate_excludes_provider_timeout_and_start(cooling, monkeypatch):
     registry, clock = cooling
+    # The cooldown and its subsequent 1ms provider budget share one clock;
+    # runner scheduling must not consume that synthetic budget.
+    monkeypatch.setattr(ensemble, "time", SimpleNamespace(**{**vars(time), "monotonic": clock}))
     provider = PhysicalProvider()
     registry.record(provider, 7, scope=provider_retry_after_scope(provider))
     starts = []

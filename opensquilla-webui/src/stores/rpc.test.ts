@@ -74,6 +74,40 @@ vi.mock('@/lib/rpc', () => ({
 }))
 
 describe('rpc link-token bootstrap', () => {
+  it('keeps the display scope through transport recovery but retires it for a new principal or catalog authority', () => {
+    const rpc = useRpcStore()
+    rpc.init()
+    const hello = { ...deliveryHello(), features: { methods: ['workspaces.list'] } }
+    clients[0]!.emit('_hello', hello)
+    const scope = rpc.presentationScope
+    clients[0]!.emit('_state', 'disconnected')
+    clients[0]!.emit('_state', 'connected')
+    clients[0]!.emit('_hello', hello)
+    expect(rpc.presentationScope).toBe(scope)
+    clients[0]!.emit('_hello', { ...deliveryHello({ tokenPublicId: 'replacement' }), features: hello.features })
+    expect(rpc.presentationScope).toBeGreaterThan(scope)
+    const replacementScope = rpc.presentationScope
+    clients[0]!.emit('_hello', { ...deliveryHello({ tokenPublicId: 'replacement' }), features: { methods: [] } })
+    expect(rpc.presentationScope).toBeGreaterThan(replacementScope)
+    expect(createV4GatewayAccess(rpc).projectCatalogAvailability).toBe('unavailable')
+    rpc.$dispose()
+  })
+
+  it('retires the display scope immediately when browser credentials or endpoint changes', async () => {
+    const rpc = useRpcStore()
+    rpc.init()
+    await rpc.connect('ws://first.example/ws', 'owner-one')
+    const original = rpc.presentationScope
+    await rpc.connect('ws://first.example/ws', 'owner-one')
+    expect(rpc.presentationScope).toBe(original)
+    await rpc.connect('ws://first.example/ws', 'owner-two')
+    expect(rpc.presentationScope).toBeGreaterThan(original)
+    const changedCredentials = rpc.presentationScope
+    await rpc.connect('ws://second.example/ws', 'owner-two')
+    expect(rpc.presentationScope).toBeGreaterThan(changedCredentials)
+    rpc.$dispose()
+  })
+
   afterEach(() => {
     vi.useRealTimers()
     vi.restoreAllMocks()
@@ -1132,7 +1166,9 @@ describe('rpc link-token bootstrap', () => {
     const store = useRpcStore()
     store.init()
     await vi.waitFor(() => expect(connectCalls).toHaveLength(1))
+    const presentationScope = store.presentationScope
     await store.connect('ws://desktop/ws')
+    expect(store.presentationScope).toBe(presentationScope)
     expect(store.error).toBeTruthy()
     expect(store.state).toBe('connected')
     expect(clients[0].disconnect).not.toHaveBeenCalled()

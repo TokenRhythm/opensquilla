@@ -33,6 +33,9 @@ function harness(options: {
   globalImageInputAdmission?: ImageInputAdmission
   globalImageInputAdmissionReason?: string
   capabilitiesByMode?: ModelRoutingCapabilitiesByMode | null
+  lastManualMode?: ModelRoutingMode | null
+  readLastManualMode?: () => ModelRoutingMode | null
+  recoveredDraftMode?: () => ModelRoutingMode | null
 } = {}) {
   const handlers = new Map<string, (payload: unknown) => void>()
   const rpc = {
@@ -54,6 +57,7 @@ function harness(options: {
   } as unknown as SessionRouting
   const sessionKey = ref(SESSION_ONE)
   const globalMode = ref<ModelRoutingMode>(options.globalMode ?? 'off')
+  const lastManualMode = ref<ModelRoutingMode | null>(options.lastManualMode ?? null)
   const globalImageInputAdmission = ref<ImageInputAdmission>(
     options.globalImageInputAdmission ?? 'unknown',
   )
@@ -73,6 +77,8 @@ function harness(options: {
     routing,
     sessionKey,
     globalMode,
+    lastManualMode: options.readLastManualMode ?? (() => lastManualMode.value),
+    recoveredDraftMode: options.recoveredDraftMode,
     globalImageInputAdmission,
     globalImageInputAdmissionReason,
     capabilitiesByMode,
@@ -92,6 +98,7 @@ function harness(options: {
     globalImageInputAdmission,
     globalImageInputAdmissionReason,
     globalMode,
+    lastManualMode,
     handlers,
     isDraft,
     isStreaming,
@@ -102,6 +109,142 @@ function harness(options: {
 }
 
 describe('useChatSessionRouting', () => {
+  it('does not consult draft recovery when loading a durable session', async () => {
+    const recoveredDraftMode = vi.fn(() => 'llm_ensemble' as const)
+    const h = harness({ recoveredDraftMode, getResponse: { mode: 'router', revision: 1 } })
+    await h.api.load()
+    expect(h.api.mode.value).toBe('squilla_router')
+    expect(recoveredDraftMode).not.toHaveBeenCalled()
+  })
+
+  it('keeps recovered mode through bootstrap and permits a later explicit choice', async () => {
+    const readLastManualMode = vi.fn(() => 'llm_ensemble' as const)
+    const h = harness({ draft: true, recoveredDraftMode: () => 'off', readLastManualMode })
+    expect(h.api.mode.value).toBe('off')
+    expect(h.api.initialRoutingMode.value).toBe('direct')
+    expect(readLastManualMode).not.toHaveBeenCalled()
+    expect(h.api.applyBootstrap({ mode: 'router', revision: 0 })).toBe(false)
+    expect(await h.api.setMode('squilla_router')).toBe(true)
+    expect(h.api.initialRoutingMode.value).toBe('router')
+  })
+
+  it('reads the latest shared preference only when a fresh draft starts', async () => {
+    let storedMode: ModelRoutingMode = 'squilla_router'
+    const readLastManualMode = vi.fn(() => storedMode)
+    const h = harness({ draft: true, readLastManualMode })
+    expect(h.api.mode.value).toBe('squilla_router')
+    await h.api.setMode('llm_ensemble')
+    readLastManualMode.mockClear()
+    storedMode = 'off'
+    await nextTick()
+    expect(h.api.mode.value).toBe('llm_ensemble')
+    expect(readLastManualMode).not.toHaveBeenCalled()
+    h.sessionKey.value = SESSION_TWO
+    expect(h.api.mode.value).toBe('off')
+    expect(h.api.initialRoutingMode.value).toBe('direct')
+    expect(readLastManualMode).toHaveBeenCalledOnce()
+    expect(h.rpc.call).not.toHaveBeenCalled()
+  })
+
+  it('does not read the new-chat preference while loading an existing session', async () => {
+    const readLastManualMode = vi.fn(() => 'llm_ensemble' as const)
+    const h = harness({ readLastManualMode, getResponse: { mode: 'router', revision: 1 } })
+    await h.api.load()
+    expect(h.api.mode.value).toBe('squilla_router')
+    expect(readLastManualMode).not.toHaveBeenCalled()
+  })
+
+  it('uses the last manually selected mode for a new draft and sends it explicitly', () => {
+    const { api } = harness({
+      draft: true,
+      globalMode: 'off',
+      lastManualMode: 'squilla_router',
+    })
+
+    expect(api.mode.value).toBe('squilla_router')
+    expect(api.initialRoutingMode.value).toBe('router')
+  })
+
+  it('lets a manual draft selection override the remembered mode', async () => {
+    const { api } = harness({
+      draft: true,
+      globalMode: 'off',
+      lastManualMode: 'squilla_router',
+    })
+
+    await expect(api.setMode('llm_ensemble')).resolves.toBe(true)
+
+    expect(api.mode.value).toBe('llm_ensemble')
+    expect(api.initialRoutingMode.value).toBe('ensemble')
+  })
+
+  it('initializes the remembered mode when a new task sets its key before its draft intent', () => {
+    const { api, isDraft, rpc, sessionKey } = harness({
+      globalMode: 'squilla_router',
+      lastManualMode: 'off',
+    })
+    api.applyBootstrap({ mode: 'ensemble', revision: 2 })
+
+    // Match startDraftSession: the current session key changes before the
+    // new_chat intent makes the surface provisional.
+    sessionKey.value = SESSION_TWO
+    isDraft.value = true
+
+    expect(api.mode.value).toBe('off')
+    expect(api.initialRoutingMode.value).toBe('direct')
+    expect(api.applyBootstrap({ mode: 'router', revision: 0 })).toBe(false)
+    expect(api.mode.value).toBe('off')
+    expect(rpc.call).not.toHaveBeenCalled()
+  })
+
+  it('restores a draft model pin ahead of the remembered default without changing the next draft', async () => {
+    const { api, lastManualMode, rpc, sessionKey } = harness({
+      draft: true,
+      lastManualMode: 'squilla_router',
+    })
+
+    await expect(api.restoreDraftModelMode()).resolves.toBe(true)
+
+    expect(api.mode.value).toBe('off')
+    expect(api.initialRoutingMode.value).toBe('direct')
+    expect(lastManualMode.value).toBe('squilla_router')
+    expect(rpc.call).not.toHaveBeenCalled()
+
+    sessionKey.value = SESSION_TWO
+    expect(api.mode.value).toBe('squilla_router')
+    expect(api.initialRoutingMode.value).toBe('router')
+  })
+
+  it('does not let model recovery override a manually chosen draft mode on reconnect', async () => {
+    const { api, available } = harness({
+      draft: true,
+      lastManualMode: 'squilla_router',
+    })
+    await expect(api.setMode('llm_ensemble')).resolves.toBe(true)
+    available.value = false
+    available.value = true
+
+    await expect(api.restoreDraftModelMode()).resolves.toBe(false)
+
+    expect(api.mode.value).toBe('llm_ensemble')
+    expect(api.initialRoutingMode.value).toBe('ensemble')
+  })
+
+  it('does not apply the remembered mode to an existing session', async () => {
+    const { api, rpc } = harness({
+      globalMode: 'off',
+      lastManualMode: 'squilla_router',
+      getResponse: { key: SESSION_ONE, mode: 'direct', revision: 1 },
+    })
+
+    await expect(api.load()).resolves.toBe(true)
+    await expect(api.restoreDraftModelMode()).resolves.toBe(false)
+
+    expect(rpc.call).toHaveBeenCalledWith('sessions.routing.get', { sessionKey: SESSION_ONE })
+    expect(api.mode.value).toBe('off')
+    expect(api.initialRoutingMode.value).toBeNull()
+  })
+
   it('does not send the global placeholder as an explicit draft override', async () => {
     const { api, rpc } = harness({ draft: true, globalMode: 'llm_ensemble' })
 
@@ -417,6 +560,30 @@ function pending<T>() {
 }
 
 describe('durable session model selection', () => {
+  it.each([
+    { mode: 'direct', expected: 'off' },
+    { mode: 'router', expected: 'squilla_router' },
+    { mode: 'ensemble', expected: 'llm_ensemble' },
+  ])('keeps its own $mode route and model when the next-chat preference changes', async ({ mode, expected }) => {
+    const h = harness({
+      globalMode: 'off',
+      lastManualMode: 'squilla_router',
+      modelSelectionCapable: true,
+    })
+    h.api.applyBootstrap(modelSnapshot(PIN, 3, mode))
+
+    h.lastManualMode.value = 'llm_ensemble'
+    await nextTick()
+    h.lastManualMode.value = 'off'
+    await nextTick()
+
+    expect(h.api.mode.value).toBe(expected)
+    expect(h.api.modelSelection.value).toEqual(PIN)
+    expect(h.api.revision.value).toBe(3)
+    expect(h.api.initialRoutingMode.value).toBeNull()
+    expect(h.rpc.call).not.toHaveBeenCalled()
+  })
+
   it('replaces a provisional default with the accepted first-turn pin under the same key and revision', async () => {
     const h = harness({ draft: true, modelSelectionCapable: true })
     h.api.applyBootstrap(modelSnapshot(null, 0))

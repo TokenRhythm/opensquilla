@@ -449,3 +449,86 @@ def test_compaction_heartbeat_does_not_erase_waiting_facts():
     assert snapshot is not None
     maintenance, = snapshot["entries"]
     assert maintenance["recovery"]["http_status"] == 429
+
+
+def _failed_second_call_events(**done: object) -> list[dict[str, object]]:
+    """Call 1 commits reasoning, text and a tool; call 2 streams, then errors."""
+    return [
+        event("provider_activity", 1, phase="requesting"),
+        event("thinking", 2, block_id="r1", block_index=0, text="first reasoning"),
+        event("thinking_end", 3, block_id="r1", status="completed"),
+        event("text_delta", 4, text="Before tool."),
+        event("tool_use_start", 5, tool_use_id="call", tool_name="record"),
+        event("tool_result", 6, tool_use_id="call", tool_name="record", is_error=False),
+        event("provider_activity", 7, phase="requesting"),
+        event("thinking", 8, block_id="r2", block_index=1, text="second partial reasoning"),
+        event("thinking_end", 9, block_id="r2", status="completed"),
+        event("text_delta", 10, text="After tool, partial text."),
+        event("error", 11, code="request_error"),
+        event("done", 12, **done),
+    ]
+
+
+def test_v2_snapshot_with_uncommitted_failed_call_output_is_incomplete() -> None:
+    snapshot = build_terminal_activity_snapshot(
+        _failed_second_call_events(
+            reasoning_content="first reasoning",
+            text_snapshot="Before tool.",
+        ),
+        task_id="task-1",
+        turn_id="turn-1",
+    )
+
+    assert snapshot is not None
+    assert snapshot["complete"] is False
+    # The streamed order is still recorded, only the completeness claim is dropped.
+    assert [entry["order"] for entry in snapshot["entries"]] == sorted(
+        entry["order"] for entry in snapshot["entries"]
+    )
+
+
+def test_v2_snapshot_with_uncommitted_reasoning_only_is_incomplete() -> None:
+    events = _failed_second_call_events(
+        reasoning_content="first reasoning",
+        text_snapshot="Before tool.After tool, partial text.",
+    )
+
+    snapshot = build_terminal_activity_snapshot(events, task_id="task-1", turn_id="turn-1")
+
+    assert snapshot is not None
+    assert snapshot["complete"] is False
+
+
+def test_v2_snapshot_with_uncommitted_text_only_is_incomplete() -> None:
+    events = _failed_second_call_events(
+        reasoning_content="first reasoning\nsecond partial reasoning",
+        text_snapshot="Before tool.",
+    )
+
+    snapshot = build_terminal_activity_snapshot(events, task_id="task-1", turn_id="turn-1")
+
+    assert snapshot is not None
+    assert snapshot["complete"] is False
+
+
+def test_v2_snapshot_matching_the_committed_done_payload_stays_complete() -> None:
+    events = _failed_second_call_events(
+        reasoning_content="first reasoning\nsecond partial reasoning",
+        text_snapshot="Before tool.After tool, partial text.",
+    )
+
+    snapshot = build_terminal_activity_snapshot(events, task_id="task-1", turn_id="turn-1")
+
+    assert snapshot is not None
+    assert snapshot["complete"] is True
+
+
+def test_v2_snapshot_without_committed_values_in_done_is_unchanged() -> None:
+    snapshot = build_terminal_activity_snapshot(
+        _failed_second_call_events(),
+        task_id="task-1",
+        turn_id="turn-1",
+    )
+
+    assert snapshot is not None
+    assert snapshot["complete"] is True

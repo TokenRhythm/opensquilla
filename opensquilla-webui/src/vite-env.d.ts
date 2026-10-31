@@ -101,7 +101,7 @@ declare global {
     }>
     revealDesktopUserData?: () => Promise<boolean>
     abandonCleanupTransaction?: () => Promise<unknown>
-    setNativeTheme?: (payload: { source: 'light' | 'dark' | 'system' }) => Promise<unknown>
+    setNativeTheme?: (payload: { source: 'light' | 'dark' | 'system'; palette?: Record<string, string> }) => Promise<unknown>
     openArtifact: (payload: ArtifactOpenRequest) => Promise<ArtifactNativeOpenResult>
     chooseLocalFilePaths?: PlatformFilesApi['chooseLocalFilePaths']
     resolveNativeFilePath?: PlatformFilesApi['resolveNativeFilePath']

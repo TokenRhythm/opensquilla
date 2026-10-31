@@ -1,4 +1,11 @@
 {
+  "desktopRuntime": {
+    "starting": "Starting OpenSquilla…",
+    "startFailed": "OpenSquilla failed to start.",
+    "sandboxUpgradeIncomplete": "Sandbox settings were not fully upgraded. The runtime is usable; check the log and retry after restarting.",
+    "retry": "Retry",
+    "showLog": "Show log"
+  },
   "visualize": {
     "runtimeError": "This canvas could not run",
     "runtimeErrorHint": "Its code encountered an error. You can ask AI to repair it, or run this version again.",
@@ -131,6 +138,7 @@
     "failed": "The file action failed."
   },
   "workspaces": {
+    "catalogUnavailable": "Projects are unavailable.",
     "openDirectory": "Open in file manager",
     "copyDirectoryPath": "Copy project directory path",
     "openDirectoryFailed": "Could not open the project directory. Try again.",
@@ -1611,7 +1619,7 @@
       "resetSaved": "{provider} recommended tiers saved; the current mode is unchanged.",
       "title": "Model routing",
       "desc": "Choose how models are picked for each request.",
-      "newSessionDefault": "This is the default for new chats. Existing chats keep their own routing mode.",
+      "newSessionDefault": "New chats reuse the last manually selected mode, including the selected model and provider in fixed-model mode. Without a saved selection, the current configuration is used. Existing chats keep their own selections.",
       "modeTitle": "Choose how models are used",
       "providerFirstTitle": "Add a model provider to start",
       "providerFirst": "Model routing needs at least one saved provider.",
@@ -4400,7 +4408,9 @@
       "stale": "Still working — no recent signal",
       "liveStep": "step {n}",
       "phaseElapsed": "Current step {duration}",
-      "recordIncomplete": "Activity record incomplete; showing the compatible history view."
+      "recordIncomplete": "Activity record incomplete; showing the compatible history view.",
+      "reasoningOrderUnavailable": "Reasoning summary · order not recorded",
+      "eventsOrderUnavailable": "Model events · order relative to transcript unavailable"
     },
     "missingCitationSources": "Some citations do not map to available sources: {citations}",
     "suggestedTasks": "Suggested tasks",
