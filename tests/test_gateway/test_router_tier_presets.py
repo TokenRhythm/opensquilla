@@ -194,8 +194,9 @@ def _previous_openrouter_tiers() -> dict[str, dict[str, str]]:
 
 @pytest.mark.parametrize("binding", ["follow_primary", "custom", None])
 @pytest.mark.parametrize("provider", ["openrouter", "tokenrhythm"])
-def test_v054_default_inline_upgrade_persists_recommendations_with_backup(
-    tmp_path: Path, binding: str | None, provider: str,
+@pytest.mark.parametrize("loader", ["gateway", "onboarding"])
+def test_v054_default_inline_load_preserves_saved_ladder_without_rewrite(
+    tmp_path: Path, binding: str | None, provider: str, loader: str,
 ) -> None:
     if provider == "openrouter":
         old_tiers = _previous_openrouter_tiers()
@@ -221,57 +222,51 @@ def test_v054_default_inline_upgrade_persists_recommendations_with_backup(
         "squilla_router": router,
     })
     path.write_text(raw, encoding="utf-8")
-    cfg = load_config(path)
-    preset = get_preset(provider)
-    assert preset is not None
-    expected_tiers = preset.tier_defaults()
+    cfg = GatewayConfig.load(path) if loader == "gateway" else load_config(path)
+    expected_tiers = old_tiers
     assert cfg.squilla_router.tiers == expected_tiers
     assert cfg.squilla_router.tier_profile is None
-    assert cfg.squilla_router.model_fields_set == set(router) | {"preset_binding"}
+    assert cfg.squilla_router.model_fields_set == set(router)
     assert cfg.squilla_router.default_tier == "c2"
     assert cfg.squilla_router.rollout_phase == "observe"
-    assert cfg.squilla_router.preset_binding == "follow_primary"
+    assert cfg.squilla_router.preset_binding == binding
     assert cfg.llm.provider == provider
     assert cfg.llm.model == direct_model
     assert cfg.config_version == LATEST_CONFIG_VERSION
-    backup, = tmp_path.glob("config.toml.backup.*")
-    assert backup.read_text(encoding="utf-8") == raw
+    assert not list(tmp_path.glob("config.toml.backup.*"))
+    assert path.read_text(encoding="utf-8") == raw
     if binding == "follow_primary" and provider == "openrouter":
         profile = next(
             item for item in router_catalog_payload()["profiles"]
             if item["providerId"] == "openrouter"
         )
-        assert {k: v["model"] for k, v in cfg.squilla_router.tiers.items()} == {
+        assert {k: v["model"] for k, v in cfg.squilla_router.tiers.items()} != {
             k: v["model"] for k, v in profile["tiers"].items()
         }
 
-    # The one-time upgrade is persisted, so later sparse settings writes and
-    # reloads cannot resurrect the pre-upgrade ladder.
+    # An unrelated settings save is not consent to adopt the latest ladder.
     cfg.log_level = "DEBUG"
     persist_config(cfg, path=path, backup=False)
     saved = tomllib.loads(path.read_text(encoding="utf-8"))
     assert saved["config_version"] == LATEST_CONFIG_VERSION
-    assert saved["squilla_router"] == {
-        **router, "preset_binding": "follow_primary", "tiers": expected_tiers,
-    }
+    assert saved["squilla_router"] == router
     assert load_config(path).squilla_router.tiers == expected_tiers
 
 
-def test_openrouter_managed_inline_refresh_survives_full_model_revalidation() -> None:
+def test_openrouter_managed_inline_choices_survive_full_model_revalidation() -> None:
     cfg = GatewayConfig(
         llm={"provider": "openrouter"},
         squilla_router={"enabled": False, "preset_binding": "follow_primary"},
     )
     cfg.squilla_router.tiers = _previous_openrouter_tiers()
     cfg.squilla_router.enabled = True
-    # Full snapshots explicitly include tier_profile=None. That must not
-    # suppress the managed refresh during hot reload/config validation.
+    # Full snapshots are saved choices, even without a revision marker.
     restored = GatewayConfig.model_validate(cfg.model_dump(mode="python"))
     assert restored.squilla_router.tier_profile is None
-    assert restored.squilla_router.tiers == _default_tiers()
+    assert restored.squilla_router.tiers == _previous_openrouter_tiers()
 
 
-def test_disabled_openrouter_managed_inline_refreshes_without_enabling() -> None:
+def test_disabled_openrouter_managed_inline_choices_survive_activation() -> None:
     cfg = GatewayConfig(
         llm={"provider": "openrouter"},
         squilla_router={
@@ -280,10 +275,10 @@ def test_disabled_openrouter_managed_inline_refreshes_without_enabling() -> None
         },
     )
     assert cfg.squilla_router.enabled is False
-    assert cfg.squilla_router.tiers == _default_tiers()
+    assert cfg.squilla_router.tiers == _previous_openrouter_tiers()
     cfg.squilla_router.enabled = True
     cfg.initialize_router_profile_defaults()
-    assert cfg.squilla_router.tiers == _default_tiers()
+    assert cfg.squilla_router.tiers == _previous_openrouter_tiers()
 
 
 # The newer ladder can remain on disk after rolling back the recommendation.
@@ -301,7 +296,7 @@ _NON_CURRENT_MODELS = {
 
 def _non_current_tiers(provider: str) -> dict[str, dict[str, str]]:
     return {
-        name: {"provider": provider, "model": model}
+        name: {"provider": provider, "model": model, "thinking_level": "low"}
         for name, model in zip(
             ("c0", "c1", "c2", "c3"), _NON_CURRENT_MODELS[provider], strict=True,
         )
@@ -310,7 +305,7 @@ def _non_current_tiers(provider: str) -> dict[str, dict[str, str]]:
 
 @pytest.mark.parametrize("provider", ["tokenrhythm", "openrouter"])
 @pytest.mark.parametrize("action", ["custom", "disable", "enable_cross_provider"])
-def test_refreshed_managed_ladder_persists_when_becoming_custom(
+def test_saved_managed_ladder_persists_when_becoming_custom(
     tmp_path: Path, provider: str, action: str,
 ) -> None:
     from opensquilla.onboarding.mutations import upsert_llm_provider, upsert_router
@@ -331,13 +326,14 @@ def test_refreshed_managed_ladder_persists_when_becoming_custom(
     cfg = load_config(path)
     preset = get_preset(provider)
     assert preset is not None
-    expected = preset.tier_defaults()
-    assert old_tiers != expected
-    assert tuple(expected[tier]["model"] for tier in ("c0", "c1", "c2", "c3")) != (
+    bundled = preset.tier_defaults()
+    assert old_tiers != bundled
+    assert tuple(bundled[tier]["model"] for tier in ("c0", "c1", "c2", "c3")) != (
         _NON_CURRENT_MODELS[provider]
     )
+    expected = old_tiers
     assert cfg.squilla_router.tiers == expected
-    # Managed refresh is effective in memory without rewriting a stamped file.
+    # Loading keeps both the effective ladder and the saved file unchanged.
     assert tomllib.loads(path.read_text(encoding="utf-8"))["squilla_router"]["tiers"] == (
         old_tiers
     )
@@ -346,6 +342,13 @@ def test_refreshed_managed_ladder_persists_when_becoming_custom(
         candidate = upsert_router(
             cfg, mode="custom", default_tier="c2", tiers=cfg.squilla_router.tiers,
         ).config
+        # The existing explicit editor fills missing descriptions/metadata.
+        # Every saved model and explicit reasoning choice must still survive.
+        for name, previous in old_tiers.items():
+            assert {key: candidate.squilla_router.tiers[name].get(key) for key in previous} == (
+                previous
+            )
+        expected = candidate.squilla_router.tiers
     else:
         candidate = upsert_llm_provider(
             cfg,
@@ -434,13 +437,8 @@ def test_managed_dormant_foreign_draft_does_not_gain_unapproved_routes(
         llm_ensemble={"enabled": False, "selection_mode": "static_openrouter_b5"},
     )
     validate_router_candidate(cfg)
-    if cross_provider:
-        assert {name for name, _, _ in executable_router_dependencies(cfg)} == {
-            "c0", "c1", "c2", "c3",
-        }
-    else:
-        assert cfg.squilla_router.tiers == tiers
-        assert executable_router_dependencies(cfg) == set()
+    assert cfg.squilla_router.tiers == tiers
+    assert executable_router_dependencies(cfg) == set()
     assert GatewayConfig.model_validate(cfg.model_dump()).squilla_router.tiers == (
         cfg.squilla_router.tiers
     )
@@ -476,7 +474,7 @@ _PREVIOUS_LADDERS = [
 @pytest.mark.parametrize(("provider", "models"), _PREVIOUS_LADDERS)
 @pytest.mark.parametrize("binding", [None, "custom", "follow_primary"])
 @pytest.mark.parametrize("enabled", [False, True])
-def test_shipped_old_ladders_upgrade_to_primary_without_changing_controls(
+def test_shipped_old_ladders_preserve_models_and_controls_on_load(
     provider: str, models: tuple[str, ...], binding: str | None, enabled: bool,
 ) -> None:
     primary = "tokenrhythm" if provider == "openrouter" else "openrouter"
@@ -500,12 +498,8 @@ def test_shipped_old_ladders_upgrade_to_primary_without_changing_controls(
             "tiers": tiers,
         },
     )
-    preset = get_preset(primary)
-    assert preset is not None
-    for name in ("c0", "c1", "c2", "c3"):
-        assert cfg.squilla_router.tiers[name]["provider"] == primary
-        assert cfg.squilla_router.tiers[name]["model"] == preset.tiers[name]["model"]
-    assert not cfg.squilla_router.tiers["c3"].get("ensemble_enabled")
+    assert cfg.squilla_router.tiers == tiers
+    assert cfg.squilla_router.tiers["c3"]["ensemble_enabled"] is True
     assert cfg.squilla_router.tiers["image_model"] == image
     assert cfg.squilla_router.enabled is enabled
     assert cfg.squilla_router.preset_binding == binding
@@ -553,7 +547,7 @@ def test_post_upgrade_explicit_old_model_choices_are_preserved(
     assert GatewayConfig.model_validate(cfg.model_dump()).squilla_router.tiers == tiers
 
 
-def test_old_ladder_upgrade_preserves_explicit_reasoning_and_other_tier_options() -> None:
+def test_old_ladder_load_preserves_model_reasoning_and_other_tier_options() -> None:
     tiers = _previous_openrouter_tiers()
     tiers["c1"].update({"thinking_level": "low", "temperature": 0.42})
     cfg = GatewayConfig(
@@ -561,7 +555,7 @@ def test_old_ladder_upgrade_preserves_explicit_reasoning_and_other_tier_options(
         llm={"provider": "openrouter"},
         squilla_router={"preset_binding": "custom", "tiers": tiers},
     )
-    assert cfg.squilla_router.tiers["c1"]["model"] == "deepseek/deepseek-v4-flash-0731"
+    assert cfg.squilla_router.tiers["c1"]["model"] == tiers["c1"]["model"]
     assert cfg.squilla_router.tiers["c1"]["thinking_level"] == "low"
     assert cfg.squilla_router.tiers["c1"]["temperature"] == 0.42
 

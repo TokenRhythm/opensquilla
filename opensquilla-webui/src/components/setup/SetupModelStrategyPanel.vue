@@ -7,6 +7,7 @@ import SetupModelCapacity from '@/components/setup/SetupModelCapacity.vue'
 import SetupModelIdentity from '@/components/setup/SetupModelIdentity.vue'
 import SetupModelCombobox from '@/components/setup/SetupModelCombobox.vue'
 import SetupTierTable from '@/components/setup/SetupTierTable.vue'
+import type { ModelRecommendation } from '@/modules/providerConfiguration'
 import { useDocumentEvent } from '@/composables/useDocumentEvent'
 import type { ModelStrategy } from '@/composables/setup/useSetupModelStrategyForm'
 import type {
@@ -117,6 +118,8 @@ interface ModelStrategyPanelContract {
 const props = defineProps<{
   panel: ModelStrategyPanelContract
   routingModeBusy?: boolean
+  routerRecommendation?: ModelRecommendation
+  ensembleRecommendation?: ModelRecommendation
 }>()
 
 const emit = defineEmits<{
@@ -141,6 +144,7 @@ const emit = defineEmits<{
   updateEnsembleProposerMaxRetries: [value: number]
   goToSection: [value: string]
   resetRecommendedRouter: []
+  resetRecommendedEnsemble: []
 }>()
 
 const resetHelpId = `router-reset-help-${useId()}`
@@ -863,6 +867,10 @@ function credentialLabel(candidate: EnsembleCandidateView): string {
           <p :id="resetHelpId">{{ panel.routingSummary.resetDisabledReason || t(panel.routingSummary.enabled ? 'setup.modelStrategy.resetKeepsMode' : 'setup.modelStrategy.resetKeepsOff') }}</p>
         </div>
       </section>
+      <div v-if="showRouterDetails && routerRecommendation?.hasUpdate" class="setup-model-strategy__recommendation-notice" data-testid="router-recommendation-update" role="status">
+        <p>{{ t('setup.modelStrategy.recommendations.available', { provider: panel.routingSummary?.recommendedProviderLabel, kind: t('setup.modelStrategy.recommendations.router') }) }}</p>
+        <p>{{ t('setup.modelStrategy.recommendations.unchanged') }}</p>
+      </div>
       <p v-if="showRouterDetails && panel.routingSummary?.crossProviderEnabled" class="setup-model-strategy__hint" data-testid="routing-cross-provider-enabled">
         {{ t('setup.modelStrategy.crossProviderNotice') }}
       </p>
@@ -975,6 +983,11 @@ function credentialLabel(candidate: EnsembleCandidateView): string {
         <p class="setup-model-strategy__hint" data-testid="ensemble-candidate-image-hint">
           {{ t('setup.modelStrategy.candidateModelHint') }}
         </p>
+        <div v-if="ensembleRecommendation" class="setup-model-strategy__recommendation-notice" data-testid="ensemble-recommendation">
+          <p v-if="ensembleRecommendation.hasUpdate" role="status">{{ t('setup.modelStrategy.recommendations.available', { provider: displayProvider(ensembleRecommendation.providerId), kind: t('setup.modelStrategy.recommendations.ensemble') }) }}</p>
+          <p>{{ t('setup.modelStrategy.recommendations.unchanged') }}</p>
+          <button type="button" class="btn btn--ghost" data-testid="ensemble-use-recommended" :disabled="routingModeBusy" @click="emit('resetRecommendedEnsemble')">{{ t('setup.modelStrategy.recommendations.useEnsemble', { provider: displayProvider(ensembleRecommendation.providerId) }) }}</button>
+        </div>
         <div
           v-if="panel.ensemble.schemeCardsAvailable && ensembleScheme !== 'legacy'"
           class="setup-model-strategy__schemes"
@@ -1812,6 +1825,16 @@ function credentialLabel(candidate: EnsembleCandidateView): string {
 </template>
 
 <style scoped>
+.setup-model-strategy__recommendation-notice {
+  margin: var(--sp-3) 0;
+  padding: var(--sp-3);
+  border-left: 3px solid var(--accent);
+  background: var(--bg-hover);
+  color: var(--text-muted);
+  font-size: var(--fs-sm);
+  line-height: 1.6;
+}
+.setup-model-strategy__recommendation-notice p { margin: 0 0 var(--sp-1); }
 .setup-model-strategy {
   container: model-strategy-panel / inline-size;
   gap: var(--sp-3);

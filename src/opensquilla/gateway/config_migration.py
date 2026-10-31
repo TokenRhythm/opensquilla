@@ -875,11 +875,11 @@ def _migrate_v1_llm_ensemble_legacy_timeouts(builder: _MigrationBuilder) -> None
 
 
 def _migrate_v2_primary_router_recommendations(builder: _MigrationBuilder) -> None:
-    """Replace pre-refresh text routing once with the primary's recommendations.
+    """Initialize missing curated text routing without replacing saved choices.
 
-    Earlier clients could save a recommended ladder as custom, or leave the
-    other curated provider's ladder behind after changing the primary. The
-    version stamp distinguishes that upgrade from subsequent deliberate edits.
+    Old model names and ownership labels cannot establish consent to an
+    update. Preserve every explicit text tier, including partial legacy
+    ladders; replacing one requires the operator's recommendation action.
     """
     llm = builder.payload.get("llm")
     router = builder.payload.get("squilla_router")
@@ -924,18 +924,38 @@ def _migrate_v2_primary_router_recommendations(builder: _MigrationBuilder) -> No
     from opensquilla.provider.preset_registry import get_preset
     from opensquilla.router_tiers import TEXT_TIERS, normalize_text_tier
 
+    has_saved_text = any(
+        normalize_text_tier(name) in TEXT_TIERS for name in existing_tiers or {}
+    )
+    profile = str(router.get("tier_profile") or "").strip().lower()
+    if profile == "tokenrhythm":
+        # TokenRhythm cannot be persisted as a compact legacy profile. Keep
+        # inline choices authoritative; only a pointer without text tiers
+        # needs expansion to preserve its provider recommendation identity.
+        router.pop("tier_profile", None)
+        if not has_saved_text:
+            preset = get_preset("tokenrhythm")
+            if preset is not None:
+                router["tiers"] = {**preset.tier_defaults(), **(existing_tiers or {})}
+        builder.changes.append(
+            "squilla_router.tier_profile: normalized unsupported tokenrhythm profile "
+            "to inline tiers"
+        )
+        return
+    if router.get("preset_binding") == "custom":
+        return
+    if has_saved_text:
+        return
+    if profile and profile != provider:
+        return  # A saved recommendation may intentionally use another provider.
+
     preset = get_preset(provider)
     if preset is None:
         return
     defaults = preset.tier_defaults()
     tiers = dict(existing_tiers or {})
     for name in TEXT_TIERS:
-        # Keep historical table spellings so lossless cross-install import
-        # can update their leaf assignments without leaving empty alias tables.
-        # SquillaRouterConfig canonicalizes these keys after migration.
-        saved_names = [key for key in tiers if normalize_text_tier(key) == name]
-        for saved_name in saved_names or [name]:
-            tiers[saved_name] = dict(defaults[name])
+        tiers[name] = dict(defaults[name])
     if "image_model" not in tiers and "image_model" in defaults:
         tiers["image_model"] = defaults["image_model"]
     router["tiers"] = tiers
@@ -943,7 +963,7 @@ def _migrate_v2_primary_router_recommendations(builder: _MigrationBuilder) -> No
     if not preset.persistable or router.get("tier_profile") != provider:
         router.pop("tier_profile", None)
     builder.changes.append(
-        f"squilla_router: upgraded text tiers to {provider} recommendations following the primary"
+        f"squilla_router: initialized missing text tiers from {provider} recommendations"
     )
 
 

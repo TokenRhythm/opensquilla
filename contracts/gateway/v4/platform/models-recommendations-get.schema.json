@@ -1,0 +1,224 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://opensquilla.dev/contracts/gateway/v4/platform/models-recommendations-get.schema.json",
+  "title": "OpenSquilla models.recommendations.get Contract",
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "request": {
+      "$ref": "#/$defs/RequestFrame"
+    },
+    "response": {
+      "$ref": "#/$defs/ResponseFrame"
+    }
+  },
+  "x-opensquilla-wire": {
+    "protocol": "opensquilla-websocket-json",
+    "version": 4,
+    "compatibility": "exact-json-tree"
+  },
+  "x-opensquilla-codegen": {
+    "python": {
+      "tool": "datamodel-code-generator",
+      "version": "0.81.0",
+      "target": "pydantic_v2.BaseModel"
+    },
+    "typescript": {
+      "tool": "json-schema-to-typescript",
+      "version": "16.0.0"
+    },
+    "runtimeValidation": {
+      "tool": "ajv",
+      "version": "8.20.0",
+      "mode": "standalone-adapter-only"
+    }
+  },
+  "x-opensquilla-method": {
+    "name": "models.recommendations.get",
+    "kind": "query",
+    "scope": "operator.read",
+    "guestAllowed": false,
+    "idempotency": "read-only",
+    "timeout": {
+      "policy": "transport"
+    },
+    "capability": {
+      "kind": "method-availability",
+      "name": "models.recommendations.get"
+    },
+    "request": "#/$defs/RequestFrame",
+    "params": "#/$defs/Params",
+    "response": "#/$defs/ResponseFrame",
+    "result": "#/$defs/Result",
+    "errors": [
+      {
+        "code": "INVALID_REQUEST"
+      },
+      {
+        "code": "UNAUTHORIZED"
+      },
+      {
+        "code": "UNAVAILABLE",
+        "retryable": true
+      },
+      {
+        "code": "INTERNAL_ERROR"
+      }
+    ]
+  },
+  "$defs": {
+    "Params": {
+      "type": "object",
+      "additionalProperties": false
+    },
+    "Result": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "plans"
+      ],
+      "properties": {
+        "plans": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/RecommendationPlan"
+          }
+        }
+      }
+    },
+    "RpcError": {
+      "type": "object",
+      "additionalProperties": true
+    },
+    "RequestFrame": {
+      "type": "object",
+      "additionalProperties": true,
+      "required": [
+        "type",
+        "id",
+        "method"
+      ],
+      "properties": {
+        "type": {
+          "const": "req"
+        },
+        "id": {
+          "type": "string"
+        },
+        "method": {
+          "const": "models.recommendations.get"
+        }
+      }
+    },
+    "ResponseFrame": {
+      "type": "object",
+      "additionalProperties": true,
+      "required": [
+        "type",
+        "id",
+        "ok"
+      ],
+      "properties": {
+        "type": {
+          "const": "res"
+        },
+        "id": {
+          "type": "string"
+        },
+        "ok": {
+          "type": "boolean"
+        },
+        "payload": {
+          "$ref": "#/$defs/Result"
+        },
+        "error": {
+          "$ref": "#/$defs/RpcError"
+        }
+      }
+    },
+    "RecommendationPlan": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "providerId",
+        "kind",
+        "revision",
+        "source",
+        "rows",
+        "currentRows",
+        "hasUpdate",
+        "notified"
+      ],
+      "properties": {
+        "providerId": {
+          "enum": [
+            "openrouter",
+            "tokenrhythm"
+          ]
+        },
+        "kind": {
+          "enum": [
+            "router",
+            "ensemble"
+          ]
+        },
+        "revision": {
+          "type": "string",
+          "minLength": 1,
+          "pattern": "\\S"
+        },
+        "source": {
+          "enum": [
+            "remote",
+            "bundled"
+          ]
+        },
+        "rows": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/RecommendationRow"
+          }
+        },
+        "currentRows": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/RecommendationRow"
+          }
+        },
+        "hasUpdate": {
+          "type": "boolean"
+        },
+        "notified": {
+          "type": "boolean"
+        }
+      }
+    },
+    "RecommendationRow": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "role",
+        "provider",
+        "model",
+        "thinkingLevel"
+      ],
+      "properties": {
+        "role": {
+          "type": "string"
+        },
+        "provider": {
+          "type": "string"
+        },
+        "model": {
+          "type": "string"
+        },
+        "thinkingLevel": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      }
+    }
+  }
+}

@@ -158,14 +158,17 @@ def test_upsert_llm_provider_same_provider_resave_keeps_custom_router_tiers():
         assert router.tiers[tier]["model"] == f"hand-{tier}"
 
 
-def test_upsert_llm_provider_same_provider_resave_still_reconciles_untouched_tiers():
-    # Guard for the skip rule: default (never hand-edited) tiers still get
-    # the packaged compact profile on a same-provider save.
+def test_upsert_llm_provider_first_save_materializes_recommended_tiers():
+    # First configuration stores actual models so later recommendation updates
+    # cannot replace them through a compact profile lookup at reload time.
     res = upsert_llm_provider(
         GatewayConfig(), provider_id="openrouter", model="m", api_key="sk-x"
     )
 
-    assert res.config.squilla_router.tier_profile == "openrouter"
+    assert res.config.squilla_router.tier_profile is None
+    assert res.config.squilla_router.recommendation_revision
+    assert res.config.squilla_router.preset_binding == "follow_primary"
+    assert all(res.config.squilla_router.tiers[name]["model"] for name in ("c0", "c1", "c2", "c3"))
 
 
 def test_upsert_llm_provider_same_provider_model_change_reseeds_preset_seeded_tiers():

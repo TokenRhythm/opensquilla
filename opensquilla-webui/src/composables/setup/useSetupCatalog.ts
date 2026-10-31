@@ -2,6 +2,7 @@ import { inject, provide, ref, computed, onMounted, onUnmounted, watch } from 'v
 import i18n from '@/i18n'
 import { MODEL_CAPACITY_KEY, useModelCapacityForm } from './useModelCapacityForm'
 import { useSetupCapabilitiesForm } from '@/composables/setup/useSetupCapabilitiesForm'
+import { useModelRecommendations } from '@/composables/setup/useModelRecommendations'
 import { useSetupBehaviorForm } from '@/composables/setup/useSetupBehaviorForm'
 import {
   hasEffectiveProvider,
@@ -30,6 +31,7 @@ import {
   type EnsembleCandidateRole,
   type EnsembleCandidateView,
   type EnsembleCredentialStatus,
+  type SavedEnsembleRecommendation,
 } from '@/composables/setup/useSetupEnsembleForm'
 import {
   CUSTOM_B5_SELECTION_MODE,
@@ -378,6 +380,7 @@ interface ConfigData {
     tiers?: Record<string, TierConfig>
   }
   llm_ensemble?: {
+    recommended_profiles?: Record<string, SavedEnsembleRecommendation>
     enabled?: boolean
     selection_mode?: string
     selection_configured?: boolean
@@ -857,6 +860,7 @@ async function loadData(options: {
   preserveDirtySectionDrafts?: boolean
   forceResetModelStrategy?: boolean
   forceResetRouter?: boolean
+  forceResetEnsemble?: boolean
   resetProviderConnection?: boolean
   throwOnError?: boolean
   rebaseSections?: ReadonlySet<string>
@@ -881,7 +885,7 @@ async function loadData(options: {
           memoryCapture: promotedForm.captureDirty.value,
           thinking: thinkingDraftScope.value === 'modelStrategy' && promotedForm.thinkingDirty.value && !options.forceResetModelStrategy,
           router: !options.forceResetModelStrategy && !options.forceResetRouter && routerForm.isDirty.value,
-          ensemble: !options.forceResetModelStrategy && ensembleForm.isDirty.value,
+          ensemble: !options.forceResetModelStrategy && !options.forceResetEnsemble && ensembleForm.isDirty.value,
           fixedModel: !options.forceResetModelStrategy && (
             modelStrategyForm.fixedProviderDirty.value
             || modelStrategyForm.fixedModelDirty.value
@@ -1865,7 +1869,7 @@ const routerBinding = computed<'follow_primary' | 'custom' | 'legacy'>(() => {
   return 'legacy'
 })
 const ensembleEnabled = computed(() => config.value.llm_ensemble?.enabled === true)
-const resetRecommendedSupported = computed(() => providerConfiguration.resetRecommendedSupported === true)
+const resetRecommendedSupported = computed(() => providerConfiguration.recommendationsSupported === true || providerConfiguration.resetRecommendedSupported === true)
 const recommendedRouterProvider = computed(() => {
   // The recommendation and summary share the saved primary. Existing custom
   // tiers and unsaved provider/tier drafts must not change the reset target.
@@ -2122,6 +2126,52 @@ const modelStrategyPanel = modelStrategyForm.createPanel({
   fixedModelCatalog,
   llmThinking: computed(() => promotedForm.llmThinking.value),
 })
+
+const recommendedEnsembleProvider = computed(() => {
+  const storedProfile = STATIC_B5_PROFILES[ensembleForm.selectionMode.value]
+  const provider = storedProfile?.provider || normalizeProviderId(currentProvider.value)
+  return provider === 'openrouter' || provider === 'tokenrhythm' ? provider : ''
+})
+const recommendations = useModelRecommendations(providerConfiguration, {
+  active: computed(() => loaded.value && gatewayAccess.isAvailable && section.value === 'modelStrategy'),
+  relevantProviders: computed(() => [recommendedRouterProvider.value, recommendedEnsembleProvider.value].filter(Boolean)),
+  draft(kind) {
+    if (kind === 'router') return {
+      dirty: routerForm.isDirty.value,
+      rows: routerPanel.value.tierRows.map(row => ({ role: row.name, provider: row.provider, model: row.model, thinkingLevel: row.thinkingLevel || null })),
+    }
+    const panel = ensemblePanel.value
+    const candidates = panel.scheme === 'preset' && panel.fixedProfile
+      ? [...panel.fixedProfile.proposers, panel.fixedProfile.aggregator]
+      : panel.customCandidates
+    let proposer = 0
+    return {
+      dirty: ensembleForm.isDirty.value,
+      rows: candidates.map(row => ({ role: row.role === 'aggregator' ? 'aggregator' : `proposer_${++proposer}`, provider: row.provider, model: row.model, thinkingLevel: row.thinkingLevel || null })),
+    }
+  },
+  async applied(kind) {
+    await loadData({ preserveProviderDraft: true, preserveDirtySectionDrafts: true, forceResetRouter: kind === 'router', forceResetEnsemble: kind === 'ensemble', throwOnError: true })
+  },
+  async uncertain(error) {
+    if (primaryMutationResultUncertain(error)) {
+      try { await loadData({ preserveFormDrafts: true, throwOnError: true }) } catch { /* Keep the user's draft. */ }
+      pushToast(t('setup.modelStrategy.resultUncertain'), { tone: 'danger' })
+    }
+  },
+})
+const routerRecommendation = computed(() => recommendations.find(recommendedRouterProvider.value, 'router'))
+const ensembleRecommendation = computed(() => recommendations.find(recommendedEnsembleProvider.value, 'ensemble'))
+watch(config, () => {
+  if (loaded.value && gatewayAccess.isAvailable && section.value === 'modelStrategy') {
+    void recommendations.refresh().catch(() => { /* Keep the last recommendation without changing forms. */ })
+  }
+})
+
+function resetRecommendedEnsemble() {
+  if (providerInteractionLocked() || recommendations.saving.value) return Promise.resolve(false)
+  return recommendations.open(recommendedEnsembleProvider.value, 'ensemble')
+}
 
 
 const capabilitiesPanel = capabilitiesForm.createPanel({
@@ -3460,6 +3510,7 @@ async function setModelStrategy(strategy: ModelStrategy) {
 
 async function resetRecommendedRouter(): Promise<boolean> {
   if (routingSummary.value.resetDisabledReason || !recommendedRouterProvider.value) return false
+  if (recommendations.supported.value) return recommendations.open(recommendedRouterProvider.value, 'router')
   const providerId = recommendedRouterProvider.value
   routerResetPending.value = true
   let acknowledged = false
@@ -3577,6 +3628,12 @@ function resetEnsembleCandidates() {
 
 function setEnsembleScheme(scheme: 'preset' | 'custom') {
   if (providerInteractionLocked()) return
+  if (scheme === 'preset' && recommendations.supported.value) {
+    // The existing preset selector explicitly chooses the primary provider's
+    // plan; the separate recommendation button updates the stored plan's provider.
+    void recommendations.open(normalizeProviderId(currentProvider.value), 'ensemble')
+    return
+  }
   ensembleForm.setScheme(scheme, staticB5ModeForProvider(currentProvider.value))
   routerForm.setEnsembleContext(ensembleForm.selectionMode.value, ensembleForm.enabled.value)
 }
@@ -4736,6 +4793,13 @@ async function copyConfigPath() {
     memoryPanel,
     modelStrategyPanel,
     resetRecommendedRouter,
+    resetRecommendedEnsemble,
+    routerRecommendation,
+    ensembleRecommendation,
+    recommendationPreview: recommendations.preview,
+    recommendationSaving: recommendations.saving,
+    closeRecommendationPreview: recommendations.close,
+    applyRecommendation: recommendations.apply,
     routerPanel,
     ensemblePanel,
     capabilitiesPanel,

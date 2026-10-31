@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from opensquilla.gateway.config import GatewayConfig, _router_tier_profile_defaults
 from opensquilla.onboarding.mutations import upsert_llm_provider, upsert_router
+from opensquilla.provider.recommendations import get_recommendation
 
 
 def test_fresh_config_uses_model_router_not_ensemble() -> None:
@@ -11,7 +12,7 @@ def test_fresh_config_uses_model_router_not_ensemble() -> None:
     assert cfg.llm_ensemble.enabled is False
 
 
-def test_openrouter_chat_model_save_seeds_packaged_router_preset() -> None:
+def test_openrouter_chat_model_save_seeds_materialized_router_recommendation() -> None:
     res = upsert_llm_provider(
         GatewayConfig(),
         provider_id="openrouter",
@@ -19,8 +20,17 @@ def test_openrouter_chat_model_save_seeds_packaged_router_preset() -> None:
         api_key="sk-test",
     )
 
-    assert res.config.squilla_router.enabled is True
-    assert res.config.squilla_router.tier_profile == "openrouter"
+    router = res.config.squilla_router
+    recommendation = get_recommendation(res.config, "openrouter", "router")
+    assert router.enabled is True
+    assert router.tier_profile is None
+    assert router.preset_binding == "follow_primary"
+    assert router.recommendation_revision == recommendation["revision"]
+    for row in recommendation["rows"]:
+        tier = router.tiers[row["role"]]
+        assert tier["provider"] == row["provider"]
+        assert tier["model"] == row["model"]
+        assert tier.get("thinking_level") == row["thinkingLevel"]
 
 
 def test_non_packaged_chat_model_save_seeds_synthesized_router_tiers() -> None:

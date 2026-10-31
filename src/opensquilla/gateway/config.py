@@ -90,6 +90,7 @@ from opensquilla.router_tiers import (
     effective_tier_ensemble_selection_modes,
     normalize_text_tier,
     normalize_tier_mapping,
+    static_b5_profile,
 )
 from opensquilla.sandbox.config import SandboxSettings
 from opensquilla.search.types import DEFAULT_SEARCH_MAX_RESULTS, MAX_SEARCH_RESULTS
@@ -708,6 +709,21 @@ class LlmEnsembleCandidateConfig(BaseModel):
         return self
 
 
+class RecommendedEnsembleMember(BaseModel):
+    """A model chosen by the operator, independent of the recommendation cache."""
+
+    model: str = Field(min_length=1)
+    thinking_level: Literal[
+        "off", "minimal", "low", "medium", "high", "xhigh", "adaptive"
+    ] | None = None
+
+
+class RecommendedEnsembleProfile(BaseModel):
+    revision: str = Field(min_length=1)
+    proposers: list[RecommendedEnsembleMember] = Field(min_length=2, max_length=6)
+    aggregator: RecommendedEnsembleMember
+
+
 class LlmEnsembleConfig(BaseSettings):
     model_config = SettingsConfigDict(
         env_prefix="OPENSQUILLA_LLM_ENSEMBLE_",
@@ -740,6 +756,11 @@ class LlmEnsembleConfig(BaseSettings):
     all_failed_policy: Literal["fallback_single", "error"] = "fallback_single"
     model_options: list[str] = Field(default_factory=_default_llm_ensemble_model_options)
     candidates: list[LlmEnsembleCandidateConfig] = Field(default_factory=list)
+    # Materialized, operator-approved plans. Fetching recommendations never
+    # modifies these snapshots; static selection keeps its existing identity.
+    recommended_profiles: dict[
+        Literal["openrouter", "tokenrhythm"], RecommendedEnsembleProfile
+    ] = Field(default_factory=dict)
     candidate_max_chars: int = Field(default=24_000, ge=0)
     proposer_timeout_seconds: float = Field(default=3600.0, gt=0.0)
     aggregator_timeout_seconds: float = Field(default=3600.0, gt=0.0)
@@ -765,6 +786,7 @@ class LlmEnsembleConfig(BaseSettings):
 
     @model_validator(mode="after")
     def _validate_success_targets(self) -> LlmEnsembleConfig:
+        saved_profile = static_b5_profile(self.selection_mode, ensemble=self)
         if (
             self.target_successful_proposers is not None
             and self.target_successful_proposers < self.min_successful_proposers
@@ -774,13 +796,13 @@ class LlmEnsembleConfig(BaseSettings):
                 "llm_ensemble.min_successful_proposers"
             )
         if (
-            self.selection_mode in STATIC_B5_SELECTION_MODES
+            saved_profile is not None
             and self.target_successful_proposers is not None
-            and self.target_successful_proposers > 4
+            and self.target_successful_proposers > len(saved_profile.proposer_models)
         ):
             raise ValueError(
                 "llm_ensemble.target_successful_proposers cannot exceed the "
-                "static B5 proposer count (4)"
+                "saved static B5 proposer count"
             )
         return self
 
@@ -1359,6 +1381,9 @@ class SquillaRouterConfig(BaseSettings):
     # records one of the two concrete values. Additive and downgrade-safe:
     # this settings section ignores unknown fields in older gateways.
     preset_binding: Literal["follow_primary", "custom"] | None = None
+    # A selected recommendation is a saved value, never a subscription. This
+    # marker also prevents a later preset/default pass replacing its tiers.
+    recommendation_revision: str | None = None
     visual_mode: str = "real_candidates"
     # Preview: execute router tiers whose provider differs from llm.provider,
     # resolving credentials from [llm_profiles.<id>] or the provider's env
@@ -2866,8 +2891,17 @@ class GatewayConfig(BaseSettings):
         router = self.squilla_router
         if not router:
             return self
+        if router.recommendation_revision:
+            return self
         fields_set = set(router.model_fields_set)
         provider = str(getattr(self.llm, "provider", "") or "").strip().lower()
+        if (
+            provider in {"openrouter", "tokenrhythm"}
+            and "tiers" in fields_set
+        ):
+            # A saved (including sparse) ladder is not consent to subscribe to recommendations,
+            # including older files without a recommendation revision marker.
+            return self
         follows_primary_preset = router.preset_binding == "follow_primary"
         has_explicit_ladder = "tiers" in fields_set or bool(router.tier_profile)
         ladder_provider = router_ladder_provider(router.tiers, provider)
@@ -3735,6 +3769,9 @@ class GatewayConfig(BaseSettings):
         cfg._mark_env_absorbed_secrets(None)
         if config_path:
             cfg.config_path = str(candidates[0])
+        from opensquilla.onboarding.recommendation_policy import initialize_new_recommendations
+
+        initialize_new_recommendations(cfg)
         cfg.set_persist_snapshot(cfg.to_toml_dict(), None)
         return cfg
 

@@ -72,6 +72,8 @@ async function mountDialog(path: '/settings/advanced' | '/settings/dataMigration
     providerPanel: ref({ runtimeProviders: [] }),
     behaviorPanel: ref({}),
     privacyPanel: ref({}),
+    recommendationPreview: ref(null), recommendationSaving: ref(false),
+    routerRecommendation: ref(undefined), ensembleRecommendation: ref(undefined),
     modelStrategyPanel: ref({}),
     channelsPanel: ref({}),
     capabilitiesPanel: ref({}),

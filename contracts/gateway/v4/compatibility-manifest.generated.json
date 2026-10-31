@@ -607,6 +607,24 @@
     },
     {
       "lifecycle": "stable",
+      "name": "models.recommendations.acknowledge",
+      "schema": "platform/models-recommendations-acknowledge.schema.json",
+      "schemaSha256": "e7e912b3aa56a5c4ed2acd5d2dd2cfd6320358831af64776f67157bbcc5a1008"
+    },
+    {
+      "lifecycle": "stable",
+      "name": "models.recommendations.apply",
+      "schema": "platform/models-recommendations-apply.schema.json",
+      "schemaSha256": "0e65d4e7c9b960c55c09bafcb20234217da77726f67cff166d57da45161b551d"
+    },
+    {
+      "lifecycle": "stable",
+      "name": "models.recommendations.get",
+      "schema": "platform/models-recommendations-get.schema.json",
+      "schemaSha256": "285a7e39646cae96106259b0f57c7f48d866ec09ddef6a520112a0e8a3c02847"
+    },
+    {
+      "lifecycle": "stable",
       "name": "models.routing.get",
       "schema": "platform/models-routing-get.schema.json",
       "schemaSha256": "f8b346c17182da24364c8c1d5f0784aeab06abbe38aeb93fbdc16138f0020217"
@@ -1452,10 +1470,10 @@
   "protocol": "opensquilla-websocket-json",
   "source": {
     "eventFamilyCount": 10,
-    "generatorSha256": "829c5afc1ad4481e06e232cd30f7746db621efafcc9c29f6dcb01e7eb3b79cad",
-    "methodCount": 213,
-    "schemaCount": 223,
-    "schemaTreeSha256": "80c689d229c795f27e43c797468cd96a83eba981383b7e5e4bf4d7a4c9d0689c",
+    "generatorSha256": "322cf69b630bbced63642484ef9c0579d664caa4f7a741fc5008f1705b1ce82c",
+    "methodCount": 216,
+    "schemaCount": 226,
+    "schemaTreeSha256": "d1495ab52d1c6cdc8c5a527069f7c488d5037065dc3defbc144d9d1836fae85f",
     "toolchains": {
       "legacyTypes": {
         "python": {

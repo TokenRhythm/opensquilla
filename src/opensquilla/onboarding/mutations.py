@@ -723,6 +723,15 @@ def _apply_primary_provider_router_policy(
         _reconcile_router_profile_for_provider(candidate, target_provider)
         return
 
+    if (
+        not primary_changed
+        and target in {"openrouter", "tokenrhythm"}
+        and not _implicit_primary_and_router(source)
+    ):
+        # Editing a key or direct model is not consent to replace the saved
+        # routing ladder with a newly downloaded recommendation.
+        return
+
     if binding == "follow_primary" or (
         binding is None and _implicit_primary_and_router(source)
     ):
@@ -1162,6 +1171,12 @@ def upsert_router(
         router_payload["preset_binding"] = (
             "follow_primary" if follows_managed_preset else "custom"
         )
+        if provider in {"openrouter", "tokenrhythm"} and source_tiers is not None:
+            # This save already contains the user's complete visible ladder.
+            # Keep those exact values through subsequent default/profile passes.
+            router_payload["recommendation_revision"] = (
+                config.squilla_router.recommendation_revision or "user-saved"
+            )
         writes_packaged_profile = (
             follows_managed_preset and preset is not None and preset.persistable
         )
