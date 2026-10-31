@@ -1461,7 +1461,7 @@ vendored into OpenSquilla's runtime.
 | `@electron/asar` 3.4.1 | <https://github.com/electron/asar> | MIT | Use minimatch's named function export. |
 | `dir-compare` 4.2.0 | <https://github.com/gliviu/dir-compare> | MIT | Use minimatch's named function export. |
 | `glob` 7.2.3 | <https://github.com/isaacs/node-glob> | ISC | Use matcher objects, preserving legacy escapes, brace rows and path handling. |
-| `filelist` 1.0.6 | <https://github.com/jakejs/filelist> | Apache-2.0 | Normalize native path separators before matching. |
+| `filelist` 1.0.6 | <https://github.com/mde/filelist> | Apache-2.0 | Normalize native path separators before matching. |
 
 The dependency lock selects `minimatch` 11.0.2 and
 `@isaacs/nonrecursive-glob-match` (BlueOak-1.0.0) from npm. Matching remains in
