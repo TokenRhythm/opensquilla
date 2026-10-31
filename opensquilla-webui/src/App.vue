@@ -124,7 +124,7 @@
     <!-- Fixed footer: settings and the desktop update entry -->
     <div class="sidebar-foot">
       <SidebarDesktopUpdate @open="openDesktopUpdateSettings" />
-      <SidebarAccountMenu v-if="platform.account" @settings="openSettings" />
+      <SidebarAccountMenu v-if="platform.account" :collapsed="!effectiveSidebarOpen" @settings="openSettings" />
       <button
         v-else
         type="button"
@@ -137,8 +137,6 @@
       </button>
     </div>
   </nav>
-
-  <SidebarAccountMenu v-if="platform.account && !effectiveSidebarOpen" collapsed class="collapsed-account-menu" @settings="openSettings" />
 
   <SidebarResizer
     v-if="effectiveSidebarOpen && isSidebarResizable"
@@ -2188,7 +2186,6 @@ onUnmounted(() => {
 </script>
 
 <style scoped>
-.collapsed-account-menu { position: fixed; left: 12px; bottom: 12px; z-index: 40; }
 .app-workspace {
   --workspace-header-height: 49px;
   position: relative;

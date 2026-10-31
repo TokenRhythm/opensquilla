@@ -1,11 +1,17 @@
 import { ref } from 'vue'
+import type { UsageRangeSelection } from '@/types/usage'
 
 const CURRENCY_KEY = 'opensquilla-currency'
 const RANGE_KEY = 'opensquilla-usage-range'
 
-export function normalizeUsageRange(range: string | null): string {
-  const value = String(range || '7')
-  return ['all', '7', '14', '30'].includes(value) ? value : '7'
+export function parseUsageRange(value: unknown): UsageRangeSelection | undefined {
+  return typeof value === 'string' && ['all', 'today', '7', '14', '30'].includes(value)
+    ? value as UsageRangeSelection
+    : undefined
+}
+
+export function normalizeUsageRange(range: string | null): UsageRangeSelection {
+  return parseUsageRange(range) ?? '7'
 }
 
 export function useUsagePreferences() {

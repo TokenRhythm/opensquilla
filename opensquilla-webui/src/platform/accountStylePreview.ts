@@ -1,20 +1,21 @@
 import type { TokenRhythmAccountState } from '../../../contracts/desktop/tokenrhythm-account'
 import type { WebAccountRequest } from './webAccount'
 
-// Visual-only fixture for the local settings preview. No account request is sent.
-const state: TokenRhythmAccountState = {
+// Synthetic, in-memory fixture enabled only by the explicit development preview.
+// No account, payment, or provider request is sent.
+const signedIn: TokenRhythmAccountState = {
   revision: 1,
   status: 'signed_in',
   profile: {
     accountId: 'preview-account',
     sessionId: 'preview-session',
-    displayName: 'vp6uk8',
-    maskedPhone: '152****3525',
+    displayName: 'Demo user',
+    maskedPhone: '',
   },
   wallet: {
     currency: 'CNY',
-    balances: { available: '0', recharge: '0', bonus: '0', debt: '0', frozen: '0' },
-    asOf: '2026-10-28T08:42:25Z',
+    balances: { available: '1241.62', recharge: '1200', bonus: '41.62', debt: '0', frozen: '0' },
+    asOf: '2026-01-12T08:00:00Z',
   },
   walletStatus: 'ready',
   keyStatus: 'ready',
@@ -27,4 +28,25 @@ const state: TokenRhythmAccountState = {
   loginExpiresAt: null,
 }
 
-export const accountStylePreviewRequest: WebAccountRequest = async () => ({ state })
+let state = structuredClone(signedIn)
+
+export const accountStylePreviewRequest: WebAccountRequest = async (path, data) => {
+  if (path === 'link') throw new Error('ACCOUNT_LINK_UNAVAILABLE')
+  if (path === 'action' && data?.action === 'logout') {
+    state = { ...state, revision: state.revision + 1, status: 'signed_out',
+      profile: null, wallet: null, walletStatus: 'idle', keyStatus: 'missing',
+      source: 'manual', selectedAccountId: null,
+      mediaSources: { image: 'inherit', video: 'inherit' } }
+  } else if (path === 'action' && data?.action === 'login') {
+    state = { ...structuredClone(signedIn), revision: state.revision + 1 }
+  } else if (path === 'source' && (data?.source === 'manual' || data?.source === 'account')) {
+    state = { ...state, revision: state.revision + 1, source: data.source,
+      selectedAccountId: data.source === 'account' ? state.profile?.accountId ?? null : null }
+  } else if (path === 'media-source'
+    && (data?.kind === 'image' || data?.kind === 'video')
+    && (data.source === 'inherit' || data.source === 'manual' || data.source === 'account')) {
+    state = { ...state, revision: state.revision + 1,
+      mediaSources: { ...state.mediaSources, [data.kind]: data.source } }
+  }
+  return { state: structuredClone(state) }
+}

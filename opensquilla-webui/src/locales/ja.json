@@ -3668,6 +3668,7 @@
       "dateRange": "日付範囲",
       "tokens": "トークン",
       "cost": "コスト",
+      "rangeToday": "今日",
       "rangeAll": "すべて",
       "rangeDays": "{days}日",
       "input": "入力",
@@ -5092,6 +5093,17 @@
     }
   },
   "account": {
+    "menu": {
+      "recharge": "チャージ",
+      "balance": "TokenRhythm 残高",
+      "todayUsage": "本日の使用量",
+      "todayUsageHint": "現在のゲートウェイが本日記録した全プロバイダーの入力・出力 Token です。ローカルタイムゾーンで集計し、使用量ページと同じデータを使用します。TokenRhythm アカウントの請求額ではありません。",
+      "viewUsage": "使用量を見る",
+      "balanceUnavailable": "残高を取得できません",
+      "balanceStale": "残高が古い可能性があります",
+      "usageUnavailable": "ローカル使用量を取得できません",
+      "usageApproximate": "概算使用量"
+    },
     "recoveryLogin": "ログインをリセットして再認証",
     "recoveryRequired": "ローカルのログイン情報を復元できません",
     "title": "アカウントと残高",

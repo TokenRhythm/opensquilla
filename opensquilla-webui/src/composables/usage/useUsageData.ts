@@ -1,8 +1,8 @@
-import { ref, computed, onUnmounted, onActivated, onDeactivated } from 'vue'
+import { ref, computed, onUnmounted, onActivated, onDeactivated, watch } from 'vue'
 import { useRouter } from 'vue-router'
 import { useDocumentEvent } from '@/composables/useDocumentEvent'
 import { useUsagePreferences } from '@/composables/usage/useUsagePreferences'
-import { requestUsageSnapshot } from '@/composables/usage/useUsageQuery'
+import { naturalRangeStartMs, requestUsageSnapshot } from '@/composables/usage/useUsageQuery'
 import { useUsageTotals } from '@/composables/usage/useUsageTotals'
 import { useUsageChartRows } from '@/composables/usage/useUsageChartRows'
 import { useUsageModelCards } from '@/composables/usage/useUsageModelCards'
@@ -62,6 +62,7 @@ const SORTABLE_COLS = ['session', 'updated_at', 'input_tokens', 'output_tokens',
 export function useUsageData(
   sessionDirectory: SessionDirectory,
   observability: Observability,
+  routeRange?: () => UsageRangeSelection | undefined,
 ) {
 // ---------------------------------------------------------------------------
 // Stores & Router
@@ -78,6 +79,8 @@ const {
   setCurrency,
   setRange: persistRange,
 } = useUsagePreferences()
+const initialRouteRange = routeRange?.()
+if (initialRouteRange) persistRange(initialRouteRange)
 const sortCol = ref('updated_at')
 const sortAsc = ref(false)
 const chartMode = ref<'tokens' | 'cost'>('tokens')
@@ -91,6 +94,7 @@ const sessions = computed(() => usageTaskRows(usageSnapshot.value))
 
 let autoRefreshId: ReturnType<typeof setInterval> | null = null
 let loadGeneration = 0
+let active = false
 
 // The rate the ledger normalized CNY receipts with, so every derived CNY
 // figure (totals, CSV export, per-row conversions) agrees with
@@ -219,12 +223,16 @@ const { sortedRows, sessionsMeta } = useUsageSessionRows({
 // first mount too, so it owns the one-time fetch as well — no separate
 // onMounted fetch, which would double-fetch Usage data on first paint.
 onActivated(() => {
+  active = true
+  const requestedRange = routeRange?.()
   if (!autoRefreshId) autoRefreshId = setInterval(loadData, 60000)
   // A returning view refreshes immediately so cached numbers don't linger.
-  loadData()
+  if (requestedRange && requestedRange !== range.value) setRange(requestedRange)
+  else loadData()
 })
 
 onDeactivated(() => {
+  active = false
   if (autoRefreshId) {
     clearInterval(autoRefreshId)
     autoRefreshId = null
@@ -232,10 +240,15 @@ onDeactivated(() => {
 })
 
 onUnmounted(() => {
+  active = false
   if (autoRefreshId) {
     clearInterval(autoRefreshId)
     autoRefreshId = null
   }
+})
+
+if (routeRange) watch(routeRange, nextRange => {
+  if (active && nextRange && nextRange !== range.value) setRange(nextRange)
 })
 
 useDocumentEvent('visibilitychange', onVisibilityChange)
@@ -279,6 +292,12 @@ type LoadOutcome = 'loaded' | 'superseded' | 'failed' | 'hidden'
 
 async function requestLoad(): Promise<LoadOutcome> {
   if (typeof document !== 'undefined' && document.visibilityState === 'hidden') return 'hidden'
+  const todayStart = range.value === 'today' ? naturalRangeStartMs('today') : null
+  if (todayStart !== null && usageSnapshot.value?.range.preset === 'today'
+    && usageSnapshot.value.asOfMs < todayStart) {
+    // An older calendar day's totals cannot serve as a fallback for Today.
+    usageSnapshot.value = null
+  }
   const generation = ++loadGeneration
   usageLoading.value = true
   usageError.value = null
@@ -336,7 +355,7 @@ function exportCsv() {
   const snapshot = usageSnapshot.value
   const rate = cnyRate.value
   const csv = buildUsageCsv(snapshot, visibleSessions.value, rate)
-  const suffix = range.value === 'all' ? 'all' : `${range.value}d`
+  const suffix = ['all', 'today'].includes(range.value) ? range.value : `${range.value}d`
   const coverageSuffix = snapshot?.mode === 'session_approximation'
     ? '-approximate'
     : snapshot?.mode === 'ledger_partial' ? '-partial' : ''

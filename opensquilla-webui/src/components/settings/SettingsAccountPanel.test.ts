@@ -1,6 +1,6 @@
 // @vitest-environment happy-dom
 import { afterEach, describe, expect, it, vi } from 'vitest'
-import { createApp, h, nextTick, reactive } from 'vue'
+import { createApp, h, nextTick, reactive, ref } from 'vue'
 import { createMemoryHistory, createRouter } from 'vue-router'
 import i18n from '@/i18n'
 import zhHans from '@/locales/zh-Hans.json'
@@ -10,6 +10,9 @@ import SidebarAccountMenu from '@/components/SidebarAccountMenu.vue'
 import type { TokenRhythmAccountState } from '../../../../contracts/desktop/tokenrhythm-account'
 const mock = vi.hoisted(() => ({ store: null as any }))
 vi.mock('@/stores/account', () => ({ useAccountStore: () => mock.store }))
+vi.mock('@/composables/usage/useTodayUsage', () => ({
+  useTodayUsage: () => ({ tokens: ref(0), loading: ref(false), error: ref(false), approximate: ref(false) }),
+}))
 const apps: ReturnType<typeof createApp>[] = []
 afterEach(() => { apps.splice(0).forEach(app => app.unmount()); document.body.innerHTML = '' })
 function state(patch: Partial<TokenRhythmAccountState> = {}): TokenRhythmAccountState {
@@ -110,13 +113,10 @@ describe('account settings and source visibility',()=>{
   expect(el.querySelector('select')).toBeNull()
   expect(el.querySelector('button')).toBeNull()
  })
- it('supports keyboard navigation and Escape focus restoration in the collapsed account menu',async()=>{
+ it('does not leave a floating account entry when the sidebar is collapsed',async()=>{
   const el=await mount(SidebarAccountMenu,state({status:'signed_in',profile,keyStatus:'ready'}),{collapsed:true,class:'collapsed-account-menu'})
-  expect(el.querySelector('.sidebar-account')?.classList.contains('collapsed-account-menu')).toBe(true)
-  const trigger=el.querySelector<HTMLButtonElement>('[aria-haspopup="menu"]')!;trigger.click();await nextTick();expect(document.activeElement?.textContent).toBe('设置')
-  expect([...el.querySelectorAll('[role="menuitem"]')].map(item=>item.textContent)).toEqual(['设置','退出登录'])
-  document.activeElement!.dispatchEvent(new KeyboardEvent('keydown',{key:'End',bubbles:true}));expect(document.activeElement?.textContent).toBe('退出登录')
-  document.activeElement!.dispatchEvent(new KeyboardEvent('keydown',{key:'Escape',bubbles:true}));await nextTick();expect(el.querySelector('[role="menu"]')).toBeNull();expect(document.activeElement).toBe(trigger)
+  expect(el.querySelector('[data-testid="sidebar-account-trigger"]')).toBeNull()
+  expect(el.querySelector('[role="menu"]')).toBeNull()
  })
 })
 

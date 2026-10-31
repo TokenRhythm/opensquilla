@@ -2,6 +2,8 @@
 import { computed, onMounted, ref } from 'vue'
 import { useI18n } from 'vue-i18n'
 import { useAccountStore } from '@/stores/account'
+import { formatAccountMoney } from '@/utils/accountMoney'
+import accountAvatarUrl from '@/assets/account/default-avatar.png'
 import Icon from '@/components/Icon.vue'
 import AccountLogoutDialog from '@/components/AccountLogoutDialog.vue'
 import AccountMediaRecovery from '@/components/settings/AccountMediaRecovery.vue'
@@ -26,16 +28,8 @@ const walletUpdatedAt = computed(() => {
   const pad = (value: number) => String(value).padStart(2, '0')
   return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())} ${pad(date.getHours())}:${pad(date.getMinutes())}:${pad(date.getSeconds())}`
 })
-// Match TokenRhythm's two-decimal ceiling display without losing source precision.
 function money(value: string | undefined) {
-  if (value === undefined) return '—'
-  const negative = value.startsWith('-')
-  const [whole, fraction = ''] = (negative ? value.slice(1) : value).split('.')
-  let cents = BigInt(whole) * 100n + BigInt(fraction.padEnd(2, '0').slice(0, 2))
-  if (!negative && /[1-9]/.test(fraction.slice(2))) cents += 1n
-  const amount = `${cents / 100n}.${String(cents % 100n).padStart(2, '0')}`
-  const currency = wallet.value?.currency === 'CNY' ? '¥' : (wallet.value?.currency || '') + ' '
-  return `${negative && cents > 0n ? '-' : ''}${currency}${amount}`
+  return formatAccountMoney(value, wallet.value?.currency)
 }
 async function act(value: AccountAction) { await account.action(value).catch(() => {}) }
 onMounted(() => { void account.init() })
@@ -48,7 +42,7 @@ onMounted(() => { void account.init() })
       <p class="control-section__desc">{{ t('account.description') }}</p>
     </div>
     <div class="account-card account-identity">
-      <span class="account-avatar" aria-hidden="true">{{ account.loggedIn ? account.initial.toUpperCase() : 'T' }}</span>
+      <span class="account-avatar" aria-hidden="true"><img v-if="account.loggedIn" :src="accountAvatarUrl" alt="" width="48" height="48" draggable="false" /><template v-else>T</template></span>
       <div class="account-identity__copy">
         <div class="account-identity__heading">
           <strong>{{ account.loggedIn ? account.name : t('account.loginTitle') }}</strong>
@@ -106,6 +100,7 @@ onMounted(() => { void account.init() })
 .account-identity + .account-wallet { margin-top: -4px; }
 .account-identity { display: flex; align-items: center; gap: 16px; flex-wrap: wrap; }
 .account-avatar { display: grid; place-items: center; flex-shrink: 0; width: 48px; height: 48px; border-radius: 50%; background: var(--bg-hover); color: var(--text); font-size: 20px; font-weight: 600; }
+.account-avatar img { display: block; width: 100%; height: 100%; object-fit: contain; border-radius: inherit; }
 .account-identity__copy { flex: 1; min-width: 160px; overflow-wrap: anywhere; }
 .account-identity__heading { display: flex; align-items: center; flex-wrap: wrap; gap: 4px 10px; }
 .account-identity__copy strong { font-size: var(--fs-md); line-height: 1.4; }

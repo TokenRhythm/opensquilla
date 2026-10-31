@@ -3769,6 +3769,7 @@
       "dateRange": "Date range",
       "tokens": "Tokens",
       "cost": "Cost",
+      "rangeToday": "Today",
       "rangeAll": "All",
       "rangeDays": "{days}d",
       "input": "Input",
@@ -5195,6 +5196,17 @@
     }
   },
   "account": {
+    "menu": {
+      "recharge": "Add funds",
+      "balance": "TokenRhythm balance",
+      "todayUsage": "Today’s usage",
+      "todayUsageHint": "Input and output tokens recorded by this Gateway today, across all providers. Uses your local time zone and the same data as the Usage page; this is not the TokenRhythm account bill.",
+      "viewUsage": "View usage",
+      "balanceUnavailable": "Balance unavailable",
+      "balanceStale": "Balance may be out of date",
+      "usageUnavailable": "Local usage unavailable",
+      "usageApproximate": "Approximate usage"
+    },
     "recoveryLogin": "Reset sign-in and authorize again",
     "recoveryRequired": "Local sign-in information cannot be restored",
     "title": "Account & balance",

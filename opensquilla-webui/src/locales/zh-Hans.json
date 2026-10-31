@@ -3768,6 +3768,7 @@
       "dateRange": "日期范围",
       "tokens": "Token",
       "cost": "成本",
+      "rangeToday": "今天",
       "rangeAll": "全部",
       "rangeDays": "{days}天",
       "input": "输入",
@@ -5194,6 +5195,17 @@
     }
   },
   "account": {
+    "menu": {
+      "recharge": "去充值",
+      "balance": "TokenRhythm 余额",
+      "todayUsage": "今日用量",
+      "todayUsageHint": "按本地时区统计当前网关今天记录的所有服务商的输入与输出 Token，与用量页口径一致，不代表 TokenRhythm 账号账单。",
+      "viewUsage": "查看用量",
+      "balanceUnavailable": "暂时无法获取余额",
+      "balanceStale": "余额可能不是最新的",
+      "usageUnavailable": "暂时无法获取本地用量",
+      "usageApproximate": "近似用量"
+    },
     "recoveryLogin": "重置本机登录并重新授权",
     "recoveryRequired": "本地登录信息无法恢复",
     "title": "账号与余额",
