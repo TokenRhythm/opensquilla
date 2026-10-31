@@ -947,6 +947,12 @@ body > .settings-overlay .settings-modal .settings-panel {
   padding: var(--sp-5) var(--sp-6) var(--sp-8);
 }
 
+@media (min-width: 769px) {
+  body > .settings-overlay .settings-modal--account .settings-panel {
+    padding-top: 20px;
+  }
+}
+
 body > .settings-overlay .settings-modal .settings-foot {
   background: var(--bg-surface-2);
   border-top: 0;

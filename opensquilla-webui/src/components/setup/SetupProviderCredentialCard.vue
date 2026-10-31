@@ -38,6 +38,7 @@ interface ProviderCredentialPanelContract {
 
 const props = defineProps<{
   panel: ProviderCredentialPanelContract
+  managed?: boolean
   compact?: boolean
   showVerification?: boolean
 }>()
@@ -286,7 +287,7 @@ const verdictModelsText = computed(() => {
     :class="{ 'setup-provider-credential--compact': compact }"
     :aria-busy="panel.removing ? 'true' : undefined"
   >
-    <div v-if="!compact" class="setup-provider-credential__head">
+    <div v-if="!compact && !managed" class="setup-provider-credential__head">
       <div>
         <h4 class="setup-provider-credential__title">{{ title }}</h4>
         <p class="setup-provider-credential__source">{{ sourceText }}</p>
@@ -294,7 +295,8 @@ const verdictModelsText = computed(() => {
       <strong class="control-pill" :class="statusTone">{{ statusText }}</strong>
     </div>
 
-    <div class="setup-provider-credential__body">
+    <p v-if="managed" class="control-row__desc">{{ t('account.editorDescription') }}</p>
+    <div v-else class="setup-provider-credential__body">
       <template v-if="!editingCredential">
         <label v-if="showCredentialControls" class="control-row control-row--stack setup-provider-credential__field">
           <div class="control-row__label-block">

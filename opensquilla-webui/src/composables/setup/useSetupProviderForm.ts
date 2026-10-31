@@ -808,6 +808,7 @@ export function useSetupProviderForm(setupWorkflow: SetupWorkflow) {
     storedProfile?: boolean
     draftProfile?: boolean
     mode?: ProviderProbeMode
+    credentialSource?: 'manual' | 'account'
   } = {}): Promise<void> {
     if (!providerSelected.value || connection.value.phase === 'probing') return
     const requestedMode = options.mode ?? 'model'
@@ -834,7 +835,9 @@ export function useSetupProviderForm(setupWorkflow: SetupWorkflow) {
       const params = connectionParams(options.defaultModel, options.modelOverride)
       const draftParams = profileDraftParams(options.defaultModel, options.modelOverride)
       let res: SetupDiscoveryResult
-      if (options.draftProfile) {
+      if (options.credentialSource === 'account') {
+        res = await setupWorkflow.provider.probePrimary({ providerId: providerSelected.value, model: params.model, credentialSource: 'account', ...modeParams }, { signal: controller.signal, timeoutMs: PROVIDER_MODEL_PROBE_REQUEST_TIMEOUT_MS }) as SetupDiscoveryResult
+      } else if (options.draftProfile) {
         res = await setupWorkflow.profile.probeDraftProfile({ ...draftParams, ...modeParams }, {
           signal: controller.signal,
           timeoutMs: mode === 'reachability'
@@ -919,6 +922,7 @@ export function useSetupProviderForm(setupWorkflow: SetupWorkflow) {
       // re-probes so a newly issued key or recovered provider is not masked by
       // a stale verdict.
       await discoverModels({
+        credentialSource: options.credentialSource,
         modelOverride: options.modelOverride,
         storedProfile: options.storedProfile,
         draftProfile: options.draftProfile,
@@ -934,6 +938,7 @@ export function useSetupProviderForm(setupWorkflow: SetupWorkflow) {
     storedProfile?: boolean
     draftProfile?: boolean
     forceRefresh?: boolean
+    credentialSource?: 'manual' | 'account'
   } = {}): Promise<void> {
     if (!providerSelected.value) return Promise.resolve()
     if (discoverPromise) {
@@ -950,16 +955,20 @@ export function useSetupProviderForm(setupWorkflow: SetupWorkflow) {
     const request = (async () => {
       try {
         const payload = {
+          ...(options.credentialSource === 'manual' && !options.draftProfile ? { credentialSource: 'manual' as const } : {}),
           ...(options.draftProfile
             ? profileDraftParams('', options.modelOverride)
             : connectionParams('', options.modelOverride)),
           ...(options.forceRefresh ? { forceRefresh: true } : {}),
         }
-        const load = (cacheOnly = false) => options.draftProfile
+        const load = (cacheOnly = false) => options.credentialSource === 'account'
+          ? setupWorkflow.provider.discoverPrimaryModels({ providerId: providerSelected.value, credentialSource: 'account', ...(options.forceRefresh ? { forceRefresh: true } : {}), ...(cacheOnly ? { cacheOnly: true } : {}) })
+          : options.draftProfile
           ? setupWorkflow.profile.discoverDraftProfileModels({ ...payload, ...(cacheOnly ? { cacheOnly: true } : {}) })
           : (options.storedProfile
               ? setupWorkflow.profile.discoverProfileModels({
                   providerId: providerSelected.value,
+                  ...(options.credentialSource === 'manual' ? { credentialSource: 'manual' as const } : {}),
                   ...(options.forceRefresh ? { forceRefresh: true } : {}),
                   ...(cacheOnly ? { cacheOnly: true } : {}),
                 })

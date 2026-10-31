@@ -218,6 +218,7 @@ function makeEnvironment() {
     waitForDesktopWriterOperations: () => env.desktopWriters.waitForAtMost(0),
     publishGatewayConnection: renderOwner, cancelGatewayUnexpectedExitRestart() {},
     desktopUpdateCheckScheduler: { stop() {} }, desktopReliabilityTelemetry: { finishSession() {} },
+    desktopAccounts: new Map(),
     artifactPreviewLeaseBroker: { clear() {}, shutdown: async () => {} }, desktopBrowser: { close: async () => {} },
     destroyWindowsTray() {}, stopGateway() {}, setQuitStatus: key => log('fixture_quit_status', { key }),
     setTimeout, clearTimeout, setImmediate, console,

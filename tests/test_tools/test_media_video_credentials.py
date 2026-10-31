@@ -9,8 +9,9 @@ from typing import Any
 
 import pytest
 
-from opensquilla.gateway.config import VideoGenerationConfig
-from opensquilla.provider.video_generation import VideoGenerationPending
+from opensquilla import desktop_account as bridge
+from opensquilla.gateway.config import GatewayConfig, VideoGenerationConfig
+from opensquilla.provider.video_generation import VideoGenerationPending, VideoGenerationResult
 from opensquilla.provider.video_generation_credentials import VideoGenerationCredential
 from opensquilla.provider.video_generation_policy import VIDEO_GENERATION_OFFICIAL_BASE_URLS
 from opensquilla.tools.builtin import media
@@ -230,5 +231,141 @@ def test_owner_can_resume_unknown_video_job_without_a_fingerprint(
     token = current_tool_context.set(ToolContext(is_owner=True))
     try:
         assert media._video_job_access_allowed(_JOB, _KEY, "openrouter")
+    finally:
+        current_tool_context.reset(token)
+
+
+def _account_state(
+    lease: str,
+    *,
+    account_id: str = "synthetic-account-a",
+    origin: str = "https://tokenrhythm.studio",
+    ready: bool = True,
+    source: str = "account",
+) -> dict[str, Any]:
+    return {
+        "source": source,
+        "selectedAccountId": account_id,
+        "accountId": account_id,
+        "ready": ready,
+        "credential": lease,
+        "origin": origin,
+        "mediaSources": {"image": "inherit", "video": "inherit"},
+    }
+
+
+@pytest.fixture
+def account_video(monkeypatch: pytest.MonkeyPatch):
+    config = GatewayConfig()
+    config.llm.api_key = "synthetic-manual-key"
+    config.video_generation.enabled = True
+    config.video_generation.provider = "tokenrhythm"
+    config.video_generation.primary = "wan3.0-video"
+    monkeypatch.setattr(media, "_video_generation_config", config.video_generation)
+    monkeypatch.setattr(media, "_video_gateway_config", config)
+    monkeypatch.setattr(bridge, "_endpoint", "")
+    monkeypatch.setattr(bridge, "_token", "")
+    token = bridge.pin_account_state(None)
+    try:
+        yield config
+    finally:
+        bridge.reset_account_state(token)
+
+
+@pytest.mark.parametrize("is_owner", [False, True])
+@pytest.mark.asyncio
+async def test_account_video_recovers_pending_and_completed_jobs_after_lease_rotation(
+    account_video: GatewayConfig,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    is_owner: bool,
+) -> None:
+    leases = ["os_local_" + character * 43 for character in "xyz"]
+    resumed: list[str] = []
+
+    async def generate(**kwargs: Any) -> None:
+        assert kwargs["api_key"] == leases[0]
+        kwargs["on_job_accepted"](_JOB)
+        raise VideoGenerationPending("synthetic pending", job_id=_JOB)
+
+    async def resume(**kwargs: Any) -> VideoGenerationResult:
+        resumed.append(kwargs["api_key"])
+        return VideoGenerationResult(
+            job_id=_JOB, output_path=kwargs["output_path"], model=kwargs["model"],
+            bytes_written=12, provider="tokenrhythm",
+        )
+
+    async def delivered(*_args: Any, **_kwargs: Any) -> str:
+        return json.dumps({"status": "ok", "job_id": _JOB})
+
+    def unexpected_fingerprint(_key: str) -> str:
+        raise AssertionError("Account ownership must not depend on a transport lease")
+
+    monkeypatch.setattr(media, "_video_adapter", lambda _provider: (generate, resume))
+    monkeypatch.setattr(media, "_video_result_payload", delivered)
+    monkeypatch.setattr(media, "_video_credential_fingerprint", unexpected_fingerprint)
+    token = current_tool_context.set(ToolContext(
+        caller_kind=CallerKind.WEB, is_owner=is_owner,
+        session_key=_SESSION, workspace_dir=str(tmp_path),
+    ))
+    try:
+        bridge.pin_account_state(_account_state(leases[0]))
+        pending = json.loads(await media.video_generate("A synthetic paper kite"))
+        assert pending["status"] == "pending"
+        receipt = media._video_job_receipt(pending["job_id"])
+        assert receipt is not None
+        assert receipt.account_authority == ("https://tokenrhythm.studio", "synthetic-account-a")
+        assert receipt.credential_fingerprint == ""
+        assert leases[0] not in repr(vars(receipt))
+
+        bridge.pin_account_state(_account_state(leases[1]))
+        completed = await media.video_status(pending["job_id"])
+        assert json.loads(completed)["status"] == "ok"
+        assert resumed == [leases[1]]
+
+        bridge.pin_account_state(_account_state(leases[2]))
+        assert await media.video_status(pending["job_id"]) == completed
+        assert resumed == [leases[1]]
+    finally:
+        current_tool_context.reset(token)
+
+
+@pytest.mark.parametrize("completed", [False, True])
+@pytest.mark.parametrize("replacement", [
+    {"account_id": "synthetic-account-b"},
+    {"origin": "https://uat.tokenrhythm.invalid"},
+    {"ready": False},
+    {"source": "manual"},
+])
+@pytest.mark.asyncio
+async def test_account_video_rejects_other_authorities_even_for_owner(
+    account_video: GatewayConfig,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    completed: bool,
+    replacement: dict[str, Any],
+) -> None:
+    async def generate(**kwargs: Any) -> None:
+        kwargs["on_job_accepted"](_JOB)
+        raise VideoGenerationPending("synthetic pending", job_id=_JOB)
+
+    async def forbidden_resume(**_kwargs: Any) -> None:
+        raise AssertionError("A different account must not query the retained video")
+
+    monkeypatch.setattr(media, "_video_adapter", lambda _provider: (generate, forbidden_resume))
+    token = current_tool_context.set(ToolContext(
+        caller_kind=CallerKind.WEB, is_owner=True,
+        session_key=_SESSION, workspace_dir=str(tmp_path),
+    ))
+    try:
+        bridge.pin_account_state(_account_state("os_local_" + "x" * 43))
+        pending = json.loads(await media.video_generate("A synthetic paper kite"))
+        if completed:
+            media._remember_video_completion(
+                pending["job_id"], None, json.dumps({"status": "ok", "job_id": _JOB})
+            )
+        bridge.pin_account_state(_account_state("os_local_" + "y" * 43, **replacement))
+        with pytest.raises(ToolError, match="unavailable in this session"):
+            await media.video_status(pending["job_id"])
     finally:
         current_tool_context.reset(token)

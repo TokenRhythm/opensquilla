@@ -304,6 +304,9 @@ _NONCRITICAL_CI_SCRIPT_TARGETS: Final[dict[str, tuple[str, ...]]] = {
     ".github/scripts/prestage-release-to-oss.sh": (
         "tests/test_scripts/test_prestage_release_to_oss.py",
     ),
+    ".github/scripts/mirror-windows-test-to-oss.py": (
+        "tests/test_scripts/test_mirror_windows_test_to_oss.py",
+    ),
     ".github/scripts/release_signing_preflight.py": (
         "tests/test_ci/test_release_signing_preflight.py",
     ),

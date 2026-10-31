@@ -3289,6 +3289,12 @@ async def build_services(
     except ValueError:
         log.warning("browser.desktop_environment_rejected")
 
+    from opensquilla.desktop_account import initialize_desktop_account
+    try:
+        initialize_desktop_account()
+    except ValueError:
+        log.warning("account.desktop_environment_rejected")
+
     # ── Load .env files (cwd/.env > ~/.opensquilla/.env, never override existing) ──
     from opensquilla.env import load_env
 

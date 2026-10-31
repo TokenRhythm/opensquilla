@@ -1273,6 +1273,9 @@ jobs:
           node --test scripts/test-electron-download-tls.mjs
           node --test scripts/test-gateway-integrity.mjs
           node scripts/test-secret-storage-policy.mjs
+          node --test scripts/test-local-account-secrets.mjs
+          node --test scripts/test-desktop-keychain-free-startup.mjs scripts/test-tokenrhythm-account.mjs scripts/test-tokenrhythm-environment.mjs
+          node --test scripts/test-desktop-account-quit.mjs scripts/test-desktop-account-update.mjs scripts/test-desktop-account-cleanup.mjs scripts/test-desktop-account-migration.mjs
           node scripts/test-update-resolver.mjs
           node scripts/test-update-check-scheduler.mjs
           node scripts/test-windows-update-security.mjs

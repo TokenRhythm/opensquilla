@@ -2,12 +2,16 @@
 import { readFileSync } from 'node:fs'
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 import { createApp, h, nextTick, reactive } from 'vue'
+import { createMemoryHistory, createRouter } from 'vue-router'
 import i18n from '@/i18n'
 import zhHans from '@/locales/zh-Hans.json'
 import { MODEL_CAPACITY_KEY, useModelCapacityForm } from '@/composables/setup/useModelCapacityForm'
 import type { ProviderConfiguration, ModelCapacityTarget } from '@/modules/providerConfiguration'
 import SetupProviderPanel from './SetupProviderPanel.vue'
 import type { ConnectionState, DiscoveredModel } from '@/composables/setup/useSetupProviderForm'
+
+const accountMock = vi.hoisted(() => ({ store: null as any }))
+vi.mock('@/stores/account', () => ({ useAccountStore: () => accountMock.store }))
 
 function connection(overrides: Partial<ConnectionState> = {}): ConnectionState {
   return {
@@ -43,6 +47,8 @@ const OPENROUTER_PROVIDER = { providerId: 'openrouter', label: 'OpenRouter' }
 
 function panel(overrides: Record<string, unknown> = {}) {
   const base = {
+    accountEditing: false,
+    accountReady: false,
     providerSummary: 'OpenAI',
     providerSelected: 'openai',
     runtimeProviders: [{ providerId: 'openai', label: 'OpenAI' }],
@@ -148,6 +154,7 @@ async function mountPanel(props: Record<string, unknown> = {}, listeners: Record
   const panelState = reactive(panel(props))
   const app = createApp(SetupProviderPanel, { panel: panelState, ...listeners })
   app.use(i18n)
+  app.use(createRouter({history:createMemoryHistory(),routes:[{path:'/:pathMatch(.*)*',component:{render:()=>null}}]}))
   if (withCapacity) app.provide(MODEL_CAPACITY_KEY, useModelCapacityForm({ capacitySupported: true,
     resolveCapacity: async (items: ModelCapacityTarget[]) => ({ models: items.map(item => ({ ...item, localRuntime: false,
       contextWindow: { automatic: 8192, automaticSource: 'default', override: null, value: 8192, source: 'default', editable: true },
@@ -246,6 +253,7 @@ async function openConfiguredEditor(el: HTMLElement, providerId = 'openai'): Pro
 }
 
 beforeEach(() => {
+  accountMock.store = reactive({loggedIn:true,ready:true,name:'Mock Account',busy:false,state:{status:'signed_in',mediaSources:{image:'inherit',video:'inherit'}},action:vi.fn(async()=>{})})
   i18n.global.locale.value = 'en'
   // The context-window keys land in the locale JSONs via the i18n merge step;
   // inject them here so assertions exercise interpolation, not raw key names.
@@ -2753,5 +2761,65 @@ describe('primary thinking control', () => {
       await nextTick()
       expect(document.querySelector('[data-testid="model-thinking-level"]')).toBeNull()
     } finally { app.unmount() }
+  })
+})
+
+describe('account service uses the shared provider editor', () => {
+  it('opens the shared model editor, keeps model operations, and hides managed connection controls', async () => {
+    const onSelectAccountProvider=vi.fn(()=>{ panelState.accountEditing=true })
+    const onUpdateProviderField=vi.fn()
+    const onProbeConnection=vi.fn()
+    const onRefreshModels=vi.fn()
+    const onSaveProvider=vi.fn()
+    const onUpdateLlmThinking=vi.fn()
+    const {app,el,panelState}=await mountPanel({
+      accountSupported:true,accountPrimary:true,accountEditing:false,accountReady:true,
+      providerSelected:'tokenrhythm',editingPrimary:true,selectedStoredProfile:true,
+      runtimeProviders:[TOKENRHYTHM_PROVIDER],
+      providerCoreFields:[{name:'model',label:'Model'},{name:'base_url',label:'Base URL'}],
+      providerAdvancedFields:[{name:'proxy',label:'Proxy'}],
+      credentialPanel:{...panel().credentialPanel,providerLabel:'TokenRhythm'},
+      providerFieldValue:(field:{name:string})=>field.name==='model'?'test-vendor/alpha':'https://managed.invalid',
+      configuredProviders:[{providerId:'tokenrhythm',label:'TokenRhythm · API Key',active:false,ready:true}],
+      connection:connection({models:DISCOVERED,modelSource:'live'}),
+    },{dirty:true,onSelectAccountProvider,onUpdateProviderField,onProbeConnection,onRefreshModels,onSaveProvider,onUpdateLlmThinking},true)
+    try {
+      const edit=el.querySelector<HTMLButtonElement>('[data-testid="account-provider"] button')!
+      edit.click();await nextTick();await nextTick()
+      expect(onSelectAccountProvider).toHaveBeenCalledOnce()
+      expect(panelState.accountEditing).toBe(true)
+      const dialog=document.querySelector<HTMLElement>('#setup-provider-editor-dialog')!
+      expect(dialog).not.toBeNull()
+      expect(dialog.querySelector('input[name="setup_provider_api_key"]')).toBeNull()
+      expect(dialog.querySelector('input[name="setup_provider_api_key_env"]')).toBeNull()
+      expect(dialog.querySelector('[data-testid="setup-provider-modal-endpoint"]')).toBeNull()
+      expect(dialog.querySelector('.setup-provider-modal__delete')).toBeNull()
+      expect(dialog.querySelector('[data-testid="provider-save-and-activate"]')).toBeNull()
+      expect(dialog.querySelector(`a[href="${TOKENRHYTHM_REGISTRATION_URL}"]`)).toBeNull()
+      expect(dialog.querySelector('select[aria-label="图片"]')).toBeNull()
+      expect(document.querySelector('.account-editor')).toBeNull()
+      const input=dialog.querySelector<HTMLInputElement>('input[name="setup_provider_model"]')!
+      expect(input).not.toBeNull();expect(input.disabled).toBe(false)
+      input.value='updated-model';input.dispatchEvent(new Event('input',{bubbles:true}))
+      expect(onUpdateProviderField).toHaveBeenCalledWith('model','updated-model')
+      testButton(dialog)!.click();expect(onProbeConnection).toHaveBeenCalledWith('reachability')
+      Array.from(dialog.querySelectorAll<HTMLButtonElement>('button')).find(button=>button.textContent?.trim()==='Test model')!.click()
+      expect(onProbeConnection).toHaveBeenCalledWith('model')
+      dialog.querySelector<HTMLButtonElement>('[data-testid="setup-refresh-models"]')!.click()
+      expect(onRefreshModels).toHaveBeenCalledOnce()
+      dialog.querySelector<HTMLButtonElement>('.model-capacity-menu')!.click()
+      await Promise.resolve();await nextTick();await nextTick()
+      const modelDialog=document.querySelector<HTMLElement>('.model-capacity-dialog')!
+      expect(modelDialog).not.toBeNull()
+      const control=modelDialog.querySelector<HTMLButtonElement>('[data-testid="model-thinking-level"][role="combobox"]')!
+      control.click();await nextTick();await nextTick()
+      const options=document.getElementById(control.getAttribute('aria-controls')!)!
+      Array.from(options.querySelectorAll<HTMLElement>('[role="option"]')).find(option=>option.textContent?.trim()==='high')!.click()
+      await nextTick()
+      modelDialog.querySelector<HTMLButtonElement>('.btn--primary')!.click()
+      expect(onUpdateLlmThinking).toHaveBeenCalledWith('high')
+      dialog.querySelector<HTMLButtonElement>('.setup-provider-modal__footer .btn--primary')!.click()
+      expect(onSaveProvider).toHaveBeenCalledOnce()
+    }finally{app.unmount()}
   })
 })

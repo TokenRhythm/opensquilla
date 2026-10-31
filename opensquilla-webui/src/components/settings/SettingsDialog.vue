@@ -1,12 +1,12 @@
 <template>
   <Teleport to="body">
-    <div class="settings-overlay" @click.self="requestClose($event)">
+    <div class="settings-overlay" :class="{ 'settings-overlay--account': section === 'account' }" @click.self="requestClose($event)">
       <Transition name="settings-pop" appear @after-leave="onLeaveComplete">
       <section
         v-if="visible"
         ref="modalRef"
         class="settings-modal"
-        :class="{ 'settings-modal--categories': showCategories }"
+        :class="{ 'settings-modal--categories': showCategories, 'settings-modal--account': section === 'account' }"
         role="dialog"
         aria-modal="true"
         aria-labelledby="settings-modal-title"
@@ -92,8 +92,9 @@
           >
           <!-- Gateway remains available even when config readiness cannot load,
                because this is where users recover the connection/runtime. -->
+          <SettingsAccountPanel v-if="section === 'account' && accountSupported" />
           <SettingsGatewayPanel
-            v-if="section === 'gateway'"
+            v-else-if="section === 'gateway'"
             :is-desktop="isDesktop"
           />
 
@@ -169,6 +170,8 @@
               @add-provider="requestAddProvider"
               @probe-configured-provider="probeConfiguredProvider"
               @activate-provider="activateProvider"
+              @activate-account="activateAccountProvider"
+              @select-account-provider="requestSelectAccountProvider"
               @update-image-generation-opt-in="setProviderImageGenerationOptIn"
             />
             <SetupModelStrategyPanel
@@ -272,6 +275,7 @@ import SettingsAdvancedPanel from '@/components/settings/SettingsAdvancedPanel.v
 import SettingsMemoryPanel from '@/components/settings/SettingsMemoryPanel.vue'
 import SettingsGatewayPanel from '@/components/settings/SettingsGatewayPanel.vue'
 import SettingsGeneralPanel from '@/components/settings/SettingsGeneralPanel.vue'
+import SettingsAccountPanel from '@/components/settings/SettingsAccountPanel.vue'
 import SettingsSecurityPrivacyPanel from '@/components/settings/SettingsSecurityPrivacyPanel.vue'
 import DataMigrationPanel from '@/components/settings/DataMigrationPanel.vue'
 import { useSetupCatalog, SETTINGS_SECTIONS } from '@/composables/setup/useSetupCatalog'
@@ -298,7 +302,8 @@ const { confirmChoice, confirmState } = useConfirm()
 // The catalog retains the desktopOnly capability for future destinations. The
 // consolidated rail currently shares all ten destinations across surfaces.
 const isDesktop = usePlatform().capabilities.isDesktop
-const visibleSections = computed(() => SETTINGS_SECTIONS.filter(s => !s.desktopOnly || isDesktop))
+const accountSupported = Boolean(usePlatform().account)
+const visibleSections = computed(() => SETTINGS_SECTIONS.filter(s => !s.desktopOnly || isDesktop || (s.id === 'account' && accountSupported)))
 
 const {
   section,
@@ -324,6 +329,7 @@ const {
   discardChanges,
   selectProvider,
   requestSelectConfiguredProvider,
+  requestSelectAccountProvider,
   requestAddProvider,
   cancelProviderEdit,
   setAutoSessionTitles,
@@ -366,6 +372,7 @@ const {
   probeConfiguredProvider,
   cancelConfiguredProviderProbe,
   activateProvider,
+  activateAccountProvider,
   removeProviderProfile,
   updateTierField,
   updateCapabilityField,
@@ -813,6 +820,7 @@ function usableInvoker(): HTMLElement | null {
 function restoreSettingsFocus() {
   const targets = [
     usableInvoker(),
+    ...document.querySelectorAll<HTMLElement>('[data-testid="sidebar-account-trigger"]'),
     document.querySelector<HTMLElement>('.sidebar-foot button[data-icon="settings"]'),
     document.querySelector<HTMLElement>('[data-testid="sidebar-toggle-collapsed"]'),
   ]
@@ -1138,6 +1146,17 @@ onUnmounted(() => {
   height: min(85vh, 100%);
   overflow: hidden;
   width: min(1200px, 100%);
+}
+
+/* The account overview uses the tall settings sheet shown in its reference. */
+@media (min-width: 769px) {
+  .settings-overlay--account {
+    padding: 8px 18px;
+  }
+
+  .settings-modal--account {
+    height: min(97vh, 100%);
+  }
 }
 
 /* Symmetric modal motion: slides up + fades in on open, slides down + fades out

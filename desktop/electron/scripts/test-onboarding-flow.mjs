@@ -1,6 +1,7 @@
 import { strict as assert } from 'node:assert'
 import { mkdir, mkdtemp, readFile, readdir, rm, writeFile } from 'node:fs/promises'
 import { createServer } from 'node:http'
+import { createHash, randomUUID } from 'node:crypto'
 import { tmpdir } from 'node:os'
 import { dirname, join, resolve } from 'node:path'
 import { setTimeout as delay } from 'node:timers/promises'
@@ -9,12 +10,14 @@ import { _electron as electron } from 'playwright'
 import { desktopRouterConfigTomlLines } from '../dist/desktop-router-config.js'
 import { DESKTOP_GATEWAY_STARTUP_TIMEOUT_MS } from '../dist/gateway-lifecycle.js'
 import { parse, stringify } from 'smol-toml'
+import { LocalAccountSecrets } from '../dist/local-account-secrets.js'
+import { renderUnconfiguredDesktopConfig } from '../dist/desktop-unconfigured-profile.js'
 
 const scriptDir = dirname(fileURLToPath(import.meta.url))
 const packageRoot = resolve(scriptDir, '..')
 const repoRoot = resolve(packageRoot, '../..')
 const screenshotPath = String(process.env.OPENSQUILLA_DESKTOP_ONBOARDING_SCREENSHOT || '').trim()
-const CASE_NAMES = ['submit', 'optional-probe', 'skip', 'close', 'slow-probe', 'provider-client']
+const CASE_NAMES = ['submit', 'optional-probe', 'skip', 'close', 'slow-probe', 'account-cancel', 'account-recovery', 'provider-client']
 const selectedCases = new Set(String(process.env.OPENSQUILLA_DESKTOP_ONBOARDING_CASES || '')
   .split(',').map(value => value.trim()).filter(Boolean))
 const onboardingDiagnosticContexts = new WeakMap()
@@ -606,7 +609,7 @@ async function verifyBootPhaseTimer(app) {
   await page.clock.resume()
 }
 
-async function launchIsolatedOnboarding(prefix, existingUserDataRoot) {
+async function launchIsolatedOnboarding(prefix, existingUserDataRoot, prepare) {
   const userDataRoot = existingUserDataRoot || await mkdtemp(join(tmpdir(), prefix))
   const userDataDir = join(userDataRoot, 'chromium-user-data')
   const isolatedHome = join(userDataRoot, 'home')
@@ -618,6 +621,7 @@ async function launchIsolatedOnboarding(prefix, existingUserDataRoot) {
     mkdir(localAppData, { recursive: true }),
     mkdir(localTemp, { recursive: true }),
   ])
+  await prepare?.(userDataDir)
   const startupStartedAt = Date.now()
   const app = await electron.launch({
     ...(process.env.OPENSQUILLA_DESKTOP_TEST_ELECTRON_EXECUTABLE
@@ -1199,6 +1203,116 @@ async function verifySlowProbeDoesNotOwnSetupActions() {
 }
 
 await runCase('slow-probe', verifySlowProbeDoesNotOwnSetupActions)
+
+async function verifyAccountCancelLocalization() {
+  const { app, userDataRoot } = await launchIsolatedOnboarding(
+    'opensquilla-electron-onboarding-account-cancel-test-',
+  )
+  try {
+    const page = await setupWindow(app)
+    await app.evaluate(({ ipcMain }) => {
+      ipcMain.removeHandler('desktop:account:action')
+      ipcMain.handle('desktop:account:action', (_event, action) => ({
+        status: action === 'cancel' ? 'signed_out' : 'authorizing',
+        profile: null,
+        keyStatus: 'missing',
+      }))
+    })
+    await page.locator('#onboardingLocale').selectOption('zh-Hans')
+    await page.evaluate(() => renderAccount({ status: 'storage_unavailable', errorCode: 'ACCOUNT_LOCAL_KEY_MISSING', profile: null, keyStatus: 'missing' }))
+    assert.equal(await page.locator('#accountLogin').innerText(), '重置本机登录并重新授权')
+    assert.match(await page.locator('#accountStatus').innerText(), /本地登录密钥丢失/)
+    await page.evaluate(() => renderAccount({ status: 'signed_out', errorCode: null, profile: null, keyStatus: 'missing' }))
+    await page.locator('#accountLogin').click()
+    const cancel = page.locator('#accountCancel')
+    await cancel.waitFor({ state: 'visible' })
+    assert.equal(await cancel.innerText(), '取消')
+    assert.equal(await page.locator('#accountStatus').innerText(), '等待浏览器授权…')
+    for (const [locale, label] of [
+      ['en', 'Cancel'], ['ja', 'キャンセル'], ['fr', 'Annuler'],
+      ['de', 'Abbrechen'], ['es', 'Cancelar'], ['zh-Hans', '取消'],
+    ]) {
+      await page.locator('#onboardingLocale').selectOption(locale)
+      assert.equal(await cancel.innerText(), label)
+      assert.equal(await cancel.isVisible(), true)
+    }
+    await cancel.click()
+    await cancel.waitFor({ state: 'hidden' })
+    assert.equal(await page.locator('#accountStatus').innerText(), '未登录')
+  } catch (error) {
+    await reportOnboardingFailure(app, 'account-cancel', error)
+    throw error
+  } finally {
+    await app.close().catch(() => {})
+    await rm(userDataRoot, { recursive: true, force: true }).catch(() => {})
+  }
+}
+
+await runCase('account-cancel', verifyAccountCancelLocalization)
+
+async function verifyAccountRecoveryEntrances() {
+  let home, directory, original
+  const installation = randomUUID()
+  const initial = await launchIsolatedOnboarding('opensquilla-electron-onboarding-account-recovery-test-', undefined, async userDataDir => {
+    home = join(userDataDir, 'opensquilla')
+    const origin = new URL(process.env.OPENSQUILLA_TOKENRHYTHM_ORIGIN || 'https://tokenrhythm.studio').origin
+    directory = join(home, 'desktop-account', createHash('sha256').update(origin).digest('hex').slice(0, 16))
+    const secrets = new LocalAccountSecrets(directory)
+    original = secrets.encrypt('{}')
+    await writeFile(join(directory, 'account.local.enc'), original, { mode: 0o600 })
+    await writeFile(join(directory, 'installation-id'), installation, { mode: 0o600 })
+    await rm(join(directory, 'account.local.key'))
+    await writeFile(join(home, 'config.toml'), renderUnconfiguredDesktopConfig('zh-Hans', process.platform))
+    await writeFile(join(userDataDir, 'desktop-locale'), 'zh-Hans')
+    await writeFile(join(home, 'conversation-recovery-test.db'), 'saved conversations')
+  })
+  const app = initial.app
+  try {
+    const page = await readyDesktopWindow(app)
+    await page.goto('opensquilla-app://desktop/settings/account')
+    const config = await readFile(join(home, 'config.toml'))
+    const panel = page.locator('[data-testid="account-panel"]')
+    await panel.waitFor({ state: 'visible' })
+    await waitFor(async () => (await panel.innerText()).includes('本地登录密钥丢失'), 'missing-key recovery message')
+    const recover = panel.getByRole('button', { name: '重置本机登录并重新授权' })
+    assert.equal(await recover.isVisible(), true)
+    await app.evaluate(({ dialog, shell }) => {
+      globalThis.__accountRecoveryDialogs = []
+      globalThis.__accountRecoveryUrl = ''
+      dialog.showMessageBox = async (...args) => {
+        globalThis.__accountRecoveryDialogs.push(args.at(-1))
+        return { response: globalThis.__accountRecoveryDialogs.length === 1 ? 0 : 1, checkboxChecked: false }
+      }
+      shell.openExternal = async url => { globalThis.__accountRecoveryUrl = url }
+    })
+    await recover.click()
+    await waitFor(() => app.evaluate(() => globalThis.__accountRecoveryDialogs.length === 1), 'cancelled recovery confirmation')
+    assert.equal(await readFile(join(directory, 'account.local.enc'), 'utf8'), original)
+    assert.equal((await readdir(directory)).some(name => name.startsWith('recovery-')), false)
+    const desktop = page
+    const state = await desktop.evaluate(() => window.opensquillaDesktop.accountAction('login'))
+    assert.equal(state.status, 'authorizing')
+    const observed = await app.evaluate(() => ({ dialogs: globalThis.__accountRecoveryDialogs, url: globalThis.__accountRecoveryUrl }))
+    assert.equal(observed.dialogs.length, 2)
+    assert.deepEqual(observed.dialogs[0].buttons, ['取消', '备份并重新授权'])
+    assert.equal(observed.dialogs[0].defaultId, 0)
+    assert.match(observed.dialogs[0].detail, /对话、模型配置/)
+    assert.equal(new URL(observed.url).searchParams.get('installation_id'), installation)
+    const backup = (await readdir(directory)).find(name => name.startsWith('recovery-'))
+    assert.equal(await readFile(join(directory, backup, 'account.local.enc'), 'utf8'), original)
+    assert.deepEqual(await readFile(join(home, 'config.toml')), config)
+    assert.equal(await readFile(join(home, 'conversation-recovery-test.db'), 'utf8'), 'saved conversations')
+    await desktop.evaluate(() => window.opensquillaDesktop.accountAction('cancel'))
+  } catch (error) {
+    await reportOnboardingFailure(app, 'account-recovery', error)
+    throw error
+  } finally {
+    await app.close().catch(() => {})
+    await rm(initial.userDataRoot, { recursive: true, force: true }).catch(() => {})
+  }
+}
+
+await runCase('account-recovery', verifyAccountRecoveryEntrances)
 
 // The remaining integration scenario is the legacy top-level client workflow.
 // Selected regression runs may finish here; the default still runs every case.

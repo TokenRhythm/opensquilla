@@ -3241,8 +3241,10 @@ class OpenAIProvider:
         normal HTTPX ownership/close lifecycle.
         """
 
+        from opensquilla.desktop_account import account_http_client
         return await asyncio.to_thread(
-            httpx.AsyncClient,
+            account_http_client,
+            self._api_key,
             timeout=timeout,
             trust_env=_trust_env(),
             proxy=self._proxy,
@@ -3794,6 +3796,31 @@ class OpenAIProvider:
             raise asyncio.CancelledError from None
 
     async def _stream(
+        self, messages: list[Message], tools: list[ToolDefinition] | None, cfg: ChatConfig,
+    ) -> AsyncIterator[StreamEvent]:
+        from opensquilla.desktop_account import is_account_credential
+        from opensquilla.provider.failures import ProviderFailureKind, classify_provider_error
+        managed = is_account_credential(self._api_key)
+        async for event in self._stream_impl(messages, tools, cfg):
+            if managed and isinstance(event, ErrorEvent):
+                kind = classify_provider_error(
+                    self._provider_kind,
+                    event.http_status or (int(event.code) if event.code.isdigit() else None),
+                    event.provider_code or event.code, event.message,
+                )
+                if kind in {ProviderFailureKind.TRANSPORT_TRANSIENT,
+                            ProviderFailureKind.PROVIDER_OVERLOADED,
+                            ProviderFailureKind.EMPTY_RESPONSE,
+                            ProviderFailureKind.MALFORMED_RESPONSE}:
+                    event.code = "account_request_uncertain"
+                    # Recovery coordinators prefer the structured provider code.
+                    # Both fields must carry the no-replay decision; retain the
+                    # HTTP status solely as diagnostic evidence.
+                    event.provider_code = "account_request_uncertain"
+                    event.retry_after_s = None
+            yield event
+
+    async def _stream_impl(
         self,
         messages: list[Message],
         tools: list[ToolDefinition] | None,
@@ -3803,7 +3830,10 @@ class OpenAIProvider:
         # request for this adapter call.  Keep the legacy compatibility
         # fallbacks available for unbounded direct calls, but never turn a
         # coordinator-owned attempt into a hidden stream/non-stream resend.
-        coordinator_owns_retry = cfg.physical_attempt_limit == 1
+        from opensquilla.desktop_account import is_account_credential
+        coordinator_owns_retry = (
+            cfg.physical_attempt_limit == 1 or is_account_credential(self._api_key)
+        )
         non_stream_fallback_allowed = (
             self._provider_kind != "dashscope"
             or _dashscope_non_stream_fallback_from_env()
