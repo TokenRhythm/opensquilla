@@ -95,6 +95,13 @@ def config_set(
         if not _set_key(data, key, parsed_value):
             console.print(f"[red]Key not found: {escape(key)}[/red]")
             raise typer.Exit(1)
+        if (
+            "tiers" not in cfg.squilla_router.model_fields_set
+            and key not in {"squilla_router", "squilla_router.tiers"}
+            and not key.startswith("squilla_router.tiers.")
+        ):
+            # A full dump must not promote implicit defaults into a saved ladder.
+            data["squilla_router"].pop("tiers", None)
         try:
             updated = GatewayConfig.model_validate(data)
             updated._mark_env_absorbed_secrets(data)
