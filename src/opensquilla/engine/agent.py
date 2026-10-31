@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import binascii
 import contextlib
 import copy
 import functools
@@ -41,7 +42,10 @@ from opensquilla.compaction_status import (
 )
 from opensquilla.context_budget import ContextBudgetClass, ContextBudgetGovernor
 from opensquilla.contracts.attachments import IMAGE_ATTACHMENT_MIMES, normalize_attachment_mime
-from opensquilla.contracts.image_validation import validate_image_bytes
+from opensquilla.contracts.image_preparation import (
+    MAX_TOOL_IMAGE_BASE64_CHARS,
+    prepare_tool_result_image,
+)
 from opensquilla.contracts.turn_execution import TurnExecutionContext
 from opensquilla.engine.agent_injection import PendingInputProvider
 from opensquilla.engine.cache_break_monitor import (
@@ -128,6 +132,7 @@ from opensquilla.engine.usage_accounting import (
     bind_usage_accounting_scope,
     current_usage_accounting_scope,
     has_known_provider_usage_receipt,
+    mark_usage_call_not_sent,
     normalize_provider_usage,
     provider_accounts_physical_usage,
     start_usage_call,
@@ -1587,6 +1592,7 @@ def _active_user_message_index_for_request(
         for index in range(len(messages) - 1, -1, -1):
             message = messages[index]
             if (message.role != "user" or _message_has_tool_result(message)
+                    or message._request_only_pending_tool_image
                     or isinstance(message, _LiveTurnContinuationMessage)):
                 continue
             content = (
@@ -1600,6 +1606,7 @@ def _active_user_message_index_for_request(
     for index in range(len(messages) - 1, -1, -1):
         message = messages[index]
         if (message.role != "user" or _message_has_tool_result(message)
+                or message._request_only_pending_tool_image
                 or isinstance(message, _LiveTurnContinuationMessage)):
             continue
         content = (
@@ -1655,6 +1662,13 @@ def _assistant_replay_tail(messages: list[Message], start: int) -> list[Message]
     tail = messages[start:]
     first = next((i for i, item in enumerate(tail) if item.role == "assistant"), len(tail))
     return tail[first:]
+
+
+def _tool_image_native_ack_indexes(messages: list[Message]) -> list[int]:
+    return [
+        index for index, message in enumerate(messages)
+        if message.role == "assistant" and message._tool_image_native_ack is True
+    ]
 
 
 def _serialize_assistant_replay(messages: list[Message]) -> dict[str, Any]:
@@ -1908,6 +1922,14 @@ def _safe_provider_terminal_message(
         ),
         ProviderFailureKind.CONTEXT_OVERFLOW: (
             "The request exceeds the model provider's context window."
+        ),
+        ProviderFailureKind.PAYLOAD_TOO_LARGE: (
+            "The model provider rejected the request size. Reduce or remove attachments "
+            "and try again."
+        ),
+        ProviderFailureKind.WIRE_PAYLOAD_TOO_LARGE: (
+            "OpenSquilla could not send this request within its size limit. "
+            "Reduce or remove attachments and try again."
         ),
         ProviderFailureKind.UNSUPPORTED_FEATURE: (
             "The model provider does not support this request."
@@ -2253,6 +2275,171 @@ def _classify_provider_attempt(
     )
 
 
+def _clear_unverified_tool_image_retention(value: Any) -> None:
+    """Do not infer a readable original from a historical tool receipt alone."""
+    if isinstance(value, ContentBlockImage):
+        value.durable_retained = None
+    elif isinstance(value, ContentBlockToolResult):
+        _clear_unverified_tool_image_retention(value.content)
+    elif isinstance(value, list):
+        for item in value:
+            _clear_unverified_tool_image_retention(item)
+    elif isinstance(value, dict):
+        block_type = str(value.get("type") or "").strip().lower()
+        if block_type == "image":
+            value.pop("durable_retained", None)
+        elif block_type == "tool_result":
+            _clear_unverified_tool_image_retention(value.get("content"))
+
+
+def _has_historical_tool_image(message: Message) -> bool:
+    if (
+        not isinstance(message, Message)
+        or not isinstance(message.content, list)
+        or not count_projected_image_blocks([message])
+    ):
+        return False
+    if any(isinstance(block, ContentBlockToolResult) for block in message.content):
+        return True
+    # Interrupted/unsigned tool chains are quoted as context during replay.
+    # Their private provenance follows request-local copies, unlike text that
+    # a user can reproduce in an image caption.
+    return message.is_recorded_tool_context
+
+
+def _historical_tool_images(value: Any) -> Iterator[ContentBlockImage]:
+    if isinstance(value, ContentBlockImage):
+        yield value
+    elif isinstance(value, ContentBlockToolResult):
+        yield from _historical_tool_images(value.content)
+    elif isinstance(value, list):
+        for item in value:
+            yield from _historical_tool_images(item)
+    elif isinstance(value, dict):
+        if value.get("type") == "image":
+            try:
+                yield ContentBlockImage.model_validate(value)
+            except ValueError:
+                pass
+        elif value.get("type") == "tool_result":
+            yield from _historical_tool_images(value.get("content"))
+
+
+_BOUNDED_TOOL_IMAGE_NOTE = (
+    "[Recorded tool image moved to the bounded image context below; "
+    "the context states how many earlier images were omitted.]"
+)
+
+
+def _move_historical_tool_images_to_context(value: Any) -> Any:
+    """Replace only request-local pixels while keeping tool-result structure."""
+    if isinstance(value, ContentBlockImage):
+        return ContentBlockText(text=_BOUNDED_TOOL_IMAGE_NOTE)
+    if isinstance(value, ContentBlockToolResult):
+        result = value.model_copy(deep=True)
+        result.content = _move_historical_tool_images_to_context(result.content)
+        return result
+    if isinstance(value, list):
+        return [_move_historical_tool_images_to_context(item) for item in value]
+    if isinstance(value, dict):
+        if value.get("type") == "image":
+            return {"type": "text", "text": _BOUNDED_TOOL_IMAGE_NOTE}
+        if value.get("type") == "tool_result":
+            copied_result = copy.deepcopy(value)
+            copied_result["content"] = _move_historical_tool_images_to_context(
+                value.get("content")
+            )
+            return copied_result
+    return copy.deepcopy(value)
+
+
+def _pending_tool_image_window_context(messages: list[Message]) -> Message | None:
+    """Carry a bounded unseen tool image tail across the ordinary turn window."""
+
+    # Keep the latest useful frames. Repeated failed turns must not accumulate
+    # unbounded image bodies in a rescued request prefix.
+    max_images = 4
+    max_data_chars = 4 * MAX_TOOL_IMAGE_BASE64_CHARS
+    selected: list[ContentBlockImage] = []
+    total_chars = 0
+    candidates = [
+        image
+        for message in messages
+        for image in _historical_tool_images(message.content)
+    ]
+    for image in reversed(candidates):
+        if len(selected) >= max_images:
+            break
+        if image.source_type != "base64":
+            continue
+        try:
+            prepared = prepare_tool_result_image(
+                base64.b64decode(image.data, validate=True), image.media_type
+            )
+        except (ValueError, binascii.Error):
+            continue
+        encoded = base64.b64encode(prepared.data).decode("ascii")
+        data_chars = len(encoded)
+        if total_chars + data_chars > max_data_chars:
+            continue
+        selected.append(image.model_copy(update={
+            "data": encoded,
+            "media_type": prepared.media_type,
+            "local_path": None,
+            "durable_retained": None,
+        }, deep=True))
+        total_chars += data_chars
+    if not candidates:
+        return None
+    omitted_count = len(candidates) - len(selected)
+    context = Message(
+        role="user",
+        content=[
+            ContentBlockText(
+                text=(
+                    "[Recorded tool image context] "
+                    f"{len(selected)} of {len(candidates)} tool images selected for "
+                    "image-capable requests; "
+                    f"{omitted_count} images omitted by recency or size limits. "
+                    "Selected images may be resized or compressed, or removed for a model "
+                    "without image support. Analyze only image blocks actually present below."
+                )
+            ),
+            *(image.model_copy(deep=True) for image in reversed(selected)),
+        ],
+    )
+    context._recorded_tool_context = True
+    context._request_only_pending_tool_image = True
+    return context
+
+
+def _bound_provider_tool_image_batch(messages: list[Message]) -> list[Message]:
+    """Bound both new and historical tool images in the physical request view."""
+    tool_messages = [message for message in messages if _has_historical_tool_image(message)]
+    images = [
+        image for message in tool_messages
+        for image in _historical_tool_images(message.content)
+    ]
+    if (
+        len(images) <= 4
+        and all(len(image.data) <= MAX_TOOL_IMAGE_BASE64_CHARS for image in images)
+        and sum(len(image.data) for image in images) <= 4 * MAX_TOOL_IMAGE_BASE64_CHARS
+    ):
+        return messages
+    bounded: list[Message] = []
+    for message in messages:
+        if _has_historical_tool_image(message):
+            detached = message.model_copy(deep=True)
+            detached.content = _move_historical_tool_images_to_context(detached.content)
+            bounded.append(detached)
+        else:
+            bounded.append(message)
+    context = _pending_tool_image_window_context(tool_messages)
+    if context is not None:
+        bounded.append(context)
+    return bounded
+
+
 def _strip_historical_image_blocks(
     messages: list[Message],
     *,
@@ -2263,17 +2450,59 @@ def _strip_historical_image_blocks(
     Current-turn uploads arrive through ``extra_messages``. Model capability
     is checked separately on each physical request, including tool-loaded images.
     """
+    # Tool images are delivered to the model immediately after the tool call.
+    # On later turns the recorded result remains useful, but replaying its
+    # pixels again can multiply the request body even when the user sends only
+    # text. Keep the canonical replay intact and omit only its provider view.
+    # A tool result can be persisted even when its following provider request
+    # fails. Keep the final unacknowledged batch available to the next vision
+    # request. New rows acknowledge only a committed reply to a native tool
+    # image request; older rows retain the prior substantive-reply heuristic.
+    pending_image_indexes: set[int] = set()
     if preserve_images:
-        # Keep the historical object graph intact for a vision-capable route.
-        # The outbound projection below still deep-copies it before a physical
-        # provider call, so callers cannot mutate the canonical transcript.
-        return messages
+        for index, message in enumerate(messages):
+            if message.role == "assistant" and (
+                message._tool_image_native_ack is True
+                or (
+                    message._tool_image_native_ack is None
+                    and not message.is_trusted_runtime_notice
+                    and (_message_has_visible_text(message) or _message_has_tool_use(message))
+                )
+            ):
+                pending_image_indexes.clear()
+            elif (
+                _has_historical_tool_image(message)
+            ):
+                pending_image_indexes.add(index)
+
+    projected_history: list[Message] = []
+    for index, message in enumerate(messages):
+        if (
+            index not in pending_image_indexes
+            and _has_historical_tool_image(message)
+        ):
+            # A stored path alone does not prove that a local tool image still
+            # exists or remains readable. Do not claim durable retention in
+            # the marker without a verified attachment reference.
+            detached = message.model_copy(deep=True)
+            _clear_unverified_tool_image_retention(detached.content)
+            projected_history.extend(project_messages(
+                [detached],
+                mode=ImageProjectionMode.MARKER,
+                marker_state=ImageMarkerState.NOT_REREAD,
+            ).messages)
+        else:
+            projected_history.append(message)
+    if preserve_images:
+        # User images and the pending tool batch remain available to vision.
+        # Historical projection is request-local; canonical replay is unchanged.
+        return projected_history
 
     # Historical images are not silently deleted.  Project them into a
     # truthful marker, recursively (including images nested in tool results),
     # while keeping the original transcript available for a later vision turn.
     return project_messages(
-        messages,
+        projected_history,
         mode=ImageProjectionMode.MARKER,
         marker_state=ImageMarkerState.NOT_REREAD,
     ).messages
@@ -5798,6 +6027,16 @@ class Agent:
             return None
         return _serialize_assistant_replay(tail)
 
+    def current_tool_image_native_ack_indexes(self) -> list[int]:
+        """Snapshot committed image acknowledgements for cancellation persistence."""
+        view: Callable[[], tuple[list[Message], int]] | None = getattr(
+            self, "_active_replay_view", None
+        )
+        if view is None:
+            return []
+        messages, start = view()
+        return _tool_image_native_ack_indexes(_assistant_replay_tail(messages, start))
+
     def _freeze_current_replay_view(self) -> None:
         """Release the live turn's history cells while keeping its accepted tail."""
         view: Callable[[], tuple[list[Message], int]] | None = getattr(
@@ -6189,7 +6428,42 @@ class Agent:
             historical_projection=historical_projection_result.__dict__,
         )
         history = limit_turns(sanitized_history, self.config.max_history_turns)
+        dropped_history_count = len(sanitized_history) - len(history)
+        pending_tool_messages = [
+            item for item in sanitized_history if _has_historical_tool_image(item)
+        ] if self.config.preserve_historical_images else []
+        pending_tool_images = [
+            image
+            for item in pending_tool_messages
+            for image in _historical_tool_images(item.content)
+        ]
+        bound_pending_batch = (
+            len(pending_tool_images) > 4
+            or any(len(image.data) > MAX_TOOL_IMAGE_BASE64_CHARS
+                   for image in pending_tool_images)
+            or sum(len(image.data) for image in pending_tool_images)
+            > 4 * MAX_TOOL_IMAGE_BASE64_CHARS
+        )
+        if bound_pending_batch:
+            bounded_history: list[Message] = []
+            for item in history:
+                if _has_historical_tool_image(item):
+                    detached = item.model_copy(deep=True)
+                    detached.content = _move_historical_tool_images_to_context(detached.content)
+                    bounded_history.append(detached)
+                else:
+                    bounded_history.append(item)
+            history = bounded_history
+        pending_window_context = _pending_tool_image_window_context(
+            pending_tool_messages if bound_pending_batch else [
+                item
+                for item in sanitized_history[:dropped_history_count]
+                if _has_historical_tool_image(item)
+            ]
+        ) if self.config.preserve_historical_images else None
         history = repair_tool_pairing(history)
+        if pending_window_context is not None:
+            history.append(pending_window_context)
         initial_provider_history = tuple(history)
         canonical_history = repair_tool_pairing(
             limit_turns(
@@ -6197,6 +6471,8 @@ class Agent:
                 self.config.max_history_turns,
             )
         )
+        if pending_window_context is not None:
+            canonical_history.append(pending_window_context)
         self._write_context_stage(
             "session:limited",
             history,
@@ -7184,8 +7460,13 @@ class Agent:
                                 )
                                 rebound_config = None
                                 if callable(prepare_continuation):
+                                    bounded_admission_messages = await asyncio.to_thread(
+                                        _bound_provider_tool_image_batch,
+                                        request_turn_messages,
+                                    )
                                     rebound_config = prepare_continuation(
-                                        request_turn_messages, chat_cfg
+                                        bounded_admission_messages,
+                                        chat_cfg,
                                     )
                                     if inspect.isawaitable(rebound_config):
                                         rebound_config = await rebound_config
@@ -7926,6 +8207,7 @@ class Agent:
 
                     usage_call: UsageCallStart | None = None
                     usage_call_terminal = False
+                    usage_call_not_sent = False
                     usage_unknown_reason = "provider_stream_ended_without_usage"
                     if usage_scope is not None and not provider_accounts_physical_usage(
                         self.provider
@@ -8242,10 +8524,10 @@ class Agent:
                                         if isinstance(row, dict)
                                     ]
                                     turn_model_usage_breakdown.extend(terminal_rows)
-                                    for item in terminal_usage.items:
+                                    for usage_item in terminal_usage.items:
                                         if (
-                                            item.cost_source == "provider_billed"
-                                            or item.billed_cost_nanos > 0
+                                            usage_item.cost_source == "provider_billed"
+                                            or usage_item.billed_cost_nanos > 0
                                         ):
                                             total_provider_billed_entries += 1
                                         else:
@@ -8253,16 +8535,16 @@ class Agent:
                                         if self._usage_tracker and self._session_key:
                                             self._usage_tracker.add(
                                                 self._session_key,
-                                                input_tokens=item.input_tokens,
-                                                output_tokens=item.output_tokens,
-                                                model_id=item.model,
-                                                cache_read_tokens=item.cache_read_tokens,
-                                                cache_write_tokens=item.cache_write_tokens,
+                                                input_tokens=usage_item.input_tokens,
+                                                output_tokens=usage_item.output_tokens,
+                                                model_id=usage_item.model,
+                                                cache_read_tokens=usage_item.cache_read_tokens,
+                                                cache_write_tokens=usage_item.cache_write_tokens,
                                                 billed_cost=(
-                                                    item.billed_cost_nanos / 1_000_000_000
+                                                    usage_item.billed_cost_nanos / 1_000_000_000
                                                 ),
-                                                provider=item.provider,
-                                                cost_source=item.cost_source,
+                                                provider=usage_item.provider,
+                                                cost_source=usage_item.cost_source,
                                             )
                                     _accumulate_turn_cost(
                                         raw_ev,
@@ -9047,6 +9329,11 @@ class Agent:
                                 pending_tool_events.clear()
                                 usage_unknown_reason = provider_error_usage_reason(raw_ev.code)
                                 known_usage_receipt = has_known_provider_usage_receipt(raw_ev)
+                                usage_call_not_sent = (
+                                    getattr(raw_ev, "_opensquilla_request_not_dispatched", False)
+                                    is True
+                                    and not known_usage_receipt
+                                )
                                 error_usage: UsageCallResult | None = None
                                 if known_usage_receipt and not cost_receipt_counted:
                                     usage_default_provider = (
@@ -9158,6 +9445,7 @@ class Agent:
                                 elif (
                                     raw_ev.tool_argument_rejection is not None
                                     and not known_usage_receipt
+                                    and not usage_call_not_sent
                                 ):
                                     # This completed, rejected generation is still
                                     # a physical request with unknown cost. Keep
@@ -9347,10 +9635,13 @@ class Agent:
                         finally:
                             stream_close_evidence.reset(close_token)
                         if usage_call is not None and not usage_call_terminal:
-                            await self._usage_call_unknown(
-                                usage_call,
-                                usage_unknown_reason,
-                            )
+                            if usage_call_not_sent and usage_scope is not None:
+                                await mark_usage_call_not_sent(usage_scope, usage_call)
+                            else:
+                                await self._usage_call_unknown(
+                                    usage_call,
+                                    usage_unknown_reason,
+                                )
                         if reasoning_only_act_now_for_call is not None and not bool(
                             getattr(
                                 self.config,
@@ -9361,7 +9652,7 @@ class Agent:
                             reasoning_only_act_now_message = None
 
                     if _got_error:
-                        if not cost_receipt_counted and (
+                        if not cost_receipt_counted and not usage_call_not_sent and (
                             provider_error is None
                             or provider_error.tool_argument_rejection is None
                         ):
@@ -12267,14 +12558,28 @@ class Agent:
                 if native_content is not None:
                     assistant_content = native_content
                 if assistant_content:
-                    turn_messages.append(
-                        Message(
-                            role="assistant",
-                            content=assistant_content,
-                            reasoning_content=iter_reasoning_content,
-                            provider_replay=iter_provider_replay,
-                        )
+                    accepted_assistant = Message(
+                        role="assistant",
+                        content=assistant_content,
+                        reasoning_content=iter_reasoning_content,
+                        provider_replay=iter_provider_replay,
                     )
+                    if any(
+                        _has_historical_tool_image(item)
+                        for item in canonical_request_messages
+                    ):
+                        native_tool_image_sent = (
+                            selector_image_provider.last_image_request_had_native_tool_images
+                            if selector_projects_images
+                            else any(
+                                _has_historical_tool_image(item)
+                                for item in request_messages
+                            )
+                        )
+                        accepted_assistant._tool_image_native_ack = bool(
+                            native_tool_image_sent
+                        )
+                    turn_messages.append(accepted_assistant)
 
                 # Detect incomplete tool calls (stream interrupted mid-generation)
                 if pending_tools and not tool_calls:
@@ -12362,7 +12667,8 @@ class Agent:
                                     1 <= len(data) <= 16 * 1024 * 1024
                                 ):
                                     raise ValueError("image is empty or exceeds the size limit")
-                                validate_image_bytes(base64.b64decode(data, validate=True), mime)
+                                payload = base64.b64decode(data, validate=True)
+                                prepared = prepare_tool_result_image(payload, mime)
                                 attachment_id = item.get("attachment_id")
                                 retained_metadata = {
                                     key: value for key in ("name", "local_path", "source_url")
@@ -12370,8 +12676,8 @@ class Agent:
                                 }
                                 images.append(
                                     ContentBlockImage(
-                                        media_type=mime,
-                                        data=data,
+                                        media_type=prepared.media_type,
+                                        data=base64.b64encode(prepared.data).decode("ascii"),
                                         attachment_id=(
                                             attachment_id
                                             if isinstance(attachment_id, str) and attachment_id
@@ -13424,6 +13730,10 @@ class Agent:
                 *turn_messages[:current_turn_start_index],
                 *project_incomplete_tool_history(turn_messages[current_turn_start_index:]),
             ]
+            self._history = [
+                item for item in self._history
+                if not item._request_only_pending_tool_image
+            ]
             self._write_context_stage("session:after", self._history)
 
         # ------ → DONE ------
@@ -13810,6 +14120,9 @@ class Agent:
                 assistant_replay=(
                     _serialize_assistant_replay(replay_messages)
                     if replay_messages else None
+                ),
+                tool_image_native_ack_indexes=(
+                    _tool_image_native_ack_indexes(replay_messages)
                 ),
                 input_tokens=done_input_tokens,
                 output_tokens=done_output_tokens,
@@ -14515,6 +14828,7 @@ class Agent:
             record=not preview,
         )
         source_messages = repair_tool_pairing(source_messages)
+        source_messages = _bound_provider_tool_image_batch(source_messages)
         request_messages, sanitize_result = sanitize_session_messages(source_messages)
         if not preview:
             self._remember_provider_visible_tool_results(request_messages)

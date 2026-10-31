@@ -4085,6 +4085,8 @@
       "credits": "Le solde du compte du service de modèle est insuffisant.",
       "modelUnavailable": "Le modèle sélectionné est indisponible.",
       "contextLimit": "Le contenu dépasse la capacité du modèle. Raccourcissez l’entrée ou choisissez un modèle avec un contexte plus grand.",
+      "requestTooLarge": "Le service du modèle a rejeté cette requête car elle est trop volumineuse. Réduisez les pièces jointes volumineuses ou démarrez une nouvelle conversation avec un bref résumé avant de réessayer.",
+      "outboundRequestTooLarge": "OpenSquilla a arrêté cette requête car le contenu à envoyer dépasse sa limite de taille. Réduisez les pièces jointes volumineuses ou démarrez une nouvelle conversation avec un bref résumé.",
       "unsupported": "Ce modèle ne prend pas en charge cette demande.",
       "imageUnsupported": "Ce modèle ne prend pas en charge les images.",
       "ensembleImageUnsupported": "Ce mode ne prend pas en charge les images.",

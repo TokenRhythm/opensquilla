@@ -239,7 +239,10 @@ def project_history_replay(
         message_provenance.pop()
 
     unique_notices = tuple(terminal_notices)
-    messages.extend(Message(role="assistant", content=notice) for notice in unique_notices)
+    for notice in unique_notices:
+        trusted = Message(role="assistant", content=notice)
+        trusted._trusted_runtime_notice = True
+        messages.append(trusted)
     message_provenance.extend(terminal_notices[notice] for notice in unique_notices)
     return HistoryReplayProjection(
         messages=tuple(messages),
@@ -408,6 +411,8 @@ def project_history_replay_capacity(
 
 
 def _is_synthetic_context_message(message: Message) -> bool:
+    if message._request_only_pending_tool_image:
+        return True
     content = message.content
     if isinstance(content, list):
         # Historical tool media is extracted beside the leading record text.
@@ -424,7 +429,9 @@ def _is_real_user_turn(message: Message) -> bool:
         return False
     content = message.content
     if isinstance(content, list):
-        return not all(isinstance(block, ContentBlockToolResult) for block in content)
+        # Tool outcomes may carry adjacent image/document blocks. They belong
+        # to the preceding assistant call, not to a new user turn.
+        return not any(isinstance(block, ContentBlockToolResult) for block in content)
     return True
 
 
@@ -633,6 +640,33 @@ class AssistantReplayError(ValueError):
     """A durable assistant replay envelope cannot be restored without data loss."""
 
 
+TOOL_IMAGE_NATIVE_ACK_CONTEXT_KEY = "tool_image_native_ack_indexes_v1"
+
+
+def restore_tool_image_ack_context(
+    messages: list[Message], turn_context: Mapping[str, Any] | None,
+) -> None:
+    """Restore accepted native-image evidence without changing provider messages.
+
+    Older transcript rows have no such field and keep their historical replay
+    behavior. A malformed new field cannot claim that an image was seen.
+    """
+    if (
+        not isinstance(turn_context, Mapping)
+        or TOOL_IMAGE_NATIVE_ACK_CONTEXT_KEY not in turn_context
+    ):
+        return
+    raw_indexes = turn_context[TOOL_IMAGE_NATIVE_ACK_CONTEXT_KEY]
+    valid_indexes = (
+        isinstance(raw_indexes, list)
+        and all(type(index) is int and 0 <= index < len(messages) for index in raw_indexes)
+    )
+    acknowledged = set(raw_indexes) if valid_indexes else set()
+    for index, message in enumerate(messages):
+        if message.role == "assistant":
+            message._tool_image_native_ack = index in acknowledged
+
+
 def decode_assistant_replay(value: Mapping[str, Any]) -> list[Message]:
     """Restore versioned accepted messages without guessing missing native state."""
 
@@ -822,9 +856,11 @@ def reconstruct_messages_from_entry(
         return []
 
     if role == "assistant" and assistant_replay is not None:
+        replayed_messages = decode_assistant_replay(assistant_replay)
+        restore_tool_image_ack_context(replayed_messages, turn_context)
         replayed_messages = project_incomplete_tool_history(
             _project_unsigned_silent_replay(
-                decode_assistant_replay(assistant_replay), turn_context, content,
+                replayed_messages, turn_context, content,
             )
         )
         artifact_context = artifact_history_context(content)

@@ -1,11 +1,13 @@
 from __future__ import annotations
 
+import asyncio
 import base64
 import io
 import json
 from copy import deepcopy
 from typing import Any
 
+import httpx
 import pytest
 from PIL import Image
 
@@ -27,7 +29,12 @@ from opensquilla.provider.request_proof import (
     provider_request_character_budget,
     provider_request_token_budget,
 )
-from opensquilla.provider.types import ChatConfig, ContentBlockToolResult, Message
+from opensquilla.provider.types import (
+    ChatConfig,
+    ContentBlockImage,
+    ContentBlockToolResult,
+    Message,
+)
 
 
 @pytest.mark.parametrize(
@@ -160,6 +167,145 @@ def test_provider_request_proof_allows_payload_within_budget() -> None:
     assert proof["system_chars"] == 0
     assert proof["top_level_chars"] == 0
     assert proof["tool_schema_too_large"] is False
+
+
+@pytest.mark.parametrize(
+    ("environment", "expected"),
+    [
+        (None, 24 * 1024 * 1024),
+        ("1024", 1024),
+        ("0", 0),
+        ("invalid", 24 * 1024 * 1024),
+        ("-1", 24 * 1024 * 1024),
+    ],
+)
+def test_wire_body_limit_defaults_and_environment_override(
+    monkeypatch: pytest.MonkeyPatch,
+    environment: str | None,
+    expected: int,
+) -> None:
+    if environment is None:
+        monkeypatch.delenv("OPENSQUILLA_PROVIDER_REQUEST_MAX_BODY_BYTES", raising=False)
+    else:
+        monkeypatch.setenv("OPENSQUILLA_PROVIDER_REQUEST_MAX_BODY_BYTES", environment)
+    assert request_proof._wire_body_max_bytes() == expected
+
+
+def test_wire_byte_limit_is_independent_of_image_token_budget(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("OPENSQUILLA_PROVIDER_REQUEST_MAX_BODY_BYTES", "600")
+    payload = {"messages": [{"role": "user", "content": [{
+        "type": "image_url",
+        "image_url": {"url": "data:image/png;base64," + "a" * 700},
+    }]}]}
+    proof = project_provider_payload(
+        payload,
+        projection_adapter="openai",
+        proof_budget=20_000,
+        token_budget=10_000,
+    )
+    request = httpx.Request("POST", "https://example.test/chat", json=payload)
+    assert proof["wire_json_bytes"] == len(request.content)
+    assert proof["fits_char_budget"] is True
+    assert proof["fits_token_budget"] is True
+    assert proof["fits_wire_byte_budget"] is False
+    assert proof["wire_byte_budget_exhausted"] is True
+    assert proof["wire_body_max_bytes"] == 600
+    assert proof["wire_body_excess_bytes"] == len(request.content) - 600
+    assert proof["fits"] is False
+    assert proof["fallback_reason"] == "provider_request_budget_exhausted"
+
+
+def test_wire_byte_limit_is_inclusive_and_can_be_disabled(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    payload = {"messages": [{"role": "user", "content": "中文 input"}]}
+    body_bytes = len(httpx.Request("POST", "https://example.test/chat", json=payload).content)
+    monkeypatch.setenv("OPENSQUILLA_PROVIDER_REQUEST_MAX_BODY_BYTES", str(body_bytes))
+    assert prove_provider_payload(
+        payload, projection_adapter="openai", proof_budget=10_000,
+    )["fits"] is True
+    monkeypatch.setenv("OPENSQUILLA_PROVIDER_REQUEST_MAX_BODY_BYTES", str(body_bytes - 1))
+    with pytest.raises(ProviderRequestBudgetExceeded) as exc_info:
+        prove_provider_payload(payload, projection_adapter="openai", proof_budget=10_000)
+    assert exc_info.value.proof["wire_json_bytes"] == body_bytes
+    monkeypatch.setenv("OPENSQUILLA_PROVIDER_REQUEST_MAX_BODY_BYTES", "0")
+    assert prove_provider_payload(
+        payload, projection_adapter="openai", proof_budget=10_000,
+    )["fits"] is True
+
+
+def test_disabled_character_and_token_proof_still_blocks_oversized_media(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("OPENSQUILLA_PROVIDER_REQUEST_MAX_BODY_BYTES", "900")
+    payload = {"messages": [{"role": "user", "content": [
+        {"type": "image_url", "image_url": {"url": "data:image/png;base64," + "a" * 500}},
+        {"type": "image_url", "image_url": {"url": "data:image/png;base64," + "a" * 500}},
+    ]}]}
+    before = deepcopy(payload)
+    with pytest.raises(ProviderRequestBudgetExceeded) as exc_info:
+        prove_or_compact_provider_payload(
+            payload, projection_adapter="openai", proof_budget=0,
+        )
+    assert exc_info.value.proof["fits_char_budget"] is True
+    assert exc_info.value.proof["fits_token_budget"] is True
+    assert exc_info.value.proof["retry_count"] == 0
+    assert exc_info.value.proof["wire_byte_budget_exhausted"] is True
+    assert payload == before
+    with pytest.raises(ProviderRequestBudgetExceeded):
+        request_proof.prove_provider_payload_from_env(
+            payload, projection_adapter="openai",
+        )
+
+
+def test_wire_byte_limit_allows_request_compaction_of_text(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("OPENSQUILLA_PROVIDER_REQUEST_MAX_BODY_BYTES", "2000")
+    payload = {"messages": [
+        {"role": "user", "content": "synthetic request"},
+        {"role": "tool", "content": "x" * 5000},
+    ]}
+    compacted, proof = prove_or_compact_provider_payload(
+        payload, projection_adapter="openai", proof_budget=30_000,
+    )
+    assert proof is not None
+    assert proof["fits"] is True
+    assert proof["retry_count"] == 1
+    assert len(httpx.Request("POST", "https://example.test/chat", json=compacted).content) <= 2000
+    assert payload["messages"][1]["content"] == "x" * 5000
+
+
+def test_provider_does_not_send_request_exceeding_wire_byte_limit(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("OPENSQUILLA_PROVIDER_REQUEST_MAX_BODY_BYTES", "800")
+
+    def unexpected_stream(*args: Any, **kwargs: Any) -> None:
+        del args, kwargs
+        raise AssertionError("Oversized request reached HTTP transport")
+
+    monkeypatch.setattr(httpx.AsyncClient, "stream", unexpected_stream)
+    provider = OpenAIProvider(
+        api_key="synthetic", model="synthetic-model", base_url="https://example.test",
+    )
+    messages = [Message(role="user", content=[
+        ContentBlockImage(media_type="image/png", data="a" * 1_000),
+    ])]
+
+    async def collect_events() -> list[Any]:
+        return [
+            event async for event in provider.chat(
+                messages, config=ChatConfig(provider_request_max_chars=20_000),
+            )
+        ]
+
+    events = asyncio.run(collect_events())
+    assert len(events) == 1
+    assert events[0].code == "provider_request_budget_exhausted"
+    assert json.loads(events[0].message)["wire_byte_budget_exhausted"] is True
 
 
 def test_character_cap_does_not_restrict_independent_token_capacity(

@@ -14,6 +14,19 @@ describe('provider terminal metadata', () => {
     expect(normalizeTurnOutcome({ ...base, [key]: fields })).toEqual(normalizeTurnOutcome({ ...base, ...fields }))
   })
 
+  it('keeps remote and local request-size causes distinct in persisted outcomes', () => {
+    const remote = normalizeTurnOutcome({ turn_id: 'remote', failure_kind: 'payload_too_large' })
+    const local = normalizeTurnOutcome({ turn_id: 'local', failure_kind: 'wire_payload_too_large' })
+    expect(remote?.failureKind).toBe('payload_too_large')
+    expect(local?.failureKind).toBe('wire_payload_too_large')
+    expect(chatErrorPresentation({ failureKind: remote?.failureKind })).toEqual({
+      messageKey: 'chat.errorMessage.requestTooLarge',
+    })
+    expect(chatErrorPresentation({ failureKind: local?.failureKind })).toEqual({
+      messageKey: 'chat.errorMessage.outboundRequestTooLarge',
+    })
+  })
+
   it.each(['ABCDEF01', 'abcdef0', 'abcdef012', 'abcdef01 ', 123, null, ''])('rejects invalid id %s', errorId => {
     const outcome = normalizeTurnOutcome({ turn_id: 't', error_id: errorId })
     expect(outcome?.errorId).toBeNull()
@@ -38,7 +51,7 @@ describe('provider terminal metadata', () => {
   it.each(['en', 'zh-Hans', 'de', 'es', 'fr', 'ja'] as const)('localizes allowlisted causes in %s', async locale => {
     await loadLocaleMessages(locale)
     i18n.global.locale.value = locale
-    for (const kind of ['rate_limited', 'provider_overloaded', 'auth_invalid', 'context_overflow',
+    for (const kind of ['rate_limited', 'provider_overloaded', 'auth_invalid', 'context_overflow', 'payload_too_large', 'wire_payload_too_large',
       'unsupported_feature', 'insufficient_credits', 'model_not_found', 'transport_transient',
       'policy_refusal', 'empty_response', 'malformed_response', 'bad_request'] as const) {
       const message = localizedChatErrorMessage('429', 'safe fallback', false, kind)
@@ -97,6 +110,8 @@ describe('provider terminal metadata', () => {
     for (const [code, key] of [
       ['timeout', 'timeout'], ['llm_timeout', 'timeout'],
       ['provider_output_truncated', 'responseIncomplete'], ['provider_request_too_large', 'contextLimit'],
+      ['provider_payload_too_large', 'requestTooLarge'],
+      ['provider_wire_payload_too_large', 'outboundRequestTooLarge'],
     ]) {
       expect(localizedChatErrorMessage(code, 'specific guidance', false, 'rate_limited'))
         .toBe(i18n.global.t(`chat.errorMessage.${key}`))

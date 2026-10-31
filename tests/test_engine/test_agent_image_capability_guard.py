@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import base64
 import io
+import json
 from collections.abc import AsyncIterator
 from pathlib import Path
 from types import SimpleNamespace
@@ -1018,6 +1019,74 @@ async def test_loaded_tool_images_keep_all_formats_and_check_next_model(mode: st
         assert agent.config.model_id == "vision-model"
         assert agent.config.context_window_tokens == 32_000
         assert request_config.provider_request_max_chars == 120_000
+
+
+@pytest.mark.asyncio
+async def test_large_tool_image_is_prepared_before_provider_call_and_replay(
+    tmp_path: Path,
+) -> None:
+    from opensquilla.attachment_workspace import AttachmentWorkspaceMaterializer
+
+    provider = _ToolImageContinuationProvider()
+    context = ToolContext()
+    output = io.BytesIO()
+    Image.new("RGB", (1200, 1200), "#2468ac").save(
+        output, format="PNG", compress_level=0,
+    )
+    original = output.getvalue()
+    assert len(base64.b64encode(original)) > 1_500_000
+    materializer = AttachmentWorkspaceMaterializer(
+        media_root=tmp_path / "media", workspace_dir=tmp_path / "workspace",
+    )
+    retained = materializer.materialize_bytes(
+        original, name="frame.png", mime="image/png", session_id="test-session",
+    )
+    assert retained.rel_path is not None
+
+    async def load_image(call: ToolCall) -> ToolResult:
+        context.tool_result_media[call.tool_use_id] = [{
+            "mime": "image/png", "data": base64.b64encode(original).decode("ascii"),
+            "name": "frame.png", "local_path": retained.rel_path,
+        }]
+        return ToolResult(
+            tool_use_id=call.tool_use_id, tool_name=call.tool_name,
+            content=json.dumps({
+                "status": "loaded", "path": "frame.png", "name": "frame.png",
+                "local_path": retained.rel_path,
+            }),
+        )
+
+    agent = Agent(
+        provider=provider,
+        config=AgentConfig(max_iterations=2, model_vision_support="supported"),
+        tool_context=context, tool_handler=load_image,
+        tool_definitions=[ToolDefinition(
+            name="observe", description="Load the frame.",
+            input_schema=ToolInputSchema(properties={}),
+        )],
+    )
+    events = [event async for event in agent.run_turn("Inspect the frame.")]
+
+    assert any(isinstance(event, DoneEvent) for event in events)
+    assert len(provider.calls) == 2
+    provider_image = _tool_images(provider.calls[1]["messages"])[0]
+    replay_image = _tool_images(decode_assistant_replay(
+        next(event.assistant_replay for event in events if isinstance(event, DoneEvent))
+    ))[0]
+    assert provider_image.data == replay_image.data
+    assert provider_image.media_type == replay_image.media_type
+    assert len(provider_image.data) <= 1536 * 1024
+    assert base64.b64decode(provider_image.data, validate=True) != original
+    assert replay_image.local_path == retained.rel_path
+    assert replay_image.name == "frame.png"
+    assert (tmp_path / "workspace" / retained.rel_path).read_bytes() == original
+    assert any(
+        isinstance(block, ContentBlockToolResult)
+        and json.loads(block.content).get("local_path") == retained.rel_path
+        for message in provider.calls[1]["messages"]
+        if isinstance(message.content, list)
+        for block in message.content
+    )
 
 
 @pytest.mark.asyncio

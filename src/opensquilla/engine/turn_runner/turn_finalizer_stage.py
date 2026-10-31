@@ -34,6 +34,7 @@ No ``TurnHook.after_turn`` fan-out today.
 
 from __future__ import annotations
 
+from contextlib import AbstractContextManager, nullcontext
 from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING, Any, Literal, Protocol, runtime_checkable
 
@@ -799,10 +800,26 @@ class TurnFinalizerStage:
                 append_kwargs["expected_session_id"] = inp.expected_session_id
             if inp.expected_session_epoch is not None:
                 append_kwargs["expected_session_epoch"] = inp.expected_session_epoch
-            append_result = await self._transcript_append.append_message(
-                inp.session_key,
-                **append_kwargs,
-            )
+            append_scope: AbstractContextManager[None] = nullcontext()
+            ack_indexes = getattr(done_event, "tool_image_native_ack_indexes", None)
+            if assistant_replay is not None and isinstance(ack_indexes, list):
+                from opensquilla.engine.history import TOOL_IMAGE_NATIVE_ACK_CONTEXT_KEY
+                from opensquilla.session.turn_context import (
+                    current_turn_context,
+                    turn_context_scope,
+                )
+
+                durable_context = current_turn_context() or {}
+                durable_context[TOOL_IMAGE_NATIVE_ACK_CONTEXT_KEY] = [
+                    index for index in ack_indexes
+                    if type(index) is int and 0 <= index < len(assistant_replay.get("messages", []))
+                ]
+                append_scope = turn_context_scope(durable_context)
+            with append_scope:
+                append_result = await self._transcript_append.append_message(
+                    inp.session_key,
+                    **append_kwargs,
+                )
             if isinstance(append_result, TranscriptAppendResult):
                 transcript_appended = append_result.appended
                 if assistant_message_id is None:

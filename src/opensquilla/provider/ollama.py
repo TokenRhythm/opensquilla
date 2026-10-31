@@ -33,6 +33,7 @@ from .protocol import ProviderModelListingResponseError
 from .recovery_origin import transport_recovery_origin
 from .request_proof import (
     ProviderRequestBudgetExceededError,
+    local_budget_rejection_event,
     project_final_request_payload,
     protected_tool_result_indexes,
     prove_provider_payload_from_env,
@@ -326,10 +327,7 @@ class OllamaProvider:
         if budget_decision.action == "budget_limited":
             proof = budget_decision.proof or {}
             log.warning("provider.request_budget_exhausted", **proof)
-            yield ErrorEvent(
-                message=json.dumps(proof, ensure_ascii=False, sort_keys=True),
-                code="provider_request_budget_exhausted",
-            )
+            yield local_budget_rejection_event(proof)
             return
         if budget_decision.action == "invalid_request":
             log.warning("provider.request_serialization_failed")
@@ -351,10 +349,7 @@ class OllamaProvider:
             )
         except ProviderRequestBudgetExceededError as exc:
             log.warning("provider.request_budget_exhausted", **exc.proof)
-            yield ErrorEvent(
-                message=json.dumps(exc.proof, ensure_ascii=False, sort_keys=True),
-                code="provider_request_budget_exhausted",
-            )
+            yield local_budget_rejection_event(exc.proof)
             return
 
         endpoint = f"{self._base_url}/api/chat"

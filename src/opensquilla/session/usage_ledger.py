@@ -14,6 +14,8 @@ from typing import Any, Literal
 
 USD_NANO_SCALE = 1_000_000_000
 _MAX_SQLITE_INTEGER = (1 << 63) - 1
+LOCAL_PRE_DISPATCH_ORIGIN = "local_pre_dispatch"
+LOCAL_WIRE_BODY_REJECTION_REASON = "wire_body_budget_not_sent"
 
 UsageEventStatus = Literal["started", "finalized", "unknown"]
 UsageBackfillStatus = Literal["pending", "running", "complete", "partial", "failed"]

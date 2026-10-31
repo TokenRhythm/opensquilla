@@ -42,6 +42,25 @@ _CONTEXT_OVERFLOW_CASES: list[Case] = [
     ("openai", 401, "", "context length exceeded", K.CONTEXT_OVERFLOW),
     # Context overflow outranks policy refusal within the pre-pass.
     ("openai", None, "", "context window hit; flagged by moderation", K.CONTEXT_OVERFLOW),
+    ("openai", 413, "context_length_exceeded", "", K.CONTEXT_OVERFLOW),
+]
+
+# A verified transport status or structured payload code proves request-size
+# rejection. Response prose alone cannot establish an HTTP status.
+_PAYLOAD_TOO_LARGE_CASES: list[Case] = [
+    ("openai", 413, "", "", K.PAYLOAD_TOO_LARGE),
+    ("openai", None, "413", "", K.PAYLOAD_TOO_LARGE),
+    ("anthropic", 413, "", "input exceeds the gateway body limit", K.PAYLOAD_TOO_LARGE),
+    ("ollama", 413, "", "", K.PAYLOAD_TOO_LARGE),
+    (_UNREGISTERED, 413, "rate_limit_exceeded", "", K.PAYLOAD_TOO_LARGE),
+    ("openrouter", None, "payload_too_large", "", K.PAYLOAD_TOO_LARGE),
+    ("openai", None, "request_entity_too_large", "", K.PAYLOAD_TOO_LARGE),
+    (
+        "openai", None, "provider_request_budget_exhausted",
+        '{"wire_byte_budget_exhausted":true,"fits_wire_byte_budget":false,'
+        '"wire_json_bytes":900,"wire_body_max_bytes":800}',
+        K.WIRE_PAYLOAD_TOO_LARGE,
+    ),
 ]
 
 # --- shared pre-pass: policy refusal ---
@@ -295,12 +314,15 @@ _UNKNOWN_CASES: list[Case] = [
     (_UNREGISTERED, None, "", "the provider sent 520 tokens", K.UNKNOWN),
     # A bare "429 Too Many Requests" body without a status code has no trigger.
     (_UNREGISTERED, None, "", "429 Too Many Requests", K.UNKNOWN),
+    (_UNREGISTERED, None, "", "HTTP 413 Request Entity Too Large", K.UNKNOWN),
+    ("openai", None, "provider_wire_payload_too_large", "", K.UNKNOWN),
     # Near-miss on the exact-match empty-response shapes.
     (_UNREGISTERED, None, "", "the empty response body was discarded", K.UNKNOWN),
 ]
 
 CORPUS: list[Case] = (
     _CONTEXT_OVERFLOW_CASES
+    + _PAYLOAD_TOO_LARGE_CASES
     + _POLICY_REFUSAL_CASES
     + _EMPTY_RESPONSE_CASES
     + _OPENAI_COMPAT_CASES

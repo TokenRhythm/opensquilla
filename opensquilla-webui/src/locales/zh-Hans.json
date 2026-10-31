@@ -4187,6 +4187,8 @@
       "credits": "模型服务账户余额不足",
       "modelUnavailable": "当前模型不可用",
       "contextLimit": "内容超出当前模型容量，请缩短输入或选择更大上下文的模型",
+      "requestTooLarge": "模型服务拒绝了过大的请求。请减少大附件，或在新对话中提供简短摘要后再试。",
+      "outboundRequestTooLarge": "OpenSquilla 已拦截超出发送大小限制的请求。请减少大附件，或在新对话中提供简短摘要后再试。",
       "unsupported": "当前模型不支持此请求",
       "imageUnsupported": "当前模型不支持图片",
       "ensembleImageUnsupported": "当前模式不支持图片",

@@ -395,6 +395,7 @@ jobs:
             ${{ runner.temp }}/nsis-packaged-proof/first-interaction/first-send.log
             ${{ runner.temp }}/security-first-send-trace.zip
             ${{ runner.temp }}/security-first-send/logs/desktop.log*
+            ${{ runner.temp }}/security-first-send/logs/gateway.log*
             ${{ runner.temp }}/security-first-send/first-send-main-console.jsonl
             candidate/audit-candidate.json
           if-no-files-found: warn

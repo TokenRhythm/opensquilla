@@ -14,6 +14,8 @@ describe('Chat user error presentation', () => {
     ['provider_overloaded', 'busy'],
     ['auth_invalid', 'credentials', 'open-provider-settings'],
     ['context_overflow', 'contextLimit', 'choose-model'],
+    ['payload_too_large', 'requestTooLarge'],
+    ['wire_payload_too_large', 'outboundRequestTooLarge'],
     ['unsupported_feature', 'unsupported', 'choose-model'],
     ['insufficient_credits', 'credits', 'open-provider-settings'],
     ['model_not_found', 'modelUnavailable', 'choose-model'],
@@ -35,6 +37,8 @@ describe('Chat user error presentation', () => {
   it.each([
     ['no_provider', 'noProvider', 'open-model-settings'],
     ['provider_request_too_large', 'contextLimit', 'choose-model'],
+    ['provider_payload_too_large', 'requestTooLarge', undefined],
+    ['provider_wire_payload_too_large', 'outboundRequestTooLarge', undefined],
     ['provider_request_budget_exhausted', 'contextLimit', 'choose-model'],
     ['current_turn_context_exhausted', 'contextLimit', 'choose-model'],
     ['attachment_capacity_too_large', 'contextLimit', 'choose-model'],
@@ -129,7 +133,7 @@ describe('Chat user error presentation', () => {
     expect(chatErrorPresentation({ terminalStatus: 'timeout', code: 'provider_retry_after_deadline' })).toEqual({ messageKey: 'chat.errorMessage.timeout' })
     expect(chatErrorPresentation({ failureKind: 'insufficient_credits' })).toEqual({ messageKey: 'chat.errorMessage.credits', action: 'open-provider-settings' })
     expect(chatErrorPresentation({ failureKind: 'usage_limit' })).toEqual({ messageKey: 'chat.errorMessage.usageLimit' })
-    for (const code of ['400', '401', '403', '404', '429', '503']) expect(chatErrorPresentation({ code })).toEqual({ messageKey: 'chat.errorMessage.unknown' })
+    for (const code of ['400', '401', '403', '404', '413', '429', '503']) expect(chatErrorPresentation({ code })).toEqual({ messageKey: 'chat.errorMessage.unknown' })
   })
 
   it('never uses a general retry hint to offer whole-turn replay', () => {

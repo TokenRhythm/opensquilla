@@ -271,6 +271,25 @@ OpenSquilla also carries provider registry entries for additional
 OpenAI-compatible or self-hosted backends. Use `opensquilla providers list` on
 your install to see the current catalog.
 
+Outgoing model requests have a separate JSON body limit of 24 MiB
+(25,165,824 bytes) by default. Set
+`OPENSQUILLA_PROVIDER_REQUEST_MAX_BODY_BYTES` in the Gateway environment to
+change the limit, or set it to `0` to disable this guard, then restart the
+Gateway. This counts the UTF-8 bytes actually sent to the provider, including
+base64 image data. The model's token budget measures a different limit: an
+image can fit its estimated token allowance while making the HTTP body too
+large. When the byte limit is exceeded, OpenSquilla attempts safe request-text
+compaction and otherwise reports a budget error before sending the request.
+An upstream service may enforce a lower body limit.
+
+Tool-produced images are prepared before model delivery, with each image
+limited to 2048 pixels on its longest edge and 1.5 MiB of base64 data. If an
+tool-image batch is larger than four images or 6 MiB, the model request
+includes at most four recent usable images and explicitly states how many were
+omitted. This applies to the first request after a tool returns images and to
+later history replay. The request-only reduction leaves the stored session
+unchanged; omitted images must be loaded again when their details are needed.
+
 Read: [`providers-and-models.md`](providers-and-models.md)
 
 ## Video Generation
