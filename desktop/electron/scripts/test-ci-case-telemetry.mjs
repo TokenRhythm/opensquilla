@@ -28,6 +28,11 @@ import { terminateWindowsProcessTree } from '../dist/windows-process-tree.js'
 import { captureFirstSendDiagnostic } from './packaged-first-send-cleanup.mjs'
 
 import { readLinuxProcessStat } from './e2e-posix-process-group.mjs'
+import {
+  cleanupGatewaySnapshot,
+  gatewayLifecycleLogSnapshot,
+  loopbackListenerSnapshot,
+} from './cleanup-shutdown-diagnostics.mjs'
 
 const scriptDir = dirname(fileURLToPath(import.meta.url))
 const helperPath = join(scriptDir, 'ci-case-telemetry.mjs')
@@ -231,6 +236,77 @@ try {
     probePid: () => {},
     readStartIdentity: () => 'windows-creation-filetime:new',
   }).alive, true, 'an opaque recorded identity cannot prove PID reuse')
+
+  for (const [event, code, status] of [
+    ['connect', null, 'listening'], ['error', 'ECONNREFUSED', 'closed'],
+    ['error', 'EPERM', 'unknown'], ['error', 'EACCES', 'unknown'],
+    ['error', 'ETIMEDOUT', 'unknown'], ['error', 'ECONNRESET', 'unknown'],
+    ['error', 'synthetic-sensitive-error', 'unknown'],
+  ]) {
+    const socket = new EventEmitter()
+    let destroyed = false
+    socket.destroy = () => { destroyed = true }
+    const snapshot = await loopbackListenerSnapshot(12345, {
+      connect: options => {
+        assert.deepEqual(options, { host: '127.0.0.1', port: 12345 })
+        queueMicrotask(() => socket.emit(event, { code }))
+        return socket
+      },
+    })
+    assert.equal(snapshot.status, status)
+    assert.equal(snapshot.errorCode, code === 'synthetic-sensitive-error' ? 'other' : code)
+    assert.equal(destroyed, true, 'diagnostic sockets must never remain open')
+  }
+  const unresponsiveSocket = new EventEmitter()
+  let timedOutSocketDestroyed = false
+  unresponsiveSocket.destroy = () => { timedOutSocketDestroyed = true }
+  assert.deepEqual(await loopbackListenerSnapshot(12345, {
+    connect: () => unresponsiveSocket, timeoutMs: 1,
+  }), { port: 12345, status: 'unknown', errorCode: 'timeout' })
+  assert.equal(timedOutSocketDestroyed, true)
+
+  const diagnosticOwner = {
+    schema_version: 1, protocol: 'opensquilla-desktop-gateway-ownership-v1',
+    pid: 1472, start_identity: 'windows-creation-filetime:123', port: 12345,
+    profile_fingerprint: '0'.repeat(64), instance_nonce: 'synthetic-nonce-never-log', version: '0.0.0',
+  }
+  for (const [loaded, relationship] of [
+    [{ status: 'missing' }, 'missing'], [{ status: 'invalid' }, 'invalid'],
+    [{ status: 'valid', record: { ...diagnosticOwner } }, 'same-instance'],
+    ...['pid', 'port', 'start_identity', 'profile_fingerprint', 'instance_nonce', 'version'].map(field => [
+      { status: 'valid', record: { ...diagnosticOwner, [field]: 'replacement' } }, 'replaced',
+    ]),
+  ]) {
+    const snapshot = await cleanupGatewaySnapshot(diagnosticOwner, loaded, {
+      processSnapshot: record => {
+        assert.equal(record.pid, 1472, 'inspect the Python owner rather than its launcher')
+        return { pid: record.pid, alive: true }
+      },
+      listenerSnapshot: async port => ({ port, status: 'unknown', errorCode: 'timeout' }),
+    })
+    assert.equal(snapshot.ownership, relationship)
+    assert.equal(snapshot.process.alive, true, 'diagnostics must preserve live/unknown process evidence')
+    assert.equal(JSON.stringify(snapshot).includes(diagnosticOwner.instance_nonce), false)
+    assert.equal(JSON.stringify(snapshot).includes(diagnosticOwner.profile_fingerprint), false)
+  }
+  const sanitizedLifecycle = gatewayLifecycleLogSnapshot([
+    JSON.stringify({ event: 'gateway.shutdown_requested', reason: 'desktop_quit', token: 'synthetic-sensitive-value' }),
+    '\u001b[32m[warning]\u001b[0m gateway.shutdown_phase_timeout phase=runtime token=synthetic-sensitive-value',
+    JSON.stringify({ event: 'gateway.run_finished', outcome: 'shutdown_requested', pid: 1472, duration_ms: 12.5, error: 'synthetic-sensitive-value' }),
+    JSON.stringify({ event: 'gateway.squilla_router_preloaded', bundle_dir: 'synthetic-sensitive-value' }),
+    JSON.stringify({ event: 'gateway.shutdown_phase_timeout', phase: 'synthetic-sensitive-value', elapsed_ms: 'synthetic-sensitive-value' }),
+    JSON.stringify({ event: 'unrelated-event', token: 'synthetic-sensitive-value' }),
+  ].join('\n'))
+  assert.deepEqual(sanitizedLifecycle.records, [
+    { event: 'gateway.shutdown_requested', reason: 'desktop_quit' },
+    { event: 'gateway.shutdown_phase_timeout', phase: 'runtime' },
+    { event: 'gateway.run_finished', outcome: 'shutdown_requested', duration_ms: 12.5, pid: 1472 },
+    { event: 'gateway.squilla_router_preloaded' },
+    { event: 'gateway.shutdown_phase_timeout' },
+  ])
+  assert.equal(JSON.stringify(sanitizedLifecycle).includes('synthetic-sensitive-value'), false)
+  assert.equal(gatewayLifecycleLogSnapshot('gateway.stopped reason=desktop_quit\n'.repeat(40)).records.length, 32)
+  assert.deepEqual(gatewayLifecycleLogSnapshot(null), { logReadFailed: true, records: [] })
   const telemetry = startCaseTelemetry({
     caseName: 'direct-case',
     os: 'TestOS',

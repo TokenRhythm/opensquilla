@@ -15,6 +15,7 @@ import { setTimeout as delay } from 'node:timers/promises'
 import { fileURLToPath } from 'node:url'
 import { _electron as electron } from 'playwright'
 import { closeElectronWithDeadline, withDeadline } from './e2e-shutdown-helpers.mjs'
+import { cleanupGatewaySnapshot, gatewayLifecycleLogSnapshot } from './cleanup-shutdown-diagnostics.mjs'
 import {
   desktopGatewayAuthToken,
   desktopProfileFingerprint,
@@ -116,30 +117,47 @@ const deleteAllHelperTimeoutMs = process.platform === 'win32' ? 90_000 : 30_000
 let desktopApp
 let flowSucceeded = false
 let phase = 'automatic-cleanup-abandon'
+let phase1Gateway = null
+let shutdownLogCheckpoint = null
+const phase1OwnershipDir = join(userData, 'gateway-ownership', desktopProfileFingerprint(primaryHome))
 
 async function shutdownDiagnostics() {
-  const log = await readFile(join(userData, 'logs', 'desktop.log'), 'utf8').catch(() => null)
-  if (log === null) return { phase, logReadFailed: true }
+  const [log, gatewayLog] = await Promise.all([
+    readFile(join(userData, 'logs', 'desktop.log'), 'utf8').catch(() => null),
+    readFile(join(userData, 'logs', 'gateway.log'), 'utf8').catch(() => null),
+  ])
+  const gateway = phase === 'automatic-cleanup-abandon' && phase1Gateway
+    ? await cleanupGatewaySnapshot(phase1Gateway, loadDesktopGatewayOwnershipRecord(phase1OwnershipDir))
+      .catch(() => ({ snapshotFailed: true })) : null
   const events = new Set([
     'gateway_spawned', 'gateway_ready', 'gateway_exited', 'quit_gateway_activity_checked',
     'quit_confirmation_required', 'quit_confirmation_failed', 'quit_cancelled_by_user',
     'quit_confirmed', 'quit_deferred_for_profile_writer', 'quit_deferred_for_update_drain',
     'before_quit', 'desktop_exit_phase', 'quit_gateway_shutdown_requested',
     'quit_gateway_exit', 'quit_gateway_drain_failed', 'quit_gateway_still_running',
+    'quit_gateway_termination', 'gateway_process_tree_termination_failed',
+    'quit_cleanup_finished', 'quit_gateway_process_cleanup',
+    'gateway_process_exit_observed', 'gateway_process_termination_requested',
   ])
   const fields = new Set([
     'event', 'at', 'pid', 'port', 'kind', 'activity', 'activeCount', 'ownershipMatched',
     'retainedScope', 'exited', 'gatewayStatus', 'from', 'to', 'activeWriters',
     'gatewayDrainInFlight', 'accepted', 'alreadyStopping', 'hardTerminated',
+    'treeStopped', 'rootExited', 'cleanupConfirmed', 'complete', 'elapsedMs',
+    'timedOut', 'exitCode', 'code', 'signal', 'requested_signal', 'stop_reason',
   ])
   const records = []
-  for (const line of log.split(/\r?\n/)) {
+  const checkpointMatched = shutdownLogCheckpoint !== null && log?.startsWith(shutdownLogCheckpoint) === true
+  const currentLog = checkpointMatched ? log.slice(shutdownLogCheckpoint.length) : log ?? ''
+  for (const line of currentLog.split(/\r?\n/)) {
     let record
     try { record = JSON.parse(line) } catch { continue }
     if (!events.has(record?.event)) continue
     records.push(Object.fromEntries(Object.entries(record).filter(([key]) => fields.has(key))))
   }
-  return { phase, logBytes: Buffer.byteLength(log, 'utf8'), records: records.slice(-32) }
+  return { phase, logReadFailed: log === null, checkpointMatched,
+    logBytes: Buffer.byteLength(log ?? '', 'utf8'), records: records.slice(-32),
+    gateway, gatewayLifecycle: gatewayLifecycleLogSnapshot(gatewayLog) }
 }
 
 async function observeDeleteAllHelper(app) {
@@ -289,8 +307,7 @@ try {
   // Journal abandonment precedes Gateway ownership verification. Closing in
   // that startup gap legitimately asks about unknown activity. This keyless
   // fixture exercises idle shutdown only after its own launch is verified.
-  const phase1OwnershipDir = join(userData, 'gateway-ownership', desktopProfileFingerprint(primaryHome))
-  const phase1Gateway = await waitFor(async () => {
+  phase1Gateway = await waitFor(async () => {
     for (const page of desktopApp.windows()) {
       if (page.isClosed()) continue
       const connection = await page.evaluate(() => window.opensquillaDesktop?.getGatewayConnection?.())
@@ -307,6 +324,7 @@ try {
   }, 'the isolated cleanup Gateway to be ready, owned and idle before shutdown')
   console.log(JSON.stringify({ event: 'desktop_cleanup_idle_verified',
     pid: phase1Gateway.pid, port: phase1Gateway.port, activeCount: 0 }))
+  shutdownLogCheckpoint = await readFile(join(userData, 'logs', 'desktop.log'), 'utf8').catch(() => null)
   const phase1Shutdown = await closeElectronWithDeadline({
     app: desktopApp,
     phase: 'cleanup-abandon-shutdown',
@@ -323,6 +341,7 @@ try {
   // (config authored by a newer build), then run the trusted
   // delete-current-profile flow from that page.
   phase = 'delete-current-profile'
+  shutdownLogCheckpoint = null
   await writeFile(
     join(primaryHome, 'config.toml'),
     `workspace_dir = ${JSON.stringify(join(root, 'missing-workspace'))}\nconfig_version = 999\n`,
