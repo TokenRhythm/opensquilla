@@ -221,7 +221,7 @@ def test_unset_tier_profile_seeds_tokenrhythm_curated_inline_tiers() -> None:
     assert cfg.squilla_router.tiers["image_model"]["model"] == "kimi-k2.6"
 
 
-def test_tokenrhythm_follow_primary_binding_refreshes_managed_inline_tiers() -> None:
+def test_tokenrhythm_follow_primary_binding_preserves_saved_inline_tiers() -> None:
     gateway_config_cls = _gateway_config_cls()
     legacy_tiers = {
         "c0": {"provider": "tokenrhythm", "model": "deepseek-v4-flash"},
@@ -239,27 +239,29 @@ def test_tokenrhythm_follow_primary_binding_refreshes_managed_inline_tiers() -> 
         },
     )
 
-    for tier, model in TOKENRHYTHM_EXPECTED_TIER_MODELS.items():
-        assert cfg.squilla_router.tiers[tier]["model"] == model
-        assert "thinking_level" not in cfg.squilla_router.tiers[tier]
-    assert cfg.squilla_router.tiers["c3"]["ensemble_enabled"] is False
-    assert "ensemble_selection_mode" not in cfg.squilla_router.tiers["c3"]
+    assert cfg.squilla_router.enabled is True
+    assert cfg.squilla_router.preset_binding == "follow_primary"
+    assert cfg.squilla_router.recommendation_revision is None
+    for tier, saved_tier in legacy_tiers.items():
+        assert cfg.squilla_router.tiers[tier] == saved_tier
 
 
-def test_tokenrhythm_direct_legacy_openrouter_router_defaults_are_migrated() -> None:
+def test_tokenrhythm_preserves_saved_openrouter_router_defaults() -> None:
     from opensquilla.gateway.config import _router_tier_profile_defaults
 
     gateway_config_cls = _gateway_config_cls()
 
+    saved_tiers = _router_tier_profile_defaults("openrouter")
     cfg = gateway_config_cls(
         llm={"provider": "tokenrhythm", "model": "deepseek-v4-pro"},
-        squilla_router={"enabled": True, "tiers": _router_tier_profile_defaults("openrouter")},
+        squilla_router={"enabled": True, "tiers": saved_tiers},
     )
 
+    assert cfg.llm.provider == "tokenrhythm"
+    assert cfg.squilla_router.enabled is True
     assert cfg.squilla_router.tier_profile is None
-    for tier, model in TOKENRHYTHM_EXPECTED_TIER_MODELS.items():
-        assert cfg.squilla_router.tiers[tier]["provider"] == "tokenrhythm"
-        assert cfg.squilla_router.tiers[tier]["model"] == model
+    assert cfg.squilla_router.recommendation_revision is None
+    assert cfg.squilla_router.tiers == saved_tiers
 
 
 def test_tokenrhythm_boot_seed_respects_custom_inline_tiers() -> None:

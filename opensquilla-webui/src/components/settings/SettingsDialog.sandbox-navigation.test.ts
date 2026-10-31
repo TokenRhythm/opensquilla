@@ -73,6 +73,8 @@ function mockCatalog() {
     behaviorPanel: ref({ autoSessionTitles: false, autoSessionTitlesDirty: false, statusText: '' }),
     privacyPanel: ref({ networkReportingEnabled: false, networkReportingForcedOff: false }),
     memoryPanel: ref({ autoCapture: true }),
+    recommendationPreview: ref(null), recommendationSaving: ref(false),
+    routerRecommendation: ref(undefined), ensembleRecommendation: ref(undefined),
     modelStrategyPanel: ref({}), capabilitiesPanel: ref({}),
     configPath: ref('/isolated/config.toml'),
     sectionStatus: () => ({ label: 'Ready', tone: 'is-ok' }),

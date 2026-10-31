@@ -605,6 +605,29 @@
     },
     {
       "kind": "method",
+      "wireName": "models.recommendations.get",
+      "roles": [
+        "result"
+      ]
+    },
+    {
+      "kind": "method",
+      "wireName": "models.recommendations.apply",
+      "roles": [
+        "params",
+        "result"
+      ]
+    },
+    {
+      "kind": "method",
+      "wireName": "models.recommendations.acknowledge",
+      "roles": [
+        "params",
+        "result"
+      ]
+    },
+    {
+      "kind": "method",
       "wireName": "models.routing.get",
       "roles": [
         "result"

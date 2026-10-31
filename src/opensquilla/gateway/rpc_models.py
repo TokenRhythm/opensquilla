@@ -111,6 +111,44 @@ async def _handle_models_routing_reset_recommended(
     )
 
 
+async def _handle_models_recommendations_get(
+    params: dict | None, ctx: RpcContext,
+) -> dict[str, Any]:
+    from opensquilla.gateway.adapters.platform_configuration_contract import (
+        validate_recommendation_params,
+    )
+
+    validate_recommendation_params("models.recommendations.get", {} if params is None else params)
+    return {"plans": await _model_routing(ctx).recommendations()}
+
+
+async def _handle_models_recommendations_apply(
+    params: dict | None, ctx: RpcContext,
+) -> dict[str, Any]:
+    from opensquilla.gateway.adapters.platform_configuration_contract import (
+        validate_recommendation_params,
+    )
+
+    values = validate_recommendation_params("models.recommendations.apply", params)
+    return cast(dict[str, Any], await _model_routing(ctx).apply_recommendation(
+        values["providerId"], values["kind"], values["revision"],
+    ))
+
+
+async def _handle_models_recommendations_acknowledge(
+    params: dict | None, ctx: RpcContext,
+) -> dict[str, Any]:
+    from opensquilla.gateway.adapters.platform_configuration_contract import (
+        validate_recommendation_params,
+    )
+
+    values = validate_recommendation_params("models.recommendations.acknowledge", params)
+    await _model_routing(ctx).acknowledge_recommendation(
+        values["providerId"], values["kind"], values["revision"],
+    )
+    return {"acknowledged": True}
+
+
 # Generated descriptors own identity/scope/validation for the contracted
 # Platform configuration methods.
 from opensquilla.gateway.adapters.platform_configuration_contract import (  # noqa: E402
@@ -127,6 +165,9 @@ _PLATFORM_CONFIGURATION_IMPLEMENTATIONS = {
     "models.routing.get": _handle_models_routing_get,
     "models.routing.set": _handle_models_routing_set,
     "models.routing.resetRecommended": _handle_models_routing_reset_recommended,
+    "models.recommendations.get": _handle_models_recommendations_get,
+    "models.recommendations.apply": _handle_models_recommendations_apply,
+    "models.recommendations.acknowledge": _handle_models_recommendations_acknowledge,
 }
 
 _PLATFORM_CONFIGURATION_CONTRACT_HANDLERS = {

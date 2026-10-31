@@ -43,6 +43,7 @@ GENERAL_SPECS = (
     "session-delivery-feedback.spec.ts",
     "router-provider-save.spec.ts",
     "activity-disclosure-scroll-overflow.spec.ts",
+    "model-recommendations.spec.ts",
 )
 GENERAL_SHARDS = tuple(f"general-{index}" for index in range(1, 5))
 VIRTUALIZATION_SPECS = (

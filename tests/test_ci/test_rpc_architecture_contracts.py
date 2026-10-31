@@ -133,7 +133,7 @@ SESSIONS_LIST_GATEWAY_ADAPTER = PACKAGE_ROOT / "gateway" / "adapters" / "session
 # Retire router learning status and training feedback (two generated methods).
 # Retire the three advanced agent administration methods.
 # Add video-generation model discovery without changing existing method names.
-RUNTIME_RPC_METHOD_BASELINE = 285
+RUNTIME_RPC_METHOD_BASELINE = 288
 RUNTIME_RPC_METHOD_DIGEST = "29b0b13c082534442371c559806c483c45d16be045f132a304fc328a6512f9ca"
 STATIC_RPC_DECORATOR_BASELINE = 63
 
@@ -1418,18 +1418,26 @@ def test_runtime_rpc_surface_is_exact_and_contract_methods_use_generic_adapter()
     }
     sidechat_methods = {"sessions.sidechat.create", "sessions.sidechat.close"}
     workspace_methods = {"workspaces.create"}
+    recommendation_methods = {
+        "models.recommendations.get", "models.recommendations.apply",
+        "models.recommendations.acknowledge",
+    }
     assert terminal_methods.issubset(methods)
     assert sidechat_methods.issubset(methods)
     assert workspace_methods.issubset(methods)
+    assert recommendation_methods.issubset(methods)
     consume_entry = registry.get_entry("terminal.consume")
     assert consume_entry is not None
     assert consume_entry.required_scope == "operator.write"
     assert len(methods) == RUNTIME_RPC_METHOD_BASELINE
     assert len(methods) == len(set(methods))
-    # The terminal, sidechat and workspace creation methods add to the frozen
+    # The terminal, sidechat, workspace and recommendation methods add to the frozen
     # legacy inventory. Keep the historical digest meaningful while pinning
     # new methods explicitly above.
-    legacy_methods = set(methods) - terminal_methods - sidechat_methods - workspace_methods
+    legacy_methods = (
+        set(methods) - terminal_methods - sidechat_methods - workspace_methods
+        - recommendation_methods
+    )
     digest = hashlib.sha256(("\n".join(sorted(legacy_methods)) + "\n").encode()).hexdigest()
     assert digest == RUNTIME_RPC_METHOD_DIGEST
 
@@ -1442,6 +1450,9 @@ def test_runtime_rpc_surface_is_exact_and_contract_methods_use_generic_adapter()
         ("turns.receipt.get", "operator.read"),
         ("sessions.sidechat.create", "operator.write"),
         ("sessions.sidechat.close", "operator.write"),
+        ("models.recommendations.get", "operator.read"),
+        ("models.recommendations.apply", "operator.admin"),
+        ("models.recommendations.acknowledge", "operator.write"),
     ):
         process_entry = registry.get_entry(method)
         assert process_entry is not None

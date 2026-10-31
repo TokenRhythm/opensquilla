@@ -8,6 +8,7 @@ import { PROVIDER_CREDENTIAL_REVEAL_TIMEOUT_MS } from './useSetupProviderForm'
 import { SetupWorkflowError } from '@/modules/setupWorkflow'
 import { AppSettingsError } from '@/modules/appSettings'
 import type { GatewayAvailability } from '@/modules/gatewayAccess'
+import type { ModelRecommendation, RecommendationTarget } from '@/modules/providerConfiguration'
 
 const rpcCall = vi.hoisted(() => vi.fn())
 const ready = vi.hoisted(() => vi.fn(async () => {}))
@@ -75,7 +76,7 @@ async function primaryTransitionScenario(first = false, mutate: (method: string,
   return { ...await mountCatalog(), saved }
 }
 
-async function mountCatalog(gatewayAvailability = ref<GatewayAvailability>('available')) {
+async function mountCatalog(gatewayAvailability = ref<GatewayAvailability>('available'), recommendationsSupported = false) {
   let api!: ReturnType<typeof useSetupCatalog>
   const el = document.createElement('div')
   document.body.appendChild(el)
@@ -218,6 +219,10 @@ async function mountCatalog(gatewayAvailability = ref<GatewayAvailability>('avai
     list: async () => ({ models: [], errors: [] }),
     status: async () => ({ activeProvider: null, providerResolution: {}, providers: [], count: 0 }),
     get: async () => ({ mode: 'direct' }),
+    recommendationsSupported,
+    recommendations: async () => await rpcCall('models.recommendations.get'),
+    applyRecommendation: async (command: RecommendationTarget) => await rpcCall('models.recommendations.apply', command),
+    acknowledgeRecommendation: async (command: RecommendationTarget) => await rpcCall('models.recommendations.acknowledge', command),
     get resetRecommendedSupported() { return hasRpcMethod('models.routing.resetRecommended') === true },
     resetRecommended: async (command: Record<string, unknown>) => await rpcCall('models.routing.resetRecommended', command),
     setRouting: async (mode: string) => await rpcCall('models.routing.set', { mode }),
@@ -239,6 +244,7 @@ async function desktopAccountScenario(options: {
   source?: ModelCredentialSource
   status?: TokenRhythmAccountState['status']
   fail?: 'cancel' | 'error'
+  recommendations?: boolean
 } = {}) {
   const events: string[] = []
   const account = reactive({
@@ -299,10 +305,62 @@ async function desktopAccountScenario(options: {
     }
     return {}
   })
-  return { ...await mountCatalog(), account, saved, events }
+  return { ...await mountCatalog(undefined, options.recommendations), account, saved, events }
 }
 
 describe('desktop account and manual provider boundaries', () => {
+  it.each(['account', 'manual'] as const)('preserves %s credentials and provider drafts when applying remote routing recommendations', async source => {
+    const { api, app, saved, account } = await desktopAccountScenario({ primary: 'tokenrhythm', source, recommendations: true })
+    try {
+      Object.assign(saved.llm, { api_key: 'synthetic-manual-key', base_url: 'https://manual.invalid/v1' })
+      await api.loadData()
+      if (source === 'account') api.requestSelectAccountProvider()
+      else await api.requestSelectConfiguredProvider('tokenrhythm')
+      api.updateProviderField('model', 'unsaved-provider-model')
+      const before = structuredClone(saved)
+      const original = rpcCall.getMockImplementation()!
+      const plan: ModelRecommendation = {
+        providerId: 'tokenrhythm', kind: 'router', revision: 'synthetic-revision', source: 'remote',
+        rows: [{ role: 'c0', provider: 'tokenrhythm', model: 'recommended-model', thinkingLevel: null }],
+        currentRows: [], hasUpdate: true, notified: false,
+      }
+      rpcCall.mockImplementation(async (method, params) => {
+        if (method === 'models.recommendations.get') return { plans: [structuredClone(plan)] }
+        if (method === 'models.recommendations.acknowledge') return { acknowledged: true }
+        if (method === 'models.recommendations.apply') {
+          Object.assign(saved.squilla_router, { tiers: { c0: { provider: 'tokenrhythm', model: 'recommended-model' } } })
+          plan.currentRows = structuredClone(plan.rows)
+          plan.hasUpdate = false
+          return { mode: 'direct' }
+        }
+        return original(method, params)
+      })
+      rpcCall.mockClear()
+      api.setSection('modelStrategy')
+      await vi.waitFor(() => expect(api.routerRecommendation.value?.revision).toBe(plan.revision))
+      expect(api.sectionDirty('modelStrategy')).toBe(true)
+      expect(saved).toEqual(before)
+      expect(account.selectSource).not.toHaveBeenCalled()
+      expect(rpcCall.mock.calls.some(([method]) => method === 'models.recommendations.apply')).toBe(false)
+
+      const pending = api.resetRecommendedRouter()
+      await nextTick()
+      expect(api.recommendationPreview.value?.plan.revision).toBe(plan.revision)
+      await api.applyRecommendation()
+      expect(await pending).toBe(true)
+      expect(rpcCall).toHaveBeenCalledWith('models.recommendations.apply', {
+        providerId: 'tokenrhythm', kind: 'router', revision: 'synthetic-revision',
+      })
+      expect(saved.llm).toEqual(before.llm)
+      expect(saved.llm_profiles).toEqual(before.llm_profiles)
+      expect(account.state.source).toBe(source)
+      expect(account.selectSource).not.toHaveBeenCalled()
+      expect(api.providerPanel.value.providerFieldValue({ name: 'model', label: 'Model' })).toBe('unsaved-provider-model')
+      expect(api.sectionDirty('modelStrategy')).toBe(true)
+      expect(rpcCall.mock.calls.filter(([method]) => /^(config\.patch|onboarding\..*(activate|configure|credential))/.test(method))).toEqual([])
+    } finally { app.unmount() }
+  })
+
   it('keeps account editor probes isolated and switches back to the same manual provider', async () => {
     const { api, app, saved, account } = await desktopAccountScenario({ primary: 'tokenrhythm' })
     try {
