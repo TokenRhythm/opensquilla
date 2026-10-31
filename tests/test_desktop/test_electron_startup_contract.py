@@ -2833,6 +2833,7 @@ def test_browser_workbench_gates_require_real_electron_and_foreground_input() ->
         package_json["scripts"]["test:desktop-browser"]
         == "npm run build && node scripts/test-desktop-browser.mjs"
         " && node scripts/test-desktop-browser-electron.mjs"
+        " && node scripts/test-browser-open-recovery-electron.mjs"
     )
     for name, script in (
         ("native-workbench-v2", "test-native-workbench-v2-electron.mjs"),
