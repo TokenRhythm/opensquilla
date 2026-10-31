@@ -1,11 +1,14 @@
 const assert = require('node:assert/strict')
 const { spawnSync } = require('node:child_process')
 const { createHash } = require('node:crypto')
-const { statSync } = require('node:fs')
+const fs = require('node:fs')
+const { statSync } = fs
 const { mkdir, mkdtemp, readFile, realpath, rm, symlink, writeFile } = require('node:fs/promises')
+const { createRequire } = require('node:module')
 const { tmpdir } = require('node:os')
-const { basename, dirname, join, resolve } = require('node:path')
+const { basename, dirname, join, resolve, win32 } = require('node:path')
 const { before, test } = require('node:test')
+const { createContext, runInContext } = require('node:vm')
 
 const { PATCHES, prepareInstalledGlobs } = require('./prepare-build-glob-compat.cjs')
 const desktopRoot = resolve(__dirname, '..')
@@ -98,6 +101,56 @@ function asyncGlob(glob, pattern, options) {
   })
 }
 
+// Execute the installed callers with Windows path semantics on every host.
+// Only filesystem paths are translated to a synthetic fixture; matching and
+// traversal still run the real dependency code and the real minimatch engine.
+function windowsDependencies(root) {
+  const cwd = 'C:\\fixture'
+  const toLocalPath = (path) => {
+    const relative = win32.relative(cwd, win32.resolve(cwd, path))
+    assert.equal(win32.isAbsolute(relative), false)
+    assert.ok(relative !== '..' && !relative.startsWith('..\\'))
+    return join(root, ...relative.split('\\'))
+  }
+  const filesystem = {}
+  for (const method of ['readdirSync', 'statSync', 'lstatSync', 'readdir', 'stat', 'lstat']) {
+    filesystem[method] = (path, ...args) => fs[method](toLocalPath(path), ...args)
+  }
+  const minimatch = require('minimatch')
+  const windowsMatcher = minimatch.defaults({ platform: 'win32' })
+  const matcherExports = { ...minimatch, ...windowsMatcher, minimatch: windowsMatcher }
+  const globRoot = dirname(require.resolve('glob/package.json'))
+  const sources = new Set([
+    ...['glob.js', 'sync.js', 'common.js'].map((file) => join(globRoot, file)),
+    require.resolve('filelist'),
+    require.resolve('dir-compare/build/src/FilterHandler/defaultFilterHandler'),
+  ])
+  const cache = new Map()
+  const context = createContext({ Buffer, console })
+  const windowsProcess = { platform: 'win32', cwd: () => cwd, nextTick: process.nextTick.bind(process) }
+  const load = (filename) => {
+    if (cache.has(filename)) return cache.get(filename).exports
+    const module = { exports: {} }
+    cache.set(filename, module)
+    const nativeRequire = createRequire(filename)
+    const moduleRequire = (request) => {
+      if (request === 'path') return win32
+      if (request === 'fs') return filesystem
+      if (request === 'path-is-absolute') return win32.isAbsolute
+      if (request === 'minimatch') return matcherExports
+      const resolved = nativeRequire.resolve(request)
+      return sources.has(resolved) ? load(resolved) : nativeRequire(request)
+    }
+    const evaluate = runInContext(
+      `(function(require, module, exports, process) {\n${fs.readFileSync(filename, 'utf8')}\n})`,
+      context, { filename },
+    )
+    evaluate(moduleRequire, module, module.exports, windowsProcess)
+    return module.exports
+  }
+  return (request) => load(require.resolve(request))
+}
+
 test('legacy glob sync and callback APIs preserve file selection, escapes, raw parents, and brace identity', async (t) => {
   const root = await fixture(t)
   for (const name of ['alpha.txt', 'beta.js', 'literal[x].txt', '.hidden.txt', 'nested/inside.txt', 'nested/skip.txt']) {
@@ -111,20 +164,64 @@ test('legacy glob sync and callback APIs preserve file selection, escapes, raw p
     ['*.txt', { dot: true }, ['.hidden.txt', 'alpha.txt', 'literal[x].txt']],
     ['**/*.txt', { ignore: ['nested/skip.txt'] }, ['alpha.txt', 'literal[x].txt', 'nested/inside.txt']],
     ['**/*.txt', { ignore: ['nested/**'] }, ['alpha.txt', 'literal[x].txt']],
-    ['literal\\[x\\].txt', {}, ['literal[x].txt']],
+    ['literal[[]x].txt', {}, ['literal[x].txt']],
     ['nested/../*.txt', {}, ['nested/../alpha.txt', 'nested/../literal[x].txt']],
     ['empty/*.{js,ts}', { nonull: true }, ['empty/*.js', 'empty/*.ts']],
     ['{alpha.txt,*.js}', { nounique: true }, ['alpha.txt', 'beta.js']],
     ['{alpha.txt,alpha.txt}', { nounique: true }, ['alpha.txt', 'alpha.txt']],
     ['{alpha.txt,alpha.txt}', {}, ['alpha.txt']],
   ]
+  // Legacy minimatch3 treated Windows backslashes as separators even when
+  // callers passed allowWindowsEscape, so escaping is a POSIX-only contract.
+  if (process.platform !== 'win32') {
+    cases.push(['literal\\[x\\].txt', {}, ['literal[x].txt']])
+  }
   for (const [pattern, options, expected] of cases) {
     const settings = { cwd: root, ...options }
     assert.deepEqual(glob.sync(pattern, settings).sort(), expected, `sync ${pattern}`)
     assert.deepEqual((await asyncGlob(glob, pattern, settings)).sort(), expected, `async ${pattern}`)
   }
-  assert.equal(glob.hasMagic('literal\\[x\\].txt'), false)
+  if (process.platform !== 'win32') assert.equal(glob.hasMagic('literal\\[x\\].txt'), false)
   assert.equal(glob.hasMagic('*.txt'), true)
+})
+
+test('Windows glob callers traverse native and mixed separator patterns', async (t) => {
+  const root = await fixture(t)
+  for (const name of ['source/main.js', 'source/.hidden.txt', 'source/nested/keep.txt']) await put(root, name)
+  const glob = windowsDependencies(root)('glob')
+  const cases = [
+    ['C:\\fixture\\source\\*.js', ['C:/fixture/source/main.js']],
+    ['C:\\fixture\\source/**/*', [
+      'C:/fixture/source/.hidden.txt',
+      'C:/fixture/source/main.js',
+      'C:/fixture/source/nested/keep.txt',
+    ]],
+  ]
+  for (const [pattern, expected] of cases) {
+    const options = { cwd: 'C:\\fixture', dot: true, nodir: true }
+    assert.deepEqual(Array.from(glob.sync(pattern, options)).sort(), expected, `sync ${pattern}`)
+    assert.deepEqual(Array.from(await asyncGlob(glob, pattern, options)).sort(), expected, `async ${pattern}`)
+  }
+})
+
+test('Windows FileList preserves native include and exclude patterns after path normalization', async (t) => {
+  const root = await fixture(t)
+  for (const name of ['alpha.txt', 'ignored.txt', 'beta.js']) await put(root, `source/${name}`)
+  const { FileList } = windowsDependencies(root)('filelist')
+  const files = new FileList()
+  files.include('C:\\fixture\\source\\*.txt')
+  files.exclude('C:\\fixture\\source\\ignore*.txt')
+  assert.deepEqual(Array.from(files.toArray()), ['C:/fixture/source/alpha.txt'])
+})
+
+test('Windows directory comparison filters match native relative paths', async (t) => {
+  const root = await fixture(t)
+  const { defaultFilterHandler } = windowsDependencies(root)('dir-compare/build/src/FilterHandler/defaultFilterHandler')
+  const options = { includeFilter: 'nested\\*.txt', excludeFilter: 'nested\\ignore*.txt' }
+  const entry = (name) => ({ name, stat: { isFile: () => true } })
+  assert.equal(defaultFilterHandler(entry('keep.txt'), 'nested', options), true)
+  assert.equal(defaultFilterHandler(entry('ignore.txt'), 'nested', options), false)
+  assert.equal(defaultFilterHandler(entry('other.js'), 'nested', options), false)
 })
 
 test('legacy glob follows an explicitly selected directory link inside the fixture', async (t) => {

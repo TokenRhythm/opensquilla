@@ -1,5 +1,5 @@
 // Keep the locked packaging APIs while using the patched, nonrecursive matcher.
-// Remove these adapters when upstream asar, dir-compare and glob support v11.
+// Remove these adapters when the packaging dependencies support v11 directly.
 const { createHash } = require('node:crypto')
 const { readFile, writeFile } = require('node:fs/promises')
 const { join } = require('node:path')
@@ -7,7 +7,9 @@ const { join } = require('node:path')
 const sha256 = (value) => createHash('sha256').update(value).digest('hex')
 const importReplacement = [
   'const minimatch_1 = __importDefault(require("minimatch"));',
-  'const minimatch_1 = __importDefault(require("minimatch").minimatch);',
+  `const minimatch_1 = __importDefault(require("minimatch").minimatch.defaults({
+    windowsPathsNoEscape: process.platform === 'win32', optimizationLevel: 0
+}));`,
 ]
 const matcherReplacements = [
   ['var rawGlob = pn._glob', 'var rawGlob = pn.pattern'],
@@ -18,13 +20,13 @@ const PATCHES = [
   {
     packageName: '@electron/asar', version: '3.4.1', file: 'lib/asar.js',
     originalSha256: '91e89e96324626b140f3e897dffaca6e3cbb1135c4192ce6ceaa0e84af4ba152',
-    patchedSha256: '0d7135c88b9a9adcd19e57c3beb64d138ee5d20fabf09821ba32fe0765127cc0', replacements: [importReplacement],
+    patchedSha256: '172c169848bfcc33eac2abf93494f8f0eedc894a8fd4309d88d38aab842c8801', replacements: [importReplacement],
   },
   {
     packageName: 'dir-compare', version: '4.2.0',
     file: 'build/src/FilterHandler/defaultFilterHandler.js',
     originalSha256: '6b753f018576fc270dc93e2be35d98a50431bd7f1e373b98acbec5e7acf381d2',
-    patchedSha256: '6e3a5f2b730da7a8131ac5726aa1c2efb56febba41d77d04ca6de654b2a378f2', replacements: [importReplacement],
+    patchedSha256: '914fd5bc8c1e4fbd9e8e87bc4b73575d01f7104fb6b7fa21e275892b29d59b72', replacements: [importReplacement],
   },
   {
     packageName: 'glob', version: '7.2.3', file: 'glob.js',
@@ -39,21 +41,29 @@ const PATCHES = [
   {
     packageName: 'glob', version: '7.2.3', file: 'common.js',
     originalSha256: 'b867e089ab5d4ab19a83e5b34da3dd7f4018fdf255fcacc681aab87d41dc77e8',
-    patchedSha256: '40db395771c6efb10f4d43385a6564dd9ec2e11fafcd6b5c64cb97db5f45d56f', replacements: [
-      // v3 ignored allowWindowsEscape. v11 must explicitly keep escapes.
-      ['options.allowWindowsEscape = false', 'options.allowWindowsEscape = true\n  options.optimizationLevel = 0'],
+    patchedSha256: '0da8eb2974e9052948e2db6db3d4cfeb2c218c6acaed55fd159920bc92420996', replacements: [
+      // v3 normalized native Windows separators; on POSIX it kept escapes.
+      ['options.allowWindowsEscape = false', "options.allowWindowsEscape = process.platform !== 'win32'\n  options.optimizationLevel = 0"],
       // glob7 indexes matches and globSet in parallel, including nonull and
       // nounique. Keep one set row per brace expansion instead of v11's merge.
       ['self.minimatch = new Minimatch(pattern, options)',
         `self.minimatch = new Minimatch(pattern, options)
-  self.minimatch.globSet = minimatch.braceExpand(pattern, options)
+  self.minimatch.globSet = minimatch.braceExpand(self.minimatch.pattern, options)
   self.minimatch.set = self.minimatch.globSet.map(function (part) {
     return new Minimatch(part, Object.assign({}, options, { nobrace: true })).set[0]
   })`],
       ['new Minimatch(gpattern, { dot: true })',
-        'new Minimatch(gpattern, { dot: true, optimizationLevel: 0 })'],
+        "new Minimatch(gpattern, { dot: true, optimizationLevel: 0, windowsPathsNoEscape: process.platform === 'win32' })"],
       ['new Minimatch(pattern, { dot: true })',
-        'new Minimatch(pattern, { dot: true, optimizationLevel: 0 })'],
+        "new Minimatch(pattern, { dot: true, optimizationLevel: 0, windowsPathsNoEscape: process.platform === 'win32' })"],
+    ],
+  },
+  {
+    packageName: 'filelist', version: '1.0.6', file: 'index.js',
+    originalSha256: 'cae1deb98621f487d8da5fd2f77c4cdd2f0312ecd3ee9c7ff2021defec89c9af',
+    patchedSha256: 'dd982843f688786fcfa75a191f254a54dea5f344918310addc39a7e20343a172', replacements: [
+      // FileList normalizes candidate filenames to slash paths above this call.
+      ['pat = path.normalize(pat);', "pat = path.normalize(pat).split(path.sep).join('/');"],
     ],
   },
 ]
