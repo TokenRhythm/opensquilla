@@ -2401,7 +2401,7 @@ export class NativeWorkbenchSurfaceManager {
           result = await page.batch(request, generation, assertCurrent, signal)
         } else if (request.operation === 'snapshot') {
           result = request.ref ? await page.readText(request, generation, assertCurrent, signal)
-            : await page.snapshot(generation, assertCurrent, signal)
+            : await page.snapshot(generation, assertCurrent, signal, request.scope)
         } else if (request.operation === 'screenshot') {
           result = await page.screenshot(assertCurrent, signal)
         } else {
@@ -2543,6 +2543,7 @@ export class NativeWorkbenchSurfaceManager {
     }
     const record = this.browserRecord(request.sessionKey, request.targetRef)
     if (record.kind === 'artifact-html') throw new DesktopBrowserError('BROWSER_UNAVAILABLE', 'Reopen this legacy preview to enable browser control.')
+    if (request.scope !== undefined) throw new DesktopBrowserError('SCOPE_UNSUPPORTED', 'Scoped inspection requires the browser_inspect MCP tool.', 400)
     const assertCurrent = () => { check(); this.browserRecord(request.sessionKey, request.targetRef) }
     if (request.operation === 'open' || request.operation === 'reload') {
       const navigation = await this.navigateSurface({ version: record.version as 2 | 3 | 4,

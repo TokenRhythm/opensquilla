@@ -497,6 +497,122 @@ async def test_dispatch_redacts_secret_like_tool_result_content() -> None:
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("as_array", [False, True])
+@pytest.mark.parametrize(
+    "observation",
+    [
+        'Password: "PUBLIC_DUMMY_VALUE"',
+        '# Password: "PUBLIC_DUMMY_VALUE"',
+        "Authorization: Bearer PUBLIC_DUMMY_VALUE",
+    ],
+)
+async def test_dispatch_redacts_serialized_receipts_without_breaking_json(
+    observation: str, as_array: bool
+) -> None:
+    receipt = {"status": "completed", "actions": [{"kind": "click", "performed": True}]}
+    payload = {
+        "execution": receipt,
+        "observation": {"text": observation + "\n公开文字 🙂"},
+        "api_key": "PUBLIC_DUMMY_API_KEY",
+    }
+    note = "\n\nLocal image is attached."
+    handler = build_tool_handler(_build_registry())
+
+    result = await handler(
+        ToolCall(
+            tool_use_id="tc-json-redaction",
+            tool_name="echo",
+            arguments={"value": json.dumps([payload] if as_array else payload) + note},
+        )
+    )
+
+    assert result.is_error is False
+    decoded, end = json.JSONDecoder().raw_decode(result.content)
+    entry = decoded[0] if as_array else decoded
+    assert entry["execution"] == receipt
+    assert "PUBLIC_DUMMY_VALUE" not in result.content
+    assert "PUBLIC_DUMMY_API_KEY" not in result.content
+    assert "公开文字 🙂" in result.content
+    assert result.content[end:] == note
+    result.content.encode("utf-8")
+
+
+@pytest.mark.asyncio
+async def test_dispatch_redacts_duplicate_json_fields_and_escaped_unicode() -> None:
+    secret = "sk-FAKE_REDACTION_TEST_VALUE"
+    value = (
+        '{"text": "' + secret + '", "text": "公开 🙂", '
+        '"escaped": "\\ud800", "literal": "\\\\ud800", "password": "PUBLIC_DUMMY_VALUE"}'
+    )
+    result = await build_tool_handler(_build_registry())(
+        ToolCall(tool_use_id="tc-json-encoding", tool_name="echo", arguments={"value": value})
+    )
+
+    assert result.is_error is False
+    payload = json.loads(result.content)
+    assert secret not in result.content
+    assert "PUBLIC_DUMMY_VALUE" not in result.content
+    assert payload["text"] == "公开 🙂"
+    assert payload["escaped"] == "\ud800"
+    assert payload["literal"] == r"\ud800"
+    assert "公开 🙂" in result.content
+    result.content.encode("utf-8")
+
+
+@pytest.mark.asyncio
+async def test_dispatch_redacts_credentials_in_serialized_json_keys() -> None:
+    secret = "sk-FAKE_PUBLIC_DUMMY_KEY_123456789"
+    value = json.dumps({"nested": [{secret: {"status": "completed"}}]})
+    result = await build_tool_handler(_build_registry())(
+        ToolCall(tool_use_id="tc-json-keys", tool_name="echo", arguments={"value": value})
+    )
+
+    assert result.is_error is False
+    assert secret not in result.content
+    assert json.loads(result.content) == {"nested": [{"[REDACTED]": {"status": "completed"}}]}
+
+
+@pytest.mark.asyncio
+async def test_dispatch_preserves_source_json_assignments() -> None:
+    value = json.dumps({"password": "source-example", "text": "公开 🙂"}, ensure_ascii=False)
+    registry = ToolRegistry()
+
+    async def read_file(path: str) -> str:
+        del path
+        return value
+
+    registry.register(
+        ToolSpec(name="read_file", description="read", parameters={"path": {"type": "string"}}),
+        read_file,
+    )
+    result = await build_tool_handler(registry)(
+        ToolCall(
+            tool_use_id="tc-source-json",
+            tool_name="read_file",
+            arguments={"path": "src/constants.py"},
+        )
+    )
+
+    assert result.is_error is False
+    assert result.content == value
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        "[" * 1_500 + "0" + "]" * 1_500,
+        '{"number": ' + "9" * 5_000 + "}",
+        '{"number": Infinity}',
+        '{"incomplete": ',
+    ],
+)
+def test_tool_result_redaction_keeps_unsupported_json_as_text(value: str) -> None:
+    from opensquilla.tools.policy.finalize import _redact_tool_result_value
+
+    assert _redact_tool_result_value(value) == value
+
+
+@pytest.mark.asyncio
 async def test_dispatch_preserves_assignments_in_source_file_results() -> None:
     registry = ToolRegistry()
     provider_key = "sk-or-v1-abcdefghijklmnopqrstuvwxyz"

@@ -54,6 +54,7 @@ export interface DesktopBrowserRequest extends DesktopBrowserAction {
   contextTargetRef?: string
   maxChars?: number
   downloadId?: string
+  scope?: string
   uploadFile?: BrowserUploadFile
   /** Authenticated Gateway request to transfer a downloaded PDF into its workspace. */
   exportPdf?: boolean
@@ -208,6 +209,7 @@ export class DesktopBrowserServer {
     let code = 'INVALID_REQUEST'
     const diagnostics: Pick<DesktopBrowserAudit, 'operationId' | 'targetRef' | 'navigationCode'> = {}
     const controller = new AbortController()
+    let canonicalLegacy = false
     this.requests.add(controller)
     let timeout: NodeJS.Timeout | undefined
     const cancel = () => { if (!response.writableFinished) controller.abort() }
@@ -274,7 +276,7 @@ export class DesktopBrowserServer {
         }
         const parsed = parseDesktopBrowserRequest(body)
         if (!['list', 'open', 'snapshot', 'act', 'screenshot', 'reload'].includes(parsed.operation)
-          || parsed.contextTargetRef !== undefined || parsed.downloadId !== undefined
+          || parsed.contextTargetRef !== undefined || parsed.downloadId !== undefined || parsed.scope !== undefined
           || parsed.operation === 'snapshot' && parsed.ref !== undefined
           || parsed.action && !['click', 'fill', 'press', 'scroll', 'hover', 'select'].includes(parsed.action)
           || parsed.button !== undefined) {
@@ -282,13 +284,62 @@ export class DesktopBrowserServer {
         }
         operation = parsed.operation
         if (controller.signal.aborted) throw new DesktopBrowserError('TIMEOUT', 'Browser request ended.', 504)
+        const operationId = request.headers['x-opensquilla-browser-operation-id']
+        const recoveryHeader = request.headers['x-opensquilla-browser-recovery-scope']
+        let recoveryScope: string | undefined
+        if (typeof recoveryHeader === 'string') {
+          // Preserve the exact MCP scope while keeping Unicode identities legal in HTTP headers.
+          try { recoveryScope = decodeURIComponent(recoveryHeader) } catch {
+            throw new DesktopBrowserError('INVALID_REQUEST', 'Invalid browser recovery identity.', 400,
+              { outcome: 'not_started', retryable: false })
+          }
+        }
+        if (operationId !== undefined || recoveryHeader !== undefined) {
+          if (typeof operationId !== 'string' || !/^[A-Za-z0-9_.:-]{1,128}$/.test(operationId)
+            || recoveryHeader !== undefined && (typeof recoveryHeader !== 'string'
+              || !recoveryScope || recoveryScope.length > 512 || /[\u0000-\u001f\u007f]/.test(recoveryScope))) {
+            throw new DesktopBrowserError('INVALID_REQUEST', 'Invalid browser call identity.', 400,
+              { outcome: 'not_started', retryable: false })
+          }
+          if (this.mcp) {
+            const replay = this.mcp.replayLegacy(parsed, operationId, recoveryScope, controller.signal)
+            if (replay) {
+              canonicalLegacy = true
+              diagnostics.operationId = auditIdentifier(operationId)
+              return await replay
+            }
+            if (parsed.operation === 'list') {
+              const listed = record(await this.execute(parsed, controller.signal))
+              canonicalLegacy = true
+              const canonical = await this.mcp.callLegacy(parsed, operationId, recoveryScope, controller.signal)
+              if (canonical.ok === false) return canonical
+              const artifacts = Array.isArray(listed?.targets)
+                ? listed.targets.filter(target => record(target)?.kind !== 'url-preview') : []
+              return { ...canonical, targets: [...(Array.isArray(canonical.targets) ? canonical.targets : []), ...artifacts] }
+            }
+            let urlTarget = !parsed.targetRef
+            if (parsed.targetRef) {
+              const listed = record(await this.execute({ sessionKey: parsed.sessionKey, operation: 'list' }, controller.signal))
+              const target = Array.isArray(listed?.targets)
+                ? listed.targets.map(record).find(target => target?.targetRef === parsed.targetRef) : undefined
+              if (!target) throw new DesktopBrowserError('TARGET_NOT_FOUND', 'The browser target is unavailable.', 404,
+                { targetRef: parsed.targetRef, outcome: 'not_started', retryable: false, recovery: 'list_tabs' })
+              urlTarget = target.kind === 'url-preview'
+            }
+            if (urlTarget) {
+              canonicalLegacy = true
+              diagnostics.operationId = auditIdentifier(operationId)
+              return await this.mcp.callLegacy(parsed, operationId, recoveryScope, controller.signal)
+            }
+          }
+        }
         return await this.execute(parsed, controller.signal)
       })()
       let result: unknown
       try {
         result = await Promise.race([work, aborted])
       } catch (error) {
-        if (!isMcp || !controller.signal.aborted) throw error
+        if (!(isMcp || canonicalLegacy) || !controller.signal.aborted) throw error
         // Native cancellation can return a retained target and a known
         // navigation outcome. Give it a short, bounded cleanup window rather
         // than discard that result at the same instant we signal cancellation.
@@ -312,15 +363,15 @@ export class DesktopBrowserServer {
       this.reply(response, 200, serialized)
       const envelope = isMcp ? record(result) : undefined
       const tool = record(envelope?.result)
-      const failure = record(tool?.structuredContent) ?? record(envelope?.error)
-      if (envelope?.error || tool?.isError === true) {
+      const failure = record(tool?.structuredContent) ?? record(envelope?.error) ?? (canonicalLegacy ? record(result) : undefined)
+      if (envelope?.error || tool?.isError === true || canonicalLegacy && failure?.ok === false) {
         outcome = 'rejected'
         code = auditIdentifier(failure?.code) ?? auditIdentifier(record(failure?.data)?.code) ?? 'MCP_ERROR'
       } else {
         outcome = 'allowed'
         code = 'OK'
       }
-      const details = record(tool?.structuredContent)
+      const details = record(tool?.structuredContent) ?? (canonicalLegacy ? record(result) : undefined)
       diagnostics.operationId ??= auditIdentifier(details?.operationId)
       diagnostics.targetRef = auditIdentifier(details?.targetRef)
       diagnostics.navigationCode = auditIdentifier(record(details?.navigation)?.code)

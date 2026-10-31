@@ -891,7 +891,15 @@ async def _handle_skills_candidates(params: dict | None, ctx: RpcContext) -> dic
     eligibility = _eligibility_context(ctx)
     eligibility.passive_managed_bins = True
     from opensquilla.browser import get_desktop_browser
+    from opensquilla.sandbox.integration import active_sandbox_policy, sandbox_policy_scope
+    from opensquilla.sandbox.policy_store import pin_sandbox_policy
+    from opensquilla.sandbox.run_context import resolve_default_run_mode
+    from opensquilla.sandbox.run_mode_policy import coerce_run_mode_for_principal
     from opensquilla.session.keys import parse_agent_id
+    from opensquilla.tools.browser_policy import (
+        browser_context_available,
+        browser_network_policy_supported,
+    )
     from opensquilla.tools.policy_helpers import apply_tool_policy_from_config
     from opensquilla.tools.policy_runtime import (
         resolve_runtime_tool_surface,
@@ -903,35 +911,45 @@ async def _handle_skills_candidates(params: dict | None, ctx: RpcContext) -> dic
     registry = getattr(ctx, "tool_registry", None)
     session_key = (params or {}).get("sessionKey", "")
     registered = set(registry.list_names()) if registry is not None else set()
-    policy = apply_tool_policy_from_config(
-        ToolContext(
-            is_owner=ctx.principal.is_owner,
-            caller_kind=CallerKind.WEB,
-            agent_id=parse_agent_id(session_key),
-            session_key=session_key,
-            surfaced_tools={"skill_list", "skill_view"},
-            desktop_browser=get_desktop_browser() if ctx.principal.is_owner else None,
-        ),
-        available_tools=list(registered),
-        config=getattr(ctx, "config", None),
+    browser = get_desktop_browser() if ctx.principal.is_owner else None
+    tool_context = ToolContext(
+        is_owner=ctx.principal.is_owner,
+        caller_kind=CallerKind.WEB,
+        agent_id=parse_agent_id(session_key),
+        session_key=session_key,
+        surfaced_tools={"skill_list", "skill_view"},
+        desktop_browser=browser,
     )
-    policy = resolve_runtime_tool_surface(
-        policy,
-        capabilities=tool_surface_capabilities_from_runtime(
-            session_manager=ctx.session_manager,
-            task_runtime=ctx.task_runtime,
-            scheduler=ctx.cron_scheduler,
-            gateway_config=ctx.config,
-            channel_manager=ctx.channel_manager,
-        ),
-    )
-    profile = resolve_profile(policy)
-    allowed = {
-        name for name in registered
-        if registry is not None and (tool := registry.get(name)) is not None
-        and is_tool_visible(tool, policy)
-        and profile_allows_tool(name, profile, explicitly_allowed=policy.allowed_tools)
-    }
+    if browser is not None:
+        mode, _ = await resolve_default_run_mode(ctx.session_manager, ctx.config)
+        tool_context.run_mode = coerce_run_mode_for_principal(mode, ctx.principal).value
+        await asyncio.to_thread(pin_sandbox_policy, tool_context, ctx.config)
+    with sandbox_policy_scope(tool_context.sandbox_policy or active_sandbox_policy()):
+        policy = apply_tool_policy_from_config(
+            tool_context,
+            available_tools=list(registered),
+            config=getattr(ctx, "config", None),
+        )
+        policy = resolve_runtime_tool_surface(
+            policy,
+            capabilities=tool_surface_capabilities_from_runtime(
+                session_manager=ctx.session_manager,
+                task_runtime=ctx.task_runtime,
+                scheduler=ctx.cron_scheduler,
+                gateway_config=ctx.config,
+                channel_manager=ctx.channel_manager,
+            ),
+        )
+        profile = resolve_profile(policy)
+        allowed = {
+            name for name in registered
+            if registry is not None and (tool := registry.get(name)) is not None
+            and is_tool_visible(tool, policy)
+            and profile_allows_tool(name, profile, explicitly_allowed=policy.allowed_tools)
+        }
+        browser_network_blocked = (
+            browser_context_available(policy) and not browser_network_policy_supported(policy)
+        )
 
     def project() -> list[dict[str, Any]]:
         result = []
@@ -948,8 +966,14 @@ async def _handle_skills_candidates(params: dict | None, ctx: RpcContext) -> dic
             )
             reason = "; ".join(report.reasons)[:800]
             if not reason_code and not tools_available:
-                reason_code = "tools_unavailable"
-                reason = "Required tools are unavailable in this conversation."
+                if skill.name == "browser-use" and browser_network_blocked:
+                    reason_code = "network_policy_unsupported"
+                    reason = (
+                        "The Desktop browser cannot enforce this conversation's network policy."
+                    )
+                else:
+                    reason_code = "tools_unavailable"
+                    reason = "Required tools are unavailable in this conversation."
             result.append({
                 "name": skill.name,
                 "instanceId": skill.instance_id,

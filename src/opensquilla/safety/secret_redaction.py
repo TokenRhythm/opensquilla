@@ -129,7 +129,9 @@ def redact_secret_value(
         )
     if isinstance(value, dict):
         return {
-            str(k): redact_secret_value(
+            redact_secret_text(
+                str(k), code_file=code_file, secret_file=secret_file
+            ): redact_secret_value(
                 v,
                 key=str(k),
                 code_file=code_file,

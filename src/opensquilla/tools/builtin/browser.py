@@ -2,11 +2,13 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 from typing import Any
 
 from opensquilla.browser import DesktopBrowserError
 from opensquilla.sandbox.operation_runtime import SandboxToolDescriptor
+from opensquilla.tools import browser_policy
 from opensquilla.tools.registry import tool
 from opensquilla.tools.types import PlanAccess, SafeToolError, current_tool_context
 
@@ -96,7 +98,28 @@ async def browser(
         }.items()
         if v is not None
     }
+    if _tool_use_id:
+        scope = context.usage_root_turn_id or context.task_id or context.session_key
+        args["operation_id"] = hashlib.sha256(json.dumps(
+            [context.session_key, context.usage_root_turn_id or context.task_id, _tool_use_id],
+        ).encode()).hexdigest()
+        args["recovery_scope"] = scope
     try:
+        if operation != "list" and not browser_policy.browser_network_policy_supported(context):
+            artifact_target = False
+            if operation != "open" and targetRef:
+                listed = await client.request(session_key=context.session_key, operation="list")
+                targets = listed.get("targets")
+                artifact_target = isinstance(targets, list) and any(
+                    isinstance(target, dict) and target.get("targetRef") == targetRef
+                    and target.get("kind") in ("artifact-preview", "artifact-html")
+                    for target in targets
+                )
+            if not artifact_target:
+                raise SafeToolError(
+                    "BROWSER_POLICY_UNSUPPORTED: Browser URL pages cannot enforce this "
+                    "conversation's network restrictions. Use managed web tools instead."
+                )
         result = await client.request(
             session_key=context.session_key,
             operation=operation,
@@ -104,7 +127,8 @@ async def browser(
             **args,
         )
     except DesktopBrowserError as exc:
-        raise SafeToolError(f"{exc.code}: {exc}") from None
+        recovery = "\n" + json.dumps(exc.details) if exc.details else ""
+        raise SafeToolError(f"{exc.code}: {exc}{recovery}") from None
     if operation == "screenshot":
         encoded = result.pop("dataBase64")
         if _tool_use_id:

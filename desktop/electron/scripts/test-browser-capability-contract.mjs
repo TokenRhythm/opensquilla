@@ -55,9 +55,20 @@ rejected(() => parseDesktopBrowserRequest({ ...target, operation: 'open',
   url: 'https://synthetic.test/', contextTargetRef: target.targetRef }))
 assert.equal(inspect({ ref: 'e1', maxChars: 65536 }).maxChars, 65536)
 assert.equal(inspect({ downloadId: 'synthetic-download', maxChars: 120 }).downloadId, 'synthetic-download')
+assert.equal(inspect({ scope: '#order-details' }).scope, '#order-details')
 rejected(() => inspect({ ref: 'e1', downloadId: 'synthetic-download' }))
+rejected(() => inspect({ scope: '#order-details', ref: 'e1' }))
+rejected(() => inspect({ scope: '#order-details', downloadId: 'synthetic-download' }))
+for (const scope of ['', 12, '#section\0secret', '#section\nbutton', 'a'.repeat(4097)]) {
+  rejected(() => inspect({ scope }))
+}
+rejected(() => parseDesktopBrowserRequest({ ...target, operation: 'observe', scope: '#order-details' }))
+const inspectSchema = browserToolDefinitions.find(tool => tool.name === 'browser_inspect').inputSchema
+assert.equal(inspectSchema.properties.scope.maxLength, 4096)
+assert.equal(Object.hasOwn(browserToolDefinitions.find(tool => tool.name === 'browser_observe').inputSchema.properties, 'scope'), false)
 for (const maxChars of [0, -1, 65537, '100']) rejected(() => inspect({ ref: 'e1', maxChars }))
 rejected(() => inspect({ maxChars: 100 }))
+rejected(() => inspect({ scope: '#order-details', maxChars: 100 }))
 
 assert.equal(act({ action: 'upload', ref: 'e1', fileId: 'att_synthetic' }).fileId, 'att_synthetic')
 assert.equal(act({ action: 'upload', chooserId: 'chooser-1', fileId: 'att_synthetic' }).chooserId, 'chooser-1')
@@ -76,6 +87,27 @@ for (const action of ['upload', 'cancelUpload', 'download']) {
   rejected(() => batch({ action, ref: 'e1' }))
 }
 console.log('Browser gesture, text, related-tab and file request contracts passed.')
+
+// Examples advertised to the model must pass the same parser as actual calls.
+const batchTool = browserToolDefinitions.find(tool => tool.name === 'browser_batch')
+const actionGuidance = batchTool.inputSchema.properties.actions.items.properties.action.description
+assert.ok(typeof actionGuidance === 'string' && actionGuidance.length > 0 && actionGuidance.length <= 512,
+  'The reported action-order field must supply bounded recovery guidance')
+assert.equal(browserToolDefinitions.find(tool => tool.name === 'browser_act')
+  .inputSchema.properties.action.description, undefined)
+const orderedActions = [{ action: 'fill', ref: 'e1', text: 'synthetic-value' }, { action: 'click', ref: 'e2' }]
+assert.deepEqual(parseDesktopBrowserRequest({ ...target, operation: 'batch', actions: orderedActions }).actions,
+  orderedActions)
+rejected(() => parseDesktopBrowserRequest({ ...target, operation: 'batch', actions: [...orderedActions].reverse() }))
+for (const form of ['DOM', 'Coordinate']) {
+  const example = batchTool.description.match(new RegExp(`${form} drag example: (\\{.*?\\})\\.`))
+  assert.ok(example, `${form} drag must have a complete argument example`)
+  const args = JSON.parse(example[1])
+  const parsed = parseDesktopBrowserRequest({ sessionKey: target.sessionKey, operation: 'batch', ...args })
+  assert.equal(parsed.targetRef, args.targetRef)
+  assert.deepEqual(parsed.actions, args.actions)
+  assert.equal(Object.hasOwn(parsed.actions[0], 'targetRef'), false)
+}
 
 // Argument diagnostics identify rejection before dispatch without retaining submitted values.
 const diagnostic = (request, field, rule, expected) => assert.throws(
@@ -101,6 +133,8 @@ diagnostic({ operation: 'act', targetRef: target.targetRef, action: 'hold', ref:
 diagnostic({ operation: 'tab', targetRef: target.targetRef, tabAction: 'erase' }, 'tabAction', 'enum', 'supported_value')
 diagnostic({ operation: 'list', 'synthetic-secret-key': 'synthetic-secret-value' }, '$', 'unknown_field', 'known_fields')
 diagnostic({ operation: 'snapshot', targetRef: target.targetRef, ref: 'e1', downloadId: 'd1' }, 'ref', 'conflict', 'exclusive_fields')
+diagnostic({ operation: 'snapshot', targetRef: target.targetRef, scope: '#order-details', ref: 'e1' }, 'scope', 'conflict', 'exclusive_fields')
+diagnostic({ operation: 'snapshot', targetRef: target.targetRef, scope: '#order-details', downloadId: 'd1' }, 'scope', 'conflict', 'exclusive_fields')
 diagnostic({ operation: 'snapshot', targetRef: target.targetRef, maxChars: 100 }, 'maxChars', 'dependency', 'related_fields')
 diagnostic({ operation: 'batch', targetRef: target.targetRef, actions: [{ action: 'click', ref: 'e1' }, { action: 'click', ref: 'e2' }] },
   'actions.0.action', 'order', 'field_update_before_final')
@@ -112,6 +146,20 @@ diagnostic({ operation: 'batch', targetRef: target.targetRef, actions: [null] },
 diagnostic({ operation: 'batch', targetRef: target.targetRef, actions: 'synthetic-secret-value' }, 'actions', 'type', 'array')
 diagnostic({ operation: 'batch', targetRef: target.targetRef, actions: [{ action: 'click', ...image, x: Infinity }] },
   'actions.0.x', 'type', 'finite_number')
+for (const field of ['ref', 'endRef']) {
+  diagnostic({ operation: 'batch', targetRef: target.targetRef,
+    actions: [{ action: 'drag', ...image, toX: 100, toY: 200, [field]: 'synthetic-secret-ref' }] },
+  `actions.0.${field}`, 'conflict', 'exclusive_fields')
+}
+diagnostic({ operation: 'batch', targetRef: target.targetRef,
+  actions: [{ action: 'fill', ...image, text: 'synthetic-secret-value' }] },
+  'actions.0.action', 'dependency', 'related_fields')
+for (const field of ['imageId', 'observationId']) {
+  const action = { action: 'drag', ...image, toX: 100, toY: 200 }
+  delete action[field]
+  diagnostic({ operation: 'batch', targetRef: target.targetRef, actions: [action] },
+    `actions.0.${field}`, 'required', 'present')
+}
 assert.throws(() => parseDesktopBrowserRequest({ operation: 'list', sessionKey: '' }), error => {
   assert.equal(error.details.phase, undefined, 'authenticated identity is outside public argument diagnostics')
   return true

@@ -11,6 +11,7 @@ from opensquilla.gateway.rpc import RpcContext
 from opensquilla.mcp.desktop_browser import browser_tool_policy
 from opensquilla.mcp.discovery import close_active_clients, register_client_tools
 from opensquilla.mcp.types import MCPServerConfig, MCPToolDef
+from opensquilla.sandbox.policy_store import SandboxPolicyStore
 from opensquilla.skills import eligibility
 from opensquilla.skills.loader import SkillLoader
 from opensquilla.tools.browser_policy import BROWSER_MCP_REQUIRED_TOOLS
@@ -139,7 +140,7 @@ async def test_browser_candidate_tracks_registered_and_authorized_tools(
     )
     monkeypatch.setattr("opensquilla.browser.get_desktop_browser", lambda: object())
     registry = skill_context.tool_registry
-    required = {f"mcp__desktop-browser__{name}" for name in BROWSER_MCP_REQUIRED_TOOLS}
+    required = {"mcp__desktop-browser__browser_tabs", "mcp__desktop-browser__browser_inspect"}
     spec = skill_context.skill_loader.snapshot_for_turn("test").get_by_name("browser-use")
     assert spec is not None
     assert set(spec.requires_tools) == required
@@ -151,7 +152,7 @@ async def test_browser_candidate_tracks_registered_and_authorized_tools(
         return next(row for row in result["candidates"] if row["name"] == "browser-use")
 
     assert (await candidate())["reasonCode"] == "tools_unavailable"
-    for name in BROWSER_MCP_REQUIRED_TOOLS:
+    for name in ("browser_tabs", "browser_inspect"):
         registry.register(
             browser_tool_policy(
                 MCPToolDef(name, "Synthetic browser tool", {"type": "object"}),
@@ -161,10 +162,27 @@ async def test_browser_candidate_tracks_registered_and_authorized_tools(
         )
     assert (await candidate())["ready"] is True
 
-    registry.unregister("mcp__desktop-browser__browser_open")
+    store = SandboxPolicyStore(Path(skill_context.config.state_dir) / "sessions.db")
+    original = store.read()
+    restricted = original.model_copy(deep=True)
+    restricted.network.deny_domains = ["restricted.invalid"]
+    saved = store.compare_and_swap(original.policy_version, restricted)
+    original_mode = skill_context.config.sandbox.run_mode
+    with monkeypatch.context() as policy_patch:
+        policy_patch.setattr("opensquilla.sandbox.integration.get_runtime", lambda: None)
+        skill_context.config.sandbox.run_mode = "safe"
+        blocked = await candidate()
+        assert blocked["ready"] is False
+        assert blocked["reasonCode"] == "network_policy_unsupported"
+        skill_context.config.sandbox.run_mode = "full"
+        assert (await candidate())["ready"] is True
+    skill_context.config.sandbox.run_mode = original_mode
+    store.compare_and_swap(saved.policy_version, original)
+
+    registry.unregister("mcp__desktop-browser__browser_inspect")
     assert (await candidate())["reasonCode"] == "tools_unavailable"
     registry.register(
-        ToolSpec("mcp__desktop-browser__browser_open", "Synthetic browser tool", {}),
+        ToolSpec("mcp__desktop-browser__browser_inspect", "Synthetic browser tool", {}),
         lambda: "",
     )
     skill_context.config.tools.deny = ["mcp__desktop-browser__*"]

@@ -26,7 +26,8 @@ const server = createServer((_request, response) => {
   #panel{position:absolute;left:20px;top:310px;width:260px;height:70px;overflow:auto}
   #panel>div{width:1500px;height:50px}
   #rtl-panel{position:absolute;left:20px;top:410px;width:260px;height:70px;overflow:auto;direction:rtl}
-  #rtl-panel>div{width:1500px;height:50px}#frame{position:absolute;left:400px;top:330px;width:300px;height:100px}</style>
+  #rtl-panel>div{width:1500px;height:50px}#frame{position:absolute;left:400px;top:330px;width:300px;height:100px}
+  #recycled{position:absolute;left:400px;top:520px}#range{position:absolute;left:20px;top:520px}</style>
   <pre id="original">${original}</pre><textarea aria-label="Editable text"></textarea>
   <input type="password" aria-label="Secret" value="synthetic-secret">
   <button id="hold">Hold target</button><button id="context">Context target</button>
@@ -35,13 +36,18 @@ const server = createServer((_request, response) => {
   <div id="panel" role="region" aria-label="Horizontal panel"><div>Horizontal content</div></div>
   <div id="rtl-panel" role="region" aria-label="RTL horizontal panel"><div>RTL horizontal content</div></div>
   <input id="file" aria-label="Upload input" type="file">
+  <button id="recycled" onmouseenter="this.textContent='Changed target'" onclick="window.recycledClicks=(window.recycledClicks||0)+1">Initial target</button>
+  <input id="range" aria-label="Level" type="range" min="0" max="100" value="40" oninput="window.rangeChanges=(window.rangeChanges||0)+1">
   <iframe id="frame" srcdoc="<pre>Frame line one&#10;&#10;Frame line two</pre>"></iframe>
   <script>window.events=[];window.changes=0;document.querySelector('textarea').value='Edited  value\\n\\n尾部\\n';
   document.addEventListener('contextmenu',e=>e.preventDefault());
   for(const type of ['mousedown','mouseup','mousemove','click','auxclick','contextmenu'])
     document.addEventListener(type,e=>events.push({type,target:e.target.id,button:e.button,buttons:e.buttons,
       x:e.clientX,y:e.clientY,time:performance.now(),trusted:e.isTrusted}),true);
-  document.getElementById('file').addEventListener('change',()=>changes++);</script>`)
+  document.getElementById('file').addEventListener('change',()=>changes++);
+  const canvas=document.getElementById('canvas');let started=false;
+  canvas.addEventListener('mousedown',e=>{started=e.offsetX<60&&e.offsetY<60});
+  canvas.addEventListener('mouseup',e=>{window.canvasPlaced=started&&e.offsetX>=180&&e.offsetY<60;started=false});</script>`)
 })
 await new Promise(resolve => server.listen(0, '127.0.0.1', resolve))
 const origin = `http://127.0.0.1:${server.address().port}`
@@ -126,6 +132,45 @@ try {
   assert.ok(gestures.some(event => event.type === 'mouseup' && event.target === 'target'))
   assert.ok(gestures.every(event => event.trusted))
 
+  const hiddenClick = await app.evaluate(async () => {
+    const f = globalThis.capabilityFixture
+    await f.read('window.events=[]')
+    f.view.setVisible(false)
+    try { await f.act('click', 'Context target') }
+    finally { f.view.setVisible(true) }
+    return await f.read('window.events')
+  })
+  assert.deepEqual(hiddenClick.filter(event => event.target === 'context'
+    && ['mousedown', 'mouseup', 'click'].includes(event.type)).map(event => event.type),
+  ['mousedown', 'mouseup', 'click'], 'hidden clicks must preserve press/release ordering')
+
+  const recycled = await app.evaluate(async () => {
+    const f = globalThis.capabilityFixture
+    await f.inspect()
+    let code
+    try { await f.act('click', 'Initial target') } catch (error) { code = error.code }
+    const before = await f.read('window.recycledClicks||0')
+    await f.inspect()
+    await f.act('click', 'Changed target')
+    return { code, before, after: await f.read('window.recycledClicks') }
+  })
+  assert.equal(recycled.code, 'STALE_ELEMENT', 'target changes during hover must reject before pressing')
+  assert.equal(recycled.before, 0)
+  assert.equal(recycled.after, 1, 'a fresh ref can act on the changed target')
+
+  const level = await app.evaluate(async () => {
+    const f = globalThis.capabilityFixture
+    await f.inspect()
+    await f.act('press', 'Level', { key: 'End' })
+    const maximum = await f.read('document.getElementById("range").value')
+    await f.act('press', 'Level', { key: 'Home' })
+    return { maximum, minimum: await f.read('document.getElementById("range").value'),
+      changes: await f.read('window.rangeChanges') }
+  })
+  assert.equal(level.maximum, '100')
+  assert.equal(level.minimum, '0')
+  assert.ok(level.changes >= 2, 'keyboard input must change the range control value')
+
   const scrolling = await app.evaluate(async () => {
     const f = globalThis.capabilityFixture
     const result = await f.act('scroll', 'Horizontal panel', { direction: 'right', amount: 180 })
@@ -206,9 +251,10 @@ try {
     try { await f.act('drag', null, { x: 420, y: 230, toX: 600, toY: 230,
       observationId: stale.observation.observationId, imageId: stale.observation.image.imageId }) }
     catch (error) { code = error.code }
-    return { result, events, code, staleEvents: await f.read('window.events') }
+    return { result, events, placed: await f.read('window.canvasPlaced'), code, staleEvents: await f.read('window.events') }
   })
   assert.equal(coordinate.result.performed, true)
+  assert.equal(coordinate.placed, true, 'a drag from the source region must reach the destination region')
   assert.equal(coordinate.events.filter(event => event.type === 'mousedown').length, 1)
   assert.equal(coordinate.events.filter(event => event.type === 'mouseup').length, 1)
   assert.ok(coordinate.events.filter(event => event.type === 'mousemove' && event.buttons === 1).length >= 10)

@@ -205,6 +205,52 @@ try {
     assert.ok(found, `Missing synthetic control ${name}: ${JSON.stringify(observation)}`)
     return found.ref
   }
+  const legacySession = 'session-legacy-adapter'
+  const legacyCall = async (operation, args = {}, operationId = `legacy-${++serial}`, trusted = true) => {
+    const response = await fetch(setup.OPENSQUILLA_DESKTOP_BROWSER_URL, {
+      signal: AbortSignal.timeout(40_000), method: 'POST', headers: {
+        'Content-Type': 'application/json', Authorization: `Bearer ${setup.OPENSQUILLA_DESKTOP_BROWSER_TOKEN}`,
+        ...(trusted ? { 'x-opensquilla-browser-operation-id': operationId,
+          'x-opensquilla-browser-recovery-scope': 'legacy-task' } : {}),
+      }, body: JSON.stringify({ sessionKey: legacySession, operation, ...args }),
+    })
+    assert.equal(response.status, 200)
+    return await response.json()
+  }
+  const legacyOpened = await legacyCall('open', { url: origin })
+  const legacyTarget = legacyOpened.targetRef
+  const legacySnapshot = await legacyCall('snapshot', { targetRef: legacyTarget })
+  // Both public tool families must resolve refs through the same real driver.
+  success(await call('browser_act', { targetRef: legacyTarget, action: 'click',
+    ref: actionRef(legacySnapshot, 'Increment') }, { sessionKey: legacySession }))
+  assert.equal(await pageValue(legacyTarget, 'window.count'), 1)
+  const canonicalSnapshot = success(await call('browser_inspect', { targetRef: legacyTarget }, { sessionKey: legacySession }))
+  const legacyAction = { targetRef: legacyTarget, action: 'click', ref: actionRef(canonicalSnapshot, 'Increment') }
+  const legacyReceipt = await legacyCall('act', legacyAction, 'legacy-submit')
+  assert.equal(legacyReceipt.performed, true)
+  assert.deepEqual(await legacyCall('act', legacyAction, 'legacy-submit'), legacyReceipt)
+  success(await call('browser_act', legacyAction, { sessionKey: legacySession, operationId: 'legacy-submit' }))
+  assert.equal(await pageValue(legacyTarget, 'window.count'), 2, 'the old and MCP entry points share mutation receipts')
+  const scopedSnapshot = success(await call('browser_inspect', { targetRef: legacyTarget, scope: '#increment' }, { sessionKey: legacySession }))
+  assert.ok(scopedSnapshot.refs.length > 0)
+  assert.ok(scopedSnapshot.refs.every(ref => ref.name === 'Increment'))
+  assert.doesNotMatch(scopedSnapshot.text, /Name|Choice|Confirm step/)
+  success(await call('browser_act', { targetRef: legacyTarget, action: 'click',
+    ref: actionRef(scopedSnapshot, 'Increment') }, { sessionKey: legacySession }))
+  assert.equal(await pageValue(legacyTarget, 'window.count'), 3)
+  const oldSnapshot = await legacyCall('snapshot', { targetRef: legacyTarget }, undefined, false)
+  const oldAction = { targetRef: legacyTarget, action: 'click', ref: actionRef(oldSnapshot, 'Increment') }
+  const expired = await legacyCall('act', oldAction)
+  assert.equal(expired.code, 'STALE_ELEMENT')
+  assert.equal(expired.outcome, 'not_started')
+  assert.equal(await pageValue(legacyTarget, 'window.count'), 3, 'an expired old ref must not fall back to another executor')
+  assert.equal((await legacyCall('act', oldAction, undefined, false)).performed, true)
+  assert.equal(await pageValue(legacyTarget, 'window.count'), 4, 'old callers keep their original snapshot/action pair')
+  const legacyImage = await legacyCall('screenshot', { targetRef: legacyTarget })
+  assert.equal(legacyImage.mimeType, 'image/png')
+  assert.ok(legacyImage.width > 0 && Buffer.from(legacyImage.dataBase64, 'base64').length > 0)
+  success(await call('browser_tab', { targetRef: legacyTarget, tabAction: 'close' }, { sessionKey: legacySession }))
+
   const blankOptions = { sessionKey: 'session-blank-browser', mode: 'dom' }
   const blank = success(await call('browser_open', {}, blankOptions))
   assert.equal(blank.url, 'about:blank')

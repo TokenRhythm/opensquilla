@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict'
+import { randomUUID } from 'node:crypto'
 import { EventEmitter } from 'node:events'
 import { readFile } from 'node:fs/promises'
 import { mock, test } from 'node:test'
@@ -9,7 +10,7 @@ import { DesktopBrowserError } from '../dist/desktop-browser.js'
 const runtime = await readFile(new URL('../dist/browser-playwright.js', import.meta.url), 'utf8')
 const source = runtime.replace(/^import .*\n/gm, '').replace(/^export /gm, '')
 const nativeImage = { createFromBuffer: bytes => ({ crop: () => ({ toBitmap: () => bytes }) }) }
-const Driver = new Function('DesktopBrowserError', 'nativeImage', `${source}\nreturn BrowserPlaywrightDriver`)(DesktopBrowserError, nativeImage)
+const Driver = new Function('DesktopBrowserError', 'nativeImage', 'randomUUID', `${source}\nreturn BrowserPlaywrightDriver`)(DesktopBrowserError, nativeImage, randomUUID)
 
 function fixture() {
   const viewport = { width: 200, height: 100, deviceScaleFactor: 1, scrollX: 0, scrollY: 0, revision: 1, surfaceWidth: 200, surfaceHeight: 100 }
@@ -61,6 +62,55 @@ test('unchanged screenshot remains actionable after 180 seconds and unrelated DO
     assert.equal(state.presses, 1)
     assert.equal(state.captures, 2, 'validate once before moving and again before pressing')
   } finally { mock.timers.reset() }
+})
+
+for (const continuallyChanging of [false, true]) {
+  test(`observation resamples transient changes and bounds unstable capture (${continuallyChanging})`, async () => {
+    const f = fixture()
+    delete f.driver.observe
+    let snapshots = 0, captures = 0
+    f.driver.snapshot = async () => ({ text: `state-${++snapshots}`, refs: [{ ref: `ref-${snapshots}` }], truncated: false })
+    f.driver.screenshot = async () => {
+      if (++captures === 1 || continuallyChanging) f.viewport.revision++
+      return { mimeType: 'image/png', width: 200, height: 100, dataBase64: Buffer.from('pixels').toString('base64') }
+    }
+    const result = await f.driver.observe(4, () => {}, f.signal)
+    assert.equal(captures, 2)
+    assert.equal(snapshots, 2)
+    assert.equal(result.observation.text, 'state-2')
+    if (continuallyChanging) {
+      assert.equal(result.observation.consistency, 'changed')
+      assert.equal(result.observation.imageStatus, 'unavailable')
+      assert.deepEqual(result.observation.refs, [])
+      assert.equal(result.dataBase64, undefined)
+      assert.equal(f.driver.latestVisual, undefined)
+      await assert.rejects(f.act(), error => error.code === 'STALE_OBSERVATION')
+      assert.equal(f.state.presses, 0)
+    } else {
+      assert.equal(result.observation.consistency, 'consistent')
+      assert.equal(result.observation.imageStatus, 'available')
+      assert.deepEqual(result.observation.refs, [{ ref: 'ref-2' }])
+      assert.equal(f.driver.latestVisual.imageId, result.observation.image.imageId)
+    }
+  })
+}
+
+test('observation does not resample across a document change', async () => {
+  const f = fixture()
+  delete f.driver.observe
+  let captures = 0
+  f.driver.snapshot = async () => ({ text: 'previous document', refs: [{ ref: 'old-ref' }], truncated: false })
+  f.driver.screenshot = async () => {
+    captures++
+    f.driver.documentEpoch++
+    return { mimeType: 'image/png', width: 200, height: 100, dataBase64: Buffer.from('pixels').toString('base64') }
+  }
+  const result = await f.driver.observe(4, () => {}, f.signal)
+  assert.equal(captures, 1)
+  assert.equal(result.observation.consistency, 'changed')
+  assert.equal(result.observation.imageStatus, 'unavailable')
+  assert.deepEqual(result.observation.refs, [])
+  assert.equal(f.driver.latestVisual, undefined)
 })
 
 for (const [name, change, reason] of [
