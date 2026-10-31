@@ -69,6 +69,7 @@ ROUTER_ASSET_RELS = (
     "v4.2_phase3_inference/mlp/model.onnx",
     "v4.2_phase3_inference/features/tfidf.pkl",
     "v4.2_phase3_inference/bge_onnx/model.onnx",
+    "v4.2_phase3_inference/bge_onnx/tokenizer.json",
 )
 REQUIRED_RUNTIME_MODULE_RELS = (
     "opensquilla/cli/main.py",
@@ -279,38 +280,41 @@ def check_router_assets(model_root: Path) -> RouterAssetCheck:
     missing_files: list[Path] = []
     pointer_files: list[Path] = []
     paths = list(required_router_assets(model_root))
-    asset_root = (model_root.parent / "lightgbm_model" / "assets").resolve()
-    manifest_path = asset_root / "artifact_manifest.json"
     records: dict[Path, dict] = {}
-    if manifest_path.is_file():
-        manifest_bytes = manifest_path.read_bytes()
-        if not manifest_bytes.startswith(LFS_POINTER_LINE.encode()):
-            try:
-                manifest = json.loads(manifest_bytes)
-                if manifest["schema_version"] != 1 or not manifest["files"]:
-                    raise ValueError("unsupported or empty asset manifest")
-                for record in manifest["files"]:
-                    relative = record["path"]
-                    path = (asset_root / relative).resolve()
-                    if (
-                        not isinstance(relative, str)
-                        or "\\" in relative
-                        or Path(relative).is_absolute()
-                        or ".." in Path(relative).parts
-                        or path == asset_root
-                        or not path.is_relative_to(asset_root)
-                        or path in records
-                        or not isinstance(record["size_bytes"], int)
-                        or isinstance(record["size_bytes"], bool)
-                        or record["size_bytes"] < 0
-                        or len(record["sha256"]) != 64
-                        or any(char not in "0123456789abcdef" for char in record["sha256"])
-                    ):
-                        raise ValueError("unsafe or incomplete asset record")
-                    records[path] = record
-                    paths.append(path)
-            except (ValueError, KeyError, TypeError, AttributeError) as exc:
-                raise SystemExit(f"Invalid LightGBM artifact manifest: {manifest_path}") from exc
+    for asset_root in (
+        (model_root / "v4.2_phase3_inference").resolve(),
+        (model_root.parent / "lightgbm_model/assets").resolve(),
+    ):
+        manifest_path = asset_root / "artifact_manifest.json"
+        if manifest_path.is_file():
+            manifest_bytes = manifest_path.read_bytes()
+            if not manifest_bytes.startswith(LFS_POINTER_LINE.encode()):
+                try:
+                    manifest = json.loads(manifest_bytes)
+                    if manifest["schema_version"] != 1 or not manifest["files"]:
+                        raise ValueError("unsupported or empty asset manifest")
+                    for record in manifest["files"]:
+                        relative = record["path"]
+                        path = (asset_root / relative).resolve()
+                        if (
+                            not isinstance(relative, str)
+                            or "\\" in relative
+                            or Path(relative).is_absolute()
+                            or ".." in Path(relative).parts
+                            or path == asset_root
+                            or not path.is_relative_to(asset_root)
+                            or path in records
+                            or not isinstance(record["size_bytes"], int)
+                            or isinstance(record["size_bytes"], bool)
+                            or record["size_bytes"] < 0
+                            or len(record["sha256"]) != 64
+                            or any(char not in "0123456789abcdef" for char in record["sha256"])
+                        ):
+                            raise ValueError("unsafe or incomplete asset record")
+                        records[path] = record
+                        paths.append(path)
+                except (ValueError, KeyError, TypeError, AttributeError) as exc:
+                    raise SystemExit(f"Invalid router artifact manifest: {manifest_path}") from exc
     for path in dict.fromkeys(paths):
         if not path.is_file():
             missing_files.append(path)
@@ -325,7 +329,7 @@ def check_router_assets(model_root: Path) -> RouterAssetCheck:
             with path.open("rb") as handle:
                 digest = hashlib.file_digest(handle, "sha256").hexdigest()
             if path.stat().st_size != record["size_bytes"] or digest != record["sha256"]:
-                raise SystemExit(f"LightGBM artifact integrity mismatch: {path}")
+                raise SystemExit(f"Router artifact integrity mismatch: {path}")
     return RouterAssetCheck(tuple(missing_files), tuple(pointer_files))
 
 

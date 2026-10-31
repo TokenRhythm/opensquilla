@@ -88,10 +88,9 @@ def test_wheel_contains_complete_verified_lightgbm_bundle(isolated_core_wheel: P
             )
             / asset_prefix
         )
-        assert {
-            "preprocess/feature/artifacts/bge/model.onnx",
-            "preprocess/feature/artifacts/bge/tokenizer.json",
-        } <= {record["path"] for record in manifest["files"]}
+        assert not any(
+            name.startswith(f"{asset_prefix}/preprocess/feature/artifacts/bge/") for name in names
+        )
         assert all(len(str(installed / record["path"])) < 260 for record in manifest["files"])
         for record in manifest["files"]:
             path = f"{asset_prefix}/{record['path']}"
@@ -104,6 +103,15 @@ def test_wheel_contains_complete_verified_lightgbm_bundle(isolated_core_wheel: P
             "29fb79337458c4f35d3e0d1148fbdb1175c20069a5fa8ee6441633b0e2eee357"
         )
         source = json.loads(original)
+        shared = "opensquilla/squilla_router/models/v4.2_phase3_inference/bge_onnx"
+        for role, filename in (("onnx_model", "model.onnx"), ("tokenizer", "tokenizer.json")):
+            reference = next(ref for ref in source["preprocess"] if f"/bge/{role}/" in ref["path"])
+            path = f"{shared}/{filename}"
+            payload = wheel.read(path)
+            shared_installed = installed.parents[1] / "models/v4.2_phase3_inference/bge_onnx"
+            assert len(str(shared_installed / filename)) < 260
+            assert len(payload) == reference["size"], path
+            assert "sha256:" + hashlib.sha256(payload).hexdigest() == reference["sha256"], path
         for target in ("intent", "tier"):
             reference = next(
                 ref

@@ -21,9 +21,9 @@ FEATURE_SCHEMA_VERSION = "lightgbm_380.v1"
 INTENT_LABELS = ("new_task", "continue", "redo")
 TIER_LABELS = ("C0", "C1", "C2", "C3")
 _EXCLUDED_TYPES = frozenset({"run_manifest", "training_metrics"})
-# Keep installed paths below Windows installer limits; source manifests retain
-# the original content-addressed names and every asset's pinned digest.
-_ENCODER_ASSETS = {"onnx_model": "bge/model.onnx", "tokenizer": "bge/tokenizer.json"}
+# The packaged classifiers share the byte-identical legacy BGE assets. External
+# bundles keep their self-contained short paths; both use the frozen digests.
+_ENCODER_ASSETS = {"onnx_model": "model.onnx", "tokenizer": "tokenizer.json"}
 
 
 class LightGBMModelError(RuntimeError):
@@ -80,12 +80,17 @@ def _verified_artifacts(model_root: str | Path | None) -> tuple[dict[str, Any], 
                 local = "bundles/" + source.name
             else:
                 local = source.parent.name + "/" + source.name
+            artifact_root = root
             if local.startswith("preprocess/feature/artifacts/bge/"):
-                local = "preprocess/feature/artifacts/" + _ENCODER_ASSETS[source.parent.parent.name]
+                filename = _ENCODER_ASSETS[source.parent.parent.name]
+                local = f"preprocess/feature/artifacts/bge/{filename}"
+                if root == default_model_root():
+                    artifact_root = root.parents[1] / "models/v4.2_phase3_inference"
+                    local = f"bge_onnx/{filename}"
             compressed = ref["artifact_type"] == "lightgbm_model"
             if compressed:
                 local += ".gz"
-            path = _safe_path(root, local)
+            path = _safe_path(artifact_root, local)
             if compressed:
                 with gzip.open(path, "rb") as handle:
                     payload = handle.read(ref["size"] + 1)
@@ -194,17 +199,11 @@ class LightGBMRouterModel:
                 return matches[0]
 
             feature_root = one("transformer_manifest").parent
-            runtime_manifest = json.loads(
-                (feature_root / "runtime_manifest.json").read_text(encoding="utf-8")
-            )
-            encoder_paths = {
-                item["role"]: feature_root / _ENCODER_ASSETS[item["role"]]
-                for item in runtime_manifest["encoder_assets"]
-            }
+            encoder_model = one("feature_artifact", "bge/onnx_model")
             encoder = BGEOnnxEncoder(
-                feature_root,
-                model_path=encoder_paths["onnx_model"],
-                tokenizer_path=encoder_paths["tokenizer"],
+                encoder_model.parent,
+                model_path=encoder_model,
+                tokenizer_path=one("feature_artifact", "bge/tokenizer"),
             )
             try:
                 self._featurizer = LightGBM380Featurizer(

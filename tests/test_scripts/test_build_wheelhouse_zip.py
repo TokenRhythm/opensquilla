@@ -1052,7 +1052,7 @@ def test_release_workflow_publishes_from_version_tags() -> None:
     assert "TAG: ${{ env.RELEASE_TAG }}" in workflow
 
 
-def _lightgbm_preflight_fixture(tmp_path: Path):
+def _router_preflight_fixture(tmp_path: Path, asset="new"):
     import hashlib
     import json
 
@@ -1061,47 +1061,60 @@ def _lightgbm_preflight_fixture(tmp_path: Path):
     for path in module.required_router_assets(model_root):
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_bytes(b"materialized asset")
-    asset_root = model_root.parent / "lightgbm_model" / "assets"
-    relative = "preprocess/feature/artifacts/tokenizer.json"
+    legacy = model_root / "v4.2_phase3_inference"
+    current = model_root.parent / "lightgbm_model/assets"
+    nested = "preprocess/feature/artifacts/tokenizer.json"
     payload = b'{"frozen": true}'
-    record = {
-        "path": relative,
-        "size_bytes": len(payload),
-        "sha256": hashlib.sha256(payload).hexdigest(),
-    }
-    (asset_root / "artifact_manifest.json").write_text(json.dumps({
-        "schema_version": 1, "files": [record],
-    }))
-    return module, model_root, asset_root / relative, payload
+    for root, names in (
+        (legacy, ["bge_onnx/model.onnx", "bge_onnx/tokenizer.json"]),
+        (current, [nested]),
+    ):
+        records = []
+        for name in names:
+            path = root / name
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(payload)
+            records.append({
+                "path": name, "size_bytes": len(payload),
+                "sha256": hashlib.sha256(payload).hexdigest(),
+            })
+        (root / "artifact_manifest.json").write_text(
+            json.dumps({"schema_version": 1, "files": records}), encoding="utf-8",
+        )
+    target = current / nested if asset == "new" else legacy / "bge_onnx" / asset
+    target.unlink()
+    return module, model_root, target, payload
 
 
-def test_router_preflight_checks_every_manifest_asset(tmp_path: Path) -> None:
-    module, model_root, nested_asset, payload = _lightgbm_preflight_fixture(tmp_path)
+@pytest.mark.parametrize("asset", ["new", "model.onnx", "tokenizer.json"])
+def test_router_preflight_checks_every_manifest_asset(tmp_path: Path, asset) -> None:
+    module, model_root, nested_asset, payload = _router_preflight_fixture(tmp_path, asset)
     assert nested_asset in module.check_router_assets(model_root).missing_files
-    nested_asset.parent.mkdir(parents=True)
+    nested_asset.parent.mkdir(parents=True, exist_ok=True)
     nested_asset.write_bytes(payload)
     assert module.check_router_assets(model_root).ok
     nested_asset.write_text(module.LFS_POINTER_LINE + "\noid sha256:dummy\nsize 1\n")
     assert nested_asset in module.check_router_assets(model_root).pointer_files
 
 
-def test_router_preflight_rejects_tampered_manifest_asset(tmp_path: Path) -> None:
-    module, model_root, nested_asset, _ = _lightgbm_preflight_fixture(tmp_path)
-    nested_asset.parent.mkdir(parents=True)
+@pytest.mark.parametrize("asset", ["new", "model.onnx", "tokenizer.json"])
+def test_router_preflight_rejects_tampered_manifest_asset(tmp_path: Path, asset) -> None:
+    module, model_root, nested_asset, _ = _router_preflight_fixture(tmp_path, asset)
+    nested_asset.parent.mkdir(parents=True, exist_ok=True)
     nested_asset.write_bytes(b"tampered")
-    with pytest.raises(SystemExit, match="LightGBM artifact integrity mismatch"):
+    with pytest.raises(SystemExit, match="Router artifact integrity mismatch"):
         module.check_router_assets(model_root)
 
 
 def test_router_preflight_rejects_escaping_manifest_path(tmp_path: Path) -> None:
     import json
 
-    module, model_root, _, _ = _lightgbm_preflight_fixture(tmp_path)
+    module, model_root, _, _ = _router_preflight_fixture(tmp_path)
     manifest = model_root.parent / "lightgbm_model" / "assets" / "artifact_manifest.json"
     data = json.loads(manifest.read_text(encoding="utf-8"))
     data["files"][0]["path"] = "../outside.json"
     manifest.write_text(json.dumps(data))
-    with pytest.raises(SystemExit, match="Invalid LightGBM artifact manifest"):
+    with pytest.raises(SystemExit, match="Invalid router artifact manifest"):
         module.check_router_assets(model_root)
 
 

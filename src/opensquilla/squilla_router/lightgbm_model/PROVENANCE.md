@@ -34,11 +34,14 @@ original manifest and the selected inference closure before native model loading
 or pickle deserialization. The two model text files are distributed as gzip;
 verification hashes the decompressed original bytes. The encoder, tokenizer,
 three joblib transformers, calibration files, bundles, and feature metadata are
-unchanged. The two BGE files use short installed names (`bge/model.onnx` and
-`bge/tokenizer.json`) to avoid the Windows packaged path length that caused a
-resource-read failure; their original paths and hashes remain in the source
-manifests. Training run manifests and training metrics remain referenced in the
-original manifest but are omitted from the inference distribution.
+unchanged. The packaged model reuses the byte-identical ONNX model and tokenizer
+in `../models/v4.2_phase3_inference/bge_onnx/`; the original manifest still
+verifies both before loading. External `lightgbm_model_dir` bundles remain
+self-contained, with `preprocess/feature/artifacts/bge/model.onnx` and
+`preprocess/feature/artifacts/bge/tokenizer.json`. Both layouts avoid the long
+content-addressed Windows paths; the source manifests and hashes are unchanged.
+Training run manifests and training metrics remain referenced in the original
+manifest but are omitted from the inference distribution.
 
 The 380 float32 features are current-request BGE/PCA64, current-request
 character TF-IDF/SVD100, rules48, history BGE/PCA64, route-history16,

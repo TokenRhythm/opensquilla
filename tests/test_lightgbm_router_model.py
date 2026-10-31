@@ -25,6 +25,15 @@ from opensquilla.squilla_router.lightgbm_model import (
 )
 
 
+def _copy_standalone_bundle(root: Path) -> None:
+    shutil.copytree(default_model_root(), root, dirs_exist_ok=True)
+    encoder = root / "preprocess/feature/artifacts/bge"
+    encoder.mkdir(parents=True, exist_ok=True)
+    shared = default_model_root().parents[1] / "models/v4.2_phase3_inference/bge_onnx"
+    for filename in ("model.onnx", "tokenizer.json"):
+        shutil.copyfile(shared / filename, encoder / filename)
+
+
 @pytest.fixture(scope="module")
 def model():
     pytest.importorskip("lightgbm")
@@ -208,39 +217,61 @@ def test_tampered_manifest_fails_closed(tmp_path: Path):
     assert caught.value.fail_closed
 
 
-def test_tampered_calibration_is_rejected_before_deserialization(tmp_path: Path):
-    shutil.copytree(default_model_root(), tmp_path, dirs_exist_ok=True)
-    (tmp_path / "intent/calibration.json").write_text("{}")
+@pytest.mark.parametrize(
+    ("relative", "payload", "message"),
+    [
+        ("intent/calibration.json", b"{}", "artifact hash mismatch: intent/calibration.json"),
+        ("preprocess/feature/artifacts/pca64.joblib", None, "assets are missing or invalid"),
+        ("intent/model.txt.gz", b"\x1f\x8b\x08", "assets are missing or invalid"),
+        ("preprocess/feature/artifacts/bge/tokenizer.json", None, "assets are missing or invalid"),
+    ],
+)
+def test_invalid_bundle_is_rejected_before_deserialization(tmp_path, relative, payload, message):
+    _copy_standalone_bundle(tmp_path)
+    path = tmp_path / relative
+    if payload is None:
+        path.unlink()
+    else:
+        path.write_bytes(payload)
     with patch("opensquilla.squilla_router.lightgbm_model.model._load_transformer") as loader:
-        with pytest.raises(
-            LightGBMModelError,
-            match="artifact hash mismatch: intent/calibration.json",
-        ):
+        with pytest.raises(LightGBMModelError, match=message) as caught:
             LightGBMRouterModel(tmp_path)
+        assert caught.value.fail_closed
         loader.assert_not_called()
 
 
-def test_missing_preprocess_asset_is_rejected_before_deserialization(tmp_path: Path):
-    shutil.copytree(default_model_root(), tmp_path, dirs_exist_ok=True)
-    (tmp_path / "preprocess/feature/artifacts/pca64.joblib").unlink()
-    with patch("opensquilla.squilla_router.lightgbm_model.model._load_transformer") as loader:
-        with pytest.raises(LightGBMModelError, match="assets are missing or invalid"):
-            LightGBMRouterModel(tmp_path)
+@pytest.mark.parametrize("filename", ["model.onnx", "tokenizer.json"])
+@pytest.mark.parametrize("missing", [False, True], ids=["tampered", "missing"])
+def test_invalid_shared_encoder_is_rejected_before_deserialization(
+    tmp_path, monkeypatch, filename, missing,
+):
+    from opensquilla.squilla_router.lightgbm_model import model as module
+
+    root = tmp_path / "lightgbm_model/assets"
+    _copy_standalone_bundle(root)
+    shared = tmp_path / "models/v4.2_phase3_inference/bge_onnx"
+    shared.parent.mkdir(parents=True)
+    (root / "preprocess/feature/artifacts/bge").rename(shared)
+    path = shared / filename
+    if missing:
+        path.unlink()
+    else:
+        path.write_bytes(b"invalid")
+    monkeypatch.setattr(module, "default_model_root", lambda: root)
+    message = (
+        "assets are missing or invalid" if missing
+        else f"artifact hash mismatch: bge_onnx/{filename}"
+    )
+    with patch.object(module, "_load_transformer") as loader:
+        with pytest.raises(LightGBMModelError, match=message):
+            LightGBMRouterModel()
         loader.assert_not_called()
-
-
-def test_truncated_compressed_model_fails_closed(tmp_path: Path):
-    shutil.copytree(default_model_root(), tmp_path, dirs_exist_ok=True)
-    (tmp_path / "intent/model.txt.gz").write_bytes(b"\x1f\x8b\x08")
-    with pytest.raises(LightGBMModelError) as caught:
-        validate_artifacts(tmp_path)
-    assert caught.value.fail_closed
 
 
 def test_native_model_loads_from_deep_install_path_with_non_utf8_locale(tmp_path, monkeypatch):
     # Match the installed Gateway's long prefix while keeping resource names short.
     root = tmp_path / ("installed-gateway-" + "x" * max(1, 145 - len(str(tmp_path)))) / "assets"
-    shutil.copytree(default_model_root(), root)
+    _copy_standalone_bundle(root)
     original_read_text = Path.read_text
     reads = []
 
@@ -285,7 +316,7 @@ def test_encoder_cache_is_bounded_lru_and_releases_owned_rows(monkeypatch):
             return [np.asarray([[value, 1, 2, 3]], dtype=np.float32)]
 
     encoder = runtime.BGEOnnxEncoder(
-        default_model_root() / "preprocess/feature/artifacts/bge",
+        default_model_root().parents[1] / "models/v4.2_phase3_inference/bge_onnx",
         tokenizer=Tokenizer(),
         session=Session(),
     )
