@@ -5,6 +5,7 @@ import json
 import os
 import subprocess
 import sys
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
@@ -31,7 +32,13 @@ _MANUAL_KEY = "synthetic-manual-video-key"
 _LEASES = ["os_local_" + character * 43 for character in "ab"]
 
 
-def test_video_receipts_survive_a_process_restart(tmp_path: Path) -> None:
+# Keep real-process SQLite recovery outside the parallel CI worker pool.
+@pytest.mark.ci_serial
+def test_video_receipts_survive_a_process_restart(
+    tmp_path: Path, migrated_db_factory: Callable[[str | None], Path],
+) -> None:
+    # This verifies receipt recovery, not cold session-schema migrations.
+    migrated_db_factory("usage.sqlite3")
     environment = {**os.environ, "PYTHONPATH": str(Path(media.__file__).parents[3])}
     outputs = []
     for phase in ("write", "read"):
