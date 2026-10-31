@@ -73,7 +73,9 @@
       "type": "object",
       "additionalProperties": true,
       "properties": {
-        "cacheOnly": { "type": "boolean" },
+        "cacheOnly": {
+          "type": "boolean"
+        },
         "providerId": {
           "type": [
             "string",
@@ -85,6 +87,11 @@
             "boolean",
             "null"
           ]
+        },
+        "credentialSource": {
+          "type": "string",
+          "const": "manual",
+          "description": "Validate or discover the manual connection without changing the selected desktop account binding; omit to use the selected runtime source."
         }
       },
       "required": [

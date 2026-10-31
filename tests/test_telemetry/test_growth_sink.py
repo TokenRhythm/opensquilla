@@ -4,6 +4,7 @@ import asyncio
 import json
 import threading
 import uuid
+from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
 
@@ -1078,6 +1079,97 @@ async def test_client_launch_retry_reuses_event_id(tmp_path) -> None:
     assert first is False
     assert second is True
     assert runtime.events[0].event_id == runtime.events[1].event_id
+
+
+@pytest.mark.parametrize("disabled_by", ["ci", "preference"])
+async def test_disabled_gateway_launch_and_retry_skip_state_io(
+    tmp_path, monkeypatch, disabled_by,
+) -> None:
+    config = _config(tmp_path, enabled=disabled_by != "preference")
+    runtime = CapturingRuntime()
+    sink = _sink(runtime, config, env={"CI": "1"} if disabled_by == "ci" else {})
+    scheduled = []
+
+    async def unexpected_io(operation):
+        scheduled.append(operation)
+        raise AssertionError("disabled startup telemetry must not schedule state I/O")
+
+    monkeypatch.setattr("opensquilla.telemetry.growth_sink.run_state_io", unexpected_io)
+    try:
+        assert not await sink.record_client_launch(
+            surface=ClientSurface.DESKTOP,
+            entrypoint=ClientEntrypoint.GATEWAY_RUN,
+            execution_mode=ExecutionMode.GATEWAY,
+        )
+        assert not await sink._has_pending()
+    finally:
+        await sink.close()
+
+    assert scheduled == []
+    assert runtime.events == []
+    assert not (tmp_path / "telemetry").exists()
+
+
+async def test_disabled_gateway_launch_cancellation_does_not_wait_for_executor(
+    tmp_path, monkeypatch,
+) -> None:
+    sink = _sink(CapturingRuntime(), _config(tmp_path), env={"CI": "1"})
+    loop = asyncio.get_running_loop()
+    worker_entered = asyncio.Event()
+    release_worker = threading.Event()
+    executor = ThreadPoolExecutor(max_workers=1)
+    original_run_in_executor = loop.run_in_executor
+
+    def run_in_executor(selected_executor, function, *args):
+        return original_run_in_executor(
+            executor if selected_executor is None else selected_executor, function, *args,
+        )
+
+    monkeypatch.setattr(loop, "run_in_executor", run_in_executor)
+
+    def occupy_worker():
+        loop.call_soon_threadsafe(worker_entered.set)
+        assert release_worker.wait(5), "synthetic executor worker was not released"
+
+    worker = executor.submit(occupy_worker)
+    launch = None
+    closing = None
+
+    async def checkpoint():
+        # Observe tasks already queued on this loop without a wall-clock race.
+        reached = loop.create_future()
+        loop.call_soon(reached.set_result, None)
+        await reached
+
+    async def stop_launch():
+        launch.cancel()
+        try:
+            await launch
+        except asyncio.CancelledError:
+            pass
+
+    try:
+        await asyncio.wait_for(worker_entered.wait(), 1)
+        launch = asyncio.create_task(sink.record_client_launch(
+            surface=ClientSurface.DESKTOP,
+            entrypoint=ClientEntrypoint.GATEWAY_RUN,
+            execution_mode=ExecutionMode.GATEWAY,
+        ))
+        await checkpoint()
+        closing = asyncio.create_task(stop_launch())
+        await checkpoint()
+        assert not release_worker.is_set()
+        assert closing.done(), "disabled launch delayed shutdown behind unrelated executor work"
+        await closing
+    finally:
+        release_worker.set()
+        await asyncio.wrap_future(worker)
+        if closing is not None:
+            await closing
+        elif launch is not None:
+            await asyncio.gather(launch, return_exceptions=True)
+        await sink.close()
+        executor.shutdown(wait=True)
 
 
 async def test_launch_observations_coalesce_and_close_drains_original_day(

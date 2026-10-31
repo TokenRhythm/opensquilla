@@ -938,6 +938,7 @@ def upsert_llm_provider(
     llm_payload.update(
         {
             "provider": provider_id,
+            "credential_source": "manual",
             "model": model_clean,
             "api_key": effective_api_key,
             "api_key_env": effective_api_key_env,
@@ -2712,7 +2713,16 @@ def upsert_llm_profile(
     else:
         effective_proxy = str(proxy or "").strip()
 
+    from opensquilla.desktop_account import account_credential
+    account_only = (
+        not effective_api_key and not effective_api_key_env and not effective_pool
+        and (
+            getattr(existing, "credential_source", "manual") == "account"
+            or not existing and account_credential(provider) is not None
+        )
+    )
     profile = LlmProviderProfile(
+        credential_source="account" if account_only else "manual",
         model=effective_model,
         api_key=effective_api_key,
         api_key_env=effective_api_key_env,
@@ -2821,6 +2831,32 @@ def clear_llm_profile_credentials(
 def remove_llm_profile(config: GatewayConfig, *, provider_id: str) -> MutationResult:
     """Remove an unused provider profile, refusing dangling route references."""
     provider = str(provider_id or "").strip().lower()
+    from opensquilla.desktop_account import account_credential
+    if provider == "tokenrhythm" and account_credential(provider) is not None:
+        # Removing the manual connection must preserve the account's models
+        # and routing references, including when both share the primary provider.
+        new_cfg = _clone(config)
+        targets: list[LlmProviderConfig | LlmProviderProfile] = []
+        paths = set()
+        if str(config.llm.provider).lower() == provider:
+            targets.append(new_cfg.llm)
+            paths.add("llm.api_key")
+        for key in _llm_profile_storage_keys(new_cfg, provider):
+            targets.append(new_cfg.llm_profiles[key])
+            paths.add(f"llm_profiles.{key}.api_key")
+        if not targets:
+            raise KeyError(f"LLM profile {provider!r} does not exist")
+        for target in targets:
+            target.api_key = ""
+            target.api_key_env = ""
+            target.credential_source = "account"
+            if hasattr(target, "api_key_env_pool"):
+                target.api_key_env_pool = []
+        clear_runtime_secret_paths(new_cfg, paths)
+        return MutationResult(
+            config=new_cfg, changed=True, restart_required=False,
+            public_payload={"provider": provider, "removed": True},
+        )
     profile_keys = _llm_profile_storage_keys(config, provider)
     if not profile_keys:
         raise KeyError(f"LLM profile {provider!r} does not exist")
@@ -2930,6 +2966,7 @@ def activate_llm_profile(
         profiles.pop(key, None)
     if previous_provider:
         profiles[previous_provider] = LlmProviderProfile(
+            credential_source=config.llm.credential_source,
             model=str(config.llm.model or ""),
             api_key=str(config.llm.api_key or ""),
             api_key_env=str(config.llm.api_key_env or ""),
@@ -2941,6 +2978,7 @@ def activate_llm_profile(
         )
     new_cfg.llm_profiles = profiles
     new_cfg.llm = LlmProviderConfig(
+        credential_source=profile.credential_source,
         provider=provider,
         model=model_id,
         api_key=str(profile.api_key or ""),
@@ -2948,6 +2986,9 @@ def activate_llm_profile(
         base_url=str(profile.base_url or spec.default_base_url or ""),
         proxy=str(profile.proxy or ""),
     )
+    # The default provider must remain explicit on disk: a legacy config with
+    # omitted provider and explicit credentials is otherwise read as OpenRouter.
+    new_cfg.mark_force_persist("llm.provider")
     _apply_primary_provider_router_policy(
         config,
         new_cfg,

@@ -12,9 +12,9 @@ export type IconName =
   | 'panel-left-open' | 'panel-left-close' | 'panel-right-open' | 'panel-right-close'
   | 'sidebar-visible' | 'sidebar-hidden'
   | 'clock' | 'microphone' | 'terminal'
-  | 'cloud' | 'folder' | 'fileText' | 'fileCode' | 'image' | 'table' | 'externalLink'
+  | 'cloud' | 'folder' | 'fileText' | 'fileCode' | 'image' | 'table' | 'externalLink' | 'arrowUpRight'
   | 'sparkles' | 'settings-2' | 'clock-3' | 'chart-no-axes-column' | 'folder-outline'
-  | 'keyboard' | 'languages' | 'shield' | 'lock'
+  | 'keyboard' | 'languages' | 'shield' | 'lock' | 'log-out'
   | 'target'
   | 'thumbs-up' | 'thumbs-down'
   | 'music' | 'pause' | 'volume' | 'video';
@@ -32,6 +32,7 @@ const ICONS: Record<IconName, IconDef> = {
   'settings-2': { path: '<path d="M14 17H5"/><path d="M19 7h-9"/><circle cx="17" cy="17" r="3"/><circle cx="7" cy="7" r="3"/>' },
   'clock-3': { path: '<circle cx="12" cy="12" r="10"/><path d="M12 6v6h4"/>' },
   'chart-no-axes-column': { path: '<path d="M5 21v-6"/><path d="M12 21V3"/><path d="M19 21V9"/>' },
+  'log-out': { path: '<path d="m16 17 5-5-5-5"/><path d="M21 12H9"/><path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4"/>' },
   'folder-outline': { path: '<path d="M20 20a2 2 0 0 0 2-2V8a2 2 0 0 0-2-2h-7.9a2 2 0 0 1-1.69-.9L9.6 3.9A2 2 0 0 0 7.93 3H4a2 2 0 0 0-2 2v13a2 2 0 0 0 2 2Z"/>' },
   terminal:   { path: '<path d="m4 5 6 7-6 7"/><path d="M13 19h7"/>', strokeWidth: 1.5 },
   chat:       { path: '<path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/>' },
@@ -115,6 +116,7 @@ const ICONS: Record<IconName, IconDef> = {
   image: { path: '<rect x="3" y="5" width="18" height="14" rx="2"/><circle cx="8.5" cy="10.5" r="1.5"/><path d="m21 15-4.5-4.5L6 19"/>', strokeWidth: 1.5 },
   table: { path: '<rect x="3" y="4" width="18" height="16" rx="2"/><path d="M3 10h18"/><path d="M9 4v16"/><path d="M15 4v16"/>', strokeWidth: 1.5 },
   externalLink: { path: '<path d="M15 3h6v6"/><path d="M10 14 21 3"/><path d="M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6"/>', strokeWidth: 1.5 },
+  arrowUpRight: { path: '<path d="M5 19 19 5"/><path d="M7 5h12v12"/>', strokeWidth: 2 },
   keyboard:   { path: '<rect width="20" height="16" x="2" y="4" rx="2"/><path d="M6 8h.01"/><path d="M10 8h.01"/><path d="M14 8h.01"/><path d="M18 8h.01"/><path d="M8 12h.01"/><path d="M12 12h.01"/><path d="M16 12h.01"/><path d="M7 16h10"/>' },
   shield:     { path: '<path d="M20 13c0 5-3.5 7.5-8 9-4.5-1.5-8-4-8-9V5l8-3 8 3v8z"/>', strokeWidth: 1.7 },
   lock:       { path: '<rect x="3" y="11" width="18" height="11" rx="2" ry="2"/><path d="M7 11V7a5 5 0 0 1 10 0v4"/>', strokeWidth: 1.7 },

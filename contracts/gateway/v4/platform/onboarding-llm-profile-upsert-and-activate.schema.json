@@ -129,6 +129,14 @@
             "preserve",
             "enable_provider_default"
           ]
+        },
+        "credentialSource": {
+          "type": "string",
+          "enum": [
+            "manual",
+            "account"
+          ],
+          "description": "Validate the manual connection or current desktop login without changing the saved account binding; omit to use the selected runtime source."
         }
       },
       "required": [

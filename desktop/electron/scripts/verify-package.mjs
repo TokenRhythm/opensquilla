@@ -566,6 +566,12 @@ async function verifyAsarPackageVersion(asarPath, label) {
   }
 
   const version = typeof packageJson.version === 'string' ? packageJson.version : ''
+  for (const [key, expected] of [
+    ['version', process.env.OPENSQUILLA_EXPECT_PACKAGE_VERSION],
+    ['opensquillaTokenRhythmOrigin', process.env.OPENSQUILLA_EXPECT_ACCOUNT_ORIGIN],
+  ]) {
+    if (expected && packageJson[key] !== expected) fail(`${label} packaged ${key} does not match the requested test build`)
+  }
   const semverPattern = /^\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?(?:\+[0-9A-Za-z.-]+)?$/
   if (!semverPattern.test(version) || /\d(?:a|b|rc)\d+$/.test(version)) {
     fail(

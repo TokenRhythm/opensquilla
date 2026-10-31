@@ -1,12 +1,14 @@
 // @vitest-environment happy-dom
 import { afterEach, describe, expect, it, vi } from 'vitest'
-import { createApp, nextTick, ref } from 'vue'
+import { createApp, nextTick, reactive, ref } from 'vue'
+import type { ModelCredentialSource, TokenRhythmAccountState } from '../../../../contracts/desktop/tokenrhythm-account'
 import { localizeImageActionableDetail, useSetupCatalog } from './useSetupCatalog'
 import { LEGACY_OPENROUTER_MODEL_OPTIONS } from './useSetupEnsembleForm'
 import { PROVIDER_CREDENTIAL_REVEAL_TIMEOUT_MS } from './useSetupProviderForm'
 import { SetupWorkflowError } from '@/modules/setupWorkflow'
 import { AppSettingsError } from '@/modules/appSettings'
 import type { GatewayAvailability } from '@/modules/gatewayAccess'
+import type { ModelRecommendation, RecommendationTarget } from '@/modules/providerConfiguration'
 
 const rpcCall = vi.hoisted(() => vi.fn())
 const ready = vi.hoisted(() => vi.fn(async () => {}))
@@ -15,6 +17,10 @@ const observeProbeRequest = vi.hoisted(() => vi.fn())
 const pushToast = vi.hoisted(() => vi.fn())
 const confirmAction = vi.hoisted(() => vi.fn(async () => true))
 const confirmChoiceAction = vi.hoisted(() => vi.fn(async () => 'cancel' as 'primary' | 'secondary' | 'cancel'))
+const accountMock = vi.hoisted(() => ({ store: null as ReturnType<typeof import('@/stores/account').useAccountStore> | null }))
+vi.mock('@/stores/account', () => ({
+  useAccountStore: () => accountMock.store ?? { supported: false, state: null, loggedIn: false, ready: false, init: async () => {} },
+}))
 
 function routerConflictForPrimary() {
   return new SetupWorkflowError('conflict', 'opaque conflict', 'router-provider-conflict', undefined, {
@@ -70,7 +76,7 @@ async function primaryTransitionScenario(first = false, mutate: (method: string,
   return { ...await mountCatalog(), saved }
 }
 
-async function mountCatalog(gatewayAvailability = ref<GatewayAvailability>('available')) {
+async function mountCatalog(gatewayAvailability = ref<GatewayAvailability>('available'), recommendationsSupported = false) {
   let api!: ReturnType<typeof useSetupCatalog>
   const el = document.createElement('div')
   document.body.appendChild(el)
@@ -213,6 +219,10 @@ async function mountCatalog(gatewayAvailability = ref<GatewayAvailability>('avai
     list: async () => ({ models: [], errors: [] }),
     status: async () => ({ activeProvider: null, providerResolution: {}, providers: [], count: 0 }),
     get: async () => ({ mode: 'direct' }),
+    recommendationsSupported,
+    recommendations: async () => await rpcCall('models.recommendations.get'),
+    applyRecommendation: async (command: RecommendationTarget) => await rpcCall('models.recommendations.apply', command),
+    acknowledgeRecommendation: async (command: RecommendationTarget) => await rpcCall('models.recommendations.acknowledge', command),
     get resetRecommendedSupported() { return hasRpcMethod('models.routing.resetRecommended') === true },
     resetRecommended: async (command: Record<string, unknown>) => await rpcCall('models.routing.resetRecommended', command),
     setRouting: async (mode: string) => await rpcCall('models.routing.set', { mode }),
@@ -224,6 +234,453 @@ async function mountCatalog(gatewayAvailability = ref<GatewayAvailability>('avai
   await nextTick()
   return { api, app }
 }
+
+async function desktopAccountScenario(options: {
+  primary?: string
+  stored?: boolean
+  accountOnly?: boolean
+  accountId?: string
+  selectedAccountId?: string
+  source?: ModelCredentialSource
+  status?: TokenRhythmAccountState['status']
+  fail?: 'cancel' | 'error'
+  recommendations?: boolean
+} = {}) {
+  const events: string[] = []
+  const account = reactive({
+    supported: true,
+    state: {
+      revision: 1, status: options.status ?? 'signed_in', profile: { accountId: options.accountId ?? 'a', sessionId: 's', displayName: 'A', maskedPhone: '' },
+      wallet: null, walletStatus: 'ready', keyStatus: 'ready', errorCode: null, walletErrorCode: null,
+      source: options.source ?? 'account', selectedAccountId: options.selectedAccountId ?? 'a', mediaSources: { image: 'inherit', video: 'inherit' }, pendingRevocation: false, loginExpiresAt: null,
+    } as TokenRhythmAccountState,
+    get loggedIn() { return ['signed_in', 'unverified'].includes(this.state.status) },
+    get ready() { return this.state.status === 'signed_in' && this.state.keyStatus === 'ready' },
+    init: vi.fn(async () => {}),
+    selectSource: vi.fn(async (source: ModelCredentialSource) => {
+      events.push(`source:${source}`)
+      account.state = { ...account.state, source, selectedAccountId: source === 'account' ? account.state.profile?.accountId ?? null : account.state.selectedAccountId, revision: account.state.revision + 1 }
+      return account.state
+    }),
+  })
+  accountMock.store = account as unknown as ReturnType<typeof import('@/stores/account').useAccountStore>
+  const saved = {
+    llm: { provider: options.primary ?? 'openai', model: 'gpt-4.1-mini', credential_source: 'manual' },
+    llm_profiles: (options.stored === false ? {} : { tokenrhythm: { model: 'gpt-4.1-mini', credential_source: options.accountOnly ? 'account' : 'manual' } }) as Record<string, { model: string; credential_source: string }>,
+    squilla_router: { enabled: false }, llm_ensemble: { enabled: false },
+  }
+  rpcCall.mockImplementation(async (method: string, params?: Record<string, unknown>) => {
+    if (method === 'onboarding.catalog') return { providers: ['openai', 'tokenrhythm'].map(providerId => ({
+      providerId, label: providerId, runtimeSupported: true, requiresApiKey: true, envKey: `${providerId.toUpperCase()}_API_KEY`, defaultDirectModel: 'gpt-4.1-mini',
+      fields: [{ name: 'model', label: 'Model', default: 'gpt-4.1-mini' }, { name: 'api_key', label: 'API key', secret: true }],
+    })) }
+    if (method === 'config.get') return structuredClone(saved)
+    if (method === 'config.effective') return { fields: { 'llm.provider': { source: 'config', value: saved.llm.provider } } }
+    if (method === 'onboarding.status') {
+      const primaryReady = saved.llm.provider !== 'tokenrhythm' || account.state.source === 'manual'
+        || (account.ready && account.state.selectedAccountId === account.state.profile?.accountId)
+      const manualConfigured = (saved.llm.provider === 'tokenrhythm' && saved.llm.credential_source !== 'account')
+        || Boolean(saved.llm_profiles.tokenrhythm && saved.llm_profiles.tokenrhythm.credential_source !== 'account')
+      return {
+        hasConfig: true, llmConfigured: primaryReady,
+        llmCredentialStatus: { provider: saved.llm.provider, available: primaryReady, source: account.state.source === 'account' && saved.llm.provider === 'tokenrhythm' ? 'account' : 'explicit' },
+        tokenRhythmManual: { configured: manualConfigured, ready: manualConfigured, credentialSource: 'explicit', credential: { provider: saved.llm.provider, available: manualConfigured, source: 'explicit' } },
+        llmProfileStatus: Object.keys(saved.llm_profiles).map(provider => ({ provider, ready: true, primaryEligible: provider !== saved.llm.provider, credentialSource: 'profile' })),
+      }
+    }
+    if (method.includes('discover')) return { ok: true, models: [{ id: params?.credentialSource === 'manual' ? 'manual-model' : 'runtime-model' }], source: 'live' }
+    if (['onboarding.llmProfile.activate', 'onboarding.llmProfile.upsertAndActivate', 'onboarding.llmProfile.active.remove', 'onboarding.provider.configure'].includes(method)) {
+      events.push(method)
+      if (options.fail === 'cancel') throw routerConflictForPrimary()
+      if (options.fail === 'error') throw new SetupWorkflowError('invalid', 'Synthetic rejection')
+      const previous = saved.llm
+      const nextProvider = String(method === 'onboarding.llmProfile.active.remove' ? params?.replacementProviderId : params?.providerId)
+      saved.llm = { provider: nextProvider, model: String(params?.model || 'gpt-4.1-mini'), credential_source: params?.credentialSource === 'manual' ? 'manual' : saved.llm_profiles[nextProvider]?.credential_source || (params?.credentialSource === 'account' ? 'account' : 'manual') }
+      if (previous.provider !== saved.llm.provider) {
+        if (method === 'onboarding.llmProfile.active.remove') delete saved.llm_profiles[previous.provider]
+        else saved.llm_profiles[previous.provider] = previous
+        delete saved.llm_profiles[saved.llm.provider]
+      }
+      return { changed: true }
+    }
+    return {}
+  })
+  return { ...await mountCatalog(undefined, options.recommendations), account, saved, events }
+}
+
+describe('desktop account and manual provider boundaries', () => {
+  it.each(['account', 'manual'] as const)('preserves %s credentials and provider drafts when applying remote routing recommendations', async source => {
+    const { api, app, saved, account } = await desktopAccountScenario({ primary: 'tokenrhythm', source, recommendations: true })
+    try {
+      Object.assign(saved.llm, { api_key: 'synthetic-manual-key', base_url: 'https://manual.invalid/v1' })
+      await api.loadData()
+      if (source === 'account') api.requestSelectAccountProvider()
+      else await api.requestSelectConfiguredProvider('tokenrhythm')
+      api.updateProviderField('model', 'unsaved-provider-model')
+      const before = structuredClone(saved)
+      const original = rpcCall.getMockImplementation()!
+      const plan: ModelRecommendation = {
+        providerId: 'tokenrhythm', kind: 'router', revision: 'synthetic-revision', source: 'remote',
+        rows: [{ role: 'c0', provider: 'tokenrhythm', model: 'recommended-model', thinkingLevel: null }],
+        currentRows: [], hasUpdate: true, notified: false,
+      }
+      rpcCall.mockImplementation(async (method, params) => {
+        if (method === 'models.recommendations.get') return { plans: [structuredClone(plan)] }
+        if (method === 'models.recommendations.acknowledge') return { acknowledged: true }
+        if (method === 'models.recommendations.apply') {
+          Object.assign(saved.squilla_router, { tiers: { c0: { provider: 'tokenrhythm', model: 'recommended-model' } } })
+          plan.currentRows = structuredClone(plan.rows)
+          plan.hasUpdate = false
+          return { mode: 'direct' }
+        }
+        return original(method, params)
+      })
+      rpcCall.mockClear()
+      api.setSection('modelStrategy')
+      await vi.waitFor(() => expect(api.routerRecommendation.value?.revision).toBe(plan.revision))
+      expect(api.sectionDirty('modelStrategy')).toBe(true)
+      expect(saved).toEqual(before)
+      expect(account.selectSource).not.toHaveBeenCalled()
+      expect(rpcCall.mock.calls.some(([method]) => method === 'models.recommendations.apply')).toBe(false)
+
+      const pending = api.resetRecommendedRouter()
+      await nextTick()
+      expect(api.recommendationPreview.value?.plan.revision).toBe(plan.revision)
+      await api.applyRecommendation()
+      expect(await pending).toBe(true)
+      expect(rpcCall).toHaveBeenCalledWith('models.recommendations.apply', {
+        providerId: 'tokenrhythm', kind: 'router', revision: 'synthetic-revision',
+      })
+      expect(saved.llm).toEqual(before.llm)
+      expect(saved.llm_profiles).toEqual(before.llm_profiles)
+      expect(account.state.source).toBe(source)
+      expect(account.selectSource).not.toHaveBeenCalled()
+      expect(api.providerPanel.value.providerFieldValue({ name: 'model', label: 'Model' })).toBe('unsaved-provider-model')
+      expect(api.sectionDirty('modelStrategy')).toBe(true)
+      expect(rpcCall.mock.calls.filter(([method]) => /^(config\.patch|onboarding\..*(activate|configure|credential))/.test(method))).toEqual([])
+    } finally { app.unmount() }
+  })
+
+  it('keeps account editor probes isolated and switches back to the same manual provider', async () => {
+    const { api, app, saved, account } = await desktopAccountScenario({ primary: 'tokenrhythm' })
+    try {
+      Object.assign(saved.llm, { api_key: 'retained-secret', base_url: 'https://manual.invalid/v1', proxy: 'http://proxy.invalid' })
+      await api.loadData()
+      api.requestSelectAccountProvider()
+      await api.refreshProviderModels()
+      expect(api.providerPanel.value.accountEditing).toBe(true)
+      expect(api.providerPanel.value.credentialPanel).toMatchObject({ acceptsApiKey: false, available: true, source: 'account', apiKeyValue: '', probeReady: true })
+      api.updateProviderField('base_url', 'https://ignored.invalid')
+      api.updateProviderField('api_key', 'ignored-draft-secret')
+      api.updateProviderField('model', 'account-fallback')
+      rpcCall.mockClear()
+      await api.probeProviderConnection('model')
+      expect(rpcCall).toHaveBeenCalledWith('onboarding.provider.probe', { providerId: 'tokenrhythm', model: 'account-fallback', credentialSource: 'account', mode: 'model' })
+      await api.refreshProviderModels()
+      expect(rpcCall).toHaveBeenCalledWith('onboarding.models.discover', expect.objectContaining({ providerId: 'tokenrhythm', credentialSource: 'account', forceRefresh: true }))
+      for (const [method, payload] of rpcCall.mock.calls) {
+        if (method === 'onboarding.provider.probe' || method === 'onboarding.models.discover') {
+          expect(payload).not.toHaveProperty('apiKey')
+          expect(payload).not.toHaveProperty('baseUrl')
+          expect(payload).not.toHaveProperty('proxy')
+        }
+      }
+      expect(account.selectSource).not.toHaveBeenCalled()
+      api.cancelProviderEdit()
+      await api.requestSelectConfiguredProvider('tokenrhythm')
+      expect(api.providerPanel.value.accountEditing).toBe(false)
+      expect(api.providerPanel.value.credentialPanel?.acceptsApiKey).toBe(true)
+      expect(api.providerPanel.value.providerFieldValue({ name: 'base_url', label: 'URL' })).toBe('https://manual.invalid/v1')
+    } finally { app.unmount() }
+  })
+
+  it('saves account primary model and thinking without credential mutations', async () => {
+    const { api, app, account } = await desktopAccountScenario({ primary: 'tokenrhythm' })
+    try {
+      api.requestSelectAccountProvider()
+      await api.refreshProviderModels()
+      api.updateProviderField('model', 'account-fallback')
+      api.updateLlmThinking('high')
+      rpcCall.mockClear()
+      expect(await api.saveProvider({ reload: false })).toBe(true)
+      expect(rpcCall).toHaveBeenCalledWith('config.patch', { patches: { 'llm.model': 'account-fallback', 'llm.thinking': 'high' } })
+      expect(rpcCall.mock.calls.every(([method]) => method === 'config.patch')).toBe(true)
+      expect(account.selectSource).not.toHaveBeenCalled()
+    } finally { app.unmount() }
+  })
+
+  it.each([true, false])('saves inactive account model with existing profile %s without changing primary', async stored => {
+    const { api, app, account } = await desktopAccountScenario({ stored, source: 'manual' })
+    try {
+      api.requestSelectAccountProvider()
+      await api.refreshProviderModels()
+      api.updateProviderField('model', 'account-fallback')
+      rpcCall.mockClear()
+      expect(await api.saveProvider({ reload: false })).toBe(true)
+      expect(rpcCall).toHaveBeenCalledWith('config.patch', { patch: { llm_profiles: { tokenrhythm: { model: 'account-fallback', ...(!stored ? { credential_source: 'account' } : {}) } } } })
+      expect(rpcCall.mock.calls.filter(([method]) => method === 'config.patch')).toHaveLength(1)
+      expect(account.state.source).toBe('manual')
+      expect(account.selectSource).not.toHaveBeenCalled()
+    } finally { app.unmount() }
+  })
+
+  it('keeps account model drafts after rejection and blocks unavailable account saves and probes', async () => {
+    const { api, app, account } = await desktopAccountScenario({ primary: 'tokenrhythm' })
+    try {
+      api.requestSelectAccountProvider()
+      await api.refreshProviderModels()
+      api.updateProviderField('model', 'account-fallback')
+      const original = rpcCall.getMockImplementation()!
+      rpcCall.mockImplementation(async (method, params) => {
+        if (method === 'config.patch') throw new AppSettingsError('forbidden', 'Synthetic model save rejection')
+        return original(method, params)
+      })
+      expect(await api.saveProvider()).toBe(false)
+      expect(api.providerDraftDirty.value).toBe(true)
+      expect(api.providerPanel.value.providerFieldValue({ name: 'model', label: 'Model' })).toBe('account-fallback')
+      account.state = { ...account.state, status: 'unverified' }
+      await nextTick(); await Promise.resolve(); await nextTick()
+      rpcCall.mockClear()
+      await api.probeProviderConnection('model')
+      await api.refreshProviderModels()
+      expect(await api.saveProvider()).toBe(false)
+      expect(rpcCall.mock.calls.some(([method]) => method === 'config.patch' || method === 'onboarding.provider.probe' || method === 'onboarding.models.discover')).toBe(false)
+      expect(account.selectSource).not.toHaveBeenCalled()
+    } finally { app.unmount() }
+  })
+
+  it.each(['image', 'video'] as const)('refreshes status after switching the %s account source while keeping unsaved drafts', async kind => {
+    const { api, app, account } = await desktopAccountScenario()
+    try {
+      api.updateProviderField('api_key', 'synthetic-draft-key')
+      api.updateCapabilityField('image', 'size', '512x512')
+      rpcCall.mockClear()
+      account.state = {
+        ...account.state, revision: account.state.revision + 1,
+        mediaSources: { ...account.state.mediaSources, [kind]: 'account' },
+      }
+      await nextTick(); await Promise.resolve(); await nextTick(); await Promise.resolve(); await nextTick()
+      expect(rpcCall).toHaveBeenCalledWith('onboarding.status')
+      expect(api.providerPanel.value.credentialPanel?.apiKeyValue).toBe('synthetic-draft-key')
+      expect(api.capabilitiesPanel.value.form.imageSize).toBe('512x512')
+    } finally { app.unmount() }
+  })
+
+  it('ignores wallet-only updates and preserves provider drafts across readiness changes', async () => {
+    const { api, app, account } = await desktopAccountScenario()
+    try {
+      api.updateProviderField('api_key', 'synthetic-draft-key')
+      rpcCall.mockClear()
+      account.state = { ...account.state, walletStatus: 'stale', revision: 2 }
+      await nextTick(); await Promise.resolve(); await nextTick()
+      expect(rpcCall).not.toHaveBeenCalled()
+      expect(api.providerPanel.value.credentialPanel?.apiKeyValue).toBe('synthetic-draft-key')
+      account.state = { ...account.state, status: 'unverified', revision: 3 }
+      await nextTick(); await Promise.resolve(); await nextTick(); await Promise.resolve(); await nextTick()
+      expect(rpcCall).toHaveBeenCalledWith('config.get')
+      expect(api.providerPanel.value.credentialPanel?.apiKeyValue).toBe('synthetic-draft-key')
+    } finally { app.unmount() }
+  })
+
+  it('does not offer an account without a persisted deployment in routing', async () => {
+    const { api, app } = await desktopAccountScenario({ stored: false, source: 'manual' })
+    try {
+      expect(api.routerPanel.value.providerOptions.map(row => row.providerId)).toEqual(['openai'])
+      api.setFixedProvider('tokenrhythm')
+      expect(api.modelStrategyPanel.value.single.providerId).toBe('openai')
+    } finally { app.unmount() }
+  })
+
+  it.each(['list', 'save-and-activate', 'routing'] as const)('selects the manual source only after successful %s validation', async entry => {
+    const { api, app, account, events } = await desktopAccountScenario({ status: 'unverified', source: entry === 'routing' ? 'manual' : 'account' })
+    try {
+      if (entry === 'list') await api.activateProvider('tokenrhythm')
+      if (entry === 'save-and-activate') {
+        api.selectConfiguredProvider('tokenrhythm')
+        api.updateProviderField('api_key', 'synthetic-manual-key')
+        expect(await api.saveProviderAndActivate()).toBe(true)
+      }
+      if (entry === 'routing') { api.setFixedProvider('tokenrhythm'); expect(await api.saveModelStrategy()).toBe(true) }
+      const method = entry === 'save-and-activate' ? 'onboarding.llmProfile.upsertAndActivate' : 'onboarding.llmProfile.activate'
+      expect(rpcCall).toHaveBeenCalledWith(method, expect.objectContaining({ providerId: 'tokenrhythm', credentialSource: 'manual' }))
+      expect(events).toEqual(entry === 'routing' ? [method] : [method, 'source:manual'])
+      expect(account.state.source).toBe('manual')
+    } finally { app.unmount() }
+  })
+
+  it.each((['cancel', 'error'] as const).flatMap(fail => (['list', 'save-and-activate', 'routing'] as const).map(entry => ({ fail, entry }))))('keeps an unavailable account binding when $entry ends with $fail', async ({ fail, entry }) => {
+    const { api, app, account } = await desktopAccountScenario({ status: 'signed_out', fail })
+    try {
+      if (entry === 'list') await api.activateProvider('tokenrhythm')
+      if (entry === 'save-and-activate') {
+        api.selectConfiguredProvider('tokenrhythm')
+        api.updateProviderField('api_key', 'synthetic-manual-key')
+        expect(await api.saveProviderAndActivate()).toBe(false)
+      }
+      if (entry === 'routing') { api.setFixedProvider('tokenrhythm'); expect(await api.saveModelStrategy()).toBe(false) }
+      expect(account.selectSource).not.toHaveBeenCalled()
+      expect(account.state.source).toBe('account')
+      expect(account.state.selectedAccountId).toBe('a')
+    } finally { app.unmount() }
+  })
+
+  it.each(['list', 'save-and-activate'] as const)('reconciles a committed %s when source selection fails and retries only the source', async entry => {
+    const { api, app, account, saved } = await desktopAccountScenario({ status: 'signed_out' })
+    account.selectSource.mockRejectedValueOnce(new Error('ACCOUNT_STORAGE_UNAVAILABLE'))
+    try {
+      if (entry === 'list') await api.activateProvider('tokenrhythm')
+      if (entry === 'save-and-activate') {
+        api.selectConfiguredProvider('tokenrhythm')
+        api.updateProviderField('api_key', 'synthetic-manual-key')
+        expect(await api.saveProviderAndActivate()).toBe(false)
+      }
+      expect(saved.llm.provider).toBe('tokenrhythm')
+      expect(api.config.value.llm?.provider).toBe('tokenrhythm')
+      expect(account.state.source).toBe('account')
+      expect(account.selectSource).toHaveBeenCalledTimes(1)
+      await api.activateProvider('tokenrhythm')
+      expect(account.state.source).toBe('manual')
+      expect(account.selectSource).toHaveBeenCalledTimes(2)
+      expect(rpcCall.mock.calls.filter(([method]) => method === 'onboarding.llmProfile.activate' || method === 'onboarding.llmProfile.upsertAndActivate')).toHaveLength(1)
+    } finally { app.unmount() }
+  })
+
+  it('preserves the TokenRhythm source when activating a different provider', async () => {
+    const { api, app, account, saved } = await desktopAccountScenario({ primary: 'tokenrhythm' })
+    saved.llm_profiles.openai = { model: 'gpt-4.1-mini', credential_source: 'manual' }
+    await api.loadData()
+    try {
+      await api.activateProvider('openai')
+      expect(saved.llm.provider).toBe('openai')
+      expect(account.selectSource).not.toHaveBeenCalled()
+      expect(account.state.source).toBe('account')
+    } finally { app.unmount() }
+  })
+
+  it('recovers an unavailable same-provider account with Save and start using', async () => {
+    const { api, app, account } = await desktopAccountScenario({ primary: 'tokenrhythm', status: 'signed_out' })
+    try {
+      api.updateProviderField('api_key', 'synthetic-manual-key')
+      expect(await api.saveProvider()).toBe(true)
+      expect(account.selectSource).toHaveBeenCalledWith('manual')
+    } finally { app.unmount() }
+  })
+
+  it('validates a manual removal replacement before selecting its source', async () => {
+    const { api, app, account, saved, events } = await desktopAccountScenario({ status: 'unverified' })
+    try {
+      await api.removeProviderProfile('openai')
+      expect(rpcCall).toHaveBeenCalledWith('onboarding.llmProfile.active.remove', expect.objectContaining({ providerId: 'openai', replacementProviderId: 'tokenrhythm', credentialSource: 'manual' }))
+      expect(events).toEqual(['onboarding.llmProfile.active.remove', 'source:manual'])
+      expect(account.state.source).toBe('manual')
+      expect(saved.llm.provider).toBe('tokenrhythm')
+      expect(saved.llm_profiles).not.toHaveProperty('openai')
+    } finally { app.unmount() }
+  })
+
+  it('preserves the selected account when removing the active provider fails', async () => {
+    const { api, app, account, saved } = await desktopAccountScenario({ status: 'unverified', fail: 'error' })
+    try {
+      await api.removeProviderProfile('openai')
+      expect(account.selectSource).not.toHaveBeenCalled()
+      expect(account.state.source).toBe('account')
+      expect(saved.llm.provider).toBe('openai')
+    } finally { app.unmount() }
+  })
+
+  it('does not replay a committed removal after source selection fails', async () => {
+    const { api, app, account, saved } = await desktopAccountScenario({ status: 'unverified' })
+    account.selectSource.mockRejectedValueOnce(new Error('ACCOUNT_STORAGE_UNAVAILABLE'))
+    try {
+      await api.removeProviderProfile('openai')
+      expect(account.state.source).toBe('account')
+      expect(saved.llm.provider).toBe('tokenrhythm')
+      expect(api.config.value.llm?.provider).toBe('tokenrhythm')
+      await api.activateProvider('tokenrhythm')
+      expect(account.state.source).toBe('manual')
+      expect(rpcCall.mock.calls.filter(([method]) => method === 'onboarding.llmProfile.active.remove')).toHaveLength(1)
+      expect(rpcCall.mock.calls.some(([method]) => method === 'onboarding.llmProfile.activate')).toBe(false)
+    } finally { app.unmount() }
+  })
+
+  it.each([false, true])('keeps the selected account source when routing activates a saved profile (account-only: %s)', async accountOnly => {
+    const { api, app, account } = await desktopAccountScenario({ accountOnly })
+    try {
+      api.setFixedProvider('tokenrhythm')
+      expect(await api.saveModelStrategy()).toBe(true)
+      const activation = rpcCall.mock.calls.find(([method]) => method === 'onboarding.llmProfile.activate')
+      expect(activation?.[1]).not.toHaveProperty('credentialSource')
+      expect(account.selectSource).not.toHaveBeenCalled()
+    } finally { app.unmount() }
+  })
+
+  it.each((['cancel', 'error'] as const).flatMap(fail => [false, true].map(stored => ({ fail, stored }))))('preserves account A when activating B ends with $fail (stored profile: $stored)', async ({ fail, stored }) => {
+    const { api, app, account, saved } = await desktopAccountScenario({ accountId: 'b', selectedAccountId: 'a', fail, stored })
+    try {
+      await api.activateAccountProvider()
+      const method = stored ? 'onboarding.llmProfile.activate' : 'onboarding.llmProfile.upsertAndActivate'
+      expect(rpcCall).toHaveBeenCalledWith(method, expect.objectContaining({ providerId: 'tokenrhythm', credentialSource: 'account' }))
+      expect(account.selectSource).not.toHaveBeenCalled()
+      expect(account.state.source).toBe('account')
+      expect(account.state.selectedAccountId).toBe('a')
+      expect(saved.llm.provider).toBe('openai')
+    } finally { app.unmount() }
+  })
+
+  it.each([false, true])('binds account B only after its provider mutation succeeds (stored profile: %s)', async stored => {
+    const { api, app, account, events } = await desktopAccountScenario({ accountId: 'b', selectedAccountId: 'a', stored })
+    try {
+      await api.activateAccountProvider()
+      const method = stored ? 'onboarding.llmProfile.activate' : 'onboarding.llmProfile.upsertAndActivate'
+      expect(events).toEqual([method, 'source:account'])
+      expect(account.state.selectedAccountId).toBe('b')
+      expect(api.providerPanel.value.accountPrimary).toBe(true)
+    } finally { app.unmount() }
+  })
+
+  it.each([false, true])('keeps a committed provider and retries only binding B when account IPC fails (stored profile: %s)', async stored => {
+    const { api, app, account, saved } = await desktopAccountScenario({ accountId: 'b', selectedAccountId: 'a', stored })
+    account.selectSource.mockRejectedValueOnce(new Error('ACCOUNT_STORAGE_UNAVAILABLE'))
+    try {
+      await api.activateAccountProvider()
+      expect(saved.llm.provider).toBe('tokenrhythm')
+      expect(api.config.value.llm?.provider).toBe('tokenrhythm')
+      expect(account.state.selectedAccountId).toBe('a')
+      expect(account.selectSource).toHaveBeenCalledTimes(1)
+      expect(api.providerPanel.value.accountPrimary).toBe(false)
+      await api.activateAccountProvider()
+      expect(account.state.selectedAccountId).toBe('b')
+      expect(account.selectSource).toHaveBeenCalledTimes(2)
+      expect(rpcCall.mock.calls.filter(([method]) => method === 'onboarding.llmProfile.activate' || method === 'onboarding.llmProfile.upsertAndActivate')).toHaveLength(1)
+    } finally { app.unmount() }
+  })
+
+  it('changes only the binding when TokenRhythm is already primary', async () => {
+    const { api, app, account, events } = await desktopAccountScenario({ primary: 'tokenrhythm', accountId: 'b', selectedAccountId: 'a' })
+    try {
+      await api.activateAccountProvider()
+      expect(events).toEqual(['source:account'])
+      expect(account.state.selectedAccountId).toBe('b')
+      expect(api.providerPanel.value.accountPrimary).toBe(true)
+    } finally { app.unmount() }
+  })
+
+  it('separates manual editor discovery from runtime model-routing catalogs', async () => {
+    const { api, app } = await desktopAccountScenario({ primary: 'tokenrhythm' })
+    try {
+      await api.refreshProviderModels()
+      expect(rpcCall).toHaveBeenCalledWith('onboarding.models.discover', expect.objectContaining({ providerId: 'tokenrhythm', credentialSource: 'manual' }))
+      rpcCall.mockClear()
+      api.setSection('modelStrategy')
+      await nextTick(); await Promise.resolve(); await nextTick(); await Promise.resolve(); await nextTick()
+      const requests = rpcCall.mock.calls.filter(([method]) => method === 'onboarding.models.discover')
+      expect(requests.length).toBeGreaterThan(0)
+      expect(requests.every(([, params]) => !('credentialSource' in (params || {})))).toBe(true)
+      expect(api.modelStrategyPanel.value.single.models.map(model => model.id)).toContain('runtime-model')
+      expect(api.modelStrategyPanel.value.single.models.map(model => model.id)).not.toContain('manual-model')
+    } finally { app.unmount() }
+  })
+})
 
 describe('primary provider transitions', () => {
   it('keeps a cancelled settings-wide save silent when no earlier write was acknowledged', async () => {
@@ -513,6 +970,7 @@ function mockConfigSequence(configs: Array<Record<string, unknown>>) {
 }
 
 afterEach(() => {
+  accountMock.store = null
   vi.useRealTimers()
   vi.restoreAllMocks()
   rpcCall.mockReset()

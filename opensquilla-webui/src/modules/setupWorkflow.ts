@@ -86,9 +86,10 @@ export interface ConfigurePrimaryProvider {
 }
 export type ProviderProbeMode = 'reachability' | 'model'
 export interface ProbePrimaryProvider extends ConfigurePrimaryProvider {
+  credentialSource?: 'manual' | 'account'
   mode?: ProviderProbeMode
 }
-export interface DiscoverPrimaryModels extends Omit<ConfigurePrimaryProvider, 'model' | 'presetId' | 'routerAction' | 'imageGenerationIntent'> { forceRefresh?: boolean | null; cacheOnly?: boolean }
+export interface DiscoverPrimaryModels extends Omit<ConfigurePrimaryProvider, 'model' | 'presetId' | 'routerAction' | 'imageGenerationIntent'> { forceRefresh?: boolean | null; cacheOnly?: boolean; credentialSource?: 'manual' | 'account' }
 
 export interface UpsertProfile {
   providerId: string
@@ -103,23 +104,27 @@ export interface UpsertProfile {
 }
 export interface ActivateProfile {
   providerId: string
+  credentialSource?: 'manual' | 'account'
   model?: string | null
   routerAction?: string | null
   imageGenerationIntent?: string | null
 }
 export interface UpsertAndActivateProfile extends UpsertProfile {
+  credentialSource?: 'manual' | 'account'
   routerAction?: string | null
   imageGenerationIntent?: string | null
 }
 export interface RemoveActiveProfile {
   providerId: string
   replacementProviderId: string
+  credentialSource?: 'manual' | 'account'
   replacementModel?: string | null
   routerAction?: string | null
   imageGenerationIntent?: string | null
 }
 export interface ProfileProbe {
   providerId: string
+  credentialSource?: 'manual'
   model?: string | null
   apiKey?: string | null
   apiKeyEnv?: string | null

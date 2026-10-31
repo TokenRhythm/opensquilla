@@ -11,6 +11,7 @@ const config = JSON.parse(readFileSync(process.env.OPENSQUILLA_TEST_FIXTURE_CONF
 const moduleAt = name => import(pathToFileURL(join(config.packageRoot, 'dist', name)).href)
 const { DesktopWriterAdmission } = await moduleAt('desktop-writer-admission.js')
 const { DesktopQuitBudget, DesktopQuitConfirmation } = await moduleAt('desktop-quit.js')
+const { AccountError, pauseAccountsForMaintenance } = await moduleAt('tokenrhythm-account.js')
 const { mainWindowCloseAction } = await moduleAt('desktop-window-lifecycle.js')
 const { WindowsUpdateCoordinator, WindowsUpdatePreparationError } = await moduleAt('windows-update-coordinator.js')
 const { WindowsUpdateSecurityError } = await moduleAt('windows-update-security.js')
@@ -54,6 +55,7 @@ const quitUnconfirmedProcessTrees = new Set()
 const systemSessionEnding = false
 let windowsTray = {}
 const desktopWriters = new DesktopWriterAdmission()
+const desktopAccounts = new Map()
 const windowsUpdateCoordinator = new WindowsUpdateCoordinator(5000)
 let windowsUpdateRecoveryGeneration = 0
 let windowsUpdateCacheDescriptor = null

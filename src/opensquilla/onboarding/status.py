@@ -448,6 +448,11 @@ def _llm_provider_credential_status(
             include_runtime_cache=False,
         )
         env_key = credential.env_name
+        if credential.source == "account":
+            return {
+                "provider": provider, "available": bool(credential.api_key),
+                "source": "account", "envKey": "",
+            }
         if credential.source == "explicit":
             return {
                 "provider": provider,
@@ -563,6 +568,12 @@ def _llm_credential_status(cfg: GatewayConfig) -> dict[str, object]:
             "envKey": resolved_env_key,
             "masked": "",
             "revealAllowed": False,
+        }
+
+    if credential.source == "account":
+        return {
+            "provider": provider, "available": bool(credential.api_key),
+            "source": "account", "envKey": "", "masked": "", "revealAllowed": False,
         }
 
     if credential.source == "explicit":
@@ -954,6 +965,9 @@ def _llm_source(cfg: GatewayConfig, status: SectionStatus) -> tuple[str, str]:
     CLI/WebUI renderers that already display it.
     """
     llm = cfg.llm
+    from opensquilla.desktop_account import account_credential
+    if account_credential(str(llm.provider)) is not None:
+        return "account", ""
     if not llm.provider or not llm.model:
         return "none", ""
     try:

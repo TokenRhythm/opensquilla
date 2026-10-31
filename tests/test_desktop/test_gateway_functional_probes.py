@@ -305,7 +305,13 @@ def test_pty_probe_cleans_child_after_failure(
     assert diagnostic["cleanupAttempted"] is True
     assert diagnostic["cleanupCompleted"] is True
     assert diagnostic["outputBytes"] == 0
+    assert diagnostic["outputChunks"] == 0
+    assert diagnostic["firstOutputElapsedMs"] is None
+    assert diagnostic["lastOutputElapsedMs"] is None
     assert diagnostic["sawTtyMarker"] is False
+    assert diagnostic["sawTtyMissMarker"] is False
+    assert diagnostic["sawCursorPositionRequest"] is False
+    assert diagnostic["sawDeviceStatusRequest"] is False
     assert diagnostic["errorTypes"][0] == {
         "read": "RuntimeError", "timeout": "TimeoutError", "initialization": "PtyBackendError",
     }[failure]
@@ -331,9 +337,17 @@ def test_pty_probe_diagnostic_keeps_only_safe_state_and_preserves_attempts(
     monkeypatch.setattr(pty_backend, "wait_pty", wait)
     monkeypatch.setattr(pty_backend, "terminate_pty", terminate)
     namespace = runpy.run_path(str(ENTRY))
-    for _ in range(2):
+    output_attempts = [
+        [
+            b"\x1b", b"[6", b"n", b"\x1b[5", b"n",
+            b"opensquilla-pty-mi", b"ss",
+            b"opensquilla-pty-o", b"k\n", b"private terminal text",
+        ],
+        [b"[6n [5n ", b"opensquilla-pty-o", b"k\n", b"private terminal text"],
+    ]
+    for output in output_attempts:
         stopped = asyncio.Event()
-        chunks = iter([b"opensquilla-pty-o", b"k\n", b"private terminal text"])
+        chunks = iter(output)
 
         async def read(current):
             chunk = next(chunks, None)
@@ -348,8 +362,14 @@ def test_pty_probe_diagnostic_keeps_only_safe_state_and_preserves_attempts(
     attempts = [json.loads(line) for line in payload.splitlines()]
     assert len(attempts) == 2
     assert all(row["sawTtyMarker"] for row in attempts)
-    assert all(row["outputBytes"] == len(b"opensquilla-pty-ok\nprivate terminal text")
-               for row in attempts)
+    assert [row["sawTtyMissMarker"] for row in attempts] == [True, False]
+    assert [row["sawCursorPositionRequest"] for row in attempts] == [True, False]
+    assert [row["sawDeviceStatusRequest"] for row in attempts] == [True, False]
+    for row, output in zip(attempts, output_attempts, strict=True):
+        assert row["outputBytes"] == len(b"".join(output))
+        assert row["outputChunks"] == len(output)
+        assert 0 <= row["firstOutputElapsedMs"] <= row["lastOutputElapsedMs"]
+        assert row["lastOutputElapsedMs"] <= row["elapsedBeforeCleanupMs"]
     assert all(row["phase"] == "read" for row in attempts)
     assert all(row["waitCompletedBeforeCleanup"] is False for row in attempts)
     assert "private terminal text" not in payload

@@ -208,6 +208,13 @@ def _without_provider_state_replay(cfg: ProviderConfig) -> ProviderConfig:
 def _build_provider(cfg: ProviderConfig) -> LLMProvider:
     """Instantiate the correct provider class from a ProviderConfig."""
     provider_id = str(cfg.provider or "").strip().lower()
+    from opensquilla.desktop_account import OFFICIAL_BASE, account_credential
+    managed = account_credential(provider_id)
+    if managed is not None:
+        if not managed.ready:
+            raise ProviderNotConfiguredError("Account model calls are paused; verify the account")
+        cfg = _copy_provider_config(cfg)
+        cfg.api_key, cfg.base_url, cfg.proxy = managed.secret, OFFICIAL_BASE, ""
     credential_hint = credential_provider_hint(cfg.api_key)
     if credential_hint and credential_hint != provider_id:
         raise ProviderBuildError(

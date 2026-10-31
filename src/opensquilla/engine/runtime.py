@@ -6327,6 +6327,15 @@ class TurnRunner:
                 "attachment_count": len(attachments),
             },
         )
+        from opensquilla.desktop_account import (
+            account_state_for_turn,
+            pin_account_state,
+            reset_account_state,
+        )
+        account_snapshot = await asyncio.to_thread(account_state_for_turn)
+        account_scope = (
+            pin_account_state(account_snapshot) if account_snapshot is not None else None
+        )
         try:
             # Resolve the durable identity before any pipeline stage can make
             # an auxiliary provider call. This lookup is independent from the
@@ -8573,6 +8582,8 @@ class TurnRunner:
             )
 
         finally:
+            if account_scope is not None:
+                reset_account_state(account_scope)
             if attachment_cleanup is not None:
                 attachment_cleanup()
                 if (
@@ -8739,6 +8750,17 @@ class TurnRunner:
         """Clone the selector and resolve provider (no shared state mutation)."""
         if self._provider_selector is None:
             return None, None
+        from opensquilla.desktop_account import desktop_account_available
+        if deployment is None and desktop_account_available():
+            from opensquilla.gateway.provider_runtime import resolve_provider_selector_config
+            cloned = self._provider_selector.clone()
+            resolved = resolve_provider_selector_config(self._turn_config())
+            if resolved is None:
+                return None, None
+            cloned.sync_primary(resolved)
+            if not getattr(cloned, "is_configured", True):
+                return None, None
+            return cloned.resolve(), cloned
         # A gateway can boot with a selector that has no usable primary yet
         # (no API key configured); treat it like "no provider" so the turn
         # fails with the same clean no_provider error instead of raising.

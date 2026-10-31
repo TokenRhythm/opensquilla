@@ -335,7 +335,8 @@ def test_desktop_explicit_exit_cannot_be_converted_back_to_window_hiding() -> No
     assert "setAppExitPhase('draining'" in before_quit
     assert "setAppExitPhase('committed'" in before_quit
     failure = _section(main_ts, "function showDesktopQuitFailure", "app.on('before-quit'")
-    assert "showDesktopQuitFailure()" in before_quit
+    assert "showDesktopQuitFailure(" in before_quit
+    assert "isQuitting = true" in failure
     assert "setAppExitPhase('failed'" in failure
     assert "setAppExitPhase('running'" not in failure
     assert "if (systemSessionEnding)" in before_quit
@@ -1401,10 +1402,16 @@ def test_reset_desktop_settings_forces_onboarding_before_gateway_reuse() -> None
     assert "inspectDesktopCleanup('reset-current-settings')" in cleanup_reset
     assert "desktopCleanupPreviews.consume(" in cleanup_reset
     assert "applyApprovedDesktopCleanup(preview" in cleanup_reset
-    assert "await waitForDesktopWriterOperations(1)" in cleanup_apply
-    assert "await stopOwnedGatewayAndWait()" in cleanup_apply
-    assert "runDesktopCleanupCli(active, 'cleanup-inspect'" in cleanup_apply
-    assert "runDesktopCleanupCli(active, 'cleanup-apply'" in cleanup_apply
+    drain = re.search(r"await\s+Promise\.all\(\[(.*?)\]\)", cleanup_apply, re.DOTALL)
+    assert drain is not None
+    assert "waitForDesktopWriterOperations(1)" in drain.group(1)
+    assert "accountPause.wait(" in drain.group(1)
+    admission = cleanup_apply.index("desktopWriters.tryBeginExclusive(")
+    pause = cleanup_apply.index("accountPause = pauseAccountsForMaintenance(")
+    stop = cleanup_apply.index("await stopOwnedGatewayAndWait()")
+    inspect = cleanup_apply.index("runDesktopCleanupCli(active, 'cleanup-inspect'")
+    apply = cleanup_apply.index("runDesktopCleanupCli(active, 'cleanup-apply'")
+    assert admission < pause < drain.start() < drain.end() < stop < inspect < apply
     assert "report.mode === 'reset-current-settings'" in cleanup_apply
     assert "forceOnboardingOnNextStartup = true" in cleanup_apply
     assert "clearReusableGatewayState()" in cleanup_apply
@@ -1584,8 +1591,22 @@ def test_desktop_onboarding_is_owned_nonmodal_child_of_main_window() -> None:
 def test_desktop_onboarding_defaults_to_tokenrhythm_with_trusted_registration_cta() -> None:
     main_ts = _read("desktop/electron/src/main.ts")
     html = _section(main_ts, "function onboardingHtml", "async function runOnboarding")
+    environment = _read("desktop/electron/src/tokenrhythm-environment.ts")
+    run = _section(main_ts, "async function runOnboarding", "async function pathExists")
 
-    assert "const TOKENRHYTHM_REGISTER_URL = 'https://tokenrhythm.studio/register'" in main_ts
+    assert "DEFAULT_TOKENRHYTHM_ORIGIN = 'https://tokenrhythm.studio'" in environment
+    assert "return accountOrigin(origin)" in environment
+    assert "const tokenrhythmAccountOrigin = resolveAccountOrigin(" in main_ts
+    assert "new URL('/register', tokenrhythmAccountOrigin).href" in main_ts
+    external_link = _section(run, "window.webContents.setWindowOpenHandler", "// The wizard")
+    assert "if (url === TOKENRHYTHM_REGISTER_URL)" in external_link
+    assert "shell.openExternal(TOKENRHYTHM_REGISTER_URL)" in external_link
+    assert "return { action: 'deny' }" in external_link
+    navigation = _section(run, "const guardOnboardingNavigation", "// Rebuild the app menu")
+    assert navigation.index("event.preventDefault()") < navigation.index(
+        "if (targetUrl === TOKENRHYTHM_REGISTER_URL)"
+    )
+    assert "shell.openExternal(TOKENRHYTHM_REGISTER_URL)" in navigation
     assert '<input id="provider" type="hidden" value="tokenrhythm" />' in html
     assert 'id="tokenrhythmRegister"' in html
     assert 'href="${TOKENRHYTHM_REGISTER_URL}"' in html
@@ -3279,8 +3300,9 @@ def test_desktop_quit_drains_gateway_before_exit_on_every_platform() -> None:
     assert exit_admission_guard in surface_navigate
     assert exit_admission_guard not in preview_revoke
     assert exit_admission_guard not in surface_destroy
-    assert "if (exited || !signalQuit)" in before_quit
-    assert before_quit.index("if (exited || !signalQuit)") < before_quit.index("app.exit(0)")
+    exit_gate = "if ((exited || !signalQuit) && !accountShutdownFailed)"
+    assert exit_gate in before_quit
+    assert before_quit.index(exit_gate) < before_quit.index("app.exit(0)")
 
 
 def test_desktop_signal_quit_keeps_gateway_handle_for_before_quit_drain() -> None:
@@ -3416,11 +3438,12 @@ def test_desktop_quit_failure_exits_normally_but_signals_remain_fail_closed() ->
     assert ".then(result => result.completed && result.value))" in before_quit
     assert ".finally(() => budget.dispose())" in before_quit
     assert "quitUnconfirmedProcessTrees.size === 0" in before_quit
+    assert "accountsClosed" in before_quit
+    assert "let accountShutdownFailed = accountEntries.length > 0" in before_quit
     assert "if (finalized) return" in before_quit
-    assert before_quit.index("finalized = true") < before_quit.index("if (exited || !signalQuit)")
-    finalizer = _section(
-        before_quit, "if (exited || !signalQuit)", "quitGatewayDrainPromise = null"
-    )
+    exit_gate = "if ((exited || !signalQuit) && !accountShutdownFailed)"
+    assert before_quit.index("finalized = true") < before_quit.index(exit_gate)
+    finalizer = _section(before_quit, exit_gate, "quitGatewayDrainPromise = null")
     assert "forceOwnedGatewayForQuit(child)" in finalizer
     assert "cleanupConfirmed: exited" in finalizer
     assert "setAppExitPhase('committed'" in finalizer
@@ -3431,8 +3454,9 @@ def test_desktop_quit_failure_exits_normally_but_signals_remain_fail_closed() ->
     assert "gatewayProcessCleanupContexts.delete(" not in finalizer
     failed_drain = _section(before_quit, "quitGatewayDrainPromise = null", "return\n  }")
     assert "quitGatewayDrainPromise = null" in failed_drain
-    assert "showDesktopQuitFailure()" in failed_drain
+    assert "showDesktopQuitFailure(accountShutdownFailed)" in failed_drain
     assert "app.exit(" not in failed_drain
+
     failed = _section(main_ts, "function showDesktopQuitFailure", "app.on('before-quit'")
     assert "isQuitting = true" in failed
     assert "setAppExitPhase('failed'" in failed
@@ -4045,13 +4069,17 @@ def test_complete_profile_import_holds_exclusive_writer_admission_through_reconc
         "ipcMain.handle('desktop:migration:last-result'",
     )
     assert "desktopWriters.tryBeginExclusive" in settings_run
-    assert "await waitForDesktopWriterOperations(1)" in settings_run
+    drain = re.search(r"await\s+Promise\.all\(\[(.*?)\]\)", settings_run, re.DOTALL)
+    assert drain is not None
+    assert "waitForDesktopWriterOperations(1)" in drain.group(1)
+    assert "accountPause.wait(" in drain.group(1)
     assert "exclusive.finish()" in settings_run
     assert "desktopWriters.reopen(exclusive.admissionToken)" in settings_run
-    assert settings_run.index("tryBeginExclusive") < settings_run.index("'--apply'")
-    assert settings_run.index("'--apply'") < settings_run.index("exclusive.finish()")
+    assert settings_run.index("tryBeginExclusive") < drain.start()
+    assert drain.end() < settings_run.index("'--apply'")
+    reconcile = settings_run.index("reconcileImportedDesktopCredential(intent, true)")
+    assert settings_run.index("'--apply'") < reconcile < settings_run.index("exclusive.finish()")
 
-    assert "reconcileImportedDesktopCredential(intent, true)" in settings_run
     save_credential = _section(
         main_ts,
         "async function saveDesktopCredential",
@@ -4111,9 +4139,16 @@ def test_settings_import_reconciles_or_prompts_for_imported_provider() -> None:
     assert "pendingProviderSetup," in onboarding
     assert "onboardingMigrationCandidates" not in onboarding
     assert "desktopSecretStoragePolicyBackend() === 'safeStorage'" in prepare
-    assert prepare.index("desktopSecretStoragePolicyBackend() === 'safeStorage'") < prepare.index(
-        "if (!pendingProviderSetup && existing && isConnectionReady(existing))"
+    reuse = prepare.index(
+        "if (!pendingProviderSetup && existing && credentialReadable "
+        "&& isConnectionReady(existing))"
     )
+    assert "existing?.encryption !== 'safeStorage'" in prepare
+    assert prepare.index("const credentialReadable =") < reuse
+    assert prepare.index("desktopSecretStoragePolicyBackend() === 'safeStorage'") < prepare.index(
+        "'keychain_unavailable'"
+    )
+    assert prepare.index("'keychain_unavailable'") < reuse
 
     reconcile = _section(
         main_ts,

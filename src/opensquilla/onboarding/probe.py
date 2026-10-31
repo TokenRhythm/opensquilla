@@ -31,6 +31,7 @@ from typing import Any, Literal, cast
 import httpx
 import structlog
 
+from opensquilla.desktop_account import manual_connection_operation
 from opensquilla.provider.app_attribution import is_host_or_subdomain
 from opensquilla.provider.auxiliary_budget import (
     ensure_auxiliary_text_fits,
@@ -963,6 +964,7 @@ async def discover_provider_models(
     )
 
 
+@manual_connection_operation
 async def discover_selectable_provider_models(
     *,
     provider_id: str,
@@ -1040,6 +1042,8 @@ async def discover_selectable_provider_models(
     if spec.selectable_model_catalog != "verified_live":
         return ProviderModelsDiscoverResult(ok=True, provider_id=provider_id)
 
+    # Callers resolve the selected connection before discovery. In particular,
+    # a manual draft's key/endpoint must not be replaced by an ambient account.
     effective_base_url = base_url.strip() or spec.default_base_url
     try:
         uses_https = httpx.URL(effective_base_url).scheme == "https"

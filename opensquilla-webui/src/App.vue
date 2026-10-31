@@ -125,7 +125,9 @@
     <!-- Fixed footer: settings and the desktop update entry -->
     <div class="sidebar-foot">
       <SidebarDesktopUpdate @open="openDesktopUpdateSettings" />
+      <SidebarAccountMenu v-if="platform.account" :collapsed="!effectiveSidebarOpen" @settings="openSettings" />
       <button
+        v-else
         type="button"
         class="sidebar-fn-item"
         data-icon="settings"
@@ -455,6 +457,7 @@
 import { computed, inject, nextTick, onMounted, onUnmounted, ref, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { SettingsBackgroundRoute, useSettingsRouteOverlay } from './router/settingsRouteOverlay'
+import SidebarAccountMenu from './components/SidebarAccountMenu.vue'
 import { useI18n } from 'vue-i18n'
 import { routeTitle } from './router'
 import { getPlatform } from '@/platform'

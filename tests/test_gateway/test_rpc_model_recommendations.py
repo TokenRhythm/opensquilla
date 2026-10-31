@@ -6,6 +6,7 @@ from types import SimpleNamespace
 from typing import Any
 
 import pytest
+import tomli_w
 
 from opensquilla.gateway.auth import Principal
 from opensquilla.gateway.config import GatewayConfig
@@ -133,6 +134,53 @@ async def test_apply_persists_only_selected_plan_and_preserves_mode(
     assert current_recommendation_rows(reloaded, "tokenrhythm", kind) == plans[
         "tokenrhythm", kind
     ]["rows"]
+
+
+@pytest.mark.parametrize("kind", ["router", "ensemble"])
+async def test_apply_with_account_selected_preserves_manual_connection_after_reload(
+    config: GatewayConfig, plans: Any, monkeypatch: pytest.MonkeyPatch, kind: str,
+) -> None:
+    from opensquilla import desktop_account as bridge
+    from opensquilla.gateway.llm_runtime import resolve_llm_credential, resolve_llm_runtime_config
+
+    saved = config.to_toml_dict()
+    saved.setdefault("llm", {}).update(
+        provider="tokenrhythm", api_key="synthetic-manual-key",
+        base_url="https://manual.invalid/v1",
+    )
+    Path(config.config_path).write_text(tomli_w.dumps(saved), encoding="utf-8")
+    config = GatewayConfig.load(config.config_path)
+    before = config.llm.model_dump(mode="python")
+    lease = "os_local_" + "a" * 43
+    account_state = {
+        "source": "account", "ready": True, "credential": lease,
+        "accountId": "synthetic-account", "selectedAccountId": "synthetic-account",
+    }
+    monkeypatch.setattr(bridge, "_endpoint", "")
+    monkeypatch.setattr(bridge, "_token", "")
+    pinned = bridge.pin_account_state(account_state)
+    try:
+        ctx = _ctx(config)
+        await _handle_models_recommendations_apply(_params(kind), ctx)
+
+        assert ctx.config.llm.model_dump(mode="python") == before
+        assert bridge.account_state() == account_state
+        persisted = Path(config.config_path).read_text(encoding="utf-8")
+        assert lease not in persisted
+        reloaded = GatewayConfig.load(config.config_path)
+        assert reloaded.llm.provider == "tokenrhythm"
+        runtime = resolve_llm_runtime_config(reloaded)
+        assert runtime.api_key == lease
+        assert runtime.base_url == bridge.OFFICIAL_BASE
+        assert resolve_llm_credential(reloaded).source == "account"
+        with bridge.manual_credential_scope():
+            runtime = resolve_llm_runtime_config(reloaded)
+            assert runtime.api_key == "synthetic-manual-key"
+            assert runtime.base_url == "https://manual.invalid/v1"
+            assert resolve_llm_credential(reloaded).source == "explicit"
+        assert bridge.account_state() == account_state
+    finally:
+        bridge.reset_account_state(pinned)
 
 
 @pytest.mark.parametrize("kind", ["router", "ensemble"])

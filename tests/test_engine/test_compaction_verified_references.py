@@ -4,10 +4,12 @@ from __future__ import annotations
 
 import copy
 import json
+from dataclasses import replace
 
 import httpx
 import pytest
 
+from opensquilla import token_estimation
 from opensquilla.engine import Agent, AgentConfig
 from opensquilla.engine.tool_result_store import ToolResultStore
 from opensquilla.provider import (
@@ -21,6 +23,15 @@ from opensquilla.session.compaction_deployment import (
     CompactionExecutionPlan,
     CompactionExecutionTarget,
 )
+
+_CONTEXT_WINDOW_TOKENS = 131_072
+
+
+@pytest.fixture(autouse=True)
+def offline_token_estimates(monkeypatch):
+    # Reference validation must also work without optional tokenizer data.
+    # Keep this contract offline and budget for the real conservative estimate.
+    monkeypatch.setattr(token_estimation, "_get_encoding", lambda: None)
 
 
 def fixture(tmp_path, *, stored_session="session-1", digest_valid=True, retrieval=True):
@@ -39,7 +50,7 @@ def fixture(tmp_path, *, stored_session="session-1", digest_valid=True, retrieva
                             input_schema=ToolInputSchema(properties={}))]
     provider = OpenAIProvider(api_key="synthetic-no-network", model="synthetic")
     agent = Agent(provider=provider, config=AgentConfig(
-        context_window_tokens=32768, context_window_known=True, max_tokens=2048,
+        context_window_tokens=_CONTEXT_WINDOW_TOKENS, context_window_known=True, max_tokens=2048,
         tool_result_store_dir=str(tmp_path / "tool-results"),
         tool_result_store_session_id="session-1",
     ), tool_definitions=tools, tool_handler=handler)
@@ -50,8 +61,27 @@ def fixture(tmp_path, *, stored_session="session-1", digest_valid=True, retrieva
         ],
     }, {"role": "assistant", "content": "Inspection completed."}]
     target = CompactionExecutionTarget(provider=provider, provider_id="openai", model="synthetic",
-                                       context_window_tokens=32768, max_output_tokens=2048,
+                                       context_window_tokens=_CONTEXT_WINDOW_TOKENS,
+                                       max_output_tokens=2048,
                                        max_generation_tokens=2048)
+    # These cases isolate Store proof from summary-only pressure recovery.
+    # Verify that the complete raw request really fits before testing references.
+    raw_context = replace(
+        agent.build_compaction_request_context(),
+        recoverable_reference_resolver=lambda _messages: frozenset(),
+    )
+    raw_messages, raw_tools, raw_config = _build_suffix_compaction_call(
+        raw_context, entries, "", "", None, provider=provider, deployment=target,
+        context_window_tokens=_CONTEXT_WINDOW_TOKENS, summary_output_tokens=2048, timeout=30,
+        provider_request_correlation=None,
+    )
+    assert tool_text(raw_messages) == content
+    raw_request = provider.project_final_request(raw_messages, raw_tools, raw_config)
+    assert raw_request.fits
+    assert next(
+        message["content"] for message in raw_request.payload["messages"]
+        if message["role"] == "tool"
+    ) == content
     return agent, provider, target, entries, store, record, raw, content
 
 
@@ -70,7 +100,7 @@ def test_verified_projection_matches_consumer_and_preserves_raw(tmp_path, mode):
     context = agent.build_compaction_request_context()
     messages, _, _ = _build_suffix_compaction_call(
         context, entries, "", "", None, provider=provider, deployment=target,
-        context_window_tokens=32768, summary_output_tokens=2048, timeout=30,
+        context_window_tokens=_CONTEXT_WINDOW_TOKENS, summary_output_tokens=2048, timeout=30,
         provider_request_correlation=None,
     )
     admitted = agent._history_messages_for_compaction_admission(
@@ -93,7 +123,7 @@ async def test_summary_wire_uses_verified_projection_and_revalidates_disappeared
     context = agent.build_compaction_request_context()
     messages, tools, config = _build_suffix_compaction_call(
         context, entries, "", "", None, provider=provider, deployment=target,
-        context_window_tokens=32768, summary_output_tokens=2048, timeout=30,
+        context_window_tokens=_CONTEXT_WINDOW_TOKENS, summary_output_tokens=2048, timeout=30,
         provider_request_correlation=None,
     )
     expected = provider.project_final_request(messages, tools, config)
@@ -123,7 +153,7 @@ async def test_summary_wire_uses_verified_projection_and_revalidates_disappeared
     monkeypatch.setattr(ToolResultStore, "read", lambda *args, **kwargs: None)
     retry_messages, _, _ = _build_suffix_compaction_call(
         context, entries, "", "", None, provider=provider, deployment=target,
-        context_window_tokens=32768, summary_output_tokens=2048, timeout=30,
+        context_window_tokens=_CONTEXT_WINDOW_TOKENS, summary_output_tokens=2048, timeout=30,
         provider_request_correlation=None,
     )
     assert tool_text(retry_messages) == original

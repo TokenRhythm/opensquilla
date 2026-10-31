@@ -59,6 +59,7 @@ async function scenario(run, { platform = 'darwin', exited = false, dev = false,
     systemSessionEnding: false, updateApplying: false, updateInstallHandoffReady: false,
     quitRequestedDuringUpdateDrain: false, quitGatewayDrainPromise: null,
     holdQuitForTaskConfirmation: () => false, desktopUpdateCheckScheduler: { stop() {} },
+    desktopAccounts: new Map(),
     desktopWriters: { activeCount: 0, close: () => Symbol('quit') },
     quitDeferredForDesktopWriters: false, quitWriterAdmission: null,
     desktopLog: (event, detail) => calls.logs.push({ event, ...detail }),
@@ -84,6 +85,7 @@ async function scenario(run, { platform = 'darwin', exited = false, dev = false,
     app: { exit: code => calls.exits.push(code) },
     desktopReliabilityTelemetry: { finishSession() {} }, destroyWindowsTray() {},
     desktopBrowser: { close: async () => {} },
+
   }
   const beforeQuit = new Function('env', `with (env) {
     ${functions.join('\n')}

@@ -711,13 +711,13 @@
       "lifecycle": "stable",
       "name": "onboarding.llmProfile.activate",
       "schema": "platform/onboarding-llm-profile-activate.schema.json",
-      "schemaSha256": "f1a424cce839b3d570c564a44107ad57b1dbe6bb360e8313649f7713fc55e1f6"
+      "schemaSha256": "a93a85cf0edec78a5f4a001ade52e8cbad0892696773cf252a7dd2549270c22e"
     },
     {
       "lifecycle": "stable",
       "name": "onboarding.llmProfile.active.remove",
       "schema": "platform/onboarding-llm-profile-active-remove.schema.json",
-      "schemaSha256": "1e737f377175c22d7433e47d41401556c1d5c471dc3664dbfe7b56f97a1998d3"
+      "schemaSha256": "d48e704686e764ad2cb067648c47c3f98d92382e4d3bb9b510ca4dc47e10a678"
     },
     {
       "lifecycle": "stable",
@@ -741,7 +741,7 @@
       "lifecycle": "stable",
       "name": "onboarding.llmProfile.models.discover",
       "schema": "platform/onboarding-llm-profile-models-discover.schema.json",
-      "schemaSha256": "fe9dfccfe89f8684897f5c6d1f29e722b752f5d80f12d7715a72a5aa4a37f74f"
+      "schemaSha256": "431778ac2eab05c9fdd299a0e90303ce983ed5dcfa2bda093b4036f2d9963a08"
     },
     {
       "lifecycle": "stable",
@@ -765,7 +765,7 @@
       "lifecycle": "stable",
       "name": "onboarding.llmProfile.upsertAndActivate",
       "schema": "platform/onboarding-llm-profile-upsert-and-activate.schema.json",
-      "schemaSha256": "201b1d7daa8c51e15cb214e588a602c3446b48e18352045ba40ebbd7259745dd"
+      "schemaSha256": "9add2e7a77cac11f286605b98622b0290b9ebe0928cb0360f3b1cc6dc78bc7b2"
     },
     {
       "lifecycle": "stable",
@@ -777,7 +777,7 @@
       "lifecycle": "stable",
       "name": "onboarding.models.discover",
       "schema": "platform/onboarding-models-discover.schema.json",
-      "schemaSha256": "50a5dd53b131d04b45062858a2b8f0d16ff01516000463f57de2e668d012aca7"
+      "schemaSha256": "cfec0884142279aeae321476264c3360f440dd1d8e5afc5a41cdf3da48619f42"
     },
     {
       "lifecycle": "stable",
@@ -1473,7 +1473,7 @@
     "generatorSha256": "322cf69b630bbced63642484ef9c0579d664caa4f7a741fc5008f1705b1ce82c",
     "methodCount": 216,
     "schemaCount": 226,
-    "schemaTreeSha256": "d1495ab52d1c6cdc8c5a527069f7c488d5037065dc3defbc144d9d1836fae85f",
+    "schemaTreeSha256": "432e1af00cddaac0dc3976c97f48608343d0e5f9f6f1cebf338f43a244a1f606",
     "toolchains": {
       "legacyTypes": {
         "python": {
