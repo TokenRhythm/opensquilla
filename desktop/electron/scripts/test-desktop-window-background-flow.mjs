@@ -233,6 +233,34 @@ async function readContinuityObservation(page, app) {
   }
 }
 
+function currentRendererHasReadyRpc() {
+  let entries
+  try { entries = JSON.parse(localStorage.getItem('opensquilla.chat.sessionNavigationDiag') || '[]') }
+  catch { return false }
+  if (!Array.isArray(entries)) return false
+  // Diagnostics survive reload, and each renderer starts its generations at 1.
+  // Ignore the previous document before looking for the latest socket lifecycle.
+  const transport = entries.filter(entry => entry?.source === 'rpc.transport'
+    && Number.isFinite(entry.t) && entry.t >= performance.timeOrigin)
+  const lifecycle = transport.find(entry => [
+    'connect_start', 'hello', 'close', 'retire', 'handshake_invalid',
+    'watchdog_timeout', 'reconnect_scheduled', 'probe_timeout', 'soft_suspect',
+    'wake_incident_start', 'wake_incident_timeout', 'wake_incident_recovered',
+  ].includes(entry.phase))
+  if (!['hello', 'wake_incident_recovered'].includes(lifecycle?.phase)
+    || typeof lifecycle.rendererInstance !== 'string'
+    || !Number.isInteger(lifecycle.generation)) return false
+  if (lifecycle.phase === 'wake_incident_recovered'
+    && (lifecycle.health !== 'healthy' || lifecycle.transportPhase !== 'healthy')) return false
+  const hello = transport.find(entry => entry.phase === 'hello'
+    && entry.rendererInstance === lifecycle.rendererInstance
+    && entry.generation === lifecycle.generation)
+  if (!hello) return false
+  return transport.some(entry => entry.phase === 'first_successful_rpc'
+    && entry.rendererInstance === lifecycle.rendererInstance
+    && entry.generation === lifecycle.generation && entry.t >= hello.t)
+}
+
 async function readRpcTransportObservation(page) {
   return await page?.evaluate(() => {
     const phases = new Set([
@@ -438,6 +466,11 @@ try {
   const draft = idleSend ? 'Synthetic background recovery request.' : 'isolated stability draft - never send'
   await composer.fill(draft)
   await composer.focus()
+  // A visible composer does not prove the post-reload RPC handshake finished.
+  // Native resume intentionally replaces an unready socket; this case measures
+  // preservation of an already healthy connection, including a real round trip.
+  await waitFor(() => page.evaluate(currentRendererHasReadyRpc),
+    'the current renderer RPC handshake and first successful round trip')
   const resumeUrl = page.url()
   await page.evaluate(() => {
     window.__stabilityComposer = document.querySelector('.chat-textarea')

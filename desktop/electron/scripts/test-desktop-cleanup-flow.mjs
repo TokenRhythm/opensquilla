@@ -15,7 +15,7 @@ import { setTimeout as delay } from 'node:timers/promises'
 import { fileURLToPath } from 'node:url'
 import { _electron as electron } from 'playwright'
 import { closeElectronWithDeadline, withDeadline } from './e2e-shutdown-helpers.mjs'
-import { cleanupGatewaySnapshot, gatewayLifecycleLogSnapshot } from './cleanup-shutdown-diagnostics.mjs'
+import { cleanupGatewaySnapshot, gatewayLifecycleLogSnapshot, gatewayStallLogSnapshot } from './cleanup-shutdown-diagnostics.mjs'
 import {
   desktopGatewayAuthToken,
   desktopProfileFingerprint,
@@ -80,6 +80,9 @@ function launchEnvironment(isolatedHome) {
     OPENSQUILLA_TEST_PROFILE_LOCK_ROOT: '1',
     OPENSQUILLA_DESKTOP_DISABLE_AUTO_UPDATE: '1',
     OPENSQUILLA_OPENROUTER_LIVE_PRICING: '0',
+    // Only this synthetic fixture opts in; retain the producer's default cadence.
+    OPENSQUILLA_STALL_DIAGNOSTICS: '1',
+    OPENSQUILLA_STALL_DIAGNOSTICS_PATH: stallDiagnosticsPath,
     OPENSQUILLA_GATEWAY_WORKSPACE_DIR: '',
     OPENSQUILLA_WORKSPACE_DIR: '',
     OPENSQUILLA_GATEWAY_STATE_DIR: '',
@@ -113,6 +116,7 @@ const cleanupJournal = join(userData, '.opensquilla.profile-cleanup.json')
 // Keep diagnostic output outside userData: delete-all removes every approved
 // userData entry, and its detached helper outlives Electron's event listeners.
 const helperDiagnostics = join(root, 'cleanup-helper-diagnostics')
+const stallDiagnosticsPath = join(root, 'gateway-stalls.jsonl')
 const deleteAllHelperTimeoutMs = process.platform === 'win32' ? 90_000 : 30_000
 let desktopApp
 let flowSucceeded = false
@@ -122,9 +126,10 @@ let shutdownLogCheckpoint = null
 const phase1OwnershipDir = join(userData, 'gateway-ownership', desktopProfileFingerprint(primaryHome))
 
 async function shutdownDiagnostics() {
-  const [log, gatewayLog] = await Promise.all([
+  const [log, gatewayLog, stallLog] = await Promise.all([
     readFile(join(userData, 'logs', 'desktop.log'), 'utf8').catch(() => null),
     readFile(join(userData, 'logs', 'gateway.log'), 'utf8').catch(() => null),
+    readFile(stallDiagnosticsPath, 'utf8').catch(() => null),
   ])
   const gateway = phase === 'automatic-cleanup-abandon' && phase1Gateway
     ? await cleanupGatewaySnapshot(phase1Gateway, loadDesktopGatewayOwnershipRecord(phase1OwnershipDir))
@@ -157,7 +162,8 @@ async function shutdownDiagnostics() {
   }
   return { phase, logReadFailed: log === null, checkpointMatched,
     logBytes: Buffer.byteLength(log ?? '', 'utf8'), records: records.slice(-32),
-    gateway, gatewayLifecycle: gatewayLifecycleLogSnapshot(gatewayLog) }
+    gateway, gatewayLifecycle: gatewayLifecycleLogSnapshot(gatewayLog),
+    gatewayStalls: gatewayStallLogSnapshot(stallLog) }
 }
 
 async function observeDeleteAllHelper(app) {

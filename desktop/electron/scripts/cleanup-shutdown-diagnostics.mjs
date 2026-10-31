@@ -84,6 +84,9 @@ const GATEWAY_VALUES = {
 const GATEWAY_NUMBERS = ['elapsed_ms', 'exit_code', 'running', 'queued', 'waiting',
   'reservations', 'auxiliary', 'remaining_drivers', 'remaining_reservations',
   'remaining_auxiliary', 'abandoned_tasks', 'duration_ms', 'pid', 'parent_pid', 'timeout', 'count', 'generation']
+// PrivateLogFormatter emits metadata JSON after this timestamp/level/logger
+// prefix. Do not search for arbitrary JSON embedded in raw exception prose.
+const PRIVATE_LOG_PREFIX = /^\d{4}-\d\d-\d\d[ T][\d:.,+Z-]+\s+\[(?:DEBUG|INFO|WARNING|ERROR|CRITICAL)\]\s+[A-Za-z_][A-Za-z0-9_.]*:\s*/
 
 /** Extract only known lifecycle events and bounded values; never return a raw log line. */
 export function gatewayLifecycleLogSnapshot(text) {
@@ -91,20 +94,27 @@ export function gatewayLifecycleLogSnapshot(text) {
   const records = []
   for (const raw of text.slice(-256 * 1024).split(/\r?\n/)) {
     const line = raw.replace(/\x1b\[[0-9;]*m/g, '')
+    const prefix = line.match(PRIVATE_LOG_PREFIX)
     let parsed
-    try { parsed = JSON.parse(line) } catch { /* Dev logs may use the console renderer. */ }
-    const event = parsed && typeof parsed === 'object'
+    try { parsed = JSON.parse(prefix ? line.slice(prefix[0].length) : line) } catch {
+      if (prefix) continue
+      // Legacy dev logs may use the unstructured console renderer.
+    }
+    const structured = parsed !== null && typeof parsed === 'object'
+    const event = structured
       ? parsed.event : [...GATEWAY_EVENTS].find(name => (
         new RegExp(`(?:^|\\s)${name.replaceAll('.', '\\.')}(?=\\s|$)`).test(line)
       ))
     if (!GATEWAY_EVENTS.has(event)) continue
     const record = { event }
     for (const [field, allowed] of Object.entries(GATEWAY_VALUES)) {
-      const value = parsed?.[field] ?? line.match(new RegExp(`\\b${field}=([A-Za-z_]+)(?=\\s|$)`))?.[1]
+      const value = structured ? parsed[field]
+        : line.match(new RegExp(`\\b${field}=([A-Za-z_]+)(?=\\s|$)`))?.[1]
       if (allowed.has(value)) record[field] = value
     }
     for (const field of GATEWAY_NUMBERS) {
-      const rawValue = parsed?.[field] ?? line.match(new RegExp(`\\b${field}=(\\d+(?:\\.\\d+)?)(?=\\s|$)`))?.[1]
+      const rawValue = structured ? parsed[field]
+        : line.match(new RegExp(`\\b${field}=(\\d+(?:\\.\\d+)?)(?=\\s|$)`))?.[1]
       const value = typeof rawValue === 'string' ? Number(rawValue) : rawValue
       if (typeof value === 'number' && Number.isFinite(value) && value >= 0 && value <= Number.MAX_SAFE_INTEGER) {
         record[field] = value
@@ -113,4 +123,41 @@ export function gatewayLifecycleLogSnapshot(text) {
     records.push(record)
   }
   return { records: records.slice(-32) }
+}
+
+const STALL_NUMBERS = ['ts', 'capture_ts', 'capture_monotonic_s', 'capture_finished_monotonic_s',
+  'lag_ms', 'heartbeat_age_ms']
+const STALL_COUNTS = ['heartbeat_seq', 'detected_heartbeat_seq', 'heartbeat_seq_before', 'heartbeat_seq_after']
+const STALL_FLAGS = ['heartbeat_alive', 'heartbeat_started', 'same_heartbeat_window']
+const PYTHON_FRAME_NAMES = new Set(['<module>', '<lambda>', '<listcomp>', '<dictcomp>', '<setcomp>', '<genexpr>'])
+
+/** Failure-only projection of the opt-in watchdog; paths, source and locals never leave the fixture. */
+export function gatewayStallLogSnapshot(text) {
+  if (typeof text !== 'string') return { logReadFailed: true, records: [] }
+  const records = []
+  for (const line of text.slice(-256 * 1024).split(/\r?\n/)) {
+    let parsed
+    try { parsed = JSON.parse(line) } catch { continue }
+    if (parsed?.type !== 'stack_sample' || !Array.isArray(parsed.stack)) continue
+    const record = { type: 'stack_sample' }
+    for (const field of [...STALL_NUMBERS, ...STALL_COUNTS]) {
+      const value = parsed[field]
+      if (typeof value === 'number' && Number.isFinite(value) && value >= 0 && value <= Number.MAX_SAFE_INTEGER
+        && (!STALL_COUNTS.includes(field) || Number.isSafeInteger(value))) record[field] = value
+    }
+    for (const field of STALL_FLAGS) {
+      if (typeof parsed[field] === 'boolean') record[field] = parsed[field]
+    }
+    // The producer reverses f_back traversal: its innermost frames are last.
+    record.stack = parsed.stack.slice(-12).flatMap(frame => {
+      if (!frame || typeof frame.file !== 'string' || typeof frame.function !== 'string'
+        || !Number.isSafeInteger(frame.line) || frame.line < 1) return []
+      const file = frame.file.replaceAll('\\', '/').split('/').at(-1)
+      if (!/^[A-Za-z0-9_][A-Za-z0-9_.-]{0,127}$/.test(file)
+        || (!/^[A-Za-z_][A-Za-z0-9_]{0,127}$/.test(frame.function) && !PYTHON_FRAME_NAMES.has(frame.function))) return []
+      return [{ file, function: frame.function, line: frame.line }]
+    })
+    records.push(record)
+  }
+  return { records: records.slice(-4) }
 }
