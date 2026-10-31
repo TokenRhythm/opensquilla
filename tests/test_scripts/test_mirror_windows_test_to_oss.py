@@ -172,7 +172,9 @@ def test_workflow_only_mirrors_successful_build_and_keeps_credentials_in_upload_
     build = workflow["jobs"]["build"]
     assert build["outputs"]["artifact_name"] == "${{ steps.target.outputs.artifact_name }}"
     artifact_upload = next(
-        step for step in build["steps"] if step.get("uses", "").startswith("actions/upload-artifact@")
+        step
+        for step in build["steps"]
+        if step.get("uses", "").startswith("actions/upload-artifact@")
     )
     assert artifact_upload["with"]["name"] == "${{ steps.target.outputs.artifact_name }}"
     assert "test-windows-production-" in build["env"]["OPENSQUILLA_TEST_ENVIRONMENT"]

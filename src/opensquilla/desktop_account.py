@@ -31,6 +31,7 @@ _token = ""
 _cached: dict[str, Any] | None = None
 _cached_at = 0.0
 _leases: dict[str, str] = {}
+_lease_authorities: dict[str, tuple[str, str]] = {}
 _turn_state: contextvars.ContextVar[dict[str, Any] | None] = contextvars.ContextVar(
     "desktop_account_turn", default=None
 )
@@ -104,6 +105,18 @@ def account_state(*, force: bool = False) -> dict[str, Any] | None:
                     r"os_local_[A-Za-z0-9_-]{43}", lease
                 ):
                     raise ValueError("Invalid account bridge credential")
+                account_id = state.get("accountId")
+                origin = state.get("origin") or "https://tokenrhythm.studio"
+                if not isinstance(account_id, str) or not account_id or not isinstance(origin, str):
+                    raise ValueError("Invalid account bridge identity")
+                authority = (origin.rstrip("/"), account_id)
+                previous = _lease_authorities.get(lease)
+                if previous is not None and previous != authority:
+                    raise ValueError("Account bridge credential identity changed")
+                # Bind the exact lease returned by the authenticated bridge.
+                # Retain old bindings for in-flight requests; the current login
+                # must never supply an identity for an unknown/older lease.
+                _lease_authorities[lease] = authority
                 _leases[lease] = _endpoint
             _cached = state
         except (OSError, ValueError, http.client.HTTPException):
@@ -210,6 +223,12 @@ def account_credential(
 
 def is_account_credential(value: str) -> bool:
     return str(value).startswith("os_local_")
+
+
+def account_credential_authority(value: str) -> tuple[str, str] | None:
+    """Return only the stable identity previously authenticated for this lease."""
+    with _lock:
+        return _lease_authorities.get(value)
 
 
 class AccountProxyTransport(httpx.AsyncBaseTransport):

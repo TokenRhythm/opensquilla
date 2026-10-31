@@ -11,6 +11,7 @@ from opensquilla.provider.deployment import resolve_provider_deployment
 def private_state(monkeypatch):
     monkeypatch.setattr(bridge, "_endpoint", "")
     monkeypatch.setattr(bridge, "_token", "")
+    monkeypatch.setattr(bridge, "_lease_authorities", {})
     token = bridge.pin_account_state(None)
     yield
     bridge.reset_account_state(token)

@@ -31,6 +31,7 @@ _PROFILE_DISCOVER = "onboarding.llmProfile.models.discover"
 def isolate_account(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
     monkeypatch.setattr(bridge, "_endpoint", "")
     monkeypatch.setattr(bridge, "_token", "")
+    monkeypatch.setattr(bridge, "_lease_authorities", {})
     monkeypatch.delenv("SYNTHETIC_MISSING_TOKENRHYTHM_KEY", raising=False)
     token = bridge.pin_account_state(None)
     try:

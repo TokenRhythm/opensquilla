@@ -695,8 +695,10 @@ async def test_delivered_video_billing_uses_original_account_transport(
 
     monkeypatch.setattr(httpx, "AsyncClient", client)
     monkeypatch.setattr(httpx, "AsyncHTTPTransport", lambda **kwargs: httpx.MockTransport(handler))
+    monkeypatch.setattr(bridge, "_lease_authorities", {})
     if account:
         monkeypatch.setitem(bridge._leases, key, "http://127.0.0.1:12345")
+        monkeypatch.setitem(bridge._lease_authorities, key, authority)
     monkeypatch.setattr(media, "_video_job_sessions", {})
     config = VideoGenerationConfig(
         enabled=True,

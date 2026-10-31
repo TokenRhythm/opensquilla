@@ -1309,6 +1309,7 @@ def _persist_video_receipt(handle: str, receipt: _VideoJobReceipt) -> None:
             "base_url": receipt.base_url,
             "native_job_id": receipt.native_job_id,
             "credential_env": receipt.credential_env,
+            "account_authority": receipt.account_authority,
             "completed_result": result,
             "completed_payload": receipt.completed_payload,
         },
@@ -1323,6 +1324,16 @@ def _restore_video_receipts() -> None:
         if handle in _video_job_sessions:
             continue
         value = dict(value)
+        authority = value.get("account_authority")
+        if authority is not None:
+            if not (
+                isinstance(authority, (list, tuple))
+                and len(authority) == 2
+                and all(isinstance(part, str) and part for part in authority)
+            ):
+                raise ToolError("Saved video job credential binding is invalid")
+            # JSON arrays must compare identically to the runtime credential tuple.
+            value["account_authority"] = (authority[0], authority[1])
         if value.get("completed_result") is not None:
             result = dict(value["completed_result"])
             result["output_path"] = Path(result["output_path"])
