@@ -8,6 +8,7 @@ from unittest.mock import AsyncMock
 import pytest
 
 from opensquilla.engine import Agent, AgentConfig, ToolResult
+from opensquilla.engine.runtime import _SelectorFallbackProvider
 from opensquilla.provider import ChatConfig, Message, ToolDefinition, ToolInputSchema
 from opensquilla.provider import DoneEvent as ProviderDone
 from opensquilla.provider import ErrorEvent as ProviderError
@@ -153,6 +154,18 @@ def _agent(
     )
 
 
+def _routed_agent(execution, provider):
+    agent = _agent(provider)
+    agent.provider = _SelectorFallbackProvider(
+        provider, execution.selector, execution.turn.metadata
+    )
+    agent.config.metadata = execution.turn.metadata
+    agent.config.model_id = execution.turn.model
+    agent.config.provider_id = "openrouter"
+    agent.config.thinking = False
+    return agent
+
+
 @pytest.mark.parametrize(
     "reason",
     [
@@ -208,7 +221,6 @@ async def test_quality_retry_large_transient_context_does_not_commit_or_activate
     execution, monkeypatch, context_kind,
 ) -> None:
     import opensquilla.engine.model_router_quality as quality
-    from opensquilla.engine.runtime import _SelectorFallbackProvider
 
     e = execution
     e.turn.config.llm.thinking = "off"
@@ -218,16 +230,11 @@ async def test_quality_retry_large_transient_context_does_not_commit_or_activate
     advance = AsyncMock(wraps=e.manager.advance_model_router_quality_retry)
     monkeypatch.setattr(e.manager, "advance_model_router_quality_retry", advance)
     provider = _QualityProvider([_tool_stream(1), _final_stream()])
-    wrapper = _SelectorFallbackProvider(provider, e.selector, e.turn.metadata)
-    agent = _agent(provider)
-    agent.provider = wrapper
-    agent.config.metadata = e.turn.metadata
-    agent.config.model_id = e.turn.model
-    agent.config.provider_id = "openrouter"
+    agent = _routed_agent(e, provider)
+    wrapper = agent.provider
     agent.config.context_window_tokens = 64000
     agent.config.context_window_known = True
     agent.config.max_tokens = 256
-    agent.config.thinking = False
     large_context = "extra context " * 1500
     if context_kind == "request":
         agent.config.request_context_prompt = large_context
@@ -338,24 +345,26 @@ async def test_provider_infrastructure_errors_do_not_call_quality_retry(code: st
     assert events
 
 
-async def test_zero_retry_budget_disables_quality_retry() -> None:
+@pytest.mark.parametrize(
+    "options,metadata",
+    [
+        pytest.param({"budget": 0}, {}, id="zero-budget"),
+        pytest.param(
+            {"fixed_route": False, "explicit_correction": True}, {}, id="unapplied-policy"
+        ),
+        pytest.param({}, {"router_control_hold_applied": True}, id="held-tier"),
+        pytest.param({}, {"routed_tier": "c3"}, id="top-tier"),
+    ],
+)
+async def test_quality_upgrade_requires_budget_and_an_unheld_applied_route(options, metadata):
     provider = _QualityProvider([_tool_stream(1), _final_stream()])
-    agent = _agent(provider, budget=0)
+    agent = _agent(provider, **options)
+    agent.config.metadata.update(metadata)
 
     events = [event async for event in agent.run_turn("hello")]
 
     assert provider.quality_calls == []
     assert agent.config.model_id == "quality-c1"
-    assert any(event.kind == "done" and event.text == "done" for event in events)
-
-
-async def test_quality_retry_requires_an_applied_model_policy() -> None:
-    provider = _QualityProvider([_tool_stream(1), _final_stream()])
-    agent = _agent(provider, fixed_route=False, explicit_correction=True)
-
-    events = [event async for event in agent.run_turn("hello")]
-
-    assert provider.quality_calls == []
     assert any(event.kind == "done" and event.text == "done" for event in events)
 
 
@@ -413,16 +422,6 @@ async def test_quality_retry_consumes_same_budget_as_later_provider_retry() -> N
         event.kind == "error" and event.code == "provider_retry_budget_exhausted"
         for event in events
     )
-
-
-@pytest.mark.parametrize("metadata", [{"router_control_hold_applied": True}, {"routed_tier": "c3"}])
-async def test_hold_and_top_tier_block_execution_quality_upgrade(metadata):
-    provider = _QualityProvider([_tool_stream(1), _final_stream()])
-    agent = _agent(provider)
-    agent.config.metadata.update(metadata)
-    events = [event async for event in agent.run_turn("hello")]
-    assert provider.quality_calls == []
-    assert any(event.kind == "done" for event in events)
 
 
 async def test_transport_retry_consumes_budget_before_later_quality_signal():
@@ -489,7 +488,6 @@ async def test_quality_retry_projects_the_same_physical_leg_as_dispatch(
 ) -> None:
     import opensquilla.engine.model_router_quality as quality
     from opensquilla.engine.model_policy_recovery import ModelPolicyRecovery
-    from opensquilla.engine.runtime import _SelectorFallbackProvider
     from opensquilla.provider.types import ContentBlockImage, ContentBlockText
 
     e = execution
@@ -563,7 +561,6 @@ async def test_quality_retry_uses_compacted_request_instead_of_original_history(
     execution, monkeypatch,
 ) -> None:
     import opensquilla.engine.model_router_quality as quality
-    from opensquilla.engine.runtime import _SelectorFallbackProvider
     from opensquilla.engine.steps.model_router import ModelRouteError, validate_model_route_capacity
 
     e = execution
@@ -582,13 +579,7 @@ async def test_quality_retry_uses_compacted_request_instead_of_original_history(
     with pytest.raises(ModelRouteError, match="cannot fit"):
         validate_model_route_capacity(e.turn, tier="c1")
     provider = _QualityProvider([_tool_stream(1), _final_stream()])
-    wrapper = _SelectorFallbackProvider(provider, e.selector, e.turn.metadata)
-    agent = _agent(provider)
-    agent.provider = wrapper
-    agent.config.metadata = e.turn.metadata
-    agent.config.model_id = e.turn.model
-    agent.config.provider_id = "openrouter"
-    agent.config.thinking = False
+    agent = _routed_agent(e, provider)
     agent.config.max_tokens = 1024
     agent.set_history([Message(role="user", content="Compacted previous task summary.")])
     projected = []
@@ -626,7 +617,6 @@ async def test_quality_retry_uses_compacted_request_instead_of_original_history(
 async def test_quality_retry_checks_call_budget_before_durable_upgrade(
     execution, monkeypatch, call_limit,
 ) -> None:
-    from opensquilla.engine.runtime import _SelectorFallbackProvider
 
     e = execution
     e.turn.config.llm.thinking = "off"
@@ -635,13 +625,8 @@ async def test_quality_retry_checks_call_budget_before_durable_upgrade(
     advance = AsyncMock(wraps=e.manager.advance_model_router_quality_retry)
     monkeypatch.setattr(e.manager, "advance_model_router_quality_retry", advance)
     provider = _QualityProvider([_tool_stream(1), _final_stream()])
-    wrapper = _SelectorFallbackProvider(provider, e.selector, e.turn.metadata)
-    agent = _agent(provider)
-    agent.provider = wrapper
-    agent.config.metadata = e.turn.metadata
-    agent.config.model_id = e.turn.model
-    agent.config.provider_id = "openrouter"
-    agent.config.thinking = False
+    agent = _routed_agent(e, provider)
+    wrapper = agent.provider
     agent.config.max_turn_llm_calls = call_limit
     dispatched = []
 
@@ -683,7 +668,6 @@ async def test_quality_retry_retains_deployment_capacity_boundaries(
     from types import SimpleNamespace
 
     import opensquilla.engine.model_router_quality as quality
-    from opensquilla.engine.runtime import _SelectorFallbackProvider
 
     e = execution
     e.turn.config.llm.thinking = "off"

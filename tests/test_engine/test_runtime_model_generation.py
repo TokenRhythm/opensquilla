@@ -32,10 +32,8 @@ def envelope(mid: str, *, generation: str | None = None, admitted: bool = True) 
 
 @pytest.mark.asyncio
 async def test_explicit_generation_uses_ephemeral_window_and_preserves_timeline(monkeypatch):
-    storage = SessionStorage(":memory:")
-    await storage.connect()
-    manager = SessionManager(storage, inject_time_prefix=False)
-    try:
+    async with SessionStorage(":memory:") as storage:
+        manager = SessionManager(storage, inject_time_prefix=False)
         node = await manager.create("agent:main:generation")
         old = await manager.append_message(node.session_key, "user", "OLD SECRET " * 500)
         reset = await manager.append_message(node.session_key, "user", "new generation " * 500)
@@ -112,16 +110,12 @@ async def test_explicit_generation_uses_ephemeral_window_and_preserves_timeline(
         assert old.message_id in {
             row.message_id for row in await manager.get_transcript(node.session_key)
         }
-    finally:
-        await storage.close()
 
 
 @pytest.mark.asyncio
 async def test_staged_explicit_reset_scopes_capacity_without_changing_active_state():
-    storage = SessionStorage(":memory:")
-    await storage.connect()
-    manager = SessionManager(storage, inject_time_prefix=False)
-    try:
+    async with SessionStorage(":memory:") as storage:
+        manager = SessionManager(storage, inject_time_prefix=False)
         node = await manager.create("agent:main:staged-generation")
         old = await manager.append_message(node.session_key, "user", "old " * 2000)
         await manager.update_message_turn_context(
@@ -163,8 +157,6 @@ async def test_staged_explicit_reset_scopes_capacity_without_changing_active_sta
             exclude_last_user=True,
         )
         assert context["router_model_state"]["task_id"] == old.message_id
-    finally:
-        await storage.close()
 
 
 def test_outcome_and_blank_latest_assistant_match_frozen_projection():
@@ -232,86 +224,84 @@ async def image_generation(monkeypatch):
     from opensquilla.engine.steps import squilla_router
     from opensquilla.provider.selector import ModelSelector, ProviderConfig, SelectorConfig
 
-    storage = SessionStorage(":memory:")
-    await storage.connect()
-    manager = SessionManager(storage, inject_time_prefix=False)
-    node = await manager.create("agent:main:generation-image")
-    image = {"type": "image/png", "data": "aGVsbG8="}
-    await manager.append_message(
-        node.session_key, "user", json.dumps({"text": "OLD IMAGE TASK", "attachments": [image]})
-    )
-    await manager.append_message(node.session_key, "assistant", "OLD IMAGE ANSWER")
-    config = GatewayConfig(
-        llm={
-            "provider": "openrouter",
-            "model": "deepseek/deepseek-v4-flash",
-            "api_key": "synthetic-offline",
-            "thinking": "off",
-        }
-    )
-    selector = ModelSelector(
-        SelectorConfig(
-            primary=ProviderConfig(
-                provider="openrouter",
-                model=config.llm.model,
-                api_key="synthetic-offline",
-                base_url="https://openrouter.ai/api/v1",
+    async with SessionStorage(":memory:") as storage:
+        manager = SessionManager(storage, inject_time_prefix=False)
+        node = await manager.create("agent:main:generation-image")
+        image = {"type": "image/png", "data": "aGVsbG8="}
+        await manager.append_message(
+            node.session_key, "user", json.dumps({"text": "OLD IMAGE TASK", "attachments": [image]})
+        )
+        await manager.append_message(node.session_key, "assistant", "OLD IMAGE ANSWER")
+        config = GatewayConfig(
+            llm={
+                "provider": "openrouter",
+                "model": "deepseek/deepseek-v4-flash",
+                "api_key": "synthetic-offline",
+                "thinking": "off",
+            }
+        )
+        selector = ModelSelector(
+            SelectorConfig(
+                primary=ProviderConfig(
+                    provider="openrouter",
+                    model=config.llm.model,
+                    api_key="synthetic-offline",
+                    base_url="https://openrouter.ai/api/v1",
+                )
             )
         )
-    )
-    runner = TurnRunner(provider_selector=selector, session_manager=manager, config=config)
-    owner = dict(expected_session_id=node.session_id, expected_session_epoch=0)
-    env = SimpleNamespace(
-        manager=manager, storage=storage, node=node, runner=runner, config=config, owner=owner
-    )
+        runner = TurnRunner(provider_selector=selector, session_manager=manager, config=config)
+        owner = dict(expected_session_id=node.session_id, expected_session_epoch=0)
+        env = SimpleNamespace(
+            manager=manager, storage=storage, node=node, runner=runner, config=config, owner=owner
+        )
 
-    async def route(text, tier, *, new_task=False, current_image=False):
-        attachments = [image] if current_image else []
-        content = json.dumps({"text": text, "attachments": attachments}) if attachments else text
-        entry = await manager.append_message(node.session_key, "user", content)
-        if new_task:
-            await manager.update_message_turn_context(
-                node.session_key, entry.message_id, {"router_model_control_event": "new_task"}
+        async def route(text, tier, *, new_task=False, current_image=False):
+            attachments = [image] if current_image else []
+            content = (
+                json.dumps({"text": text, "attachments": attachments}) if attachments else text
             )
-        context = await runner._router_previous_assistant_context(
-            node.session_key,
-            bound_user_message_id=entry.message_id,
-            exclude_last_user=True,
-            include_capacity=True,
-            **owner,
-        )
-        env.context, env.entry = context, entry
-        classifier = SimpleNamespace(
-            predict=lambda _: SimpleNamespace(
-                intent_probabilities={"continue": 0.0, "redo": 0.0, "new_task": 1.0},
-                tier_probabilities={f"c{i}": float(tier == f"c{i}") for i in range(4)},
-            )
-        )
-        monkeypatch.setattr(squilla_router, "_get_strategy", lambda _: classifier)
-        return await runner._run_pipeline(
-            text,
-            node.session_key,
-            selector.resolve(),
-            selector,
-            [],
-            "system",
-            attachments,
-            model_router_context=context,
-            history_has_recent_image=context.get("history_has_recent_image", False),
-            bound_user_message_id=entry.message_id,
-            **owner,
-            router_history_replay_request=RouterHistoryReplayRequest(
+            entry = await manager.append_message(node.session_key, "user", content)
+            if new_task:
+                await manager.update_message_turn_context(
+                    node.session_key, entry.message_id, {"router_model_control_event": "new_task"}
+                )
+            context = await runner._router_previous_assistant_context(
+                node.session_key,
+                bound_user_message_id=entry.message_id,
                 exclude_last_user=True,
+                include_capacity=True,
+                **owner,
+            )
+            env.context, env.entry = context, entry
+            classifier = SimpleNamespace(
+                predict=lambda _: SimpleNamespace(
+                    intent_probabilities={"continue": 0.0, "redo": 0.0, "new_task": 1.0},
+                    tier_probabilities={f"c{i}": float(tier == f"c{i}") for i in range(4)},
+                )
+            )
+            monkeypatch.setattr(squilla_router, "_get_strategy", lambda _: classifier)
+            return await runner._run_pipeline(
+                text,
+                node.session_key,
+                selector.resolve(),
+                selector,
+                [],
+                "system",
+                attachments,
+                model_router_context=context,
+                history_has_recent_image=context.get("history_has_recent_image", False),
                 bound_user_message_id=entry.message_id,
                 **owner,
-            ),
-        )
+                router_history_replay_request=RouterHistoryReplayRequest(
+                    exclude_last_user=True,
+                    bound_user_message_id=entry.message_id,
+                    **owner,
+                ),
+            )
 
-    env.route = route
-    try:
+        env.route = route
         yield env
-    finally:
-        await storage.close()
 
 
 @pytest.mark.asyncio

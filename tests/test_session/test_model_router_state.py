@@ -200,47 +200,45 @@ async def test_stage_survives_restart_is_idempotent_and_preserves_lifecycle_cont
     tmp_path: Path,
 ):
     path = tmp_path / "sessions.db"
-    storage = SessionStorage(path)
-    await storage.connect()
-    node = SessionNode(session_key="agent:main:router", session_id="sid")
-    await storage.upsert_session(node)
-    entry = user("accepted", "request")
-    entry.turn_context["router_model_control_event"] = "new_task"
-    await storage.append_transcript_entry(entry, expected_epoch=0)
-    first = {
-        **record("accepted"),
-        "status": "staged",
-        "state_committed": False,
-        "decided_at_ms": 12345,
-    }
-    assert (
-        await storage.stage_model_router_decision(
+    async with SessionStorage(path) as storage:
+        node = SessionNode(session_key="agent:main:router", session_id="sid")
+        await storage.upsert_session(node)
+        entry = user("accepted", "request")
+        entry.turn_context["router_model_control_event"] = "new_task"
+        await storage.append_transcript_entry(entry, expected_epoch=0)
+        first = {
+            **record("accepted"),
+            "status": "staged",
+            "state_committed": False,
+            "decided_at_ms": 12345,
+        }
+        assert (
+            await storage.stage_model_router_decision(
+                node.session_key,
+                entry.message_id,
+                first,
+                expected_session_id=node.session_id,
+                expected_epoch=0,
+            )
+            == first
+        )
+        assert (
+            await storage.stage_model_router_decision(
+                node.session_key,
+                entry.message_id,
+                record("accepted", "c3"),
+                expected_session_id=node.session_id,
+                expected_epoch=0,
+            )
+            == first
+        )
+        await storage.update_transcript_turn_context(
             node.session_key,
             entry.message_id,
-            first,
-            expected_session_id=node.session_id,
-            expected_epoch=0,
+            dict(turn_id="promoted", disposition="promoted", router_model_control_event="redo"),
         )
-        == first
-    )
-    assert (
-        await storage.stage_model_router_decision(
-            node.session_key,
-            entry.message_id,
-            record("accepted", "c3"),
-            expected_session_id=node.session_id,
-            expected_epoch=0,
-        )
-        == first
-    )
-    await storage.update_transcript_turn_context(
-        node.session_key,
-        entry.message_id,
-        {"turn_id": "promoted", "disposition": "promoted", "router_model_control_event": "redo"},
-    )
-    await storage.close()
-    await storage.connect()
-    try:
+        await storage.close()
+        await storage.connect()
         rows = await storage.get_canonical_transcript(node.session_id)
         assert rows[0].turn_context == {
             "turn_id": "promoted",
@@ -264,16 +262,12 @@ async def test_stage_survives_restart_is_idempotent_and_preserves_lifecycle_cont
                 expected_session_id=node.session_id,
                 expected_epoch=0,
             )
-    finally:
-        await storage.close()
 
 
 @pytest.mark.asyncio
 async def test_runtime_reads_canonical_model_state_with_complete_usage():
-    storage = SessionStorage(":memory:")
-    await storage.connect()
-    manager = SessionManager(storage)
-    try:
+    async with SessionStorage(":memory:") as storage:
+        manager = SessionManager(storage)
         node = await manager.create("agent:main:router")
         accepted = await manager.append_message(node.session_key, "user", "earlier")
         await admit(manager, node.session_key, accepted.message_id, record(accepted.message_id))
@@ -303,8 +297,6 @@ async def test_runtime_reads_canonical_model_state_with_complete_usage():
         )
         assert result["router_model_state"]["tier"] == "c2"
         assert result["router_model_input"]["previous_usage"]["reasoning_tokens"] == 90
-    finally:
-        await storage.close()
 
 
 @pytest.mark.asyncio
@@ -314,10 +306,8 @@ async def test_pipeline_commits_state_before_capacity_error_and_observe_does_not
 ):
     from opensquilla.engine import pipeline, steps
 
-    storage = SessionStorage(tmp_path / "sessions.db")
-    await storage.connect()
-    manager = SessionManager(storage)
-    try:
+    async with SessionStorage(tmp_path / "sessions.db") as storage:
+        manager = SessionManager(storage)
         node = await manager.create("agent:main:model-commit")
         entry = await manager.append_message(node.session_key, "user", "request")
         envelope = record(entry.message_id)
@@ -340,33 +330,15 @@ async def test_pipeline_commits_state_before_capacity_error_and_observe_does_not
         runner = TurnRunner(
             provider_selector=MagicMock(), session_manager=manager, config=GatewayConfig()
         )
-        apply = False
-        with pytest.raises(ValueError, match="physical capacity"):
-            await runner._run_pipeline(
-                "request",
-                node.session_key,
-                None,
-                None,
-                [],
-                "",
-                [],
-                bound_user_message_id=entry.message_id,
-            )
-        before = await storage.get_canonical_transcript(node.session_id)
-        assert MODEL_DECISION_KEY not in (before[0].turn_context or {})
-        apply = True
-        with pytest.raises(ValueError, match="physical capacity"):
-            await runner._run_pipeline(
-                "request",
-                node.session_key,
-                None,
-                None,
-                [],
-                "",
-                [],
-                bound_user_message_id=entry.message_id,
-            )
-        after = await storage.get_canonical_transcript(node.session_id)
+        for apply in (False, True):
+            with pytest.raises(ValueError, match="physical capacity"):
+                await runner._run_pipeline(
+                    "request", node.session_key, None, None, [], "", [],
+                    bound_user_message_id=entry.message_id,
+                )
+            after = await storage.get_canonical_transcript(node.session_id)
+            if not apply:
+                assert MODEL_DECISION_KEY not in (after[0].turn_context or {})
         persisted = after[0].turn_context[MODEL_DECISION_KEY]
         assert persisted["state"] == envelope["state"]
         assert persisted["status"] == "staged"
@@ -377,16 +349,12 @@ async def test_pipeline_commits_state_before_capacity_error_and_observe_does_not
         assert persisted["decided_at_ms"] > 0
         with pytest.raises(RuntimeError, match="durable accepted"):
             await runner._run_pipeline("request", node.session_key, None, None, [], "", [])
-    finally:
-        await storage.close()
 
 
 @pytest.mark.asyncio
 async def test_canonical_compaction_and_prefix_fork_keep_only_owned_state():
-    storage = SessionStorage(":memory:")
-    await storage.connect()
-    manager = SessionManager(storage, inject_time_prefix=False)
-    try:
+    async with SessionStorage(":memory:") as storage:
+        manager = SessionManager(storage, inject_time_prefix=False)
         node = await manager.create("agent:main:canonical-state")
         first = await manager.append_message(node.session_key, "user", "anchor")
         first_record = record(first.message_id)
@@ -428,16 +396,12 @@ async def test_canonical_compaction_and_prefix_fork_keep_only_owned_state():
         recovered = context([*child_rows, child_current], child_current.message_id)
         assert recovered["router_model_state"]["tier"] == "c2"
         assert recovered["router_model_input"]["task_anchor"] == "anchor"
-    finally:
-        await storage.close()
 
 
 @pytest.mark.asyncio
 async def test_previous_outcome_uses_terminal_ledger_when_reply_missing():
-    storage = SessionStorage(":memory:")
-    await storage.connect()
-    manager = SessionManager(storage, inject_time_prefix=False)
-    try:
+    async with SessionStorage(":memory:") as storage:
+        manager = SessionManager(storage, inject_time_prefix=False)
         node = await manager.create("agent:main:failed-state")
         first = await manager.append_message(node.session_key, "user", "request")
         await manager.update_message_turn_context(
@@ -460,8 +424,6 @@ async def test_previous_outcome_uses_terminal_ledger_when_reply_missing():
         assert (
             context(rows, current.message_id)["router_model_input"]["previous_outcome"] == "failure"
         )
-    finally:
-        await storage.close()
 
 
 def test_source_route_features_and_explicit_reset_keep_cross_task_input():
@@ -521,10 +483,8 @@ def test_failed_latest_route_does_not_pair_an_older_answer_and_attachments_are_n
 
 @pytest.mark.asyncio
 async def test_quality_retry_cas_retains_prediction_and_restart_uses_final_tier(tmp_path: Path):
-    storage = SessionStorage(tmp_path / "quality.db")
-    await storage.connect()
-    manager = SessionManager(storage, inject_time_prefix=False)
-    try:
+    async with SessionStorage(tmp_path / "quality.db") as storage:
+        manager = SessionManager(storage, inject_time_prefix=False)
         node = await manager.create("agent:main:quality")
         accepted = await manager.append_message(node.session_key, "user", "request")
         original = record(accepted.message_id, "c1")
@@ -573,8 +533,6 @@ async def test_quality_retry_cas_retains_prediction_and_restart_uses_final_tier(
                 accepted.message_id,
                 **{**args, "expected_session_id": "wrong"},
             )
-    finally:
-        await storage.close()
 
 
 @pytest.mark.asyncio

@@ -58,10 +58,8 @@ async def first_admitted(manager, node):
 
 @pytest.mark.asyncio
 async def test_rejected_stage_survives_restart_without_advancing_task(tmp_path: Path):
-    storage = SessionStorage(tmp_path / "routing.db")
-    await storage.connect()
-    manager = SessionManager(storage, inject_time_prefix=False)
-    try:
+    async with SessionStorage(tmp_path / "routing.db") as storage:
+        manager = SessionManager(storage, inject_time_prefix=False)
         node = await manager.create("agent:main:admission")
         first, admitted = await first_admitted(manager, node)
         rejected = await manager.append_message(node.session_key, "user", "redo")
@@ -85,16 +83,12 @@ async def test_rejected_stage_survives_restart_without_advancing_task(tmp_path: 
             == staged
         )
         assert rows[0].message_id == first.message_id
-    finally:
-        await storage.close()
 
 
 @pytest.mark.asyncio
 async def test_admission_cas_rejects_competing_state_and_is_idempotent():
-    storage = SessionStorage(":memory:")
-    await storage.connect()
-    manager = SessionManager(storage, inject_time_prefix=False)
-    try:
+    async with SessionStorage(":memory:") as storage:
+        manager = SessionManager(storage, inject_time_prefix=False)
         node = await manager.create("agent:main:cas")
         await first_admitted(manager, node)
         entries = [
@@ -140,16 +134,12 @@ async def test_admission_cas_rejects_competing_state_and_is_idempotent():
             )
         rows = await manager.get_model_router_transcript(node.session_key)
         assert active_state(rows, node) == admitted["state"]
-    finally:
-        await storage.close()
 
 
 @pytest.mark.asyncio
 async def test_quality_cas_ignores_staged_candidates_and_never_upgrades_them():
-    storage = SessionStorage(":memory:")
-    await storage.connect()
-    manager = SessionManager(storage, inject_time_prefix=False)
-    try:
+    async with SessionStorage(":memory:") as storage:
+        manager = SessionManager(storage, inject_time_prefix=False)
         node = await manager.create("agent:main:quality-admission")
         first, admitted = await first_admitted(manager, node)
         rejected = await manager.append_message(node.session_key, "user", "candidate")
@@ -192,16 +182,12 @@ async def test_quality_cas_ignores_staged_candidates_and_never_upgrades_them():
         )
         rows = await manager.get_model_router_transcript(node.session_key)
         assert rows[-1].turn_context[MODEL_DECISION_KEY] == staged
-    finally:
-        await storage.close()
 
 
 @pytest.mark.asyncio
 async def test_admission_follows_accepted_row_into_compaction_archive():
-    storage = SessionStorage(":memory:")
-    await storage.connect()
-    manager = SessionManager(storage, inject_time_prefix=False)
-    try:
+    async with SessionStorage(":memory:") as storage:
+        manager = SessionManager(storage, inject_time_prefix=False)
         node = await manager.create("agent:main:archived-admission")
         accepted = await manager.append_message(node.session_key, "user", "request")
         staged = await manager.stage_model_router_decision(
@@ -224,5 +210,3 @@ async def test_admission_follows_accepted_row_into_compaction_archive():
         rows = await manager.get_model_router_transcript(node.session_key)
         assert rows[0].turn_context[MODEL_DECISION_KEY] == admitted
         assert active_state(rows, node) == admitted["state"]
-    finally:
-        await storage.close()

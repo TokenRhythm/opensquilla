@@ -17,10 +17,13 @@ from opensquilla.session.storage import SessionStorage
 
 
 class ScriptedClassifier:
+    def __init__(self, tier="c0"):
+        self.tier = tier
+
     def predict(self, value):
         return SimpleNamespace(
             intent_probabilities={"continue": 0.0, "redo": 0.0, "new_task": 1.0},
-            tier_probabilities={"c0": 1.0, "c1": 0.0, "c2": 0.0, "c3": 0.0},
+            tier_probabilities={f"c{i}": float(self.tier == f"c{i}") for i in range(4)},
         )
 
 
@@ -28,41 +31,39 @@ class ScriptedClassifier:
 async def execution(monkeypatch, request):
     phase = getattr(request, "param", "full")
     monkeypatch.setattr(squilla_router, "_get_strategy", lambda _: ScriptedClassifier())
-    storage = SessionStorage(":memory:")
-    await storage.connect()
-    manager = SessionManager(storage, inject_time_prefix=False)
-    node = await manager.create("agent:main:model-execution")
-    entry = await manager.append_message(node.session_key, "user", "Hello")
-    config = GatewayConfig(
-        llm={
-            "provider": "openrouter",
-            "model": "deepseek/deepseek-v4-pro",
-            "api_key": "synthetic-offline",
-            "thinking": "high",
-        },
-        squilla_router={"rollout_phase": phase},
-        llm_ensemble={"enabled": phase != "observe"},
-    )
-    selector = ModelSelector(
-        SelectorConfig(
-            primary=ProviderConfig(
-                provider="openrouter",
-                model=config.llm.model,
-                api_key="synthetic-offline",
-                base_url="https://openrouter.ai/api/v1",
-            ),
-            fallbacks=[
-                ProviderConfig(
+    async with SessionStorage(":memory:") as storage:
+        manager = SessionManager(storage, inject_time_prefix=False)
+        node = await manager.create("agent:main:model-execution")
+        entry = await manager.append_message(node.session_key, "user", "Hello")
+        config = GatewayConfig(
+            llm={
+                "provider": "openrouter",
+                "model": "deepseek/deepseek-v4-pro",
+                "api_key": "synthetic-offline",
+                "thinking": "high",
+            },
+            squilla_router={"rollout_phase": phase},
+            llm_ensemble={"enabled": phase != "observe"},
+        )
+        selector = ModelSelector(
+            SelectorConfig(
+                primary=ProviderConfig(
                     provider="openrouter",
-                    model="synthetic-forbidden-fallback",
+                    model=config.llm.model,
                     api_key="synthetic-offline",
                     base_url="https://openrouter.ai/api/v1",
-                )
-            ],
+                ),
+                fallbacks=[
+                    ProviderConfig(
+                        provider="openrouter",
+                        model="synthetic-forbidden-fallback",
+                        api_key="synthetic-offline",
+                        base_url="https://openrouter.ai/api/v1",
+                    )
+                ],
+            )
         )
-    )
-    runner = TurnRunner(provider_selector=selector, session_manager=manager, config=config)
-    try:
+        runner = TurnRunner(provider_selector=selector, session_manager=manager, config=config)
         turn, provider = await runner._run_pipeline(
             "Hello",
             node.session_key,
@@ -85,8 +86,6 @@ async def execution(monkeypatch, request):
             node=node,
             entry=entry,
         )
-    finally:
-        await storage.close()
 
 
 @pytest.mark.asyncio
@@ -225,14 +224,7 @@ async def test_failed_selected_deployment_keeps_audit_but_not_active_state(execu
     previous = deepcopy(e.turn.metadata["router_model_decision"]["state"])
     invalid = await e.manager.append_message(e.node.session_key, "user", "inspect this image")
 
-    class TextOnlyChoice:
-        def predict(self, value):
-            return SimpleNamespace(
-                intent_probabilities={"continue": 0.0, "redo": 0.0, "new_task": 1.0},
-                tier_probabilities={"c0": 0.0, "c1": 0.0, "c2": 1.0, "c3": 0.0},
-            )
-
-    monkeypatch.setattr(squilla_router, "_get_strategy", lambda _: TextOnlyChoice())
+    monkeypatch.setattr(squilla_router, "_get_strategy", lambda _: ScriptedClassifier("c2"))
     with pytest.raises(ModelRouteError, match="image support"):
         await e.runner._run_pipeline(
             "inspect this image",
@@ -507,15 +499,7 @@ async def test_model_execution_respects_actual_thinking_requirement(
     if model is not None:
         e.turn.config.squilla_router.tiers[tier]["model"] = model
 
-    class SelectedTier(ScriptedClassifier):
-        def predict(self, value):
-            result = super().predict(value)
-            result.tier_probabilities = {
-                name: float(name == tier) for name in ("c0", "c1", "c2", "c3")
-            }
-            return result
-
-    monkeypatch.setattr(squilla_router, "_get_strategy", lambda _: SelectedTier())
+    monkeypatch.setattr(squilla_router, "_get_strategy", lambda _: ScriptedClassifier(tier))
     entry = await e.manager.append_message(e.node.session_key, "user", "Hello")
     turn, provider = await e.runner._run_pipeline(
         "Hello", e.node.session_key, e.selector.resolve(), e.selector,
