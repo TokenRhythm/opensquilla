@@ -1,5 +1,17 @@
-import { expect, test } from '@playwright/test'
+import { expect, test, type Page } from '@playwright/test'
 import { installRecommendationsGateway } from './support/recommendations-fixture'
+
+async function openModelRouting(page: Page) {
+  // Enter through the shell so relative production assets also resolve under
+  // the static preview server, which does not rewrite Gateway deep links.
+  await page.goto('/control/')
+  await expect(page.locator('.topbar[data-connection-state]')).toBeVisible()
+  const more = page.locator('.mobile-tabbar').getByRole('button', { name: 'More' })
+  const mobile = await more.isVisible()
+  if (mobile) await more.click()
+  await page.locator('.sidebar-foot button[data-icon="settings"]').click()
+  await page.getByRole(mobile ? 'button' : 'tab', { name: /^Model Routing:/ }).click()
+}
 
 test.use({ viewport: { width: 1440, height: 1000 } })
 for (const provider of ['tokenrhythm', 'openrouter'] as const) for (const kind of ['router', 'ensemble'] as const) {
@@ -7,7 +19,7 @@ for (const provider of ['tokenrhythm', 'openrouter'] as const) for (const kind o
     const errors: string[] = []; page.on('pageerror', error => errors.push(error.message))
     const gateway = await installRecommendationsGateway(page, provider, kind)
     const other = structuredClone(gateway.plans[`${provider}:${kind === 'router' ? 'ensemble' : 'router'}`].currentRows)
-    await page.goto('/control/settings/modelStrategy')
+    await openModelRouting(page)
     const entry = page.getByTestId(kind === 'router' ? 'router-reset-recommended' : 'ensemble-use-recommended')
     await expect(entry).toBeVisible()
     const section = page.locator('.setup-model-strategy')
@@ -31,7 +43,7 @@ for (const provider of ['tokenrhythm', 'openrouter'] as const) for (const kind o
     await expect(page.getByTestId(kind === 'router' ? 'router-recommendation-update' : 'ensemble-recommendation')).toContainText('New ')
     expect(gateway.writes).toHaveLength(1)
     await expect(section).not.toContainText(`synthetic-${provider}-${kind === 'router' ? 'c0' : 'proposer_1'}-v3`)
-    await page.reload(); await expect(entry).toBeVisible()
+    await openModelRouting(page); await expect(entry).toBeVisible()
     if (kind === 'router') await expect(page.getByRole('combobox', { name: 'c0 model', exact: true })).toHaveValue(`synthetic-${provider}-c0-v2`)
     else await expect(section).toContainText(`synthetic-${provider}-proposer_1-v2`)
     expect(gateway.writes).toHaveLength(1); expect(errors).toEqual([])
@@ -43,7 +55,7 @@ for (const provider of ['tokenrhythm', 'openrouter'] as const) for (const kind o
 test('a changed recommendation requires a second confirmation and the preview is usable on mobile', async ({ page }, info) => {
   const gateway = await installRecommendationsGateway(page)
   await page.setViewportSize({ width: 390, height: 844 })
-  await page.goto('/control/settings/modelStrategy')
+  await openModelRouting(page)
   await page.getByTestId('router-reset-recommended').click()
   gateway.publish('tokenrhythm', 'router', 3)
   await page.getByTestId('recommendation-confirm').click()
@@ -61,7 +73,7 @@ test('a changed recommendation requires a second confirmation and the preview is
 
 test('unsaved custom edits survive refresh, cancellation and a rejected replacement', async ({ page }) => {
   const gateway = await installRecommendationsGateway(page)
-  await page.goto('/control/settings/modelStrategy')
+  await openModelRouting(page)
   const thinking = page.getByRole('combobox', { name: 'c0 thinking level', exact: true })
   await thinking.click(); await page.getByRole('option', { name: 'low', exact: true }).click()
   await expect(page.locator('.settings-dirtybar')).toBeVisible()
@@ -88,7 +100,7 @@ test('unsaved custom edits survive refresh, cancellation and a rejected replacem
 
 test('a failed recommendation read keeps the last preview and saved models', async ({ page }) => {
   const gateway = await installRecommendationsGateway(page)
-  await page.goto('/control/settings/modelStrategy')
+  await openModelRouting(page)
   await expect(page.getByTestId('router-recommendation-update')).toBeVisible()
   gateway.failReads()
   await page.getByRole('tab', { name: /^General:/ }).click()
@@ -103,7 +115,7 @@ test('other providers do not get recommendation actions or notifications', async
   const gateway = await installRecommendationsGateway(page)
   gateway.config.llm.provider = 'openai'
   gateway.config.llm_ensemble.selection_mode = 'custom_b5'
-  await page.goto('/control/settings/modelStrategy')
+  await openModelRouting(page)
   await expect(page.locator('.setup-model-strategy')).toBeVisible()
   await expect(page.getByTestId('router-reset-recommended')).toHaveCount(0)
   await expect(page.getByTestId('router-recommendation-update')).toHaveCount(0)
@@ -114,7 +126,7 @@ test('other providers do not get recommendation actions or notifications', async
 
 test('an older Gateway retains the existing router confirmation without new RPC calls', async ({ page }) => {
   const gateway = await installRecommendationsGateway(page, 'tokenrhythm', 'router', false)
-  await page.goto('/control/settings/modelStrategy')
+  await openModelRouting(page)
   await page.getByTestId('router-reset-recommended').click()
   await expect(page.locator('.modal').filter({ hasText: 'recommended tiers' })).toBeVisible()
   await expect(page.getByTestId('recommendation-dialog')).toHaveCount(0)
@@ -123,7 +135,7 @@ test('an older Gateway retains the existing router confirmation without new RPC 
 
 test('saving locks the confirmation, settings edits and exits until acknowledgement', async ({ page }, info) => {
   const gateway = await installRecommendationsGateway(page)
-  await page.goto('/control/settings/modelStrategy')
+  await openModelRouting(page)
   await page.getByTestId('router-reset-recommended').click()
   gateway.delayNextApply(1_500)
   await page.getByTestId('recommendation-confirm').click()
