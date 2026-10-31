@@ -1447,6 +1447,28 @@ Python package code, model files, rule files, binary assets, or generated
 runtime artifacts into the repository, the component must be recorded here or
 in a package-local provenance file.
 
+### Electron build glob compatibility adapters
+
+`desktop/electron/scripts/prepare-build-glob-compat.cjs` modifies these locked,
+registry-installed build dependencies to use the official patched minimatch
+API. It contains short replacement fragments and verifies package versions and
+complete original/patched file SHA-256 digests before writing. Upstream package
+sources and license files remain in their installed packages; they are not
+vendored into OpenSquilla's runtime.
+
+| Component | Upstream | License | Adaptation |
+| --- | --- | --- | --- |
+| `@electron/asar` 3.4.1 | <https://github.com/electron/asar> | MIT | Use minimatch's named function export. |
+| `dir-compare` 4.2.0 | <https://github.com/gliviu/dir-compare> | MIT | Use minimatch's named function export. |
+| `glob` 7.2.3 | <https://github.com/isaacs/node-glob> | ISC | Use matcher objects, preserving legacy escapes, brace rows and path handling. |
+
+The dependency lock selects `minimatch` 11.0.2 and
+`@isaacs/nonrecursive-glob-match` (BlueOak-1.0.0) from npm. Matching remains in
+these upstream packages. The adapters are build-only and should be removed
+when the packaging dependencies support the new API directly. The bundled PDF
+toolkit's pypdf dependency remains BSD-3-Clause; its attribution is recorded in
+`src/opensquilla/skills/bundled/pdf-toolkit/THIRD_PARTY_NOTICES.md`.
+
 ## OpenClaw-derived bundled skill descriptors
 
 - Component: SKILL.md frontmatter and instruction text for these bundled skills:

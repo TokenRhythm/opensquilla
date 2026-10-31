@@ -1266,6 +1266,7 @@ jobs:
         working-directory: desktop/electron
         run: |
           npm run test:local-build
+          npm run test:build-glob-compat
           node scripts/test-macos-keychain-patch.cjs
           node scripts/test-installer-progress-contract.mjs
           node --test scripts/test-electron-download-proxy.mjs
@@ -2359,6 +2360,10 @@ jobs:
         working-directory: desktop/electron
         shell: bash
         run: npm ci
+
+      - name: Verify desktop build glob compatibility
+        working-directory: desktop/electron
+        run: npm run test:build-glob-compat
 
       - name: Prepare and verify pinned Electron binary
         shell: bash

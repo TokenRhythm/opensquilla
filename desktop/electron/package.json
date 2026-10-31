@@ -10,6 +10,8 @@
   "type": "module",
   "main": "dist/main.js",
   "scripts": {
+    "postinstall": "node scripts/prepare-build-glob-compat.cjs",
+    "test:build-glob-compat": "node --test scripts/test-build-glob-compat.cjs",
     "build": "node scripts/build.mjs",
     "build:gateway": "node scripts/build-gateway.mjs",
     "fetch:runtimes": "node scripts/fetch-bundled-runtimes.mjs",
@@ -116,10 +118,14 @@
     "ws": "^8.22.0"
   },
   "overrides": {
+    "minimatch": "11.0.2",
     "global-agent@3.0.0": {
       "roarr": {
         ".": "3.3.0",
-        "fast-json-stringify": "5.16.1"
+        "fast-json-stringify": {
+          ".": "5.16.1",
+          "fast-uri": "3.1.9"
+        }
       }
     },
     "fast-json-stringify@5.16.1": {
