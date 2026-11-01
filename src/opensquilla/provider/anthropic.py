@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import re
 from collections.abc import AsyncIterator
 from copy import deepcopy
 from dataclasses import replace
@@ -292,6 +293,29 @@ def _uses_adaptive_thinking(model: str) -> bool:
     return "claude-sonnet-4-6" in model_lower or "claude-opus-4-6" in model_lower
 
 
+_CLAUDE_GENERATION_RE = re.compile(r"claude-(opus|sonnet|fable)-(\d+)(?:-(\d+))?")
+
+
+def _has_fixed_sampling(model: str) -> bool:
+    """Return True for models that reject caller-chosen sampling controls.
+
+    Claude Opus 4.7 and later, Sonnet 5, and Fable 5 fix sampling
+    server-side: a non-default ``temperature`` in the request is a 400,
+    and thinking accepts only ``{"type": "adaptive"}`` — a
+    ``budget_tokens`` body is rejected as well. Haiku is deliberately not
+    matched, following the conservative gate in
+    :func:`_supports_document_blocks`.
+    """
+    match = _CLAUDE_GENERATION_RE.search(model.lower())
+    if match is None:
+        return False
+    family = match.group(1)
+    generation = (int(match.group(2)), int(match.group(3) or 0))
+    if family == "opus":
+        return generation >= (4, 7)
+    return generation >= (5, 0)
+
+
 def _coerce_int(value: Any) -> int:
     try:
         return int(value or 0)
@@ -437,7 +461,7 @@ class AnthropicProvider:
         max_tokens = max(1, cfg.max_tokens)
         thinking_payload: dict[str, Any] | None = None
         if cfg.thinking:
-            if _uses_adaptive_thinking(self._model):
+            if _uses_adaptive_thinking(self._model) or _has_fixed_sampling(self._model):
                 thinking_payload = {"type": "adaptive"}
             else:
                 budget_tokens = max(1, cfg.thinking_budget_tokens)
@@ -477,7 +501,11 @@ class AnthropicProvider:
         system_payload = _build_system_payload(cfg)
         if system_payload:
             payload["system"] = system_payload
-        if cfg.temperature is not None and not cfg.thinking:
+        if (
+            cfg.temperature is not None
+            and not cfg.thinking
+            and not _has_fixed_sampling(self._model)
+        ):
             temperature = cfg.temperature
             if (
                 self._model.rsplit("/", 1)[-1].strip().lower()
