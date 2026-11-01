@@ -2757,6 +2757,7 @@ jobs:
                 'native-workbench-v2:scripts/test-native-workbench-v2-electron.mjs'
                 'desktop-browser:scripts/test-desktop-browser.mjs'
                 'desktop-browser-electron:scripts/test-desktop-browser-electron.mjs'
+                'browser-open-recovery:scripts/test-browser-open-recovery-electron.mjs'
                 'live-html-business:scripts/test-live-html-business.mjs'
                 'unsafe-legacy-recovery-no-write:scripts/test-unsafe-legacy-recovery-no-write.mjs'
               )
@@ -2808,6 +2809,7 @@ jobs:
                 'native-workbench-v2:scripts/test-native-workbench-v2-electron.mjs'
                 'desktop-browser:scripts/test-desktop-browser.mjs'
                 'desktop-browser-electron:scripts/test-desktop-browser-electron.mjs'
+                'browser-open-recovery:scripts/test-browser-open-recovery-electron.mjs'
                 'live-html-business:scripts/test-live-html-business.mjs'
                 'unsafe-legacy-recovery-no-write:scripts/test-unsafe-legacy-recovery-no-write.mjs'
               )
@@ -2820,6 +2822,7 @@ jobs:
                 'native-workbench-v2:scripts/test-native-workbench-v2-electron.mjs'
                 'desktop-browser:scripts/test-desktop-browser.mjs'
                 'desktop-browser-electron:scripts/test-desktop-browser-electron.mjs'
+                'browser-open-recovery:scripts/test-browser-open-recovery-electron.mjs'
                 'live-html-business:scripts/test-live-html-business.mjs'
                 'unsafe-legacy-recovery-no-write:scripts/test-unsafe-legacy-recovery-no-write.mjs'
               )

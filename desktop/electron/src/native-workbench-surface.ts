@@ -154,6 +154,8 @@ interface NativeWorkbenchSurfaceRecord {
   popupAnnounced?: boolean
   browserNavigationPromise?: Promise<void>
   browserNavigationGeneration: number
+  /** Renderer redirects belong to a new, unpublished tab only while this receipt is live. */
+  browserOpeningNavigation?: { generation: number; redirects: number; url: string; invalid?: boolean }
   browserNavigationOwner?: { url: string; started: boolean; cancelled: boolean;
     manualDownload: boolean; downloadAccepted: boolean; acceptDownload(): void; supersede(): void; cancel(): void }
   browserPreviousDocument?: { url: string; ready: boolean; stopped: boolean;
@@ -1183,6 +1185,10 @@ export class NativeWorkbenchSurfaceManager {
       record.view.setVisible(false)
       owner.contentView.addChildView(record.view)
       this.emit(record, 'loading')
+      if (prepareBrowser && record.kind === 'url-preview') {
+        record.browserOpeningNavigation = { generation: record.browserNavigationGeneration + 1,
+          redirects: 0, url: record.documentUrl }
+      }
       try {
         if (record.kind === 'url-preview') {
           // Versions 2 and 3 acknowledge creation after initial navigation settles.
@@ -2463,6 +2469,40 @@ export class NativeWorkbenchSurfaceManager {
     })
   }
 
+  private async reconcileBrowserOpening(record: NativeWorkbenchSurfaceRecord, signal: AbortSignal): Promise<boolean> {
+    const opening = record.browserOpeningNavigation
+    if (!opening) return false
+    const deadline = Date.now() + 5_000
+    let receiptDeadline = Date.now() + 100
+    let acceptedGeneration = opening.generation
+    while (Date.now() < deadline) {
+      if (signal.aborted) throw new DesktopBrowserError('TIMEOUT', 'Browser opening ended. Inspect the existing tab.', 409,
+        { targetRef: record.targetRef, outcome: 'unknown', retryable: false, recovery: 'inspect' })
+      if (record.disposed || record.crashed || record.owner.isDestroyed() || record.contents.isDestroyed()
+        || this.surfaces.get(record.id) !== record) {
+        throw new DesktopBrowserError('TARGET_NOT_FOUND', 'The browser page was closed.', 404)
+      }
+      if (record.browserNavigationError) throw this.browserNavigationFailure(record)
+      if (record.browserOpeningNavigation !== opening || opening.invalid
+        || record.requestedRect !== null || this.hasRecentTrustedGesture(record)
+        || record.browserNavigationStopped) return false
+      if (opening.generation !== acceptedGeneration) {
+        acceptedGeneration = opening.generation
+        receiptDeadline = Date.now() + 100
+      }
+      if (opening.redirects && opening.generation === record.browserNavigationGeneration) {
+        if (record.playwright?.pendingDialog || this.browserHostBlockers(record).length) return true
+        if (record.browserDocumentReady && !record.contents.isLoadingMainFrame()
+          && !record.browserNavigationOwner) return true
+      } else if (Date.now() >= receiptDeadline) return false
+      // did-start-navigation precedes will-navigate. Give the policy-checked
+      // renderer receipt a bounded opportunity to identify that navigation.
+      await new Promise<void>(resolve => setTimeout(resolve, 10))
+    }
+    throw new DesktopBrowserError('PAGE_NOT_READY', 'The opening page is still loading. Inspect the existing tab.', 409,
+      { targetRef: record.targetRef, pageState: 'loading', outcome: 'unknown', retryable: false, recovery: 'inspect' })
+  }
+
   async executeBrowser(request: DesktopBrowserRequest, signal: AbortSignal): Promise<unknown> {
     const check = () => {
       if (signal.aborted) throw new DesktopBrowserError('TIMEOUT', 'The browser request ended.', 504)
@@ -2489,34 +2529,51 @@ export class NativeWorkbenchSurfaceManager {
           throw new DesktopBrowserError('TARGET_NOT_FOUND', 'The browser page was closed.', 404)
         }
       }
-      const openingGeneration = record.annotationDocumentGeneration
-      const assertOpening = () => {
-        check(); assertOpeningRecord()
-        if (record.annotationDocumentGeneration !== openingGeneration) {
-          throw new DesktopBrowserError('PAGE_CHANGED', 'The page navigated while it was being opened.', 409,
+      const opening = record.browserOpeningNavigation
+      let openingNavigationGeneration = opening?.generation ?? record.browserNavigationGeneration
+      record.browserOpenedHidden = true
+      try {
+        if (record.browserNavigationError) throw this.browserNavigationFailure(record)
+        const openingChanged = result.code === 'PAGE_CHANGED' || Boolean(opening
+          && (opening.invalid || opening.generation !== record.browserNavigationGeneration || opening.redirects))
+        if (openingChanged && opening
+          && await this.reconcileBrowserOpening(record, signal)) {
+          openingNavigationGeneration = record.browserNavigationGeneration
+        } else if (openingChanged || result.code === 'TIMEOUT') {
+          throw new DesktopBrowserError(result.code === 'TIMEOUT' ? 'TIMEOUT' : 'PAGE_CHANGED',
+            result.message || 'The tab was created but its navigation was interrupted. Inspect the existing tab.', 409,
             { targetRef: record.targetRef, outcome: 'unknown', retryable: false, recovery: 'inspect' })
         }
-      }
-      record.browserOpenedHidden = true
-      if (record.browserNavigationError) {
-        const target = this.getBrowserTarget(surfaceId)
-        this.emit(record, 'browser-opened', { url, title: target.title,
-          sessionKey: request.sessionKey, targetRef: target.targetRef,
-          navigationError: record.browserNavigationError })
-        this.emitNavigationState(record)
-        throw this.browserNavigationFailure(record)
-      }
-      if (result.code === 'PAGE_CHANGED' || result.code === 'TIMEOUT') {
-        const target = this.getBrowserTarget(surfaceId)
-        this.emit(record, 'browser-opened', { url: target.url, title: target.title,
-          sessionKey: request.sessionKey, targetRef: target.targetRef })
-        throw new DesktopBrowserError(result.code, result.message || 'The tab was created but its navigation was interrupted.', 409,
-          { targetRef: record.targetRef, outcome: 'unknown', retryable: false, recovery: 'inspect' })
-      }
-      try {
-        if (!record.playwright?.pendingDialog && !this.browserHostBlockers(record).length) await this.initializeHiddenBrowserViewport(record, assertOpening)
-        assertOpening()
-        if (!record.playwright?.pendingDialog && !this.browserHostBlockers(record).length) await this.touchBrowserPointer(record)
+        // Startup scripts can update same-document routes while the hidden
+        // viewport is initialized. Reconcile that document a bounded number of
+        // times without opening another tab or repeating its navigation.
+        for (let attempt = 0; ; attempt += 1) {
+          const openingGeneration = record.annotationDocumentGeneration
+          const assertOpening = () => {
+            check(); assertOpeningRecord()
+            if (record.browserNavigationError) throw this.browserNavigationFailure(record)
+            if (record.annotationDocumentGeneration !== openingGeneration
+              || record.browserNavigationGeneration !== openingNavigationGeneration
+              || record.browserOpeningNavigation?.invalid) {
+              throw new DesktopBrowserError('PAGE_CHANGED', 'The page navigated while it was being opened. Inspect the existing tab.', 409,
+                { targetRef: record.targetRef, outcome: 'unknown', retryable: false, recovery: 'inspect' })
+            }
+          }
+          try {
+            if (!record.playwright?.pendingDialog && !this.browserHostBlockers(record).length) await this.initializeHiddenBrowserViewport(record, assertOpening)
+            assertOpening()
+            if (!record.playwright?.pendingDialog && !this.browserHostBlockers(record).length) await this.touchBrowserPointer(record)
+            assertOpening()
+            break
+          } catch (error) {
+            check(); assertOpeningRecord()
+            if (!(error instanceof DesktopBrowserError) || error.code !== 'PAGE_CHANGED' || attempt >= 2) throw error
+            if (record.browserNavigationGeneration !== openingNavigationGeneration) {
+              if (!record.browserOpeningNavigation || !await this.reconcileBrowserOpening(record, signal)) throw error
+              openingNavigationGeneration = record.browserNavigationGeneration
+            }
+          }
+        }
         // The current session's UI adopts the hidden page and supplies its visible layout.
         const target = this.getBrowserTarget(surfaceId)
         this.emit(record, 'browser-opened', { url: target.url, title: target.title,
@@ -2524,14 +2581,17 @@ export class NativeWorkbenchSurfaceManager {
         return target
       } catch (error) {
         if (record.owner.isDestroyed() || record.contents.isDestroyed()
-          || record.disposed || this.surfaces.get(surfaceId) !== record) {
+          || record.disposed || record.crashed || this.surfaces.get(surfaceId) !== record) {
           if (this.surfaces.get(surfaceId) === record) await this.destroyRecord(record)
           throw error
         }
-        if (error instanceof DesktopBrowserError && error.code === 'PAGE_CHANGED') {
+        if (error instanceof DesktopBrowserError && (error.code === 'PAGE_CHANGED'
+          || error.details.recovery === 'inspect' || error.details.recovery === 'change_url_or_network')) {
           const target = this.getBrowserTarget(surfaceId)
           this.emit(record, 'browser-opened', { url: target.url, title: target.title,
-            sessionKey: request.sessionKey, targetRef: target.targetRef })
+            sessionKey: request.sessionKey, targetRef: target.targetRef,
+            ...(record.browserNavigationError ? { navigationError: record.browserNavigationError } : {}) })
+          if (record.browserNavigationError) this.emitNavigationState(record)
           throw error
         }
         this.noteBrowserNavigationFailure(record, url,
@@ -2539,7 +2599,7 @@ export class NativeWorkbenchSurfaceManager {
         this.emit(record, 'browser-opened', { url, sessionKey: request.sessionKey,
           targetRef: record.targetRef, navigationError: record.browserNavigationError })
         throw this.browserNavigationFailure(record)
-      }
+      } finally { record.browserOpeningNavigation = undefined }
     }
     const record = this.browserRecord(request.sessionKey, request.targetRef)
     if (record.kind === 'artifact-html') throw new DesktopBrowserError('BROWSER_UNAVAILABLE', 'Reopen this legacy preview to enable browser control.')
@@ -5225,6 +5285,18 @@ export class NativeWorkbenchSurfaceManager {
           reason: 'scheme-or-offline-policy',
         })
       } else {
+        const opening = record.browserOpeningNavigation
+        if (opening) {
+          let ownFrame = false
+          try { ownFrame = event.initiator === contents.mainFrame && event.frame === contents.mainFrame } catch {}
+          if (!opening.invalid && ownFrame && record.requestedRect === null
+            && !this.hasRecentTrustedGesture(record) && record.documentUrl === targetUrl
+            && record.browserNavigationGeneration === opening.generation + 1 && opening.redirects < 3) {
+            opening.generation = record.browserNavigationGeneration
+            opening.redirects += 1
+            opening.url = targetUrl
+          } else opening.invalid = true
+        }
         this.rejectPendingPermissions(record)
         this.cancelPendingAuthentication(record)
         record.authenticationAttempts.clear()
@@ -5248,6 +5320,9 @@ export class NativeWorkbenchSurfaceManager {
           })
         }
       } else {
+        const opening = record.browserOpeningNavigation
+        if (opening && event.isMainFrame && !opening.invalid
+          && opening.generation === record.browserNavigationGeneration) opening.url = targetUrl
         this.rejectPendingPermissions(record)
         this.cancelPendingAuthentication(record)
         record.authenticationAttempts.clear()
@@ -5464,12 +5539,13 @@ export class NativeWorkbenchSurfaceManager {
     contents.on('dom-ready', () => {
       record.browserViewportReady = Promise.resolve()
       if (!record.browserOpenedHidden || record.requestedRect !== null || record.browserNavigationStopped) return
-      const generation = record.annotationDocumentGeneration
+      const opening = Boolean(record.browserOpeningNavigation)
+      const generation = opening ? record.browserNavigationGeneration : record.annotationDocumentGeneration
       const isCurrent = () => !record.disposed && !record.crashed
         && !record.browserNavigationStopped
         && !record.browserNavigationError
         && !contents.isDestroyed() && this.surfaces.get(record.id) === record
-        && record.annotationDocumentGeneration === generation
+        && (opening ? record.browserNavigationGeneration : record.annotationDocumentGeneration) === generation
       record.browserViewportReady = this.initializeHiddenBrowserViewport(record, () => {
         if (!isCurrent()) throw new DesktopBrowserError('PAGE_NOT_READY', 'The browser document changed.')
       })
@@ -5483,13 +5559,14 @@ export class NativeWorkbenchSurfaceManager {
       })
     })
     contents.on('did-finish-load', () => {
-      const generation = record.annotationDocumentGeneration
+      const opening = Boolean(record.browserOpeningNavigation)
+      const generation = opening ? record.browserNavigationGeneration : record.annotationDocumentGeneration
       void record.browserViewportReady.then(() => {
         if (record.disposed || record.crashed || contents.isDestroyed()
           || record.browserNavigationStopped
           || record.browserNavigationError
           || this.surfaces.get(record.id) !== record
-          || record.annotationDocumentGeneration !== generation) return
+          || (opening ? record.browserNavigationGeneration : record.annotationDocumentGeneration) !== generation) return
         if (record.kind !== 'artifact-html') record.browserDocumentReady = true
         record.initialDocumentCommitted = true
         void record.pointer?.documentReady()
@@ -5517,8 +5594,11 @@ export class NativeWorkbenchSurfaceManager {
         // Programmatic navigation owns its promise and generation. Let that
         // path reject with the right target, and ignore late failures from a
         // navigation that has already been superseded.
-        if (!record.browserNavigationPromise && !record.browserDocumentReady
-          && (!failedUrl || failedUrl === record.documentUrl)) {
+        const opening = record.browserOpeningNavigation
+        const openingRedirect = opening && opening.generation === record.browserNavigationGeneration
+          && opening.redirects > 0 && !record.browserNavigationOwner
+        if ((!record.browserNavigationPromise || openingRedirect) && (!record.browserDocumentReady || openingRedirect)
+          && (!failedUrl || failedUrl === record.documentUrl || openingRedirect && failedUrl === opening.url)) {
           this.noteBrowserNavigationFailure(record, failedUrl || record.documentUrl,
             errorDescription || 'ERR_FAILED', errorCode)
         }
