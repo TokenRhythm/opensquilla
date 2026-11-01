@@ -14,7 +14,8 @@ from rich.console import Console
 from rich.table import Table
 
 from opensquilla.agents.registry import AgentRegistry
-from opensquilla.onboarding.config_store import default_config_path, load_config, persist_config
+from opensquilla.cli.config_errors import load_config_or_exit
+from opensquilla.onboarding.config_store import default_config_path, persist_config
 from opensquilla.session.keys import normalize_agent_id
 
 agents_app = typer.Typer(help="Manage durable agents.")
@@ -33,7 +34,7 @@ def _print_restart_notice() -> None:
 
 def _load_registry(config_path: Path | None) -> tuple[Path, Any, AgentRegistry]:
     target = config_path or default_config_path()
-    cfg = load_config(target)
+    cfg = load_config_or_exit(target)
     return target, cfg, AgentRegistry(cfg, config_path=target, persist_changes=False)
 
 
