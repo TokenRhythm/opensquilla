@@ -625,6 +625,14 @@ def test_runner_saturated_subprocess_contracts_are_marked_ci_serial() -> None:
             "test_direct_send_rejects_dropping_durable_runner",
         ),
         (
+            "tests/test_gateway/test_task_progress_projection.py",
+            "test_discovered_progress_projects_ordinary_task_and_naturally_created_and_edited_goal",
+        ),
+        (
+            "tests/test_gateway/test_task_progress_projection.py",
+            "test_progress_cannot_publish_goal_cleared_before_observer_runs",
+        ),
+        (
             "tests/test_engine/test_interactive_approval_retry.py",
             "test_pending_approval_ignores_legacy_timeout_and_waits_for_decision",
         ),
@@ -687,6 +695,7 @@ def test_recovery_close_probes_are_explicitly_serial(function_name: str) -> None
     ("tests/test_gateway/test_native_attachment_import.py", 3),
     ("tests/test_observability/test_http_client.py", 2),
     ("tests/test_recovery/test_runtime_writer_guard.py", 3),
+    ("tests/test_gateway/test_task_progress_projection.py", 4),
 ])
 def test_process_probe_collection_is_complete_and_disjoint(target: str, serial_count: int) -> None:
     """Exercise actual pytest collection, not fixture-setup-time marker changes."""
