@@ -3,5 +3,21 @@
   "uv_version": "0.12.15",
   "pip_audit_version": "2.10.1",
   "npm_version": "11.12.1",
-  "timeout_seconds": 600
+  "timeout_seconds": 600,
+  "minimatch_globparts_false_positive": {
+    "ecosystem": "npm",
+    "package": "minimatch",
+    "versions": [
+      "3.1.5",
+      "5.1.9"
+    ],
+    "advisory": "GHSA-g3hv-75wg-m249",
+    "expires": "2026-11-16",
+    "reason": "These locked versions do not implement firstPhasePreProcess or optimizationLevel; the advisory's globparts amplification cannot occur. Versions 9 and 10 are upgraded, not excepted.",
+    "evidence": [
+      "https://github.com/isaacs/minimatch/security/advisories/GHSA-g3hv-75wg-m249",
+      "https://github.com/isaacs/minimatch/blob/v3.1.5/minimatch.js",
+      "https://github.com/isaacs/minimatch/blob/v5.1.9/minimatch.js"
+    ]
+  }
 }

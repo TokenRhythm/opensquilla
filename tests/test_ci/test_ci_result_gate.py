@@ -3,6 +3,8 @@ from __future__ import annotations
 import json
 import runpy
 import subprocess
+from copy import deepcopy
+from datetime import date
 from pathlib import Path
 from typing import Any
 
@@ -110,6 +112,114 @@ def test_npm_audit_rejects_incomplete_or_network_error_reports(mutation: str) ->
     with pytest.raises(AuditError):
         AUDIT["validate_npm_report"](report, lock)
 
+
+
+def _minimatch_evidence() -> tuple[dict, dict, dict]:
+    lock = {"lockfileVersion": 3, "packages": {
+        "": {"name": "app", "version": "1"},
+        "node_modules/minimatch": {"version": "3.1.5", "dev": True},
+        "node_modules/parent/node_modules/minimatch": {"version": "5.1.9", "dev": True},
+        "node_modules/parent": {"version": "1", "dev": True},
+        "node_modules/cycle": {"version": "1", "dev": True},
+    }}
+    report = {"auditReportVersion": 2, "vulnerabilities": {
+        "minimatch": {"via": [{
+            "name": "minimatch", "dependency": "minimatch",
+            "url": "https://github.com/advisories/GHSA-g3hv-75wg-m249",
+        }], "nodes": ["node_modules/minimatch", "node_modules/parent/node_modules/minimatch"]},
+        "parent": {"via": ["cycle", "minimatch"], "nodes": ["node_modules/parent"]},
+        "cycle": {"via": ["parent"], "nodes": ["node_modules/cycle"]},
+    }, "metadata": {"vulnerabilities": {"total": 3}, "dependencies": {"total": 4}}}
+    policy = json.loads(Path(".github/ci/dependency-audit.v1.json").read_text(encoding="utf-8"))
+    return report, lock, policy
+
+
+@pytest.mark.parametrize("mutation,actionable", [
+    ("none", 0), ("expired", 3), ("after-expiry", 3), ("missing-rule", 3),
+    ("other-advisory", 3), ("other-version", 3), ("other-package", 3),
+    ("missing-reference", 2), ("orphan-cycle", 2), ("empty-via", 2),
+])
+def test_npm_false_positive_is_exact_expiring_and_preserves_raw_evidence(
+    mutation: str, actionable: int,
+) -> None:
+    raw, lock, policy = _minimatch_evidence()
+    today = date(2026, 11, 15)
+    findings = raw["vulnerabilities"]
+    if mutation == "expired":
+        today = date(2026, 11, 16)
+    elif mutation == "after-expiry":
+        today = date(2026, 11, 17)
+    elif mutation == "missing-rule":
+        policy.pop("minimatch_globparts_false_positive")
+    elif mutation == "other-advisory":
+        findings["minimatch"]["via"].append({"url": "https://github.com/advisories/OTHER"})
+    elif mutation == "other-version":
+        lock["packages"]["node_modules/parent/node_modules/minimatch"]["version"] = "9.0.9"
+    elif mutation == "other-package":
+        findings["minimatch"]["via"][0]["dependency"] = "another-package"
+    elif mutation == "missing-reference":
+        findings["cycle"]["via"] = ["missing"]
+    elif mutation == "orphan-cycle":
+        findings["cycle"]["via"] = ["cycle"]
+    elif mutation == "empty-via":
+        findings["cycle"]["via"] = []
+    before = deepcopy(raw)
+    parsed = AUDIT["validate_npm_report"](raw, lock)
+    result = AUDIT["classify_minimatch_false_positive"](parsed, policy, today=today)
+    assert result["actionable_count"] == actionable
+    assert result["false_positive_count"] == 3 - actionable
+    assert result["vulnerability_count"] == 3
+    assert result["findings"] == parsed["findings"]
+    assert raw == before
+
+
+@pytest.mark.parametrize("field,value", [
+    ("ecosystem", "python"), ("versions", ["3.1.5", "5.1.9", "9.0.9"]),
+    ("advisory", "OTHER"), ("expires", "2026-12-16"),
+])
+def test_npm_false_positive_rejects_unreviewed_scope(field: str, value: Any) -> None:
+    raw, lock, policy = _minimatch_evidence()
+    policy["minimatch_globparts_false_positive"][field] = value
+    with pytest.raises(AuditError, match="Unreviewed"):
+        AUDIT["classify_minimatch_false_positive"](
+            AUDIT["validate_npm_report"](raw, lock), policy,
+        )
+
+
+def test_npm_audit_cli_keeps_reported_count_when_exception_is_actionable(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys,
+) -> None:
+    raw, lock, policy = _minimatch_evidence()
+    repo, output = tmp_path / "repo", tmp_path / "evidence"
+    repo.mkdir()
+    for name in ("pyproject.toml", "uv.lock"):
+        (repo / name).write_text(name, encoding="utf-8")
+    for path in AUDIT["NPM_PROJECTS"].values():
+        (repo / path).mkdir(parents=True)
+        (repo / path / "package.json").write_text("{}", encoding="utf-8")
+        (repo / path / "package-lock.json").write_text(json.dumps(lock), encoding="utf-8")
+    globals_ = AUDIT["main"].__globals__
+    classify = AUDIT["classify_minimatch_false_positive"]
+    monkeypatch.setitem(globals_, "classify_minimatch_false_positive", lambda parsed, config: (
+        classify(parsed, config, today=date(2026, 11, 15))
+    ))
+    monkeypatch.setitem(globals_, "audit_python", lambda *args: {"vulnerability_count": 0})
+
+    def fake_command(args, **kwargs):
+        if args[:2] == ["npm", "audit"]:
+            return subprocess.CompletedProcess(args, 1, json.dumps(raw), "")
+        value = policy["npm_version"] if args == ["npm", "--version"] else "a" * 40
+        return subprocess.CompletedProcess(args, 0, value, "")
+
+    monkeypatch.setitem(globals_, "run_command", fake_command)
+    assert AUDIT["main"](["--repo", str(repo), "--output-dir", str(output)]) == 0
+    summary = json.loads((output / "summary.json").read_text(encoding="utf-8"))
+    assert summary["vulnerability_count"] == summary["false_positive_count"] == 6
+    assert summary["actionable_count"] == 0 and not summary["errors"]
+    assert json.loads((output / "electron.json").read_text(encoding="utf-8")) == raw
+    assert "6 reported package records, 6 documented false positives, 0 actionable" in (
+        capsys.readouterr().out
+    )
 
 def test_artifact_audit_excludes_only_local_project_and_explicit_build_only(tmp_path: Path) -> None:
     inventory = tmp_path / "inventory.json"

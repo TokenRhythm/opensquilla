@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Audit immutable dependency inventories; incomplete evidence fails closed.
 
-Exit 0: complete, no known vulnerabilities; 1: vulnerabilities; 2: audit error.
+Exit 0: complete, no actionable findings; 1: actionable findings; 2: audit error.
 No project dependencies are installed and no dependency files are rewritten.
 """
 
@@ -15,7 +15,7 @@ import shutil
 import subprocess
 import tempfile
 import tomllib
-from datetime import UTC, datetime
+from datetime import UTC, date, datetime
 from pathlib import Path
 from typing import Any
 
@@ -222,7 +222,7 @@ def validate_npm_report(report: Any, lock: Any) -> dict[str, Any]:
         if not isinstance(nodes, list) or not nodes or any(node not in packages for node in nodes):
             raise AuditError("npm vulnerability refers to absent lockfile nodes")
         findings.append({
-            "name": name, **vulnerability,
+            **vulnerability, "name": name,
             "packages": [
                 {"path": node, "version": packages[node].get("version"),
                  "dev": bool(packages[node].get("dev")),
@@ -240,6 +240,74 @@ def validate_npm_report(report: Any, lock: Any) -> dict[str, Any]:
         "distinct_advisory_count": len(advisories),
     }
 
+
+
+def classify_minimatch_false_positive(
+    report: dict[str, Any], policy: dict[str, Any], *, today: date | None = None,
+) -> dict[str, Any]:
+    """Keep raw findings, except only the reviewed, expiring npm false positive."""
+    rule = policy.get("minimatch_globparts_false_positive")
+    exempt = []
+    if rule is not None:
+        if (
+            not isinstance(rule, dict) or rule.get("ecosystem") != "npm"
+            or rule.get("package") != "minimatch"
+            or rule.get("versions") != ["3.1.5", "5.1.9"]
+            or rule.get("advisory") != "GHSA-g3hv-75wg-m249"
+            or rule.get("expires") != "2026-11-16"
+        ):
+            raise AuditError("Unreviewed minimatch false-positive scope")
+        if (today or datetime.now(UTC).date()) < date.fromisoformat(rule["expires"]):
+            findings = {finding["name"]: finding for finding in report["findings"]}
+            direct, invalid, edges = set(), set(), {}
+            for name, finding in findings.items():
+                edges[name] = set()
+                if not finding["via"]:
+                    invalid.add(name)
+                for via in finding["via"]:
+                    if isinstance(via, str) and via in findings:
+                        edges[name].add(via)
+                    elif (
+                        isinstance(via, dict) and name == "minimatch"
+                        and via.get("name") == "minimatch"
+                        and via.get("dependency") == "minimatch"
+                        and via.get("url") == (
+                            "https://github.com/advisories/" + rule["advisory"]
+                        )
+                        and all(
+                            package["path"].endswith("/node_modules/minimatch")
+                            or package["path"] == "node_modules/minimatch"
+                            for package in finding["packages"]
+                        )
+                        and all(package["version"] in rule["versions"]
+                                for package in finding["packages"])
+                    ):
+                        direct.add(name)
+                    else:
+                        invalid.add(name)
+            # npm reports parent cycles (e.g. builder <-> dmg-builder).
+            # Every node must reach a proved advisory; orphan cycles fail closed.
+            reaches_direct = set(direct)
+            while True:
+                expanded = reaches_direct | {
+                    name for name, children in edges.items() if children & reaches_direct
+                }
+                if expanded == reaches_direct:
+                    break
+                reaches_direct = expanded
+            for name, finding in findings.items():
+                seen, pending = set(), {name}
+                while pending:
+                    current = pending.pop()
+                    if current not in seen:
+                        seen.add(current)
+                        pending.update(edges[current] - seen)
+                if seen <= reaches_direct and not seen & invalid:
+                    exempt.append(finding)
+    return {
+        **report, "false_positive_findings": exempt, "false_positive_count": len(exempt),
+        "actionable_count": report["vulnerability_count"] - len(exempt),
+    }
 
 def validate_npm_manifest(manifest: Any, lock: Any) -> None:
     if not isinstance(manifest, dict) or not isinstance(lock, dict):
@@ -345,7 +413,7 @@ def audit_npm(repo: Path, output: Path, policy: dict[str, Any], ecosystem: str) 
         )
         if (result.returncode == 0) != (report["vulnerability_count"] == 0):
             raise AuditError("npm audit exit status disagrees with its findings")
-        return report
+        return classify_minimatch_false_positive(report, policy)
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -406,11 +474,19 @@ def main(argv: list[str] | None = None) -> int:
     except (AuditError, OSError, ValueError, KeyError, TypeError) as exc:
         errors.append({"message": str(exc)})
     findings = sum(result["vulnerability_count"] for result in summary["results"].values())
-    exit_code = 2 if errors else (1 if findings else 0)
-    summary.update(finished_at=datetime.now(UTC).isoformat(), exit_code=exit_code)
+    false_positives = sum(result.get("false_positive_count", 0)
+                          for result in summary["results"].values())
+    actionable = findings - false_positives
+    exit_code = 2 if errors else (1 if actionable else 0)
+    summary.update(
+        finished_at=datetime.now(UTC).isoformat(), exit_code=exit_code,
+        vulnerability_count=findings, false_positive_count=false_positives,
+        actionable_count=actionable,
+    )
     write_json(output / "summary.json", summary)
     print(
-        f"Dependency audit: {len(errors)} errors, {findings} vulnerable package records; "
+        f"Dependency audit: {len(errors)} errors, {findings} reported package records, "
+        f"{false_positives} documented false positives, {actionable} actionable; "
         f"{output / 'summary.json'}",
     )
     return exit_code

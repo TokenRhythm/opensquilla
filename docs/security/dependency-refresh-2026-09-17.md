@@ -109,3 +109,31 @@ WeasyPrint alert #40 has no patched-version metadata in GitHub, but upstream v69
 | #153 | GHSA-82fw-gwwq-j7x9 | @vitest/mocker | `opensquilla-webui/package-lock.json` | medium | 4.1.9 | 4.1.11 | outside affected range |
 | #154 | GHSA-82fw-gwwq-j7x9 | vitest | `opensquilla-webui/package-lock.json` | medium | 4.1.9 | 4.1.11 | outside affected range |
 | #155 | GHSA-jf6q-chmf-3h3v | weasyprint | `uv.lock` | medium | 68.1 | 70.0 | outside affected range |
+
+## Follow-up audit: 2026-11-02
+
+The locked pypdf version is now 6.21.4. Electron's minimatch 9/10 dependencies
+are overridden to 11.0.3. Legacy minimatch 3.1.5 and 5.1.9 retain the API used by
+glob 7, FileList and the existing ASAR packaging chain; replacing these with 11
+breaks legacy glob's regular-expression interface.
+
+The temporary rule in `.github/ci/dependency-audit.v1.json` covers only those two
+locked legacy versions and GHSA-g3hv-75wg-m249. The upstream source links in that
+rule show neither version implements `firstPhasePreProcess` or
+`optimizationLevel`, the amplification mechanism described by the advisory.
+For `'**/../a/b/'.repeat(n) + 'file'` with optimization level 2 and n=1..5,
+both legacy versions retain one alternative and generate no preprocessing
+branches; the previous 9.0.9/10.2.6 versions generate 1, 3, 7, 15, 31 branches.
+
+The exception expires at **2026-11-16 00:00 UTC**. Raw npm reports and reported
+finding counts remain intact. Summary output separately identifies documented
+false positives and actionable findings. Indirect findings qualify only when
+every reachable advisory matches the exact rule and every dependency node has
+a path to such an advisory; unknown references, isolated cycles, changed versions
+and additional advisories still fail the gate. Remove the exception after the
+upstream affected range is corrected, or update the packaging chain and re-audit.
+
+Compatibility was exercised on CI's minimum Node 22.12: synchronous/asynchronous
+glob, FileList, builder filtering and stream-ASAR packing, ASAR unpacking and
+universal ASAR merging. The audit gate regressions also cover expiry boundaries,
+mixed advisories, lock-version drift and preservation of raw reports.
