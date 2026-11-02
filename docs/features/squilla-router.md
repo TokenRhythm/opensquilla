@@ -55,6 +55,11 @@ new path; the following behavior changes apply even to an existing V4 configurat
 - A new task uses the tier classifier. Continue keeps the last admitted tier;
   Redo advances it by one, capped at C3. Explicit New Task starts a new context
   generation. The two classifiers and their preprocessing run locally.
+  When that generation exceeds the request window, the existing summarizer first
+  condenses its own history under the configured budget. The summary is request-local:
+  it neither reads an older task's checkpoint nor rewrites the full transcript.
+  With summarization disabled or unavailable, the temporary window still reports
+  omitted history; repeated long requests may need to summarize again.
 - Confidence, probability-margin, difficulty, continuity, and initial budget-cap
   heuristics do not rewrite the selected tier. In particular, the existing router
   budget configuration does not demote or cap the initial model-policy choice.

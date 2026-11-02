@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
@@ -31,7 +32,12 @@ def envelope(mid: str, *, generation: str | None = None, admitted: bool = True) 
 
 
 @pytest.mark.asyncio
-async def test_explicit_generation_uses_ephemeral_window_and_preserves_timeline(monkeypatch):
+@pytest.mark.parametrize("summary_mode", [
+    "unavailable", "disabled", "timeout", "cancelled", "unexpected-error",
+])
+async def test_explicit_generation_uses_ephemeral_window_and_preserves_timeline(
+    monkeypatch, summary_mode,
+):
     async with SessionStorage(":memory:") as storage:
         manager = SessionManager(storage, inject_time_prefix=False)
         node = await manager.create("agent:main:generation")
@@ -55,8 +61,21 @@ async def test_explicit_generation_uses_ephemeral_window_and_preserves_timeline(
         )
         before = await storage.get_canonical_transcript(node.session_id)
         runner = TurnRunner(
-            provider_selector=MagicMock(), session_manager=manager, config=GatewayConfig()
+            provider_selector=MagicMock(), session_manager=manager,
+            config=GatewayConfig(compaction={"enabled": summary_mode != "disabled"}),
         )
+        from opensquilla.session.compaction_lifecycle import CompactionTimeoutError
+
+        failures = {
+            "disabled": AssertionError("disabled compaction must not summarize"),
+            "timeout": CompactionTimeoutError("summarizing"),
+            "cancelled": asyncio.CancelledError(),
+            "unexpected-error": RuntimeError("summary accounting failed"),
+        }
+        summarizer = None
+        if summary_mode in failures:
+            summarizer = AsyncMock(side_effect=failures[summary_mode])
+            monkeypatch.setattr("opensquilla.session.compaction.compact_context", summarizer)
         monkeypatch.setattr(
             runner,
             "_load_compaction_context_records",
@@ -68,7 +87,7 @@ async def test_explicit_generation_uses_ephemeral_window_and_preserves_timeline(
         def admitted(summary, rows):
             return len(summary) + sum(len(str(row.get("content") or "")) for row in rows) < 700
 
-        window = await runner._maybe_preflight_compact(
+        prepare = runner._maybe_preflight_compact(
             node.session_key,
             200,
             history_capacity_tokens=200,
@@ -78,6 +97,18 @@ async def test_explicit_generation_uses_ephemeral_window_and_preserves_timeline(
             expected_session_epoch=0,
             consumer_admission=admitted,
         )
+        if summary_mode in {"cancelled", "unexpected-error"}:
+            with pytest.raises(type(failures[summary_mode])):
+                await prepare
+            assert [row.model_dump() for row in before] == [
+                row.model_dump() for row in await storage.get_canonical_transcript(node.session_id)
+            ]
+            return
+        window = await prepare
+        if summary_mode == "disabled":
+            summarizer.assert_not_awaited()
+        elif summary_mode == "timeout":
+            summarizer.assert_awaited_once()
         assert window is not None and window.reason == "model_generation_context"
         assert all("OLD SECRET" not in row.content for row in window.kept_entries)
         queued = await manager.append_message(node.session_key, "user", "FUTURE SECRET")
@@ -392,3 +423,175 @@ async def test_observed_new_task_keeps_existing_image_history(image_generation):
         **e.owner,
     )
     assert context["history_has_recent_image"] is True
+
+
+@pytest.mark.asyncio
+async def test_new_default_generation_summary_preserves_facts_and_tool_pairs_on_wire(
+    tmp_path, monkeypatch,
+):
+    """The offline responder can only repeat facts it actually receives."""
+    import functools
+    import json
+
+    import httpx
+
+    from opensquilla.engine.routing.model_policy import ModelPolicyState
+    from opensquilla.engine.steps import squilla_router
+    from opensquilla.gateway.config import ModelOverrideConfig, SquillaRouterConfig
+    from opensquilla.provider import model_catalog
+    from opensquilla.provider.model_catalog import ModelCatalog
+    from opensquilla.provider.selector import ModelSelector, ProviderConfig, SelectorConfig
+    from opensquilla.provider.types import ModelInfo
+    from opensquilla.token_estimation import estimate_tokens
+    from opensquilla.tools.registry import ToolRegistry
+    from opensquilla.tools.types import ToolContext
+    from scripts import live_reasoning_replay_e2e as harness
+
+    monkeypatch.setenv("OPENROUTER_API_KEY", "synthetic-openrouter")
+    monkeypatch.setenv("OPENSQUILLA_OPENROUTER_LIVE_PRICING", "0")
+    model, window = "qwen/qwen-2.5-coder-32b-instruct", 32768
+    endpoint = harness.registry_endpoint("openrouter")
+    config = harness._config(tmp_path, "openrouter", model, endpoint)
+    config.llm.context_window_tokens = window
+    config.llm.max_tokens = 4096
+    config.llm.thinking = "off"
+    config.compaction.enabled = True
+    config.compaction.protected_recent_messages = 4
+    config.squilla_router = SquillaRouterConfig(
+        rollout_phase="full", preset_binding="custom", auto_thinking=False,
+        tiers={f"c{i}": {"provider": "openrouter", "model": model} for i in range(4)},
+    )
+    assert config.squilla_router.strategy == "lightgbm_model"
+    classifier = SimpleNamespace(predict=lambda _: SimpleNamespace(
+        intent_probabilities={"continue": 1.0, "redo": 0.0, "new_task": 0.0},
+        tier_probabilities={f"c{i}": float(i == 1) for i in range(4)},
+    ))
+    monkeypatch.setattr(squilla_router, "_get_strategy", lambda _: classifier)
+    catalog = ModelCatalog()
+    config.models = {"openrouter": {model: ModelOverrideConfig(
+        context_window=window, max_output_tokens=4096,
+    )}}
+    catalog._models[model] = ModelInfo(
+        provider="openrouter", model_id=model, display_name=model,
+        context_window=window, max_output_tokens=4096,
+        supports_reasoning=False, supports_tools=True, supports_vision=False,
+    )
+    catalog.set_user_overrides({
+        f"openrouter/{model}": config.models["openrouter"][model].model_dump(exclude_none=True),
+    })
+    monkeypatch.setattr(model_catalog, "_shared_catalog", catalog)
+    facts = {
+        "constraint": "Do not rename public endpoints.",
+        "artifact": "reports/router-review.json",
+        "pending": "Run the SQLite migration check.",
+    }
+    seen = []
+
+    def respond(request):
+        payload = json.loads(request.content)
+        text = json.dumps(payload["messages"], ensure_ascii=False)
+        assert "OLD TASK SECRET" not in text
+        assert "OLD CHECKPOINT SECRET" not in text
+        assert "FUTURE QUEUED SECRET" not in text
+        available = {key: value for key, value in facts.items() if value in text}
+        seen.append((payload, available))
+        frame = {
+            "id": "generation-response", "model": model,
+            "choices": [{"index": 0, "delta": {"content": json.dumps(available)},
+                         "finish_reason": "stop"}],
+            "usage": {"prompt_tokens": 100, "completion_tokens": 100, "total_tokens": 200},
+        }
+        return httpx.Response(
+            200, request=request, headers={"content-type": "text/event-stream"},
+            content=("data: " + json.dumps(frame) + "\n\ndata: [DONE]\n\n").encode(),
+        )
+
+    observer = harness.WireObserver(endpoint, transport=httpx.MockTransport(respond), max_calls=8)
+    async with SessionStorage(tmp_path / "generation.sqlite") as storage:
+        manager = SessionManager(storage, inject_time_prefix=False)
+        node = await manager.create("agent:main:scoped-generation-summary")
+        key = node.session_key
+        await manager.append_message(key, "user", "OLD TASK SECRET")
+        await storage.save_summary(SessionSummary(
+            session_id=node.session_id, session_key=key, summary_text="OLD CHECKPOINT SECRET",
+        ))
+        unit = " log 17;"
+        repeats = 48000 // (6 * estimate_tokens(unit))
+        reset = None
+        for index in range(6):
+            prefix = json.dumps({"constraint": facts["constraint"]}) + "\n" if index == 0 else ""
+            entry = await manager.append_message(key, "user", prefix + unit * repeats)
+            if index == 0:
+                reset = entry
+                decision = envelope(entry.message_id, generation=entry.message_id)
+                decision["state"] = ModelPolicyState(
+                    tier="c1", task_id=entry.message_id,
+                    task_start_input_message_id=entry.message_id,
+                    generation_start_input_message_id=entry.message_id,
+                ).to_dict()
+                await manager.update_message_turn_context(key, entry.message_id, {
+                    "router_model_decision": decision,
+                })
+            # Early discovered facts live in an assistant reply, which the
+            # old user-prioritizing temporary window can omit under pressure.
+            reply = (json.dumps({key: value for key, value in facts.items() if key != "constraint"})
+                     if index == 0 else "Disposable logs acknowledged.")
+            await manager.append_message(key, "assistant", reply)
+        assert reset is not None
+        await manager.append_message(key, "user", "Inspect the current specification.")
+        await manager.append_message(key, "assistant", "", tool_calls=[{
+            "type": "tool_use", "tool_use_id": "generation-read", "name": "read_file",
+            "input": {"path": "spec.txt"},
+        }, {
+            "type": "tool_result", "tool_use_id": "generation-read", "name": "read_file",
+            "result": "The current specification is available.",
+        }])
+        await manager.append_message(key, "assistant", "Specification inspected.")
+        original = harness._canonical_message_digests(await manager.get_canonical_transcript(key))
+        prompt = "Continue: return the original constraint, artifact and pending action as JSON."
+        current = await manager.append_message(key, "user", prompt)
+        await manager.append_message(key, "user", "FUTURE QUEUED SECRET")
+        runner = TurnRunner(
+            provider_selector=ModelSelector(SelectorConfig(primary=ProviderConfig(
+                provider="openrouter", model=model, api_key="synthetic-openrouter",
+                base_url=endpoint,
+            ))),
+            tool_registry=ToolRegistry(), session_manager=manager, config=config,
+            model_catalog=catalog,
+        )
+        prepared = []
+        original_preflight = runner._maybe_preflight_compact
+
+        @functools.wraps(original_preflight)
+        async def capture_preflight(*args, **kwargs):
+            candidate = await original_preflight(*args, **kwargs)
+            if candidate is not None:
+                rows = [runner._entry_for_emergency_compaction(row)
+                        for row in candidate.kept_entries]
+                assert kwargs["compaction_budget"].consumer_admission(candidate.summary, rows)
+                prepared.append(candidate)
+            return candidate
+
+        monkeypatch.setattr(runner, "_maybe_preflight_compact", capture_preflight)
+        with observer.observe():
+            events = [event async for event in runner.run(
+                prompt, session_key=key, bound_user_message_id=current.message_id,
+                tool_context=ToolContext(is_owner=True, workspace_dir=config.workspace_dir),
+            )]
+        assert not [event for event in events if event.kind == "error"]
+        payload, visible_facts = seen[-1]
+        assert visible_facts == facts
+        summary_calls = [call for call in observer.calls if harness._is_compaction_wire_call(call)]
+        assert summary_calls, "A new generation must summarize its own early facts before trimming"
+        assert prepared and all(value in prepared[-1].summary for value in facts.values())
+        assert estimate_tokens(json.dumps(payload)) + config.llm.max_tokens < window
+        calls = [call["id"] for message in payload["messages"]
+                 for call in message.get("tool_calls", [])]
+        results = [message["tool_call_id"] for message in payload["messages"]
+                   if message["role"] == "tool"]
+        assert calls == results == ["generation-read"]
+        canonical = harness._canonical_message_digests(await manager.get_canonical_transcript(key))
+        assert all(canonical.get(message_id) == digest for message_id, digest in original.items())
+        assert [row.summary_text for row in await manager.get_summaries(key)] == [
+            "OLD CHECKPOINT SECRET",
+        ]

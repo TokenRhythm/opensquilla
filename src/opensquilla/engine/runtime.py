@@ -13005,14 +13005,139 @@ class TurnRunner:
                          <= history_capacity_chars)
                 ):
                     return None
+            protected_suffix_count = self._protected_current_turn_suffix_count(
+                generation, history_has_persisted_user=history_has_persisted_user,
+                bound_user_message_id=bound_user_message_id,
+            )
+            compaction_id = new_compaction_id()
+            self.mark_compaction_attempted_this_turn(session_key)
+            if (
+                getattr(configured_compaction, "enabled", True) is not False
+                and not self._compaction_circuit_open(session_key)
+            ):
+                from opensquilla.session.compaction import (
+                    CompactionRequest,
+                    compact_context,
+                    compaction_replay_summary,
+                )
+
+                compaction_config.protected_recent_messages = max(
+                    effective_protected_recent_messages(compaction_config),
+                    protected_suffix_count,
+                )
+                arm_compaction_deadline(compaction_config, operation_id=compaction_id)
+                notify_compaction(
+                    session_key, source="automatic", phase="preflight", status="started",
+                    reason="model_generation_context",
+                    **compaction_effect_payload(status="started"),
+                    **compaction_lifecycle_payload(compaction_id, COMPACTION_TRIGGERED_EVENT),
+                )
+                generation_summary_started = False
+                previous_generation_started = compaction_config.on_summary_call_started
+
+                def on_generation_summary_started() -> None:
+                    nonlocal generation_summary_started
+                    generation_summary_started = True
+                    if previous_generation_started is not None:
+                        previous_generation_started()
+
+                compaction_config.on_summary_call_started = on_generation_summary_started
+                try:
+                    # Summarize only this task's canonical generation. The
+                    # resulting view is request-owned: never read a prior task's
+                    # checkpoint or rewrite the user's durable transcript.
+                    generation_result = await compact_context(CompactionRequest(
+                        session_id=expected_session_id or next(
+                            (row.session_id for row in generation), session_key,
+                        ),
+                        entries=[self._entry_for_emergency_compaction(row) for row in generation],
+                        context_window_tokens=history_window_tokens,
+                        context_window_chars=history_capacity_chars,
+                        config=compaction_config,
+                        previous_summary="",
+                        summary_replay_renderer=lambda text: (
+                            _format_compaction_summary_context([text]) or ""
+                        ),
+                        consumer_admission=consumer_admission,
+                        provider_request_correlation=provider_request_correlation,
+                        reason="model_generation_context",
+                        # Exact consumer admission above has already found
+                        # pressure, including non-token provider limits. Keep
+                        # the compactor's complete-round and protected-tail gates.
+                        force=True,
+                    ))
+                except asyncio.CancelledError:
+                    notify_compaction(
+                        session_key, source="automatic", phase="preflight", status="cancelled",
+                        reason="model_generation_context",
+                        **compaction_effect_payload(status="cancelled"),
+                        **compaction_lifecycle_payload(compaction_id, COMPACTION_TRIGGERED_EVENT),
+                    )
+                    raise
+                except CompactionTimeoutError:
+                    require_parent_time(terminalize=True)
+                    if generation_summary_started:
+                        self._record_compaction_failure(
+                            session_key, failure_kind="operation_timeout",
+                        )
+                    generation_result = None
+                finally:
+                    compaction_config.on_summary_call_started = previous_generation_started
+                require_parent_time(terminalize=True)
+                if (generation_result is not None and generation_result.removed_count > 0
+                        and generation_result.summary):
+                    summary = compaction_replay_summary(generation_result)
+                    generation_window = PreparedRequestWindow(
+                        session_key=session_key, summary=summary,
+                        kept_entries=tuple(
+                            self._emergency_replay_entry(row)
+                            for row in generation_result.kept_entries
+                        ),
+                        reason="model_generation_context", compaction_id=compaction_id,
+                        expected_session_id=expected_session_id,
+                        expected_session_epoch=expected_session_epoch,
+                        source_fingerprint=self._emergency_source_fingerprint(generation),
+                        history_window_tokens=history_window_tokens,
+                        history_capacity_chars=history_capacity_chars,
+                        protected_recent_messages=protected_suffix_count,
+                        preserve_historical_images=preserve_historical_images,
+                        consumer_admission=consumer_admission,
+                    )
+                    self.mark_compacted_this_turn(session_key)
+                    self._record_compaction_success(session_key)
+                    completed_payload = compaction_lifecycle_payload(
+                        compaction_id, COMPACTION_TRIGGERED_EVENT,
+                    )
+                    completed_payload.update(compaction_result_payload(generation_result))
+                    notify_compaction(
+                        session_key, source="automatic", phase="preflight", status="completed",
+                        reason="model_generation_context", archived_count=0,
+                        **compaction_effect_payload(
+                            status="completed", durability="request_scoped",
+                        ),
+                        **completed_payload,
+                    )
+                    return generation_window
+                skip_reason = (
+                    (generation_result.skip_reason or "empty_summary")
+                    if generation_result is not None
+                    else "compaction_deadline_exceeded"
+                )
+                if generation_result is not None and generation_summary_started:
+                    self._record_compaction_failure(
+                        session_key, failure_kind=generation_result.failure_kind or skip_reason,
+                    )
+                notify_compaction(
+                    session_key, source="automatic", phase="preflight", status="failed",
+                    reason=skip_reason,
+                    **compaction_effect_payload(status="failed", reason=skip_reason),
+                    **compaction_lifecycle_payload(compaction_id, COMPACTION_TRIGGERED_EVENT),
+                )
             return await self._prepare_request_window(
                 session_key, generation, history_window_tokens,
-                compaction_id=new_compaction_id(), phase="preflight",
+                compaction_id=compaction_id, phase="preflight",
                 reason="model_generation_context",
-                protected_recent_messages=self._protected_current_turn_suffix_count(
-                    generation, history_has_persisted_user=history_has_persisted_user,
-                    bound_user_message_id=bound_user_message_id,
-                ),
+                protected_recent_messages=protected_suffix_count,
                 history_capacity_chars=history_capacity_chars,
                 expected_session_id=expected_session_id,
                 expected_session_epoch=expected_session_epoch,
