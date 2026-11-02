@@ -15,6 +15,12 @@ class AssetBudget:
     maximum_bytes: int
 
 
+# #2020 adds the mandatory dual-classifier bundle. Its artifact manifest records
+# 24,209,129 resource bytes; the manifest itself is 3,629 bytes. Keep this fixed
+# allowance separate from candidate sizes and shared BGE assets already budgeted.
+LIGHTGBM_ASSET_ALLOWANCE = 24_212_758
+
+
 ASSET_BUDGETS: dict[str, tuple[AssetBudget, ...]] = {
     "macos": (
         # #1224 established the v0.5.3 reduction targets. #1913 added four
@@ -22,11 +28,11 @@ ASSET_BUDGETS: dict[str, tuple[AssetBudget, ...]] = {
         # This is a one-time fixed allowance for those assets, not a measured
         # DMG compression delta or a budget derived from the candidate size.
         # The package gate still forbids bundled developer Runtime Packs.
-        AssetBudget("OpenSquilla-*-mac-arm64.dmg", 400_886_040),
-        AssetBudget("OpenSquilla-*-mac-arm64.zip", 405_301_192),
+        AssetBudget("OpenSquilla-*-mac-arm64.dmg", 400_886_040 + LIGHTGBM_ASSET_ALLOWANCE),
+        AssetBudget("OpenSquilla-*-mac-arm64.zip", 405_301_192 + LIGHTGBM_ASSET_ALLOWANCE),
     ),
     "windows": (
-        AssetBudget("OpenSquilla-*-win-x64.exe", 423_062_346),
+        AssetBudget("OpenSquilla-*-win-x64.exe", 423_062_346 + LIGHTGBM_ASSET_ALLOWANCE),
     ),
 }
 
