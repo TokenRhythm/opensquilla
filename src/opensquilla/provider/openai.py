@@ -3810,12 +3810,12 @@ class OpenAIProvider:
         )
         stream_timeout_fallback = (
             self._compat.stream_timeout_fallback
-            and not coordinator_owns_retry
+            and cfg.compatibility_recovery != "non_stream"
             and non_stream_fallback_allowed
         )
         empty_stream_fallback = (
             self._compat.empty_stream_fallback
-            and not coordinator_owns_retry
+            and cfg.compatibility_recovery != "non_stream"
             and non_stream_fallback_allowed
         )
         (
@@ -4136,6 +4136,13 @@ class OpenAIProvider:
             return released
 
         try:
+            if cfg.compatibility_recovery == "non_stream":
+                async for event in self._complete_non_stream(
+                    payload=payload, headers=headers, cfg=cfg, tools=tools,
+                    timeout_exc=httpx.ReadTimeout("Coordinator requested non-stream recovery"),
+                ):
+                    yield event
+                return
             client = await self._build_http_client(
                 timeout=(
                     _stream_timeout(cfg.timeout)
@@ -5094,6 +5101,12 @@ class OpenAIProvider:
                             and input_tokens == 0
                             and output_tokens == 0
                         ):
+                            if coordinator_owns_retry:
+                                yield stream_error(
+                                    message="Provider returned an empty stream.",
+                                    code="incomplete_stream", compatibility_recovery="non_stream",
+                                )
+                                return
                             log.warning(
                                 "openai.empty_stream_fallback_started",
                                 provider=self._provider_kind,
@@ -5466,6 +5479,12 @@ class OpenAIProvider:
                         and input_tokens == 0
                         and output_tokens == 0
                     ):
+                        if coordinator_owns_retry:
+                            yield stream_error(
+                                message="Provider returned an empty stream.",
+                                code="incomplete_stream", compatibility_recovery="non_stream",
+                            )
+                            return
                         log.warning(
                             "openai.empty_stream_fallback_started",
                             provider=self._provider_kind,
@@ -5570,6 +5589,13 @@ class OpenAIProvider:
                 and not emitted_stream_event
                 and code != CONNECTION_FAILED_CODE
             ):
+                if coordinator_owns_retry:
+                    yield stream_error(
+                        message=safe_error, code=code,
+                        recovery_origin=transport_recovery_origin(exc),
+                        compatibility_recovery="non_stream",
+                    )
+                    return
                 event_name = (
                     "openrouter.stream_timeout_fallback_started"
                     if self._provider_kind == "openrouter"

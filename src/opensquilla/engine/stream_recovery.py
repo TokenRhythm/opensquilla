@@ -38,7 +38,15 @@ class StreamRecoveryRequest:
             provider=provider,
             messages=copy.deepcopy(messages),
             tools=copy.deepcopy(tools),
-            config=config.model_copy(deep=True, update={"physical_attempt_limit": 1}),
+            config=config.model_copy(deep=True, update={
+                "physical_attempt_limit": 1,
+                # Credential refresh precedes the original model request. A
+                # response replay uses those credentials, not another refresh.
+                "compatibility_recovery": (
+                    None if config.compatibility_recovery == "refresh_credentials"
+                    else config.compatibility_recovery
+                ),
+            }),
             account_usage=account_usage,
             provider_id=provider_id,
             model=model,

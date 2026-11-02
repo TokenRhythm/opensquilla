@@ -68,6 +68,8 @@ new path; the following behavior changes apply even to an existing V4 configurat
   Ensemble or silently select another tier/provider when credentials, image
   support, or request capacity fail admission. The turn fails with that admission
   error. Choose compatible models for every tier that can receive image requests.
+  Tool-produced image continuations also keep the admitted tier without rerouting;
+  a deployment without proven vision support is explicitly rejected.
 - Reasoning capability is required only when the effective request enables
   thinking. Explicit `llm.thinking = "off"` remains authoritative, including
   with `squilla_router.auto_thinking = false`.
@@ -75,6 +77,11 @@ new path; the following behavior changes apply even to an existing V4 configurat
   quality upgrade. The complete target request must pass admission before its
   tier is committed. Quality and transport retries share a maximum of three
   additional provider calls, further bounded by `max_provider_retries`.
+  Supported stream-to-non-stream recovery and Codex credential refresh remain
+  available before response output: the coordinator reserves the same allowance
+  before retrying, with at most one credential refresh per request. Child agents
+  have an independent allowance with the same configured bound; they do not inherit
+  the parent's routing state or quality-upgrade callback.
 - Missing or invalid model assets fail closed. Source checkouts must hydrate
   Git LFS model weights before starting the Gateway. Packaged builds validate
   the same frozen asset hashes.

@@ -238,6 +238,7 @@ from opensquilla.provider.types import (
     ExecutionIdentity,
     FailureInjector,
     ModelCapabilities,
+    ProviderCompatibilityRecovery,
     ProviderFinalRequestProjection,
     ProviderMessageCountProjection,
     ProviderMessageLimitProof,
@@ -6283,7 +6284,12 @@ class Agent:
             validation_failure,
         )
 
-        model_policy_recovery = ModelPolicyRecovery(self.config)
+        model_policy_recovery = ModelPolicyRecovery(
+            self.config,
+            coordinate_retries=(
+                getattr(self.provider, "coordinates_physical_retries", False) is True
+            ),
+        )
         pending_model_quality_retry: str | None = None
 
         async def _try_model_quality_retry(
@@ -7090,6 +7096,8 @@ class Agent:
 
                 _retry_attempt = 0
                 stream_replay_request: StreamRecoveryRequest | None = None
+                compatibility_recovery: ProviderCompatibilityRecovery | None = None
+                compatibility_recoveries: set[ProviderCompatibilityRecovery] = set()
                 stream_recovery_used = False
                 _connection_wait_attempt = 0
                 _call_attempt = 0
@@ -7971,6 +7979,14 @@ class Agent:
                         yield self._transition(AgentState.ERROR)
                         yield terminal_error
                         break
+                    if compatibility_recovery is not None:
+                        call_chat_cfg = call_chat_cfg.model_copy(update={
+                            "compatibility_recovery": compatibility_recovery,
+                        })
+                        if compatibility_recovery == "refresh_credentials":
+                            # Refresh at most once; subsequent transport retries use
+                            # the already persisted credential, never another refresh.
+                            compatibility_recovery = None
                     turn_llm_calls += 1
                     cache_prompt_snapshot = None
                     if self._session_key:
@@ -10585,6 +10601,31 @@ class Agent:
                             failure_kind.value,
                         )
                         kind = failure_kind
+                        recovery_action = provider_error.compatibility_recovery
+                        if (
+                            model_policy_recovery.owns_retry_budget
+                            and recovery_action is not None
+                            and recovery_action in {"non_stream", "refresh_credentials"}
+                            and recovery_action not in compatibility_recoveries
+                            and _retry_attempt < _fallback.max_retries
+                            and not provider_error.recovery_exhausted
+                            and not attempt_irreversible_output_emitted
+                            and not attempt_user_visible_emitted
+                            and not _got_done_event
+                            and provider_stream_closed and not close_evidence.failed
+                            and getattr(self.provider, "retry_failed_call_safe", True) is not False
+                        ):
+                            compatibility_recovery = recovery_action
+                            compatibility_recoveries.add(recovery_action)
+                            _retry_attempt += 1
+                            self._write_turn_call_log(
+                                "provider_compatibility_recovery", action=recovery_action,
+                                attempt=_retry_attempt, model=self._provider_activity_model(),
+                            )
+                            # The next dispatch reserves the shared budget before
+                            # either refreshing credentials or issuing a model call.
+                            _call_attempt += 1
+                            continue
                         if (
                             provider_error.code == "provider_protocol_error"
                             and not protocol_recovery_used
@@ -18143,6 +18184,7 @@ class Agent:
             provider_id=child_target.provider_id,
             model_id=child_target.model_id or self.config.model_id,
             max_tokens=child_target.max_output_tokens,
+            max_provider_retries=self.config.max_provider_retries,
             temperature=self.config.temperature,
             top_p=self.config.top_p,
             max_turn_llm_calls=self.config.max_turn_llm_calls,

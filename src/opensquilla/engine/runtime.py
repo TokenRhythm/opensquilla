@@ -2305,10 +2305,15 @@ class _SelectorFallbackProvider:
         health_ledger: ProviderHealthLedger | None = None,
         image_routing_config: Any | None = None,
         image_routing_session_key: str = "",
+        coordinate_retries: bool = False,
     ) -> None:
         self._provider = provider
         self._selector = selector
         self._turn_metadata = turn_metadata
+        self.coordinates_physical_retries = coordinate_retries or (
+            (turn_metadata or {}).get("router_tier_policy") == "model"
+            and (turn_metadata or {}).get("routing_applied") is True
+        )
         self._image_routing_config = image_routing_config
         self._image_routing_session_key = image_routing_session_key
         self._image_continuation_rebound = False
@@ -2426,11 +2431,7 @@ class _SelectorFallbackProvider:
             provider=provider, model=model, config=config,
             content_started=content_started,
             reset_attempt=reset_attempt,
-            max_retries=(0 if (
-                (self._turn_metadata or {}).get("router_tier_policy") == "model"
-                and (self._turn_metadata or {}).get("routing_applied") is True
-            )
-                         else self._retry_policy.max_retries),
+            max_retries=0 if self.coordinates_physical_retries else self._retry_policy.max_retries,
             base_ms=self._retry_policy.base_backoff_ms,
             max_ms=self._retry_policy.max_backoff_ms,
             # Preserve selector semantics: overload/transport may choose another
@@ -2486,11 +2487,25 @@ class _SelectorFallbackProvider:
         frozen_selector.override_model(model)
         frozen_provider = frozen_selector.resolve()
         metadata_copy = dict(self._turn_metadata) if isinstance(self._turn_metadata, dict) else None
+        if self.coordinates_physical_retries:
+            # Child execution has independent routing state and accounting, but
+            # failures still belong to the physical credential pool it inherited.
+            source_metadata = metadata_copy or {}
+            metadata_copy = {
+                key: copy.deepcopy(source_metadata[key])
+                for key in (
+                    "credential_pool", "routed_provider_applied",
+                    "session_credential_pool", "session_provider_applied",
+                    "routed_provider_fallback_reason",
+                )
+                if key in source_metadata
+            }
         return _SelectorFallbackProvider(
             frozen_provider,
             frozen_selector,
             turn_metadata=metadata_copy,
             health_ledger=self._health_ledger,
+            coordinate_retries=self.coordinates_physical_retries,
         )
 
     @property
@@ -3183,11 +3198,7 @@ class _SelectorFallbackProvider:
 
         provider_id, model = self._active_deployment()
         config = rebind_execution_identity(config, provider=provider_id, model=model)
-        if (
-            (self._turn_metadata or {}).get("router_tier_policy") == "model"
-            and (self._turn_metadata or {}).get("routing_applied") is True
-            and isinstance(config, ChatConfig)
-        ):
+        if self.coordinates_physical_retries and isinstance(config, ChatConfig):
             config = config.model_copy(update={"physical_attempt_limit": 1})
         if not self._used_fallback and not self._image_continuation_rebound:
             return config

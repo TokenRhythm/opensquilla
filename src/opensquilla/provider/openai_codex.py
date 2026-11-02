@@ -283,6 +283,10 @@ class OpenAICodexProvider:
     ) -> AsyncIterator[StreamEvent]:
         try:
             credentials = load_codex_credentials(self._auth_path)
+            if cfg.compatibility_recovery == "refresh_credentials":
+                credentials = await refresh_codex_credentials(
+                    credentials, path=self._auth_path, proxy=self._proxy,
+                )
         except CodexAuthError as exc:
             yield ErrorEvent(message=str(exc), code="401")
             return
@@ -368,7 +372,7 @@ class OpenAICodexProvider:
                 trust_env=_trust_env(),
                 proxy=self._proxy,
             ) as client:
-                refreshed = False
+                refreshed = cfg.compatibility_recovery == "refresh_credentials"
                 while True:
                     async with client.stream(
                         "POST",
@@ -392,6 +396,17 @@ class OpenAICodexProvider:
                                 yield ErrorEvent(message=str(exc), code="401")
                                 return
                             continue
+                        if (
+                            response.status_code == 401 and coordinator_owns_retry
+                            and cfg.compatibility_recovery != "refresh_credentials"
+                            and credentials.refresh_token
+                        ):
+                            yield ErrorEvent(
+                                message="Codex authorization requires credential refresh.",
+                                code="401", http_status=401,
+                                compatibility_recovery="refresh_credentials",
+                            )
+                            return
                         if response.status_code != 200:
                             body = await response.aread()
                             yield ErrorEvent(

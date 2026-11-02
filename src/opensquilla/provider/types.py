@@ -223,6 +223,9 @@ class ToolArgumentRejection:
     terminal_reason: str
 
 
+ProviderCompatibilityRecovery = Literal["non_stream", "refresh_credentials"]
+
+
 @dataclass
 class ErrorEvent:
     """Stream error.
@@ -262,6 +265,8 @@ class ErrorEvent:
     # Trusted transport evidence, distinct from broad retry classifications.
     # Unknown extensions and protocol/consumer failures cannot authorize replay.
     recovery_origin: RecoveryOrigin = "unknown"
+    # Adapter evidence for a coordinator-owned next attempt; never a hidden resend.
+    compatibility_recovery: ProviderCompatibilityRecovery | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -719,6 +724,10 @@ class ChatConfig(BaseModel):
         ge=0,
         exclude=True,
         repr=False,
+    )
+    # A budgeted coordinator request, excluded from all provider wire payloads.
+    compatibility_recovery: ProviderCompatibilityRecovery | None = Field(
+        default=None, exclude=True, repr=False,
     )
     # Runtime-only absolute turn deadline. Provider selectors use it to avoid
     # violating an upstream Retry-After when the same account/endpoint owns the

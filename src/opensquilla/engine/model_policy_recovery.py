@@ -58,13 +58,16 @@ def validation_failure(results: Sequence[Any]) -> bool:
 
 
 class ModelPolicyRecovery:
-    def __init__(self, config: Any) -> None:
+    def __init__(self, config: Any, *, coordinate_retries: bool = False) -> None:
         self.metadata = config.metadata
         self.context_overflow_threshold = float(config.context_overflow_threshold)
         self.enabled = (
             self.metadata.get("router_tier_policy") == "model"
             and self.metadata.get("routing_applied") is True
         )
+        # A cloned child owns its own finite budget, without inheriting the
+        # parent's routing decision, quality callback or durable session state.
+        self.owns_retry_budget = self.enabled or coordinate_retries
         self.budget = min(3, max(0, int(config.max_provider_retries or 0)))
         self.used = 0
         self.quality_attempted = False
@@ -79,7 +82,7 @@ class ModelPolicyRecovery:
         self.repeat_last_error = False
 
     def reserve_transport_retry(self) -> bool:
-        if not self.enabled:
+        if not self.owns_retry_budget:
             return True
         if self.used >= self.budget:
             return False
