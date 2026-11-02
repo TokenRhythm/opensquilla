@@ -287,16 +287,33 @@ function verifyGatewayDocument(gatewayBinary, env, path) {
   })
 }
 
-async function verifyGatewayCodeExecution(gatewayBinary, env, tempHome) {
-  const code = await readFile(join(scriptDir, 'probe-code-execution.py'), 'utf8')
+function isolatedProbeEnv(env) {
   const inheritedKeys = new Set([
     'PATH', 'SYSTEMROOT', 'WINDIR', 'COMSPEC', 'PATHEXT',
     'LD_LIBRARY_PATH', 'DYLD_LIBRARY_PATH', 'HOME', 'USERPROFILE',
     'PYTHONUNBUFFERED', 'PYTHONUTF8', 'PYTHONIOENCODING',
   ])
-  const probeEnv = Object.fromEntries(Object.entries(env).filter(([key]) => (
+  return Object.fromEntries(Object.entries(env).filter(([key]) => (
     inheritedKeys.has(key.toUpperCase()) || key.startsWith('OPENSQUILLA_')
   )))
+}
+
+async function verifyGatewayRouter(gatewayBinary, env) {
+  const code = await readFile(join(scriptDir, 'probe-router.py'), 'utf8')
+  assert.deepEqual(functionalProbe(gatewayBinary, isolatedProbeEnv(env), [
+    '--internal-child', 'python-code', code,
+  ], { label: 'router' }), {
+    probe: 'opensquilla-desktop-router', frozen: true,
+    modelType: 'lightgbm', executionMode: 'native_embedded', featureVectorDim: 380,
+    runtimeVersions: ['joblib', 'lightgbm', 'numpy', 'onnxruntime', 'scikit-learn', 'tokenizers'],
+    lightgbmVersionResource: true,
+    intentLabels: ['continue', 'new_task', 'redo'], tierLabels: ['C0', 'C1', 'C2', 'C3'],
+  })
+}
+
+async function verifyGatewayCodeExecution(gatewayBinary, env, tempHome) {
+  const code = await readFile(join(scriptDir, 'probe-code-execution.py'), 'utf8')
+  const probeEnv = isolatedProbeEnv(env)
   probeEnv.APPDATA = join(tempHome, 'AppData', 'Roaming')
   probeEnv.LOCALAPPDATA = join(tempHome, 'AppData', 'Local')
   probeEnv.TMP = probeEnv.TEMP = probeEnv.TMPDIR = join(tempHome, 'code-execution-temp')
@@ -607,6 +624,7 @@ async function main() {
     verifyGatewayPty(gatewayBinary, env)
     verifyGatewayFilesystemWorker(gatewayBinary, env, join(workspaceDir, 'SOUL.md'))
     verifyGatewayDocument(gatewayBinary, env, documentPath)
+    await verifyGatewayRouter(gatewayBinary, env)
     await verifyGatewayCodeExecution(gatewayBinary, env, tempHome)
     let safeExecution = { status: 'passed', backend: process.platform === 'win32' ? 'windows_default' : process.platform }
     try {

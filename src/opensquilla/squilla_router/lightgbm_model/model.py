@@ -149,6 +149,20 @@ def _load_transformer(path: Path) -> Any:
         return FrozenUnpickler(str(path), handle, ensure_native_byte_order=True).load()
 
 
+def _runtime_version(name: str, module: Any) -> str:
+    """Keep optional version diagnostics from blocking a loaded frozen runtime."""
+    module_version = getattr(module, "__version__", None)
+    if isinstance(module_version, str) and module_version:
+        return module_version
+
+    from importlib.metadata import PackageNotFoundError, version
+
+    try:
+        return version(name)
+    except PackageNotFoundError:
+        return "unknown"
+
+
 @dataclass(frozen=True, slots=True)
 class LightGBMPrediction:
     intent_probabilities: dict[str, float]
@@ -236,7 +250,7 @@ class LightGBMRouterModel:
                 "execution_mode": "native_embedded",
                 "model_type": "lightgbm",
                 "runtime_versions": {
-                    name: module.__version__
+                    name: _runtime_version(name, module)
                     for name, module in {
                         "numpy": np,
                         "lightgbm": lgb,

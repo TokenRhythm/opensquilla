@@ -110,6 +110,14 @@ jobs:
         uv run --no-sync python desktop/electron/scripts/verify-mcp-frozen.py \
           --output-dir "${CI_REPORT_DIR}/mcp-frozen" \
           2>&1 | tee "${CI_REPORT_DIR}/mcp-frozen.log"
+    - name: Verify the frozen production router and LightGBM version resources
+      if: ${{ matrix.probe == 'frozen' }}
+      shell: bash
+      run: |
+        set -euo pipefail
+        uv run --no-sync python desktop/electron/scripts/verify-router-frozen.py \
+          --output-dir "${CI_REPORT_DIR}/router-frozen" \
+          2>&1 | tee "${CI_REPORT_DIR}/router-frozen.log"
     - name: Build production Docker image and verify MCP
       if: ${{ matrix.probe == 'docker' }}
       shell: bash

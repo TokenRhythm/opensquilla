@@ -83,7 +83,16 @@ export function assertRouterIntegrity(bundleDir, expectedBundleDir = bundleDir) 
 export function assertGatewayResources(repoRoot, runtimeRoot) {
   // build-gateway uses PyInstaller onedir with its default _internal layout.
   // Validate the package the frozen interpreter resolves, not an arbitrary copy.
-  const packageDir = join(runtimeRoot, 'opensquilla-gateway', '_internal', 'opensquilla')
+  const internalDir = join(runtimeRoot, 'opensquilla-gateway', '_internal')
+  const packageDir = join(internalDir, 'opensquilla')
+  const lightgbmVersionPath = join(internalDir, 'lightgbm', 'VERSION.txt')
+  if (!existsSync(lightgbmVersionPath) || !statSync(lightgbmVersionPath).isFile()) {
+    fail('LightGBM VERSION.txt: missing')
+  }
+  const lightgbmVersion = readFileSync(lightgbmVersionPath, 'utf8').trim()
+  if (!/^\d+\.\d+\.\d+(?:[a-zA-Z0-9.+-]*)$/.test(lightgbmVersion)) {
+    fail('LightGBM VERSION.txt: invalid version')
+  }
   const migrationFiles = (root) => Object.fromEntries(
     Object.entries(inventory(root)).filter(([name]) => /^V[^/]*\.py$/.test(name)),
   )
