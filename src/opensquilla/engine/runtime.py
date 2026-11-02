@@ -2875,12 +2875,26 @@ class _SelectorFallbackProvider:
         if (
             not getattr(router_config, "enabled", False)
             or getattr(router_config, "rollout_phase", "observe") == "observe"
-            or not callable(self._image_catalog_lookup)
             or not _count_image_blocks(messages)
         ):
             return None
         if self.active_model_vision_support(config) == "supported":
             return cast(ChatConfig, self._config_for_active_leg(config))
+
+        metadata = self._turn_metadata or {}
+        if (
+            metadata.get("router_tier_policy") == "model"
+            and metadata.get("routing_applied") is True
+        ):
+            from opensquilla.engine.steps.model_router import ModelRouteError
+
+            # Tool output continues the admitted task; it must not classify an
+            # empty user message or substitute a different tier for image support.
+            raise ModelRouteError(
+                f"Selected tier {metadata.get('routed_tier')} has no proven image support"
+            )
+        if not callable(self._image_catalog_lookup):
+            return None
 
         from opensquilla.engine.history import (
             HistoryReplayProjection,

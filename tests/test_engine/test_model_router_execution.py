@@ -537,3 +537,121 @@ async def test_model_execution_respects_actual_thinking_requirement(
         assert request.thinking_level in {None, ThinkingLevel.OFF}
     else:
         assert request.thinking_level is ThinkingLevel(expected_level)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("vision_support", "default_tier"),
+    [("supported", "c0"), ("unsupported", "c0"), ("unsupported", "c1"), ("unknown", "c0")],
+)
+async def test_model_policy_tool_image_continues_only_the_admitted_tier(
+    execution, monkeypatch, vision_support, default_tier,
+):
+    import json
+    from base64 import b64encode
+
+    from opensquilla.engine import Agent, ToolResult
+    from opensquilla.engine.steps.model_router import ModelRouteError
+    from opensquilla.provider import (
+        DoneEvent,
+        ModelCapabilities,
+        TextDeltaEvent,
+        ToolDefinition,
+        ToolInputSchema,
+        ToolUseEndEvent,
+        ToolUseStartEvent,
+    )
+    from opensquilla.provider.openai import OpenAIProvider
+    from opensquilla.provider.protocol import count_provider_image_blocks
+    from opensquilla.tools.types import ToolContext
+    from tests.helpers.image_bytes import image_bytes
+    from tests.test_engine.test_selector_fallback_routed_model import _ProjectingScriptProvider
+
+    e = execution
+    config = e.turn.config
+    config.llm.thinking = "off"
+    config.squilla_router.default_tier = default_tier
+    if vision_support == "supported":
+        config.squilla_router.tiers["c2"]["model"] = "qwen/qwen3.7-flash"
+    monkeypatch.setattr(squilla_router, "_get_strategy", lambda _: ScriptedClassifier("c2"))
+    entry = await e.manager.append_message(e.node.session_key, "user", "Inspect the tool image.")
+    model_context = await e.runner._router_previous_assistant_context(
+        e.node.session_key, bound_user_message_id=entry.message_id, exclude_last_user=True,
+        expected_session_id=e.node.session_id, expected_session_epoch=0,
+    )
+    turn, _ = await e.runner._run_pipeline(
+        "Inspect the tool image.", e.node.session_key, e.selector.resolve(), e.selector,
+        [], "system", [], bound_user_message_id=entry.message_id,
+        expected_session_id=e.node.session_id, expected_session_epoch=0,
+        model_router_context=model_context,
+    )
+    assert turn.metadata["routed_tier"] == "c2"
+    before = deepcopy(turn.metadata["router_model_decision"])
+    monkeypatch.setattr(
+        squilla_router, "_get_strategy",
+        lambda _: pytest.fail("Internal image continuation must not reclassify a user task"),
+    )
+    provider = _ProjectingScriptProvider(
+        provider_name="openrouter",
+        wire_provider=OpenAIProvider(
+            api_key="synthetic-offline", model=turn.model,
+            base_url="https://openrouter.ai/api/v1", provider_kind="openrouter",
+        ),
+        streams=[
+            [
+                ToolUseStartEvent(tool_use_id="load-image", tool_name="image"),
+                ToolUseEndEvent(tool_use_id="load-image", tool_name="image", arguments={}),
+                DoneEvent(stop_reason="tool_use"),
+            ],
+            [TextDeltaEvent(text="image answer"), DoneEvent()],
+        ],
+    )
+    wrapper = _SelectorFallbackProvider(
+        provider, e.selector, turn.metadata,
+        image_routing_config=config, image_routing_session_key=e.node.session_key,
+    )
+    wrapper.configure_image_continuation_catalog(
+        lambda *args, **kwargs: pytest.fail("Do not look for another image deployment")
+    )
+    context = ToolContext(is_owner=True)
+    image_data = b64encode(image_bytes()).decode("ascii")
+
+    async def image_tool(call):
+        context.tool_result_media[call.tool_use_id] = [{"mime": "image/png", "data": image_data}]
+        return ToolResult(call.tool_use_id, call.tool_name, "Image loaded.")
+
+    agent = Agent(
+        provider=wrapper,
+        config=AgentConfig(
+            model_id=turn.model, provider_id="openrouter", metadata=turn.metadata,
+            max_iterations=2, max_provider_retries=0, thinking=False, max_tokens=1024,
+            model_vision_support=vision_support,
+            model_capabilities=ModelCapabilities(
+                supports_vision=vision_support == "supported", supports_tools=True,
+            ),
+        ),
+        tool_context=context, tool_handler=image_tool,
+        tool_definitions=[
+            ToolDefinition(
+                name="image", description="Load an image.", input_schema=ToolInputSchema(),
+            )
+        ],
+    )
+    if vision_support == "supported":
+        events = [event async for event in agent.run_turn("Inspect the tool image.")]
+        assert not [event for event in events if event.kind == "error"], events
+        assert any(event.kind == "done" and event.text == "image answer" for event in events)
+        assert len(provider.calls) == 2
+        assert count_provider_image_blocks(provider.calls[-1]["messages"]) == 1
+        assert f"data:image/png;base64,{image_data}" in json.dumps(provider.calls[-1]["payload"])
+    else:
+        with pytest.raises(ModelRouteError, match="Selected tier c2 has no proven image support"):
+            _ = [event async for event in agent.run_turn("Inspect the tool image.")]
+        assert len(provider.calls) == 1
+    assert count_provider_image_blocks(provider.calls[0]["messages"]) == 0
+    assert wrapper.active_deployment_config().model == turn.model
+    assert turn.metadata["routed_tier"] == "c2"
+    assert turn.metadata["router_model_decision"] == before
+    rows = await e.manager.get_model_router_transcript(e.node.session_key)
+    admitted = next(row for row in rows if row.message_id == entry.message_id)
+    assert admitted.turn_context["router_model_decision"] == before
