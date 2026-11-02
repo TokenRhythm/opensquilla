@@ -306,7 +306,9 @@ def _has_fixed_sampling(model: str) -> bool:
     matched, following the conservative gate in
     :func:`_supports_document_blocks`.
     """
-    match = _CLAUDE_GENERATION_RE.search(model.lower())
+    # Dated major-only IDs (e.g. opus-4-20250514) have no minor version.
+    model_version = re.sub(r"-\d{8}(?=-|:|$)", "", model.lower())
+    match = _CLAUDE_GENERATION_RE.search(model_version)
     if match is None:
         return False
     family = match.group(1)

@@ -16,6 +16,8 @@ from opensquilla.provider.types import ChatConfig, Message
 _FIXED_SAMPLING_MODELS = [
     "claude-opus-4-7",
     "claude-opus-4-8",
+    "claude-opus-4-10-20261001",
+    "claude-opus-5-20261001",
     "claude-sonnet-5",
     "claude-fable-5",
     # Registry-style ids carry the vendor prefix.
@@ -56,6 +58,19 @@ def test_sonnet_4_5_keeps_temperature_and_budget_thinking() -> None:
     payload = _payload("claude-sonnet-4-5", ChatConfig(thinking=True))
     assert payload["thinking"]["type"] == "enabled"
     assert payload["thinking"]["budget_tokens"] == 5000
+
+
+@pytest.mark.parametrize("model", [
+    "claude-opus-4-20250514",
+    "anthropic/claude-opus-4-20250514",
+    "anthropic.claude-opus-4-20250514-v1:0",
+    "claude-opus-4-1-20250805",
+])
+def test_dated_legacy_opus_keeps_temperature_and_budget_thinking(model: str) -> None:
+    payload = _payload(model, ChatConfig(temperature=0.7))
+    assert payload["temperature"] == 0.7
+    payload = _payload(model, ChatConfig(thinking=True))
+    assert payload["thinking"] == {"type": "enabled", "budget_tokens": 5000}
 
 
 def test_haiku_4_5_keeps_temperature() -> None:
