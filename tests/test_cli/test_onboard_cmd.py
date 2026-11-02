@@ -12,6 +12,7 @@ import pytest
 from typer.testing import CliRunner
 
 from opensquilla.cli.main import app
+from opensquilla.provider.recommendations import get_recommendation
 
 runner = CliRunner()
 _ANSI_RE = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
@@ -161,13 +162,20 @@ def test_onboard_accepts_skip_image_generation_option(tmp_path, monkeypatch):
     # A save marker: the flag-accepting run must actually persist the
     # provider config; a fresh-config default check alone is vacuous.
     # (Values equal to model defaults are omitted by the sparse persist, so
-    # the stored key and router profile are the observable markers.)
+    # the stored key and router recommendation are the observable markers.)
     assert target.exists()
     data = tomllib.loads(target.read_text())
     assert data["llm"]["api_key"] == "sk"
-    assert data["squilla_router"]["tier_profile"] == "openrouter"
+    cfg = _effective_config(target)
+    recommendation = get_recommendation(cfg, "openrouter", "router")
+    router = data["squilla_router"]
+    assert "tier_profile" not in router
+    assert router["recommendation_revision"] == recommendation["revision"]
+    for row in recommendation["rows"]:
+        assert router["tiers"][row["role"]]["provider"] == "openrouter"
+        assert router["tiers"][row["role"]]["model"] == row["model"]
     assert "image_generation" not in data or not data["image_generation"].get("enabled")
-    assert _effective_config(target).image_generation.enabled is False
+    assert cfg.image_generation.enabled is False
 
 
 def test_onboard_passes_skip_migration_to_interactive_flow(tmp_path, monkeypatch):

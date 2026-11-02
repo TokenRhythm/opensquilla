@@ -353,15 +353,23 @@ def cleanup_desktop_processes(ownership_dir: Path, nonce: str, *, deadline: floa
             "WHERE launch_digest = ?", (digest,),
         ).fetchall()
         connection.execute("COMMIT")
+    # Uncertain receipts grant no control, but must not block other verified owners.
     records = []
+    unconfirmed_receipts = False
     for row in rows:
         if row["status"] == "complete":
             continue
         if row["status"] != "pending":
-            return False
-        record = process_tree._PersistedOwnerRecord(**json.loads(row["record_json"]))
-        if not process_tree._valid_owner_record(record) or row["owner_id"] != record.owner_id:
-            return False
+            unconfirmed_receipts = True
+            continue
+        try:
+            record = process_tree._PersistedOwnerRecord(**json.loads(row["record_json"]))
+            valid = process_tree._valid_owner_record(record) and row["owner_id"] == record.owner_id
+        except (TypeError, ValueError):
+            valid = False
+        if not valid:
+            unconfirmed_receipts = True
+            continue
         records.append(process_tree._PersistedOwnerRef(database, record))
 
     # Each exact controller can be serviced independently. Threads are daemonized so the
@@ -411,14 +419,14 @@ def cleanup_desktop_processes(ownership_dir: Path, nonce: str, *, deadline: floa
             "SELECT COUNT(*) FROM desktop_process_launch_owners "
             "WHERE launch_digest = ? AND status != 'complete'", (digest,),
         ).fetchone()[0]
-        if remaining == 0:
+        if remaining == 0 and not unconfirmed_receipts:
             # Keep the closed admission fence, but retire successful per-tool
             # evidence once the entire launch has been confirmed empty.
             connection.execute(
                 "DELETE FROM desktop_process_launch_owners WHERE launch_digest = ?", (digest,),
             )
         connection.execute("COMMIT")
-    return remaining == 0 and time.monotonic() <= deadline
+    return not unconfirmed_receipts and remaining == 0 and time.monotonic() <= deadline
 
 
 def cleanup_main() -> int:

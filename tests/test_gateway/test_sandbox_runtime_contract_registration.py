@@ -161,8 +161,18 @@ def test_production_registry_uses_contract_wrappers_without_surface_drift() -> N
 
     # V2 recovery, video discovery, message search, five interactive terminal
     # methods, side create/close and workspace creation add sixteen to the
-    # previous 269-method surface.
-    assert len(registry.list_methods()) == 285
+    # previous 269-method surface; model recommendations add three more.
+    assert len(registry.list_methods()) == 288
+    for method, scope in (
+        ("models.recommendations.get", "operator.read"),
+        ("models.recommendations.apply", "operator.admin"),
+        ("models.recommendations.acknowledge", "operator.write"),
+    ):
+        entry = registry.get_entry(method)
+        assert entry is not None
+        assert entry.required_scope == scope
+        assert entry.generated_contract_name == method
+        assert entry.handler.__module__ == "opensquilla.gateway.adapters.contract_method"
     workspace_entry = registry.get_entry("workspaces.create")
     assert workspace_entry is not None
     assert workspace_entry.required_scope == "operator.write"

@@ -115,12 +115,19 @@ def test_upgraded_config_enables_explicit_foreign_route_without_changing_load_se
     path = tmp_path / "config.toml"
     config = _saved_config(path, cross_provider=saved_flag, config_version=1)
     assert config.squilla_router.cross_provider_tiers is (saved_flag is True)
-    migrated = tomllib.loads(path.read_text(encoding="utf-8"))
-    assert migrated["config_version"] == LATEST_CONFIG_VERSION
+    assert config.config_version == LATEST_CONFIG_VERSION
+    # A version stamp alone must not rewrite an otherwise preserved saved ladder.
+    unchanged = tomllib.loads(path.read_text(encoding="utf-8"))
+    assert unchanged["config_version"] == 1
+    assert unchanged["squilla_router"]["preset_binding"] == "custom"
+    for index in range(4):
+        assert config.squilla_router.tiers[f"c{index}"]["model"] == f"primary-c{index}"
 
     result = upsert_router(config, mode="custom", tiers=_foreign_tiers(config))
     persist_config(result.config, path=path)
 
+    saved = tomllib.loads(path.read_text(encoding="utf-8"))
+    assert saved["config_version"] == LATEST_CONFIG_VERSION
     restored = load_config(path)
     assert restored.squilla_router.cross_provider_tiers is True
     assert restored.squilla_router.tiers["c3"]["provider"] == "openrouter"

@@ -19,14 +19,14 @@
       </div>
       <div class="control-segmented" role="group" :aria-label="t('usageLogs.chart.dateRange')">
         <button
-          v-for="r in ['all', '7', '14', '30']"
+          v-for="r in ['all', 'today', '7', '14', '30']"
           :key="r"
           type="button"
           class="control-segmented__btn"
           :class="{ 'is-active': range === r }"
           :aria-pressed="range === r"
           @click="emit('setRange', r)"
-        >{{ r === 'all' ? t('usageLogs.chart.rangeAll') : t('usageLogs.chart.rangeDays', { days: r }) }}</button>
+        >{{ r === 'all' ? t('usageLogs.chart.rangeAll') : r === 'today' ? t('usageLogs.chart.rangeToday') : t('usageLogs.chart.rangeDays', { days: r }) }}</button>
       </div>
     </div>
     <div class="usage-chart__legend">

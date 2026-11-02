@@ -31,6 +31,8 @@ STATUS_TOP_LEVEL_KEYS = frozenset(
         "llmSource",
         "llmEnvKey",
         "llmCredentialStatus",
+        # Desktop-only manual connection projection; null on other surfaces.
+        "tokenRhythmManual",
         # Additive, secret-free deployment readiness for Router/Ensemble
         # provider pickers. Older gateways omit it and clients must tolerate
         # that absence; new gateways freeze the entry shape below.
@@ -230,6 +232,41 @@ def _synthetic_config(tmp_path, **overrides) -> GatewayConfig:
     return GatewayConfig(config_path=str(tmp_path / "opensquilla.toml"), **overrides)
 
 
+@pytest.mark.parametrize("has_manual_key", [False, True])
+def test_desktop_manual_connection_status_is_separate_and_secret_free(
+    tmp_path, monkeypatch, has_manual_key: bool,
+) -> None:
+    from opensquilla import desktop_account as bridge
+
+    manual_key = "synthetic-manual-connection-secret"
+    lease = "os_local_" + "x" * 43
+    cfg = _synthetic_config(tmp_path, llm={
+        "provider": "tokenrhythm",
+        "api_key": manual_key if has_manual_key else "",
+        "credential_source": "manual" if has_manual_key else "account",
+    })
+    monkeypatch.setattr(bridge, "desktop_account_available", lambda: True)
+    scope = bridge.pin_account_state({
+        "source": "account", "accountId": "synthetic-account",
+        "selectedAccountId": "synthetic-account", "ready": True, "credential": lease,
+    })
+    try:
+        payload = _status_payload(RpcContext(conn_id="contract", config=cfg))
+    finally:
+        bridge.reset_account_state(scope)
+
+    assert set(payload) == STATUS_TOP_LEVEL_KEYS
+    manual = payload["tokenRhythmManual"]
+    assert set(manual) == LLM_PROFILE_STATUS_KEYS | {"configured", "credential", "connectionId"}
+    assert manual["connectionId"] == "tokenrhythm:manual"
+    assert manual["configured"] is has_manual_key
+    assert manual["ready"] is has_manual_key
+    assert manual["credential"]["available"] is has_manual_key
+    assert payload["llmCredentialStatus"]["source"] == "account"
+    assert manual_key not in repr(payload)
+    assert lease not in repr(payload)
+
+
 async def test_onboarding_status_top_level_keys_are_frozen(tmp_path) -> None:
     cfg = _synthetic_config(tmp_path)
     payload = _status_payload(RpcContext(conn_id="contract", config=cfg))
@@ -237,6 +274,7 @@ async def test_onboarding_status_top_level_keys_are_frozen(tmp_path) -> None:
     # configPath must round-trip the running config's path so clients can tell
     # operators which file to edit.
     assert payload["configPath"] == cfg.config_path
+    assert payload["tokenRhythmManual"] is None
     assert payload["llmProfileStatus"]
     assert all(set(row) == LLM_PROFILE_STATUS_KEYS for row in payload["llmProfileStatus"])
     image_state = payload["imageGenerationState"]

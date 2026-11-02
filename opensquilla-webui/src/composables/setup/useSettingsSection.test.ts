@@ -10,8 +10,9 @@ import en from '@/locales/en.json'
 import zhHans from '@/locales/zh-Hans.json'
 
 describe('settings section IA', () => {
-  it('exposes the approved ten first-level settings pages in order', () => {
+  it('exposes the account page followed by existing settings pages in order', () => {
     expect(SETTINGS_SECTIONS.map(section => section.id)).toEqual([
+      'account',
       'gateway',
       'provider',
       'modelStrategy',

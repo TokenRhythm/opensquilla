@@ -6907,13 +6907,22 @@ def _build_router_dynamic_members(
     return f"{ROUTER_DYNAMIC_SELECTION_MODE}/{routed_tier}", proposers, aggregator, plan
 
 
-def _static_b5_ref(profile: StaticB5Profile, model: str) -> _DynamicModelRef:
+def _static_b5_ref(
+    profile: StaticB5Profile, model: str, *, proposer_index: int | None = None,
+    aggregator: bool = False,
+) -> _DynamicModelRef:
     # Thinking belongs to the shared plan, not to the C3 tier that happened to
     # activate it. Each profile declares its own provider-compatible override.
+    thinking = profile.thinking_level
+    if profile.proposer_thinking_levels:
+        if aggregator:
+            thinking = profile.aggregator_thinking_level
+        elif proposer_index is not None:
+            thinking = profile.proposer_thinking_levels[proposer_index]
     return _DynamicModelRef(
         provider=profile.provider_id,
         model=model,
-        thinking=profile.thinking_level,
+        thinking=thinking,
     )
 
 
@@ -6939,7 +6948,7 @@ def _build_static_b5_members(
 ) -> tuple[str, list[EnsembleMemberConfig], EnsembleMemberConfig, dict[str, Any]]:
     proposers = [
         _member_from_ref(
-            _static_b5_ref(profile, model),
+            _static_b5_ref(profile, model, proposer_index=index),
             config=config,
             inherited=inherited_provider_config,
             label=f"proposer_{index + 1}",
@@ -6949,7 +6958,7 @@ def _build_static_b5_members(
         for index, model in enumerate(profile.proposer_models)
     ]
     aggregator = _member_from_ref(
-        _static_b5_ref(profile, profile.aggregator_model),
+        _static_b5_ref(profile, profile.aggregator_model, aggregator=True),
         config=config,
         inherited=inherited_provider_config,
         label="aggregator",
@@ -7199,7 +7208,7 @@ def static_b5_credential_available(
     profiles have no config-level member overrides today). An unknown
     ``selection_mode`` returns False.
     """
-    profile = static_b5_profile(selection_mode)
+    profile = static_b5_profile(selection_mode, config)
     if profile is None:
         return False
     if isinstance(inherited_provider_config, ProviderConfig):
@@ -7364,7 +7373,7 @@ def ensemble_runtime_status(
     if not enabled:
         return base
 
-    static_profile = static_b5_profile(selection_mode)
+    static_profile = static_b5_profile(selection_mode, config)
     if static_profile is not None:
         lineup_ready = static_b5_credential_available(
             config,
@@ -7707,7 +7716,7 @@ def build_ensemble_provider_from_config(
         or ""
     )
     plan_provider_config = _plan_provider_config or inherited_provider_config
-    static_profile = static_b5_profile(selection_mode)
+    static_profile = static_b5_profile(selection_mode, config)
     if static_profile is not None:
         profile_name, proposers, aggregator, selection_plan = _build_static_b5_members(
             static_profile,

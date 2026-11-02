@@ -1,16 +1,27 @@
 // @vitest-environment happy-dom
 import { createPinia, setActivePinia } from 'pinia'
-import { markRaw, watch } from 'vue'
+import { computed, effectScope, markRaw, watch } from 'vue'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { createV4GatewayAccess } from '@/adapters/gateway/gatewayAccessV4'
 import { createPrivateGatewayTransports } from '@/adapters/gateway/privateTransports'
 import { createV4SessionDirectoryChanges } from '@/adapters/gateway/sessionDirectoryChangesV4'
 import { createV4SessionDirectory } from '@/adapters/gateway/sessionDirectoryV4'
-import { useSessions } from '@/composables/useSessions'
+import { arrangeSidebarSections, useSessions, useSidebarProjectDisplay } from '@/composables/useSessions'
+import { useProjectWorkspaces } from '@/composables/useProjectWorkspaces'
+import { createV4WorkspaceCatalog } from '@/adapters/gateway/workspaceCatalogV4'
 import { RpcClient } from '@/lib/rpc'
 import type { DesktopGatewayConnection } from '@/platform/types'
 import { createAppAutomaticRpc } from '@/utils/appAutomaticRpc'
 import { useRpcStore } from './rpc'
+import appSource from '@/App.vue?raw'
+
+const displayStart = appSource.indexOf('const sidebarProjectDisplay = useSidebarProjectDisplay(')
+const displayEnd = appSource.indexOf('const sidebarSections = computed(', displayStart)
+if (displayStart < 0 || displayEnd < 0) throw new Error('Missing App project display boundary')
+const createAppProjectDisplay = new Function(
+  'gatewayAccess', 'projectWorkspaces', 'useSidebarProjectDisplay', 'computed',
+  `${appSource.slice(displayStart, displayEnd)}; return sidebarProjectDisplay`,
+)
 
 // Only the external socket and Desktop IPC are substitutes. Cancellation,
 // connection generations, request rejection and App refreshes are production code.
@@ -73,7 +84,7 @@ function hello(socket: Socket) {
   socket.receive({
     type: 'hello-ok', protocol: 3,
     server: { version: 'test', conn_id: `conn-${Socket.instances.indexOf(socket)}` },
-    features: { methods: ['sessions.list', 'sessions.subscribe', 'sessions.unsubscribe'], events: ['sessions.changed'] },
+    features: { methods: ['sessions.list', 'sessions.subscribe', 'sessions.unsubscribe', 'workspaces.list'], events: ['sessions.changed'] },
     snapshot: {}, policy: {},
     auth: { principal: {
       role: 'operator',
@@ -144,6 +155,39 @@ async function setup(cancelPending = true) {
 }
 
 type App = Awaited<ReturnType<typeof setup>>
+
+async function setupProjectDisplay(app: App) {
+  const scope = effectScope()
+  const view = scope.run(() => {
+    const access = createV4GatewayAccess(app.store)
+    const transports = createPrivateGatewayTransports(app.store)
+    const projects = useProjectWorkspaces(createV4WorkspaceCatalog(transports.rpc), access)
+    const display = createAppProjectDisplay(access, projects, useSidebarProjectDisplay, computed) as ReturnType<typeof useSidebarProjectDisplay>
+    const rows = computed(() => arrangeSidebarSections(app.sessions.sessionsList.value, display.value)[0]!.rows)
+    return { access, projects, display, rows }
+  })!
+  cleanups.push(() => scope.stop())
+  const ordinary = app.sessions.sessionsList.value[0]!
+  app.sessions.sessionsList.value = [
+    { ...ordinary, workspace: '/tasks/20300101-managed', workspaceLabel: '20300101-managed' },
+    { ...ordinary, key: 'agent:main:webchat:project', workspaceId: 'project-a' },
+    { ...ordinary, key: 'agent:main:webchat:removed', workspaceId: 'removed-project' },
+  ]
+  expect(view.display.value.kind).toBe('pending')
+  expect(view.rows.value.map(row => row.key)).toEqual([ordinary.key])
+  const read = view.projects.loadWorkspaces()
+  await vi.advanceTimersByTimeAsync(0)
+  app.socket.respond('workspaces.list', { workspaces: [
+    { id: 'project-b', name: 'Empty pinned project', path: '/repo/b', pinned: true, taskCount: 0, available: true },
+    { id: 'project-a', name: 'Project A', path: '/repo/a', pinned: false, taskCount: 1, available: true },
+  ] })
+  await read
+  expect(view.rows.value.filter(row => row.rowKind === 'workspace').map(row => row.title))
+    .toEqual(['Empty pinned project', 'Project A'])
+  expect(view.rows.value.some(row => row.key.includes('removed'))).toBe(false)
+  return view
+}
+
 async function pendingRead(app: App, kind: 'list' | 'next-page') {
   const completion = kind === 'list' ? app.automatic.load() : app.sessions.loadMoreSessions()
   await vi.advanceTimersByTimeAsync(0)
@@ -178,6 +222,63 @@ afterEach(async () => {
 })
 
 describe('Desktop shutdown with the real RPC and App directory lifecycle', () => {
+  it.each(['stopped', 'socket-close'] as const)('retains canonical projects after %s while retiring directory authority', async transition => {
+    const app = await setup()
+    const view = await setupProjectDisplay(app)
+    const before = view.rows.value
+    expect(view.projects.getValidatedWorkspace('project-a', '/repo/a')).toBeDefined()
+    if (transition === 'stopped') app.publish(stopped)
+    else app.socket.close()
+    expect(view.access.canManageProjectWorkspaces).toBe(false)
+    expect(view.projects.hasLoaded.value).toBe(false)
+    expect(view.projects.workspaces.value).toEqual([])
+    expect(view.projects.getValidatedWorkspace('project-a', '/repo/a')).toBeUndefined()
+    expect(view.rows.value).toEqual(before)
+    if (transition === 'stopped') {
+      app.publish({ ...ready, revision: 3 })
+      hello(Socket.instances[Socket.instances.length - 1]!)
+      await vi.advanceTimersByTimeAsync(0)
+      // The same runtime's new Hello restores authority, not its directory
+      // validation. Its last display remains until a fresh catalog arrives.
+      expect(view.projects.hasLoaded.value).toBe(false)
+      expect(view.rows.value).toEqual(before)
+    }
+  })
+
+  it.each(['owner', 'method'] as const)('does not select legacy grouping when %s access disappears', async authority => {
+    const app = await setup()
+    const view = await setupProjectDisplay(app)
+    if (authority === 'owner') app.store.auth = { principal: { isOwner: false } }
+    else app.store.methods = []
+    expect(view.access.projectCatalogAvailability).toBe('unavailable')
+    expect(view.display.value.kind).toBe('pending')
+    expect(view.rows.value.some(row => row.rowKind === 'workspace' || row.workspaceId)).toBe(false)
+  })
+
+  it.each(['profile', 'runtime', 'credentials'] as const)('discards the display snapshot when the %s changes', async target => {
+    const app = await setup()
+    const view = await setupProjectDisplay(app)
+    const refresh = view.projects.loadWorkspaces().catch(() => undefined)
+    await vi.advanceTimersByTimeAsync(0)
+    const lateMessage = app.socket.onmessage
+    const requests = app.socket.requests('workspaces.list')
+    const request = requests[requests.length - 1]!
+    app.publish(stopped)
+    expect(view.display.value.kind).toBe('canonical')
+    app.publish(target === 'credentials'
+      ? { ...ready, revision: 3, authToken: 'replacement-owner-nonce' }
+      : { ...stopped, revision: 3,
+          ...(target === 'profile' ? { profileFingerprint: 'profile-b' } : { instanceId: 'runtime-b' }) })
+    expect(view.display.value.kind).toBe('pending')
+    expect(view.rows.value.some(row => row.rowKind === 'workspace')).toBe(false)
+    expect(view.rows.value.some(row => row.workspaceId)).toBe(false)
+    lateMessage?.({ data: JSON.stringify({ type: 'res', id: request.id, ok: true, payload: { workspaces: [
+      { id: 'retired-project', name: 'Retired project', path: '/retired', taskCount: 0, pinned: false, available: true },
+    ] } }) } as MessageEvent)
+    await refresh
+    expect(view.display.value.kind).toBe('pending')
+  })
+
   it('recovers from a missing directory event and failed read without clearing a successor task', async () => {
     vi.spyOn(console, 'error').mockImplementation(() => {})
     const app = await setup()

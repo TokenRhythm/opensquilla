@@ -6,7 +6,7 @@ import hashlib
 import json
 import os
 from collections.abc import Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any, Literal
 
 TEXT_TIERS: tuple[str, str, str, str] = ("c0", "c1", "c2", "c3")
@@ -39,6 +39,8 @@ class StaticB5Profile:
     api_key_env: str
     thinking_level: str | None = None
     ownership_role: str = "static_profile"
+    proposer_thinking_levels: tuple[str | None, ...] = ()
+    aggregator_thinking_level: str | None = None
 
 
 STATIC_B5_PROFILES: dict[str, StaticB5Profile] = {
@@ -516,10 +518,29 @@ def effective_tier_ensemble_selection_modes(
     return resolved
 
 
-def static_b5_profile(selection_mode: object) -> StaticB5Profile | None:
-    """Return canonical static profile metadata, or ``None`` for dynamic/custom."""
+def static_b5_profile(
+    selection_mode: object, config: Any = None, *, ensemble: Any = None,
+) -> StaticB5Profile | None:
+    """Resolve the saved lineup, falling back to the bundled legacy profile.
 
-    return STATIC_B5_PROFILES.get(str(selection_mode or "").strip())
+    Deliberately never reads the remote recommendation cache. Passing the
+    task's config snapshot keeps queued and running tasks on their lineup.
+    """
+    profile = STATIC_B5_PROFILES.get(str(selection_mode or "").strip())
+    if profile is None:
+        return None
+    ensemble = ensemble if ensemble is not None else getattr(config, "llm_ensemble", None)
+    saved = (getattr(ensemble, "recommended_profiles", None) or {}).get(profile.provider_id)
+    if saved is None:
+        return profile
+    return replace(
+        profile,
+        proposer_models=tuple(row.model for row in saved.proposers),
+        aggregator_model=saved.aggregator.model,
+        thinking_level=None,
+        proposer_thinking_levels=tuple(row.thinking_level for row in saved.proposers),
+        aggregator_thinking_level=saved.aggregator.thinking_level,
+    )
 
 
 def selection_mode_ownership(selection_mode: object) -> str:

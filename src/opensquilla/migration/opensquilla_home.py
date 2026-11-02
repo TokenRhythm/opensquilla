@@ -131,11 +131,10 @@ _EXCLUDED_TOP_LEVEL_DIRS = frozenset(
         "recovery-profiles",
     }
 )
-#: Machine-local run worktrees are intentionally not portable profile data.
-#: They contain cloned repositories, virtual environments, native build output,
-#: and per-run provider snapshots.  The source is left untouched so operators
-#: can still recover a patch or transcript from the originating installation.
-_EXCLUDED_NONPORTABLE_TOP_LEVEL_DIRS = frozenset({"code-task"})
+#: Worktrees and Desktop account sessions belong to the source installation.
+#: Copying refresh tokens or installation IDs would make two profiles share a
+#: rotating login. The target must create its own installation and sign in.
+_EXCLUDED_NONPORTABLE_TOP_LEVEL_DIRS = frozenset({"code-task", "desktop-account"})
 #: The initial snapshot is inspection-only: it supplies bounded config/dotenv
 #: reads before data roots are classified, and is never copied.  On POSIX it may
 #: therefore record any relative link that stays lexically inside the source
@@ -4915,15 +4914,22 @@ class OpenSquillaHomeMigrator:
                 if resolved in seen:
                     continue
                 seen.add(resolved)
-                if _path_is_relative_to_lexical(root, source / "code-task"):
+                nonportable = next(
+                    (
+                        entry for entry in sorted(_EXCLUDED_NONPORTABLE_TOP_LEVEL_DIRS)
+                        if _path_is_relative_to_lexical(root, source / entry)
+                    ),
+                    None,
+                )
+                if nonportable:
                     self._record(
                         "preflight/data-root",
                         root,
                         self.target / name,
                         "error",
-                        f"configured {name} root points inside source code-task; "
-                        "machine-local code-task runs are not portable",
-                        {"stable_code": "configured_code_task_root"},
+                        f"configured {name} root points inside source {nonportable}; "
+                        "machine-local data is not portable",
+                        {"stable_code": f"configured_{nonportable.replace('-', '_')}_root"},
                     )
                     self._blocked = True
                     continue
@@ -5071,15 +5077,22 @@ class OpenSquillaHomeMigrator:
                     )
                     self._blocked = True
                     continue
-                if _path_is_relative_to_lexical(configured_workspace, source / "code-task"):
+                nonportable = next(
+                    (
+                        entry for entry in sorted(_EXCLUDED_NONPORTABLE_TOP_LEVEL_DIRS)
+                        if _path_is_relative_to_lexical(configured_workspace, source / entry)
+                    ),
+                    None,
+                )
+                if nonportable:
                     self._record(
                         "preflight/data-root",
                         configured_workspace,
                         self.target / "workspace" / "agents" / agent_id,
                         "error",
                         f"configured workspace for agent {agent_id} points inside "
-                        "source code-task; machine-local code-task runs are not portable",
-                        {"stable_code": "configured_code_task_root"},
+                        f"source {nonportable}; machine-local data is not portable",
+                        {"stable_code": f"configured_{nonportable.replace('-', '_')}_root"},
                     )
                     self._blocked = True
                     continue
@@ -5263,7 +5276,7 @@ class OpenSquillaHomeMigrator:
                     entry,
                     None,
                     "skipped",
-                    "machine-local code-task runs remain unchanged in the source profile",
+                    f"machine-local {entry.name} data remains unchanged in the source profile",
                 )
                 continue
             entries.append(entry)

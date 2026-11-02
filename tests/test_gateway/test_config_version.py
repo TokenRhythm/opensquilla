@@ -797,10 +797,52 @@ def test_migrate_twice_equals_migrate_once(
 
 
 @pytest.mark.parametrize("primary", ["openrouter", "tokenrhythm"])
+@pytest.mark.parametrize("binding", [None, "follow_primary"])
+@pytest.mark.parametrize("saved_tiers", [None, {}, {"image_model": {
+    "provider": "openai", "model": "synthetic-image", "supports_image": True,
+}}])
+def test_router_migration_initializes_only_missing_text_ladder(
+    primary: str, binding: str | None, saved_tiers: dict | None,
+) -> None:
+    router = {
+        "enabled": False,
+        **({"preset_binding": binding} if binding else {}),
+        **({"tiers": saved_tiers} if saved_tiers is not None else {}),
+    }
+    migrated = migrate_config_payload({
+        "config_version": 1, "llm": {"provider": primary}, "squilla_router": router,
+    })
+    expected = get_preset(primary).tier_defaults()
+    expected.update(saved_tiers or {})
+    assert migrated.changed is True
+    assert migrated.payload["squilla_router"]["tiers"] == expected
+    assert migrated.payload["squilla_router"]["preset_binding"] == "follow_primary"
+    assert migrated.payload["squilla_router"]["enabled"] is False
+    assert migrate_config_payload(migrated.payload).changed is False
+
+
+@pytest.mark.parametrize("primary", ["openrouter", "tokenrhythm"])
+@pytest.mark.parametrize("router", [
+    {"preset_binding": "custom"},
+    {"preset_binding": "custom", "tiers": {}},
+    {"tiers": {"c0": {"thinking_level": "low"}}},
+    {"preset_binding": "follow_primary", "tiers": {"t1": {}}},
+])
+def test_router_migration_preserves_explicit_custom_and_sparse_legacy_intent(
+    primary: str, router: dict,
+) -> None:
+    migrated = migrate_config_payload({
+        "config_version": 1, "llm": {"provider": primary}, "squilla_router": router,
+    })
+    assert migrated.changed is False
+    assert migrated.payload["squilla_router"] == router
+
+
+@pytest.mark.parametrize("primary", ["openrouter", "tokenrhythm"])
 @pytest.mark.parametrize("binding", [None, "custom", "follow_primary"])
 @pytest.mark.parametrize("enabled", [False, True])
 @pytest.mark.parametrize("version", [None, 1])
-def test_old_router_configuration_adopts_primary_recommendations_once(
+def test_old_router_configuration_preserves_saved_model_choices(
     primary: str, binding: str | None, enabled: bool, version: int | None,
 ) -> None:
     foreign_provider = "tokenrhythm" if primary == "openrouter" else "openrouter"
@@ -817,7 +859,10 @@ def test_old_router_configuration_adopts_primary_recommendations_once(
             **({"preset_binding": binding} if binding else {}),
             "tiers": {
                 **{
-                    name: {"provider": foreign_provider, "model": f"synthetic-old-{name}"}
+                    name: {
+                        "provider": foreign_provider, "model": f"synthetic-old-{name}",
+                        "thinking_level": "low",
+                    }
                     for name in ("c0", "c1", "c2", "c3")
                 },
                 "image_model": image,
@@ -828,17 +873,13 @@ def test_old_router_configuration_adopts_primary_recommendations_once(
 
     migrated = migrate_config_payload(payload)
 
-    preset = get_preset(primary)
-    assert preset is not None
-    expected_tiers = {**preset.tier_defaults(), "image_model": image}
-    assert migrated.changed is True
-    assert migrated.payload["squilla_router"] == {
-        **original_router, "preset_binding": "follow_primary", "tiers": expected_tiers,
-    }
+    assert migrated.changed is False
+    assert migrated.payload["squilla_router"] == original_router
     assert migrated.payload["llm"] == payload["llm"]
     assert migrated.payload["llm_ensemble"] == payload["llm_ensemble"]
     cfg = GatewayConfig.model_validate(migrated.payload)
-    assert cfg.squilla_router.tiers == expected_tiers
+    assert cfg.squilla_router.tiers == original_router["tiers"]
+    assert cfg.squilla_router.preset_binding == binding
     assert cfg.squilla_router.enabled is enabled
     assert cfg.config_version == LATEST_CONFIG_VERSION
     assert migrate_config_payload(migrated.payload).changed is False
@@ -855,16 +896,27 @@ def test_old_router_configuration_adopts_primary_recommendations_once(
 
 @pytest.mark.parametrize("primary", ["openrouter", "tokenrhythm"])
 @pytest.mark.parametrize("loader", ["load", "load_from_toml", "onboarding"])
-def test_primary_router_upgrade_is_backed_up_and_later_edits_survive_reload(
-    tmp_path: Path, primary: str, loader: str,
+@pytest.mark.parametrize("binding", [None, "custom", "follow_primary"])
+@pytest.mark.parametrize("tier_key", ["c1", "t1"])
+def test_legacy_sparse_router_load_preserves_choices_until_explicit_recommendation(
+    tmp_path: Path, primary: str, loader: str, binding: str | None, tier_key: str,
 ) -> None:
+    from opensquilla.onboarding.recommendation_policy import (
+        apply_recommendation,
+        current_recommendation_rows,
+    )
+    from opensquilla.provider.recommendations import get_recommendation
+
+    selected = {
+        "provider": primary, "model": "synthetic-old-model", "thinking_level": "low",
+    }
     path = _write_toml(tmp_path / "config.toml", {
         "config_version": 1,
         "llm": {"provider": primary, "model": "synthetic-direct-model"},
         "squilla_router": {
             "enabled": False,
-            "preset_binding": "custom",
-            "tiers": {"c1": {"provider": "openrouter", "model": "synthetic-old-model"}},
+            **({"preset_binding": binding} if binding else {}),
+            "tiers": {tier_key: selected},
         },
     })
     original = path.read_bytes()
@@ -872,15 +924,21 @@ def test_primary_router_upgrade_is_backed_up_and_later_edits_survive_reload(
         cfg = config_store.load_config(path)
     else:
         cfg = getattr(GatewayConfig, loader)(path)
-    preset = get_preset(primary)
-    assert preset is not None
-    assert cfg.squilla_router.tiers == preset.tier_defaults()
+    assert cfg.squilla_router.tiers == {"c1": selected}
     assert cfg.squilla_router.enabled is False
-    backup, = tmp_path.glob("config.toml.backup.*")
-    assert backup.read_bytes() == original
-    saved = tomllib.loads(path.read_text(encoding="utf-8"))
-    assert saved["config_version"] == LATEST_CONFIG_VERSION
-    assert saved["squilla_router"]["tiers"] == cfg.squilla_router.tiers
+    assert cfg.squilla_router.preset_binding == binding
+    assert path.read_bytes() == original
+    assert not list(tmp_path.glob("config.toml.backup.*"))
+
+    # An explicit action still replaces this preserved ladder and persists
+    # the exact recommendation, without changing the selected routing mode.
+    plan = get_recommendation(cfg, primary, "router")
+    apply_recommendation(cfg, plan)
+    config_store.persist_config(cfg, path=path, backup=False)
+    restored = config_store.load_config(path)
+    assert current_recommendation_rows(restored, primary, "router") == plan["rows"]
+    assert restored.squilla_router.recommendation_revision == plan["revision"]
+    assert restored.squilla_router.enabled is False
 
     cfg.squilla_router.preset_binding = "custom"
     cfg.squilla_router.tiers["c1"]["model"] = "synthetic-post-upgrade-model"
@@ -890,7 +948,7 @@ def test_primary_router_upgrade_is_backed_up_and_later_edits_survive_reload(
     assert restored.squilla_router.tiers == cfg.squilla_router.tiers
     assert restored.squilla_router.preset_binding == "custom"
     assert path.read_bytes() == before_reload
-    assert list(tmp_path.glob("config.toml.backup.*")) == [backup]
+    assert not list(tmp_path.glob("config.toml.backup.*"))
 
 
 @pytest.mark.parametrize("provider", ["openai", "groq"])
@@ -909,7 +967,7 @@ def test_router_recommendations_upgrade_does_not_change_other_providers(provider
 
 @pytest.mark.parametrize("provider", ["openrouter", "tokenrhythm"])
 @pytest.mark.parametrize("evidence", ["endpoint", "key_env", "both"])
-def test_providerless_router_upgrade_uses_distinctive_file_evidence(
+def test_providerless_router_load_infers_provider_without_replacing_saved_tiers(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, provider: str, evidence: str,
 ) -> None:
     monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
@@ -934,17 +992,16 @@ def test_providerless_router_upgrade_uses_distinctive_file_evidence(
 
     cfg = config_store.load_config(path)
 
-    preset = get_preset(provider)
-    assert preset is not None
     assert cfg.llm.provider == provider
-    assert cfg.squilla_router.tiers == preset.tier_defaults()
-    assert cfg.squilla_router.preset_binding == "follow_primary"
+    expected = {"c1": {"provider": "openrouter", "model": "synthetic-old-model"}}
+    assert cfg.squilla_router.tiers == expected
+    assert cfg.squilla_router.preset_binding == "custom"
     saved = tomllib.loads(path.read_text(encoding="utf-8"))
     assert saved["llm"] == llm  # Preserve provider inference on later loads.
-    assert saved["config_version"] == LATEST_CONFIG_VERSION
-    assert saved["squilla_router"]["tiers"] == preset.tier_defaults()
-    backup, = tmp_path.glob("config.toml.backup.*")
-    assert backup.read_bytes() == before
+    assert saved["config_version"] == 1
+    assert saved["squilla_router"]["tiers"] == expected
+    assert path.read_bytes() == before
+    assert not list(tmp_path.glob("config.toml.backup.*"))
 
 
 @pytest.mark.parametrize("llm", [
@@ -985,15 +1042,62 @@ def test_providerless_router_upgrade_does_not_override_conflicting_ambient_crede
 
 
 @pytest.mark.parametrize("profile", ["openrouter", "tokenrhythm"])
-def test_tokenrhythm_upgrade_clears_persisted_tier_profile(profile: str) -> None:
+def test_tokenrhythm_missing_tiers_preserve_foreign_profile_or_initialize_own(profile: str) -> None:
     migrated = migrate_config_payload({
         "config_version": 1,
         "llm": {"provider": "tokenrhythm"},
         "llm_profiles": {"openrouter": {"model": "synthetic-model"}},
         "squilla_router": {"tier_profile": profile},
     })
-    assert "tier_profile" not in migrated.payload["squilla_router"]
-    assert GatewayConfig.model_validate(migrated.payload).squilla_router.tier_profile is None
+    if profile == "tokenrhythm":
+        assert "tier_profile" not in migrated.payload["squilla_router"]
+        assert GatewayConfig.model_validate(migrated.payload).squilla_router.tier_profile is None
+    else:
+        assert migrated.changed is False
+        assert migrated.payload["squilla_router"]["tier_profile"] == "openrouter"
+        assert GatewayConfig.model_validate(migrated.payload).squilla_router.tier_profile == (
+            "openrouter"
+        )
+
+
+@pytest.mark.parametrize("primary", ["openrouter", "tokenrhythm"])
+@pytest.mark.parametrize("binding", [None, "custom", "follow_primary"])
+@pytest.mark.parametrize("inline", [False, True])
+@pytest.mark.parametrize("loader", _CONFIG_LOADERS, ids=_CONFIG_LOADER_IDS)
+def test_unsupported_tokenrhythm_profile_load_keeps_inline_choices_and_ownership(
+    tmp_path: Path, primary: str, binding: str | None, inline: bool,
+    loader: Callable[[Path], GatewayConfig],
+) -> None:
+    tiers = {"c1": {
+        "provider": primary, "model": "synthetic-selected-model", "thinking_level": "low",
+    }}
+    path = _write_toml(tmp_path / "config.toml", {
+        "config_version": 1,
+        "llm": {"provider": primary, "model": "synthetic-direct"},
+        "llm_profiles": {"tokenrhythm": {"model": "synthetic-standby"}},
+        "squilla_router": {
+            "enabled": False, "tier_profile": "tokenrhythm",
+            **({"preset_binding": binding} if binding else {}),
+            **({"tiers": tiers} if inline else {}),
+        },
+    })
+    original = path.read_bytes()
+
+    cfg = loader(path)
+
+    expected = tiers if inline else get_preset("tokenrhythm").tier_defaults()
+    assert cfg.squilla_router.tier_profile is None
+    assert cfg.squilla_router.tiers == expected
+    assert cfg.squilla_router.preset_binding == binding
+    assert cfg.squilla_router.enabled is False
+    assert cfg.llm.provider == primary
+    backup, = tmp_path.glob("config.toml.backup.*")
+    assert backup.read_bytes() == original
+    saved = tomllib.loads(path.read_text(encoding="utf-8"))
+    assert "tier_profile" not in saved["squilla_router"]
+    assert saved["squilla_router"]["tiers"] == expected
+    assert loader(path).squilla_router.tiers == expected
+    assert list(tmp_path.glob("config.toml.backup.*")) == [backup]
 
 
 # ---------------------------------------------------------------------------

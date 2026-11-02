@@ -86,18 +86,21 @@ def test_session_router_preserves_explicit_operator_tiers_and_provider_policy(
 
 
 @pytest.mark.parametrize("has_explicit_ladder", [False, True])
-def test_session_router_managed_ladder_follows_primary(has_explicit_ladder: bool) -> None:
+def test_session_router_preserves_saved_ladder_and_initializes_only_missing_defaults(
+    has_explicit_ladder: bool,
+) -> None:
     from opensquilla.provider.preset_registry import get_preset
 
+    explicit_tiers = {
+        "c0": {"provider": "openrouter", "model": "old-primary/model", "thinking_level": "low"},
+    }
     config = GatewayConfig(
         llm={"provider": "tokenrhythm", "model": "configured-direct-model"},
         squilla_router={
             "enabled": False,
             "preset_binding": "follow_primary",
             "cross_provider_tiers": has_explicit_ladder,
-            **({"tiers": {
-                "c0": {"provider": "openrouter", "model": "old-primary/model"},
-            }} if has_explicit_ladder else {}),
+            **({"tiers": explicit_tiers} if has_explicit_ladder else {}),
         },
     )
     original = config.squilla_router.model_dump()
@@ -106,8 +109,27 @@ def test_session_router_managed_ladder_follows_primary(has_explicit_ladder: bool
 
     preset = get_preset("tokenrhythm")
     assert preset is not None
-    assert accepted.squilla_router.tiers == preset.tier_defaults()
+    if has_explicit_ladder:
+        assert original["tiers"] == explicit_tiers
+    expected = original["tiers"] if has_explicit_ladder else preset.tier_defaults()
+    assert accepted.squilla_router.tiers == expected
+    assert accepted.squilla_router.enabled is True
+    assert accepted.squilla_router.rollout_phase == "full"
+    assert accepted.squilla_router.cross_provider_tiers is has_explicit_ladder
     assert config.squilla_router.model_dump() == original
+
+    persisted_snapshot = durable_model_routing_config_snapshot(accepted)
+    assert persisted_snapshot is not None
+    config.squilla_router.tiers["c0"]["model"] = "later-primary/model"
+    assert accepted.squilla_router.tiers == expected
+    restored = restore_durable_model_routing_config_snapshot(
+        persisted_snapshot,
+        session_mode="router",
+        session_routing_revision=0,
+        session_routing_source="session",
+    )
+    for field in ("provider", "model", "thinking_level"):
+        assert restored.squilla_router.tiers["c0"].get(field) == expected["c0"].get(field)
 
 
 @pytest.mark.asyncio

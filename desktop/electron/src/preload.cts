@@ -1,6 +1,16 @@
 import { contextBridge, ipcRenderer, webUtils } from 'electron'
 
 if (process.isMainFrame) contextBridge.exposeInMainWorld('opensquillaDesktop', {
+  getAccountState: () => ipcRenderer.invoke('desktop:account:get'),
+  accountAction: (action: unknown) => ipcRenderer.invoke('desktop:account:action', action),
+  selectAccountSource: (source: unknown) => ipcRenderer.invoke('desktop:account:source', source),
+  selectAccountMediaSource: (kind: unknown, source: unknown) => ipcRenderer.invoke('desktop:account:media-source', kind, source),
+  openAccountLink: (link: unknown) => ipcRenderer.invoke('desktop:account:link', link),
+  onAccountState: (callback: (payload: unknown) => void) => {
+    const handler = (_event: unknown, state: unknown) => callback(state)
+    ipcRenderer.on('desktop:account:state', handler)
+    return () => ipcRenderer.removeListener('desktop:account:state', handler)
+  },
   getOsLocale: () => ipcRenderer.invoke('desktop:os-locale'),
   getPendingSessionDeepLink: () => ipcRenderer.invoke('desktop:deep-link-session:get'),
   isAutoUpdateEnabled: () => ipcRenderer.invoke('desktop:update:supported'),
@@ -97,6 +107,7 @@ if (process.isMainFrame) contextBridge.exposeInMainWorld('opensquillaDesktop', {
   getOnboardingDefaults: () => ipcRenderer.invoke('desktop:onboarding:defaults'),
   probeOnboarding: (payload: unknown) => ipcRenderer.invoke('desktop:onboarding:probe', payload),
   saveOnboarding: (payload: unknown) => ipcRenderer.invoke('desktop:onboarding:save', payload),
+  completeAccountOnboarding: () => ipcRenderer.invoke('desktop:onboarding:account'),
   skipOnboarding: () => ipcRenderer.invoke('desktop:onboarding:skip'),
   cancelOnboarding: () => ipcRenderer.invoke('desktop:onboarding:cancel'),
   getBootState: () => ipcRenderer.invoke('desktop:boot:state'),

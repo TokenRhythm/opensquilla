@@ -441,6 +441,50 @@ def test_code_task_runs_are_left_in_source_for_preview_and_apply(
         assert os.readlink(code_task_python) == link_payload
 
 
+@pytest.mark.parametrize("replace_target", [False, True])
+def test_desktop_account_sessions_and_installation_id_are_not_imported(
+    tmp_path: Path,
+    replace_target: bool,
+) -> None:
+    source = _build_source_home(tmp_path)
+    target = tmp_path / "target-home"
+    account = source / "desktop-account" / "synthetic-origin"
+    account.mkdir(parents=True)
+    files = {
+        "account.enc": b"synthetic encrypted session and pending revocations",
+        "installation-id": b"8b5ed79a-e259-4830-af60-0a94fb1bb6bc",
+        "logged-out": b"1",
+    }
+    for name, content in files.items():
+        (account / name).write_bytes(content)
+    if replace_target:
+        target_account = target / "desktop-account" / "synthetic-origin"
+        target_account.mkdir(parents=True)
+        (target_account / "account.enc").write_bytes(b"old target session")
+
+    preview = _run(source, target, replace_target=replace_target)
+    applied = _run(
+        source, target, apply=True, replace_target=replace_target,
+        confirm_replace_target=target if replace_target else None,
+    )
+
+    for report in (preview, applied):
+        assert not _errors(report)
+        assert any(
+            item["kind"] == "home-entry" and item["status"] == "skipped"
+            and Path(item["source"]).name == "desktop-account"
+            for item in report["items"]
+        )
+    assert not (target / "desktop-account").exists()
+    assert (target / "workspace" / "MEMORY.md").is_file()
+    for name, content in files.items():
+        assert (account / name).read_bytes() == content
+    if replace_target:
+        backup = next(tmp_path.glob("target-home.backup.*"))
+        old_account = backup / "desktop-account" / "synthetic-origin" / "account.enc"
+        assert old_account.read_bytes() == b"old target session"
+
+
 def test_direct_migrator_rejects_config_path_without_writing(tmp_path: Path) -> None:
     source = _build_source_home(tmp_path)
     target = tmp_path / "target-home"
@@ -2364,13 +2408,15 @@ def test_code_task_bytes_are_excluded_from_disk_preflight(tmp_path: Path) -> Non
 
 @pytest.mark.parametrize("root_name", ["state", "workspace", "media"])
 @pytest.mark.parametrize("descendant", [False, True], ids=["exact", "descendant"])
-def test_configured_data_root_inside_source_code_task_blocks_import(
+@pytest.mark.parametrize("nonportable", ["code-task", "desktop-account"])
+def test_configured_data_root_inside_source_nonportable_data_blocks_import(
     tmp_path: Path,
     root_name: str,
     descendant: bool,
+    nonportable: str,
 ) -> None:
     source = _build_source_home(tmp_path)
-    configured = source / "code-task"
+    configured = source / nonportable
     if descendant:
         configured = configured / "selected-subdir"
     configured.mkdir(parents=True)
@@ -2394,8 +2440,9 @@ def test_configured_data_root_inside_source_code_task_blocks_import(
             and item["source"] == str(configured)
         ]
         assert data_root_errors
-        assert "inside source code-task" in data_root_errors[0]["reason"]
-        assert data_root_errors[0]["details"]["stable_code"] == "configured_code_task_root"
+        assert f"inside source {nonportable}" in data_root_errors[0]["reason"]
+        expected_code = f"configured_{nonportable.replace('-', '_')}_root"
+        assert data_root_errors[0]["details"]["stable_code"] == expected_code
     assert not applied_target.exists()
 
 
@@ -2464,9 +2511,12 @@ def test_dotenv_data_root_inside_source_code_task_blocks_import(tmp_path: Path) 
     assert not target.exists()
 
 
-def test_agent_workspace_inside_source_code_task_blocks_import(tmp_path: Path) -> None:
+@pytest.mark.parametrize("nonportable", ["code-task", "desktop-account"])
+def test_agent_workspace_inside_source_nonportable_data_blocks_import(
+    tmp_path: Path, nonportable: str,
+) -> None:
     source = _build_source_home(tmp_path)
-    configured = source / "code-task" / "agent-run"
+    configured = source / nonportable / "agent-run"
     configured.mkdir(parents=True)
     (configured / "must-not-migrate.txt").write_text("local run data\n", encoding="utf-8")
     payload = tomllib.loads((source / "config.toml").read_text(encoding="utf-8"))
@@ -2482,8 +2532,9 @@ def test_agent_workspace_inside_source_code_task_blocks_import(tmp_path: Path) -
         if item["kind"] == "preflight/data-root" and item["source"] == str(configured)
     ]
     assert data_root_errors
-    assert "inside source code-task" in data_root_errors[0]["reason"]
-    assert data_root_errors[0]["details"]["stable_code"] == "configured_code_task_root"
+    assert f"inside source {nonportable}" in data_root_errors[0]["reason"]
+    expected_code = f"configured_{nonportable.replace('-', '_')}_root"
+    assert data_root_errors[0]["details"]["stable_code"] == expected_code
     assert not target.exists()
 
 

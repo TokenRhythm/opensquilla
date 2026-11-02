@@ -777,6 +777,9 @@ def _status_payload(status: OnboardingStatus, *, config: GatewayConfig) -> dict:
         "llmSource": status.llm_source,
         "llmEnvKey": status.llm_env_key,
         "llmCredentialStatus": dict(status.llm_credential_status),
+        # The standalone CLI has no desktop account bridge. Keep the nullable
+        # RPC projection so clients can consume the same status shape.
+        "tokenRhythmManual": None,
         "llmProfileStatus": [dict(row) for row in status.llm_profile_status],
         "searchConfigured": status.search_configured,
         "searchProvider": status.search_provider,

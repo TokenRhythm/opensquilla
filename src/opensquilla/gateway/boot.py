@@ -3296,6 +3296,12 @@ async def build_services(
     except ValueError:
         log.warning("browser.desktop_environment_rejected")
 
+    from opensquilla.desktop_account import initialize_desktop_account
+    try:
+        initialize_desktop_account()
+    except ValueError:
+        log.warning("account.desktop_environment_rejected")
+
     # ── Load .env files (cwd/.env > ~/.opensquilla/.env, never override existing) ──
     from opensquilla.env import load_env
 
@@ -4864,6 +4870,13 @@ async def start_gateway_server(
         start_background_update_check(config=config)
     except Exception:
         log.debug("gateway.update_check_skipped", exc_info=True)
+
+    try:
+        from opensquilla.provider.recommendations import start_background_recommendation_refresh
+
+        start_background_recommendation_refresh(config=config)
+    except Exception:
+        log.debug("gateway.recommendation_refresh_skipped", exc_info=True)
 
     # ── Reusable service initialization via build_services ───────────
     try:

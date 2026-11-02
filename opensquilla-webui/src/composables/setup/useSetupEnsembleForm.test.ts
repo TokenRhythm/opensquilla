@@ -1215,3 +1215,19 @@ describe('thinking edits in a custom lineup with a stored preset', () => {
     expect(f.payload()).toEqual({})
   })
 })
+
+describe('saved remote ensemble snapshots', () => {
+  it('shows and seeds the actual saved lineup with per-member thinking instead of global presets', () => {
+    const form = useSetupEnsembleForm()
+    form.initFromConfig({ selection_mode: 'static_tokenrhythm_b5', recommended_profiles: {
+      tokenrhythm: { revision: 'saved-revision', proposers: [{ model: 'synthetic-saved-a', thinking_level: 'low' }, { model: 'synthetic-saved-b', thinking_level: null }], aggregator: { model: 'synthetic-saved-c', thinking_level: 'high' } },
+    } })
+    const panel = makePanel(form, 'tokenrhythm')
+    expect(panel.value.fixedProfile?.proposers.map(row => [row.model, row.thinkingLevel])).toEqual([['synthetic-saved-a', 'low'], ['synthetic-saved-b', '']])
+    expect(panel.value.fixedProfile?.aggregator.model).toBe('synthetic-saved-c')
+    expect(panel.value.presetFacts.proposerCount).toBe(2)
+    form.setScheme('custom', 'static_tokenrhythm_b5')
+    expect(form.candidates.value.map(row => row.model)).toEqual(['synthetic-saved-a', 'synthetic-saved-b', 'synthetic-saved-c'])
+    expect(form.candidates.value[0].thinking_level).toBe('low')
+  })
+})

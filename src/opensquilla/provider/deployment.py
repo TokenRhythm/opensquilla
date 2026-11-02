@@ -137,9 +137,31 @@ def resolve_provider_deployment(
     if not spec.runtime_supported:
         return _unready(provider, model_id, "runtime_unsupported")
 
-    inherited_provider = _text(
-        getattr(inherited_provider_config, "provider", "")
-    ).lower()
+    from opensquilla.desktop_account import OFFICIAL_BASE, account_credential
+
+    managed = account_credential(provider)
+    if managed is not None:
+        return ProviderDeploymentResolution(
+            provider=provider,
+            model=model_id,
+            ready=managed.ready,
+            reason=managed.reason,
+            credential_source="account",
+            endpoint_source="account",
+            provider_config=ProviderConfig(
+                provider=provider, model=model_id, api_key=managed.secret, base_url=OFFICIAL_BASE
+            ),
+        )
+
+    stored_connection = (
+        getattr(config, "llm", None)
+        if _text(getattr(getattr(config, "llm", None), "provider", "")).lower() == provider
+        else _profile_for(config, provider)
+    )
+    if getattr(stored_connection, "credential_source", "manual") == "account":
+        return _unready(provider, model_id, "account_model_unavailable")
+
+    inherited_provider = _text(getattr(inherited_provider_config, "provider", "")).lower()
     same_provider = bool(inherited_provider_config) and provider == inherited_provider
     profile = None if same_provider else _profile_for(config, provider)
     member_base_url = _text(getattr(overrides, "base_url", ""))
@@ -166,9 +188,7 @@ def resolve_provider_deployment(
             credential_endpoint = profile_base_url or _text(spec.default_base_url)
 
     pool_names = [
-        _text(name)
-        for name in (getattr(profile, "api_key_env_pool", None) or [])
-        if _text(name)
+        _text(name) for name in (getattr(profile, "api_key_env_pool", None) or []) if _text(name)
     ]
     if not api_key and pool_names:
         pooled = None
@@ -196,9 +216,7 @@ def resolve_provider_deployment(
             api_key = _text(getattr(pooled, "api_key", ""))
             credential_source = "profile_pool"
             credential_env = _text(getattr(pooled, "env_name", ""))
-            credential_pool_lease_token = _text(
-                getattr(pooled, "lease_token", "")
-            )
+            credential_pool_lease_token = _text(getattr(pooled, "lease_token", ""))
             credential_endpoint = profile_base_url or _text(spec.default_base_url)
             if turn_metadata is not None:
                 # Non-secret identifiers only; used by the router failure hook
@@ -275,12 +293,7 @@ def resolve_provider_deployment(
         if base_url:
             endpoint_source = "registry"
     endpoint_hint = endpoint_provider_hint(base_url)
-    if (
-        api_key
-        and credential_hint
-        and endpoint_hint
-        and credential_hint != endpoint_hint
-    ):
+    if api_key and credential_hint and endpoint_hint and credential_hint != endpoint_hint:
         api_key = ""
         credential_source = "none"
         credential_env = ""
@@ -339,11 +352,7 @@ def resolve_provider_deployment(
         model=model_id,
         api_key=api_key,
         base_url=base_url,
-        org_id=(
-            _text(getattr(inherited_provider_config, "org_id", ""))
-            if same_provider
-            else ""
-        ),
+        org_id=(_text(getattr(inherited_provider_config, "org_id", "")) if same_provider else ""),
         proxy=proxy,
         provider_routing=provider_routing,
         replay_provider_state=replay,

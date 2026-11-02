@@ -16,15 +16,14 @@ export function secretStorageBackendForPolicy(input: SecretStoragePolicyInput): 
   if (mode === 'plain' || mode === 'plaintext' || mode === 'none') return 'plain'
   if (mode === 'safe' || mode === 'safe-storage' || mode === 'safestorage') return 'safeStorage'
 
-  if (input.platform === 'darwin' && input.appPackaged && macCodeSignatureIsAdHoc(input.codesignDiagnostic || '')) {
-    return 'plain'
-  }
+  // Default macOS credentials to user-private files, without native Keychain UI.
+  // OS storage remains an explicit opt-in for installations that require it.
+  if (input.platform === 'darwin') return 'plain'
 
   return 'safeStorage'
 }
 
 export function shouldUseChromiumMockKeychainForPolicy(input: SecretStoragePolicyInput): boolean {
   return input.platform === 'darwin' &&
-    input.appPackaged &&
     secretStorageBackendForPolicy(input) === 'plain'
 }

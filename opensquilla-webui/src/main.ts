@@ -4,6 +4,7 @@ import { createPinia } from 'pinia'
 import App from './App.vue'
 import { router } from './router'
 import i18n from './i18n'
+import { installDesktopRuntimeBanner } from './desktop-runtime-banner'
 import { useAppStore } from './stores/app'
 import { useRpcStore } from './stores/rpc'
 import { createGatewayAdapters } from './adapters/gateway/gatewayAdapters'
@@ -173,5 +174,11 @@ router.afterEach(() => {
 // already in the right language (no English flash). initLocale never rejects
 // (it falls back to en internally); finally() guarantees the app still mounts.
 appStore.initLocale().finally(() => {
+  try {
+    app.onUnmount(installDesktopRuntimeBanner())
+  } catch {
+    // Optional native status must never prevent the main UI from mounting.
+    console.warn('Desktop runtime banner is unavailable.')
+  }
   app.mount('#app')
 })

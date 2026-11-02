@@ -80,6 +80,24 @@ class ModelRoutingMutation(ModelRoutingSnapshot):
     restartRequired: NotRequired[bool]
 
 
+class RecommendationRow(TypedDict):
+    role: str
+    provider: str
+    model: str
+    thinkingLevel: str | None
+
+
+class RecommendationPlan(TypedDict):
+    providerId: Literal["openrouter", "tokenrhythm"]
+    kind: Literal["router", "ensemble"]
+    revision: str
+    source: Literal["remote", "bundled"]
+    rows: list[RecommendationRow]
+    currentRows: list[RecommendationRow]
+    hasUpdate: bool
+    notified: bool
+
+
 class ProviderModelProbe(TypedDict):
     attempted: bool
     status: str
@@ -149,6 +167,16 @@ class ModelRoutingPolicyPort(Protocol):
         *,
         activate_router: bool,
     ) -> PreparedModelRouting: ...
+
+    def recommendations(self, config: Any) -> list[RecommendationPlan]: ...
+
+    def prepare_recommendation(
+        self, config: Any, provider_id: str, kind: str, revision: str,
+    ) -> PreparedModelRouting: ...
+
+    def acknowledge_recommendation(
+        self, config: Any, provider_id: str, kind: str, revision: str,
+    ) -> None: ...
 
 
 class ModelRoutingRuntimePort(Protocol):
@@ -260,6 +288,24 @@ class ModelRouting:
             activate_router=activate_router,
         )
         return await self._commit(previous, candidate, source="models.routing.resetRecommended")
+
+    async def recommendations(self) -> list[RecommendationPlan]:
+        return self._policy.recommendations(self._config.active_config())
+
+    async def apply_recommendation(
+        self, provider_id: str, kind: str, revision: str,
+    ) -> ModelRoutingMutation:
+        current = self._config.active_config()
+        previous = self._policy.snapshot(current)
+        candidate = self._policy.prepare_recommendation(current, provider_id, kind, revision)
+        return await self._commit(previous, candidate, source="models.recommendations.apply")
+
+    async def acknowledge_recommendation(
+        self, provider_id: str, kind: str, revision: str,
+    ) -> None:
+        self._policy.acknowledge_recommendation(
+            self._config.active_config(), provider_id, kind, revision,
+        )
 
     async def _commit(
         self,

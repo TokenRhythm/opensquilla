@@ -12,6 +12,7 @@ from opensquilla.application.provider_configuration import (
     ModelRoutingSnapshot,
     PreparedModelRouting,
     ProviderStatusResult,
+    RecommendationPlan,
 )
 from opensquilla.gateway.model_routing import (
     apply_model_routing_mode,
@@ -421,6 +422,80 @@ class GatewayModelRoutingPolicyPort:
     def snapshot(self, config: Any) -> ModelRoutingSnapshot:
         return cast(ModelRoutingSnapshot, model_routing_public_snapshot(config))
 
+    def recommendations(self, config: Any) -> list[RecommendationPlan]:
+        from opensquilla.onboarding.recommendation_policy import current_recommendation_rows
+        from opensquilla.provider.recommendations import (
+            get_recommendation,
+            recommendation_notified,
+            start_background_recommendation_refresh,
+        )
+
+        start_background_recommendation_refresh(config=config)
+        plans: list[RecommendationPlan] = []
+        for provider_id in ("openrouter", "tokenrhythm"):
+            for kind in ("router", "ensemble"):
+                plan = get_recommendation(config, provider_id, kind)
+                rows = plan["rows"]
+                current_rows = current_recommendation_rows(config, provider_id, kind)
+                plans.append(cast(RecommendationPlan, {
+                    "providerId": provider_id,
+                    "kind": kind,
+                    "revision": plan["revision"],
+                    "source": plan["source"],
+                    "rows": rows,
+                    "currentRows": current_rows,
+                    "hasUpdate": plan["source"] == "remote" and (
+                        sorted(current_rows, key=lambda row: row["role"])
+                        != sorted(rows, key=lambda row: row["role"])
+                    ),
+                    "notified": recommendation_notified(
+                        config, provider_id, kind, plan["revision"],
+                    ),
+                }))
+        return plans
+
+    def _recommendation(
+        self, config: Any, provider_id: str, kind: str, revision: str,
+    ) -> dict[str, Any]:
+        from opensquilla.gateway.rpc import RpcHandlerError
+        from opensquilla.provider.recommendations import get_recommendation
+
+        plan = get_recommendation(config, provider_id, kind)
+        if plan["revision"] != revision:
+            raise RpcHandlerError(
+                "CONFLICT",
+                "The recommendation changed; reload the preview before applying it",
+                details={"reason": "recommendation_changed"},
+            )
+        return plan
+
+    def prepare_recommendation(
+        self, config: Any, provider_id: str, kind: str, revision: str,
+    ) -> PreparedModelRouting:
+        from opensquilla.onboarding.recommendation_policy import apply_recommendation
+        from opensquilla.onboarding.router_policy import (
+            PrimaryProviderChangedError,
+            validate_router_reactivation,
+        )
+
+        if kind == "router" and provider_id != str(config.llm.provider).strip().lower():
+            raise PrimaryProviderChangedError(
+                "The primary provider changed; reload the recommendation preview",
+            )
+        plan = self._recommendation(config, provider_id, kind, revision)
+        candidate = config.model_copy(deep=True)
+        patched = apply_recommendation(candidate, plan)
+        validate_router_reactivation(config, candidate)
+        return PreparedModelRouting(candidate, tuple(patched))
+
+    def acknowledge_recommendation(
+        self, config: Any, provider_id: str, kind: str, revision: str,
+    ) -> None:
+        from opensquilla.provider.recommendations import mark_recommendation_notified
+
+        self._recommendation(config, provider_id, kind, revision)
+        mark_recommendation_notified(config, provider_id, kind, revision)
+
     def prepare(self, config: Any, mode: str) -> PreparedModelRouting:
         patches = model_routing_patches(config, mode)
         candidate = config.model_copy(deep=True)
@@ -462,6 +537,8 @@ class GatewayModelRoutingPolicyPort:
             "squilla_router.tier_profile",
             "squilla_router.preset_binding",
         ]
+        if primary in {"openrouter", "tokenrhythm"}:
+            patched.append("squilla_router.recommendation_revision")
         for path in patched:
             candidate.mark_force_persist(path)
         if activate_router:
@@ -500,7 +577,8 @@ class GatewayModelRoutingRuntimePort:
     ) -> None:
         current = model_routing_public_snapshot(config)
         if self._subscription_manager is None or (
-            current == previous and not force and source != "models.routing.resetRecommended"
+            current == previous and not force
+            and source not in {"models.routing.resetRecommended", "models.recommendations.apply"}
         ):
             return
         from opensquilla.gateway.event_bridge import EventBridge

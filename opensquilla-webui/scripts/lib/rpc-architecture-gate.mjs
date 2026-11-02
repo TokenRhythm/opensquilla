@@ -142,6 +142,9 @@ export function evaluateRpcArchitectureGate({ root = defaultRoot } = {}) {
           targetRel.startsWith('src/adapters/gateway/')
           && !isGatewayAdapter(rel)
           && rel !== 'src/main.ts'
+          // Platform selection composes this one local-only account adapter
+          // before the router evaluates the active platform.
+          && !(rel === 'src/platform/index.ts' && targetRel === 'src/adapters/gateway/localAccountV1')
           && !isTestFile(rel)
           && !isTestingSupport(rel)
         ) {

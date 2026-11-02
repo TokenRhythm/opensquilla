@@ -194,6 +194,10 @@ test('resizing closes the existing preview and keyboard focus respects the break
     if (await toggle.isVisible()) await toggle.click()
     // Wait for the drawer/compact layout to settle before the keyboard gesture.
     await firstButton.click({ trial: true })
+    // The trial click can scroll the list. Native scroll events close previews
+    // and are delivered before animation-frame callbacks, so settle that input
+    // before starting the separate keyboard-focus gesture.
+    await page.evaluate(() => new Promise<void>(resolve => requestAnimationFrame(() => resolve())))
     await page.locator(`${ROW_SELECTOR} .sidebar-history-item`).nth(1).focus()
     await firstButton.focus()
     await expect(page.locator('.sidebar-session-preview')).toHaveCount(width > 768 ? 1 : 0)

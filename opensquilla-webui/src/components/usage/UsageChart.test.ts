@@ -87,16 +87,22 @@ describe('UsageChart endpoint rendering', () => {
     const metricButtons = groups[0]!.querySelectorAll<HTMLButtonElement>('button')
     const rangeButtons = groups[1]!.querySelectorAll<HTMLButtonElement>('button')
     expect(Array.from(metricButtons, button => button.getAttribute('aria-pressed'))).toEqual(['true', 'false'])
-    expect(Array.from(rangeButtons, button => button.getAttribute('aria-pressed'))).toEqual(['false', 'true', 'false', 'false'])
+    expect(Array.from(rangeButtons, button => button.getAttribute('aria-pressed'))).toEqual(['false', 'false', 'true', 'false', 'false'])
 
     metricButtons[1]!.focus()
     expect(document.activeElement).toBe(metricButtons[1])
     metricButtons[1]!.click()
-    rangeButtons[2]!.click()
+    rangeButtons[3]!.click()
     await nextTick()
     expect(state).toEqual({ chartMode: 'cost', range: '14' })
     expect(Array.from(metricButtons, button => button.getAttribute('aria-pressed'))).toEqual(['false', 'true'])
-    expect(Array.from(rangeButtons, button => button.getAttribute('aria-pressed'))).toEqual(['false', 'false', 'true', 'false'])
+    expect(Array.from(rangeButtons, button => button.getAttribute('aria-pressed'))).toEqual(['false', 'false', 'false', 'true', 'false'])
+
+    rangeButtons[1]!.click()
+    await nextTick()
+    expect(state.range).toBe('today')
+    expect(rangeButtons[1]!.textContent).toBe('Today')
+    expect(Array.from(rangeButtons, button => button.getAttribute('aria-pressed'))).toEqual(['false', 'true', 'false', 'false', 'false'])
   })
 
   it('omits endpoint caps while preserving row values and widths', async () => {

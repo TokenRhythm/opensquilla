@@ -65,6 +65,7 @@ GEMINI.md
 !/assets/*.png
 !/src/opensquilla/gateway/static/img/*.png
 !/opensquilla-webui/public-assets/opensquilla-mark.png
+!/opensquilla-webui/src/assets/account/default-avatar.png
 # Four reviewed, local chat-topbar baselines are the only tracked Playwright
 # screenshots. Reports, failures, and every other generated PNG stay ignored.
 !/opensquilla-webui/e2e/topbar-visual.spec.ts-snapshots/

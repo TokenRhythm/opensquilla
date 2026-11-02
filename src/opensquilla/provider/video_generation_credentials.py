@@ -5,6 +5,7 @@ from __future__ import annotations
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 
+from opensquilla.desktop_account import media_connection_operation
 from opensquilla.endpoint_identity import (
     base_url_allows_credential_reuse,
     credential_env_for_endpoint,
@@ -36,6 +37,8 @@ class VideoGenerationCredential:
     env_key: str = ""
     source: str = "none"
     owner: str = "none"
+    # Stable service/account identity; the api_key is only a rotating local lease.
+    account_authority: tuple[str, str] | None = field(default=None, repr=False)
 
 
 def video_generation_provider(config: object | None) -> str:
@@ -58,8 +61,7 @@ def _setting_was_authored(
     field_name: str,
 ) -> bool:
     setting_name = (
-        f"OPENSQUILLA_{section_name.upper()}_PROVIDERS__{provider.upper()}__"
-        f"{field_name.upper()}"
+        f"OPENSQUILLA_{section_name.upper()}_PROVIDERS__{provider.upper()}__{field_name.upper()}"
     )
     if environment_value(setting_name):
         return True
@@ -91,9 +93,7 @@ def _env_was_authored(
     )
 
 
-def _model_service(
-    gateway_config: object | None, provider: str
-) -> tuple[object | None, str]:
+def _model_service(gateway_config: object | None, provider: str) -> tuple[object | None, str]:
     active = getattr(gateway_config, "llm", None)
     if str(getattr(active, "provider", "") or "").strip().lower() == provider:
         return active, "primary"
@@ -110,8 +110,7 @@ def _configured_model_service(gateway_config: object | None, provider: str) -> b
     if deployment is None:
         return False
     if owner == "profile" or any(
-        str(getattr(deployment, name, "") or "").strip()
-        for name in ("api_key", "api_key_env")
+        str(getattr(deployment, name, "") or "").strip() for name in ("api_key", "api_key_env")
     ):
         return True
     raw = getattr(gateway_config, "_persist_raw_base", None)
@@ -264,6 +263,7 @@ def _image_credential(
     return None
 
 
+@media_connection_operation('video')
 def resolve_video_generation_credential(
     config: object | None,
     *,
@@ -290,6 +290,24 @@ def resolve_video_generation_credential(
         return VideoGenerationCredential(available=False)
     provider_config = _provider_config(config, selected)
     direct_key = str(getattr(provider_config, "api_key", "") or "").strip()
+    from opensquilla.desktop_account import account_credential
+
+    managed = account_credential(
+        selected,
+        kind="video",
+        explicit=bool(
+            direct_key
+            or _env_was_authored("video_generation", selected, provider_config, gateway_config)
+        ),
+    )
+    if managed is not None:
+        return VideoGenerationCredential(
+            available=managed.ready,
+            api_key=managed.secret,
+            source="account",
+            owner="model_service",
+            account_authority=(managed.origin, managed.account_id),
+        )
     stale_direct_key = False
     if direct_key:
         bound_endpoint = str(getattr(provider_config, "api_key_base_url", "") or "").strip()
@@ -340,18 +358,23 @@ def resolve_video_generation_credential(
     missing_reference = _missing_model_service_reference(gateway_config, selected)
     if missing_reference is not None:
         return missing_reference
-    resolution = resolve_image_generation_credential(
-        provider_id=selected,
-        provider_config=None,
-        default_env_key="",
-        default_base_url=default_endpoint,
-        effective_base_url=endpoint,
-        gateway_config=gateway_config,
-        model=str(getattr(config, "primary", "") or ""),
-        runtime=runtime,
-        session_key=session_key,
-        include_image_credentials=False,
-    )
+    # The video's account selection was resolved above. This shared helper
+    # must not apply an independent image-account override to a video request.
+    from opensquilla.desktop_account import manual_credential_scope
+
+    with manual_credential_scope():
+        resolution = resolve_image_generation_credential(
+            provider_id=selected,
+            provider_config=None,
+            default_env_key="",
+            default_base_url=default_endpoint,
+            effective_base_url=endpoint,
+            gateway_config=gateway_config,
+            model=str(getattr(config, "primary", "") or ""),
+            runtime=runtime,
+            session_key=session_key,
+            include_image_credentials=False,
+        )
     shared_credential = VideoGenerationCredential(
         available=resolution.available,
         api_key=resolution.api_key,

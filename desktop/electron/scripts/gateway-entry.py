@@ -135,7 +135,21 @@ def _run_desktop_pty_probe() -> int:
     )
 
     started_at = time.monotonic()
-    diagnostic = {"phase": "spawn", "outputBytes": 0, "sawTtyMarker": False}
+    diagnostic_markers = {
+        "sawTtyMarker": b"opensquilla-pty-ok",
+        "sawTtyMissMarker": b"opensquilla-pty-miss",
+        "sawCursorPositionRequest": b"\x1b[6n",
+        "sawDeviceStatusRequest": b"\x1b[5n",
+    }
+    marker_overlap = max(len(marker) for marker in diagnostic_markers.values()) - 1
+    diagnostic = {
+        "phase": "spawn",
+        "outputBytes": 0,
+        "outputChunks": 0,
+        "firstOutputElapsedMs": None,
+        "lastOutputElapsedMs": None,
+        **{name: False for name in diagnostic_markers},
+    }
 
     def write_failure_diagnostic(exc: Exception) -> None:
         report_dir = os.environ.get("CI_REPORT_DIR")
@@ -209,9 +223,17 @@ def _run_desktop_pty_probe() -> int:
                     if not chunk:
                         break
                     diagnostic["outputBytes"] += len(chunk)
+                    diagnostic["outputChunks"] += 1
+                    output_elapsed_ms = round((time.monotonic() - started_at) * 1000)
+                    if diagnostic["firstOutputElapsedMs"] is None:
+                        diagnostic["firstOutputElapsedMs"] = output_elapsed_ms
+                    diagnostic["lastOutputElapsedMs"] = output_elapsed_ms
                     marker_window = marker_tail + chunk
-                    diagnostic["sawTtyMarker"] |= b"opensquilla-pty-ok" in marker_window
-                    marker_tail = marker_window[-17:]
+                    # Detect fixed protocol markers across read boundaries;
+                    # never put terminal output itself in the diagnostic.
+                    for name, marker in diagnostic_markers.items():
+                        diagnostic[name] |= marker in marker_window
+                    marker_tail = marker_window[-marker_overlap:]
                     chunks.append(chunk)
                 diagnostic["phase"] = "wait-exit"
                 return b"".join(chunks).decode("utf-8", errors="replace"), await exited

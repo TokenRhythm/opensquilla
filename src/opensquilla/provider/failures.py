@@ -510,6 +510,7 @@ def classify_provider_error(
 
     # Explicit business codes win over contradictory HTTP envelopes/prose.
     structured_kind = {
+        "account_request_uncertain": ProviderFailureKind.BAD_REQUEST,
         "usage_limit": ProviderFailureKind.USAGE_LIMIT,
         "usage_limit_reached": ProviderFailureKind.USAGE_LIMIT,
         "usage_limited": ProviderFailureKind.USAGE_LIMIT,

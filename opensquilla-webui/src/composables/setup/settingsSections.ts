@@ -6,6 +6,7 @@
 // Order matters for both navigation and the dirty-bar summary; AI configuration
 // follows dependency order, while ordinary preferences precede safety and data.
 export const SETTINGS_SECTIONS = [
+  { id: 'account', label: 'Account & Balance', icon: 'user', client: true, desktopOnly: true, group: null },
   // Gateway is the recovery/operations entry point on every surface. Desktop
   // augments it with local runtime controls, but the rail destination is shared.
   { id: 'gateway', label: 'Gateway', icon: 'home', client: false, desktopOnly: false, group: null },

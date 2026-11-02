@@ -169,11 +169,35 @@ export interface ProviderStatusQuery {
 }
 
 export interface ModelRouting {
+  readonly recommendationsSupported?: boolean
+  recommendations?(options?: { signal?: AbortSignal }): Promise<{ plans: ModelRecommendation[] }>
+  applyRecommendation?(command: RecommendationTarget, options?: { signal?: AbortSignal }): Promise<ModelRoutingSnapshot>
+  acknowledgeRecommendation?(command: RecommendationTarget, options?: { signal?: AbortSignal }): Promise<{ acknowledged: boolean }>
   readonly resetRecommendedSupported?: boolean
   resetRecommended?(command: { providerId: string; activateRouter?: boolean }, options?: { signal?: AbortSignal }): Promise<ModelRoutingSnapshot>
   get(options?: { signal?: AbortSignal }): Promise<ModelRoutingSnapshot>
   setRouting(mode: RoutingMode, options?: { signal?: AbortSignal }): Promise<ModelRoutingSnapshot>
   subscribeChanged(listener: (snapshot: ModelRoutingSnapshot) => void): { close(): void }
+}
+
+export type RecommendationKind = 'router' | 'ensemble'
+export interface RecommendationTarget {
+  providerId: 'openrouter' | 'tokenrhythm'
+  kind: RecommendationKind
+  revision: string
+}
+export interface RecommendationRow {
+  role: string
+  provider: string
+  model: string
+  thinkingLevel: string | null
+}
+export interface ModelRecommendation extends RecommendationTarget {
+  source: 'remote' | 'bundled'
+  rows: RecommendationRow[]
+  currentRows: RecommendationRow[]
+  hasUpdate: boolean
+  notified: boolean
 }
 
 /** Composition object retained while pages migrate to narrow domain seams. */

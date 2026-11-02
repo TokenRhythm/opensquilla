@@ -147,6 +147,19 @@ for (const alreadyExited of [false, true]) {
 }
 
 {
+  const budget = new DesktopQuitBudget(10_000, 5_000)
+  const h = harness()
+  const cleanup = cleanupDesktopProcessTrees({ ...h.options, budget })
+  budget.dispose()
+  assert.deepEqual(h.calls.signals, [[-h.helper.pid, 'SIGKILL']],
+    'outer Quit finalization synchronously stops its helper before Electron exits')
+  assert.equal(await cleanup, false)
+  const afterDispose = harness()
+  assert.equal(await cleanupDesktopProcessTrees({ ...afterDispose.options, budget }), false)
+  assert.deepEqual(afterDispose.calls.spawns, [], 'late cleanup cannot spawn after finalization')
+}
+
+{
   const budget = new DesktopQuitBudget(10_000, 5000)
   const h = harness({ respond: ({ close }) => close(JSON.stringify({ protocol, complete: true })) })
   h.options.launch.env = {

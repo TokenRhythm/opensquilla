@@ -25,6 +25,10 @@ import type { ChatLiveConnectionPhase } from '@/utils/chat/chatConnectionState'
 export type ThemeMode = 'light' | 'dark' | 'system' | (string & {})
 
 const LOCALE_SYNC_PENDING_KEY = 'opensquilla-locale-sync-pending'
+const DESKTOP_DIALOG_COLOR_TOKENS = [
+  '--bg-surface', '--bg-hover', '--text', '--text-muted', '--border',
+  '--accent', '--accent-hover', '--accent-foreground',
+] as const
 
 function readPendingLocaleSync(): LocaleCode | null {
   try {
@@ -173,8 +177,20 @@ export const useAppStore = defineStore('app', () => {
     // Lazily bring in the theme's global "world" layer (structure/type/texture)
     // if it has one; flat value themes have no world and this is a no-op.
     void ensureThemeWorld(resolvedTheme.value)
+    const source = desktopNativeThemeSource.value
+    const palette: Record<string, string> = {}
+    // Standalone desktop dialogs reuse the applied palette without depending
+    // on this renderer at quit time. System mode keeps their native media
+    // query live instead of freezing a palette when the dialog opens.
+    if (platform.capabilities.isDesktop && source !== 'system') {
+      const style = window.getComputedStyle(document.documentElement)
+      for (const token of DESKTOP_DIALOG_COLOR_TOKENS) {
+        const value = style.getPropertyValue(token).trim()
+        if (value) palette[token] = value
+      }
+    }
     void platform
-      .setNativeTheme({ source: desktopNativeThemeSource.value })
+      .setNativeTheme({ source, ...(Object.keys(palette).length ? { palette } : {}) })
       .catch(() => undefined)
   }
 

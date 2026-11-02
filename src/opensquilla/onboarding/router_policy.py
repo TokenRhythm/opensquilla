@@ -50,11 +50,18 @@ def reconcile_recommended_router(
     """Replace only trusted ladder ownership, preserving all strategy settings."""
     from opensquilla.gateway.config import SquillaRouterConfig
 
+    if preset is None and provider_id in {"openrouter", "tokenrhythm"}:
+        from opensquilla.onboarding.recommendation_policy import apply_recommendation
+        from opensquilla.provider.recommendations import get_recommendation
+
+        apply_recommendation(config, get_recommendation(config, provider_id, "router"))
+        return
     preset = preset or get_preset(provider_id)
     if preset is None:
         raise ValueError(f"provider {provider_id!r} has no managed router preset")
     payload = config.squilla_router.model_dump(mode="python")
     payload.pop("tiers", None)
+    payload["recommendation_revision"] = None
     payload["preset_binding"] = "follow_primary"
     if (
         preset.persistable

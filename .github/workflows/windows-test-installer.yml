@@ -1,0 +1,136 @@
+name: Windows Test Installer
+
+# Test tags are separate from the v* tags used by Release Assets.
+on:
+  push:
+    tags:
+      - 'test-windows-*'
+  workflow_dispatch:
+    inputs:
+      account_environment:
+        description: Account/API environment embedded in the test installer
+        type: choice
+        default: uat
+        options:
+          - uat
+          - production
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build unsigned Windows x64 test installer
+    runs-on: windows-2022
+    timeout-minutes: 90
+    outputs:
+      artifact_name: ${{ steps.target.outputs.artifact_name }}
+    defaults:
+      run:
+        shell: pwsh
+    env:
+      PYTHONUTF8: '1'
+      PYTHONUNBUFFERED: '1'
+      CSC_IDENTITY_AUTO_DISCOVERY: 'false'
+      OPENSQUILLA_TEST_ENVIRONMENT: ${{ (inputs.account_environment == 'production' || startsWith(github.ref_name, 'test-windows-production-')) && 'production' || 'uat' }}
+    steps:
+      - name: Select test account environment
+        id: target
+        run: |
+          if ($env:OPENSQUILLA_TEST_ENVIRONMENT -eq 'production') {
+            'package_root=dist/desktop-electron/test/production' >> $env:GITHUB_OUTPUT
+            'account_origin=https://tokenrhythm.studio' >> $env:GITHUB_OUTPUT
+            'artifact_name=windows-production-test-installer' >> $env:GITHUB_OUTPUT
+          } else {
+            'package_root=dist/desktop-electron/test' >> $env:GITHUB_OUTPUT
+            'account_origin=https://gpt.tokenrhythm.studio' >> $env:GITHUB_OUTPUT
+            'artifact_name=windows-uat-test-installer' >> $env:GITHUB_OUTPUT
+          }
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+          lfs: true
+          persist-credentials: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version-file: opensquilla-webui/.node-version
+          cache: npm
+          cache-dependency-path: |
+            opensquilla-webui/package-lock.json
+            desktop/electron/package-lock.json
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+      - name: Hydrate router assets
+        run: |
+          git lfs pull --include='src/opensquilla/squilla_router/models/v4.2_phase3_inference/**'
+          if ($LASTEXITCODE -ne 0) { throw 'Router LFS fetch failed' }
+      - name: Build and verify full Windows test package
+        working-directory: desktop/electron
+        run: |
+          npm ci
+          if ($LASTEXITCODE -ne 0) { throw 'Electron dependency installation failed' }
+          $buildArgs = @('run', 'dist:local:test')
+          if ($env:OPENSQUILLA_TEST_ENVIRONMENT -eq 'production') { $buildArgs += @('--', '--production') }
+          npm @buildArgs
+          if ($LASTEXITCODE -ne 0) { throw 'Windows test packaging or verification failed' }
+      - name: Verify installer size and record checksum
+        run: |
+          python .github/scripts/verify_desktop_slim_size.py --root '${{ steps.target.outputs.package_root }}' --platform windows
+          if ($LASTEXITCODE -ne 0) { throw 'Windows installer exceeds the existing size budget' }
+          $installers = @(Get-ChildItem '${{ steps.target.outputs.package_root }}' -Filter 'OpenSquilla-*-test-*-win-x64.exe' -File)
+          if ($installers.Count -ne 1) { throw 'Expected exactly one Windows test installer' }
+          $installer = $installers[0]
+          $digest = (Get-FileHash -LiteralPath $installer.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
+          "$digest  $($installer.Name)" | Set-Content -LiteralPath "$($installer.FullName).sha256" -Encoding utf8
+          "Windows $env:OPENSQUILLA_TEST_ENVIRONMENT test installer: $($installer.Name); source: $env:GITHUB_SHA; account/API origin: ${{ steps.target.outputs.account_origin }}; unsigned." >> $env:GITHUB_STEP_SUMMARY
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.target.outputs.artifact_name }}
+          path: |
+            ${{ steps.target.outputs.package_root }}/OpenSquilla-*-test-*-win-x64.exe
+            ${{ steps.target.outputs.package_root }}/*.sha256
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 14
+
+  mirror-to-oss:
+    name: Mirror Windows test installer to domestic OSS
+    needs: build
+    if: github.repository == 'TokenRhythm/opensquilla'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+          sparse-checkout: .github/scripts
+      - uses: actions/download-artifact@v4
+        with:
+          name: ${{ needs.build.outputs.artifact_name }}
+          path: test-installer
+      - name: Install pinned ossutil
+        env:
+          OSSUTIL_VERSION: '2.3.0'
+          OSSUTIL_SHA256: 3ae4d9fc85a7a6e9f5654d1599766f1a3a42a3692870887b5ae9338d582ef65a
+        run: |
+          set -euo pipefail
+          archive="ossutil-${OSSUTIL_VERSION}-linux-amd64.zip"
+          curl --fail --silent --show-error --retry 3 --connect-timeout 15 --max-time 180 \
+            -o "${archive}" "https://gosspublic.alicdn.com/ossutil/v2/${OSSUTIL_VERSION}/${archive}"
+          echo "${OSSUTIL_SHA256}  ${archive}" | sha256sum -c -
+          unzip -q "${archive}"
+          sudo install -m 0755 "ossutil-${OSSUTIL_VERSION}-linux-amd64/ossutil" /usr/local/bin/ossutil
+      - name: Upload, verify public downloads and prune old test installers
+        env:
+          ALIYUN_OSS_BUCKET: ${{ vars.ALIYUN_OSS_BUCKET }}
+          ALIYUN_OSS_PREFIX: ${{ vars.ALIYUN_OSS_PREFIX }}
+          OSS_REGION: ${{ vars.ALIYUN_OSS_REGION }}
+          OSS_ENDPOINT: ${{ vars.ALIYUN_OSS_ENDPOINT }}
+          OSS_ADDRESSING_STYLE: ${{ vars.ALIYUN_OSS_ADDRESSING_STYLE }}
+          OSS_ACCESS_KEY_ID: ${{ secrets.ALIYUN_OSS_ACCESS_KEY_ID }}
+          OSS_ACCESS_KEY_SECRET: ${{ secrets.ALIYUN_OSS_ACCESS_KEY_SECRET }}
+        run: python3 .github/scripts/mirror-windows-test-to-oss.py test-installer

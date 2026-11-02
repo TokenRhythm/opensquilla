@@ -31,6 +31,7 @@ RPC_STATUS_KEYS = frozenset(
         "llmSource",
         "llmEnvKey",
         "llmCredentialStatus",
+        "tokenRhythmManual",
         "llmProfileStatus",
         "imageGenerationConfigured",
         "imageGenerationEnabled",
@@ -114,6 +115,7 @@ def test_status_json_is_a_superset_of_the_rpc_payload(tmp_path, monkeypatch):
     assert set(cli_payload) - set(rpc_payload) == {"sectionAliases"}
     assert cli_payload["capabilityConfiguration"] == rpc_payload["capabilityConfiguration"]
     assert cli_payload["videoGenerationState"] == rpc_payload["videoGenerationState"]
+    assert cli_payload["tokenRhythmManual"] is rpc_payload["tokenRhythmManual"] is None
 
 
 @pytest.mark.parametrize(

@@ -30,6 +30,7 @@ type BoundedResult<T> = { completed: true; value: T } | { completed: false }
 export class DesktopQuitBudget {
   private readonly startedAt: number
   private readonly controller = new AbortController()
+  private readonly disposalController = new AbortController()
   private cleanupTimer: ReturnType<typeof setTimeout>
   private cleanupDeadline: number
   private totalDeadline: number
@@ -47,6 +48,7 @@ export class DesktopQuitBudget {
   }
 
   get signal(): AbortSignal { return this.controller.signal }
+  get disposalSignal(): AbortSignal { return this.disposalController.signal }
   get elapsedMs(): number { return Math.max(0, this.now() - this.startedAt) }
   get remainingCleanupMs(): number { return Math.max(0, Math.floor(this.cleanupDeadline - this.now())) }
   get remainingTotalMs(): number {
@@ -76,6 +78,7 @@ export class DesktopQuitBudget {
   dispose(): void {
     clearTimeout(this.cleanupTimer)
     this.controller.abort()
+    this.disposalController.abort()
   }
 
   private async wait<T>(work: Promise<T>, remainingMs: () => number): Promise<BoundedResult<T>> {

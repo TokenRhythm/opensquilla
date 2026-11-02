@@ -6,6 +6,7 @@ from pathlib import Path
 from typing import Any
 
 import click
+import pytest
 from typer.testing import CliRunner
 
 from opensquilla.cli import gateway_lifecycle
@@ -386,6 +387,37 @@ def test_config_set_ensemble_toggle_rejects_custom_foreign_router_without_writes
     assert result.exit_code != 0
     assert isinstance(result.exception, RouterProviderConflictError)
     assert target.read_text(encoding="utf-8") == original
+
+
+@pytest.mark.parametrize(
+    ("key", "value"),
+    [
+        ("squilla_router.tiers.c1.model", '"synthetic-edited-model"'),
+        (
+            "squilla_router.tiers",
+            '{ c1 = { provider = "tokenrhythm", model = "synthetic-edited-model" } }',
+        ),
+        (
+            "squilla_router",
+            '{ enabled = false, tiers = { c1 = { provider = "tokenrhythm", '
+            'model = "synthetic-edited-model" } } }',
+        ),
+    ],
+)
+def test_config_set_preserves_explicit_edits_to_implicit_router_tiers(
+    tmp_path: Path, key: str, value: str,
+) -> None:
+    target = tmp_path / "routing.toml"
+    target.write_text(
+        f"config_version = {LATEST_CONFIG_VERSION}\n[squilla_router]\nenabled = false\n",
+        encoding="utf-8",
+    )
+
+    result = runner.invoke(app, ["config", "set", key, value, "--config", str(target)])
+
+    assert result.exit_code == 0, result.stdout
+    persisted = tomllib.loads(target.read_text(encoding="utf-8"))
+    assert persisted["squilla_router"]["tiers"]["c1"]["model"] == "synthetic-edited-model"
 
 
 def test_config_set_get_privacy_network_observability_round_trips(tmp_path: Path):

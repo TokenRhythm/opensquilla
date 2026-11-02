@@ -1,4 +1,5 @@
 import { webCapabilities } from './capabilities'
+import { createWebAccount, type WebAccountRequest } from './webAccount'
 import type { DesktopUpdateState, GatewayStatus, Platform } from './types'
 
 const unavailableGateway: GatewayStatus = {
@@ -30,9 +31,10 @@ async function webUpdateState(): Promise<DesktopUpdateState> {
   return { ...unavailableUpdate }
 }
 
-export function createWebPlatform(): Platform {
+export function createWebPlatform(accountRequest?: WebAccountRequest): Platform {
   return {
     id: 'web',
+    account: accountRequest ? createWebAccount(accountRequest) : undefined,
     capabilities: webCapabilities,
     async getOsLocale() {
       return undefined

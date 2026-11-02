@@ -16,6 +16,12 @@ import type {
   RoutingMode,
 } from '@/modules/providerConfiguration'
 import { ProviderConfigurationError } from '@/modules/providerConfiguration'
+import { MODELS_RECOMMENDATIONS_GET_METHOD } from '@/contracts/generated/v4/modelsRecommendationsGet'
+import { MODELS_RECOMMENDATIONS_APPLY_METHOD } from '@/contracts/generated/v4/modelsRecommendationsApply'
+import { MODELS_RECOMMENDATIONS_ACKNOWLEDGE_METHOD } from '@/contracts/generated/v4/modelsRecommendationsAcknowledge'
+import { validateResult as validateRecommendationsResult } from '@/contracts/generated/v4/modelsRecommendationsGetValidators.mjs'
+import { validateParams as validateRecommendationApplyParams, validateResult as validateRecommendationApplyResult } from '@/contracts/generated/v4/modelsRecommendationsApplyValidators.mjs'
+import { validateParams as validateRecommendationAckParams, validateResult as validateRecommendationAckResult } from '@/contracts/generated/v4/modelsRecommendationsAcknowledgeValidators.mjs'
 import { mapSetupError } from './setupWorkflowV4'
 import { MODELS_ROUTING_RESET_RECOMMENDED_METHOD } from '@/contracts/generated/v4/modelsRoutingResetRecommended'
 import { validateParams as validateResetRecommendedParams, validateResult as validateResetRecommendedResult } from '@/contracts/generated/v4/modelsRoutingResetRecommendedValidators.mjs'
@@ -217,6 +223,31 @@ export function createV4ProviderConfiguration(
   events: EventTransport,
 ): ProviderConfiguration {
   return {
+    get recommendationsSupported() {
+      return [MODELS_RECOMMENDATIONS_GET_METHOD, MODELS_RECOMMENDATIONS_APPLY_METHOD, MODELS_RECOMMENDATIONS_ACKNOWLEDGE_METHOD].every(method => rpc.supports?.(method) === true)
+    },
+    async recommendations(request) {
+      if (rpc.supports?.(MODELS_RECOMMENDATIONS_GET_METHOD) !== true) throw new ProviderConfigurationError('unsupported', 'This Gateway does not support model recommendations.')
+      const result = await requestProvider(rpc, MODELS_RECOMMENDATIONS_GET_METHOD, {}, options(request?.signal))
+      if (!validateRecommendationsResult(result)) throw new Error('Invalid model recommendations response')
+      return result as { plans: import('@/modules/providerConfiguration').ModelRecommendation[] }
+    },
+    async applyRecommendation(command, request) {
+      if (rpc.supports?.(MODELS_RECOMMENDATIONS_APPLY_METHOD) !== true) throw new ProviderConfigurationError('unsupported', 'This Gateway does not support applying model recommendations.')
+      const params = { ...command }
+      if (!validateRecommendationApplyParams(params)) throw new ProviderConfigurationError('invalid', 'Invalid model recommendation target')
+      const result = await requestProvider(rpc, MODELS_RECOMMENDATIONS_APPLY_METHOD, params, options(request?.signal))
+      if (!validateRecommendationApplyResult(result)) throw new Error('Invalid model recommendation result')
+      return routing(result)
+    },
+    async acknowledgeRecommendation(command, request) {
+      if (rpc.supports?.(MODELS_RECOMMENDATIONS_ACKNOWLEDGE_METHOD) !== true) throw new ProviderConfigurationError('unsupported', 'This Gateway does not support recommendation notifications.')
+      const params = { ...command }
+      if (!validateRecommendationAckParams(params)) throw new ProviderConfigurationError('invalid', 'Invalid model recommendation target')
+      const result = await requestProvider(rpc, MODELS_RECOMMENDATIONS_ACKNOWLEDGE_METHOD, params, options(request?.signal))
+      if (!validateRecommendationAckResult(result)) throw new Error('Invalid recommendation acknowledgement')
+      return result as { acknowledged: boolean }
+    },
     get capacitySupported() {
       return rpc.supports?.(MODELS_CAPACITY_RESOLVE_METHOD) === true
     },

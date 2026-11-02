@@ -16,6 +16,23 @@ export interface DesktopQuitDialogCopy {
   remember?: string
 }
 
+const QUIT_DIALOG_COLOR_TOKENS = [
+  '--bg-surface', '--bg-hover', '--text', '--text-muted', '--border',
+  '--accent', '--accent-hover', '--accent-foreground',
+] as const
+
+/** Accept only a complete palette of literal colors, never renderer-supplied CSS. */
+export function normalizeDesktopQuitDialogPalette(value: unknown): Record<string, string> {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return {}
+  const palette: Record<string, string> = {}
+  for (const token of QUIT_DIALOG_COLOR_TOKENS) {
+    const color = (value as Record<string, unknown>)[token]
+    if (typeof color !== 'string' || !/^#[\da-f]{6}$/i.test(color)) return {}
+    palette[token] = color
+  }
+  return palette
+}
+
 /** Escape text inserted into the self-contained confirmation document. */
 export function escapeQuitDialogHtml(value: string): string {
   return value
@@ -37,10 +54,12 @@ export function parseDesktopQuitDialogResponse(value: unknown): DesktopQuitDialo
 }
 
 /** Build a small, keyboard-accessible modal without depending on the host OS dialog theme. */
-export function buildDesktopQuitDialogHtml(copy: DesktopQuitDialogCopy): string {
+export function buildDesktopQuitDialogHtml(copy: DesktopQuitDialogCopy, palette?: unknown): string {
   const text = Object.fromEntries(
     Object.entries(copy).map(([key, value]) => [key, escapeQuitDialogHtml(value ?? '')]),
   ) as unknown as DesktopQuitDialogCopy
+  const themeStyle = Object.entries(normalizeDesktopQuitDialogPalette(palette))
+    .map(([token, color]) => `${token}: ${color};`).join(' ')
   return `<!doctype html>
 <html lang="${text.lang || 'en'}">
 <head>
@@ -48,42 +67,41 @@ export function buildDesktopQuitDialogHtml(copy: DesktopQuitDialogCopy): string 
   <meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'unsafe-inline'; script-src 'unsafe-inline'">
   <meta name="color-scheme" content="light dark">
   <style>
-    :root { color-scheme: light dark; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }
+    :root { color-scheme: light dark; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      --bg-surface: #FFFFFF; --bg-hover: #F0F0F0; --text: #202020; --text-muted: #626262;
+      --border: #E5E5E5; --accent: #BA4D0F; --accent-hover: #A5440C; --accent-foreground: #FFFFFF; }
+    @media (prefers-color-scheme: dark) {
+      :root { --bg-surface: #202022; --bg-hover: #353539; --text: #F5F5F7; --text-muted: #B0B0B6;
+        --border: #303034; --accent: #F26A1B; --accent-hover: #FF7A2E; --accent-foreground: #160B02; }
+    }
+    /* The cached application palette also covers custom themes; startup and
+       system mode use the matching light/dark token defaults above. */
+    :root { ${themeStyle} }
     * { box-sizing: border-box; }
     html, body { margin: 0; min-height: 100%; }
-    body { padding: 1px; background: transparent; color: #1f2937; }
+    body { padding: 1px; background: transparent; color: var(--text); }
     .card { min-height: calc(100vh - 2px); display: flex; flex-direction: column;
-      padding: 24px 28px; border: 1px solid #d8dadd; border-radius: 8px; background: #fff; }
+      padding: 24px 28px; border: 1px solid var(--border); border-radius: 8px; background: var(--bg-surface); }
     .heading { -webkit-app-region: drag; }
     h1 { margin: 0; font-size: 20px; line-height: 1.35; font-weight: 600; letter-spacing: -.01em; }
-    .message, .detail { color: #555b64; font-size: 14px; line-height: 1.6; white-space: pre-line; }
+    .message, .detail { color: var(--text-muted); font-size: 14px; line-height: 1.6; white-space: pre-line; }
     .message { margin: 16px 0 0; }
     .detail { margin: 8px 0 0; }
     .remember { display: flex; align-items: center; gap: 8px; margin-top: 16px;
-      color: #555b64; font-size: 12px; cursor: pointer; }
-    .remember input { width: 15px; height: 15px; margin: 0; accent-color: #34373c; }
+      color: var(--text-muted); font-size: 12px; cursor: pointer; }
+    .remember input { width: 15px; height: 15px; margin: 0; accent-color: var(--accent); }
     .actions { display: flex; justify-content: flex-end; gap: 8px; margin-top: auto; padding-top: 24px; }
     .actions.with-background #keep { margin-right: auto; }
-    button { min-width: 72px; min-height: 36px; padding: 7px 16px; border: 1px solid #d8dadd; border-radius: 5px; font: inherit; font-size: 13px;
+    button { min-width: 72px; min-height: 36px; padding: 7px 16px; border: 1px solid var(--border); border-radius: 5px; font: inherit; font-size: 13px;
       line-height: 1.45; -webkit-app-region: no-drag;
       font-weight: 500; cursor: pointer; }
     button:disabled { cursor: default; opacity: .7; }
-    button:focus-visible, input:focus-visible { outline: 2px solid #737b88; outline-offset: 3px; }
-    .secondary, .with-background .primary { color: #34373c; background: transparent; }
-    .secondary:hover, .with-background .primary:hover { background: #f0f1f2; }
-    .primary, .background { color: #fff; background: #34373c; border-color: #34373c; }
-    .primary:hover, .background:hover { background: #202226; }
-    .with-background .primary { border-color: #d8dadd; }
-    @media (prefers-color-scheme: dark) {
-      body { color: #e5e7eb; }
-      .card { border-color: #484c52; background: #20242b; }
-      .message, .detail, .remember { color: #b9bec6; }
-      .remember input { accent-color: #e5e7eb; }
-      .secondary, .with-background .primary { color: #e5e7eb; border-color: #555a62; }
-      .secondary:hover, .with-background .primary:hover { background: #30353d; }
-      .primary, .background { color: #20242b; background: #e5e7eb; border-color: #e5e7eb; }
-      .primary:hover, .background:hover { background: #fff; }
-    }
+    button:focus-visible, input:focus-visible { outline: 2px solid var(--accent); outline-offset: 3px; }
+    .secondary, .with-background .primary { color: var(--text); background: transparent; }
+    .secondary:hover, .with-background .primary:hover { background: var(--bg-hover); }
+    .primary, .background { color: var(--accent-foreground); background: var(--accent); border-color: var(--accent); }
+    .primary:hover, .background:hover { background: var(--accent-hover); }
+    .with-background .primary { border-color: var(--border); }
   </style>
 </head>
 <body>

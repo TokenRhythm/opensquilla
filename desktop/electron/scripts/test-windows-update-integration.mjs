@@ -9,6 +9,7 @@ import { fileURLToPath, pathToFileURL } from 'node:url'
 import ts from '@typescript/typescript6'
 import { DesktopWriterAdmission } from '../dist/desktop-writer-admission.js'
 import { DesktopQuitBudget } from '../dist/desktop-quit.js'
+import { pauseAccountsForMaintenance } from '../dist/tokenrhythm-account.js'
 import { mainWindowCloseAction } from '../dist/desktop-window-lifecycle.js'
 import { WindowsUpdateCoordinator, WindowsUpdatePreparationError } from '../dist/windows-update-coordinator.js'
 import { WindowsUpdateSecurityError } from '../dist/windows-update-security.js'
@@ -171,6 +172,8 @@ const compiled = ts.transpileModule(`${extracted}\nconst beforeQuit = ${beforeQu
     await until(() => exits.length > 0, 'native fixture ordinary quit')
     assert.deepEqual(exits, [0])
     assert.equal(fixture.liveLifecycleOwnedGatewayProcesses().length, 0)
+    assert.deepEqual(logs.filter(row => row.event === 'quit_finalize_failed'), [],
+      'the native fixture must provide every production quit dependency')
     assert.equal(fixture.phase(), 'committed')
     assert.equal(fixture.confirmationPending(), null)
     assert.ok(logs.findIndex(row => row.event === 'gateway_exit')
@@ -215,7 +218,7 @@ function fixture(options = {}) {
       finishSession() {},
     },
     process: { platform: 'win32', arch: 'x64', env: options.gateOff ? { OPENSQUILLA_DESKTOP_ENABLE_WIN_INSTALL: '0' } : {} },
-    join, setImmediate,
+    join, setImmediate, pauseAccountsForMaintenance, desktopAccounts: new Map(),
     WindowsUpdateSecurityError, WindowsUpdateHandoffError, WindowsUpdatePreparationError, UpdateChannelError,
     updateAssetUrl,
     app: {
@@ -295,6 +298,7 @@ function lifecycleFixture(options = {}) {
     quitConfirmationPromise: null, quitConfirmed: false, quitFromSignal: false,
     quitUnconfirmedProcessTrees: new Set(),
     gatewayProcessCleanupContexts: new Map(),
+    gatewayProcessTreeTerminations: new Map(),
     holdQuitForTaskConfirmation: () => false,
     cancelGatewayUnexpectedExitRestart: () => {},
     showDesktopQuitFailure: () => { assert.fail('synthetic normal quit cleanup must succeed') },
@@ -306,6 +310,7 @@ function lifecycleFixture(options = {}) {
     focusOnboardingWindow: () => { assert.fail('no onboarding exists in this lifecycle fixture') },
     promptForMainWindowClose: () => { assert.fail('close during a deferred/draining exit must not reopen a prompt') },
     desktopUpdateCheckScheduler: { stop: () => { calls.schedulerStops += 1 } },
+    desktopAccounts: new Map(),
     artifactPreviewLeaseBroker: { clear: () => {}, revokeAll: async () => {}, shutdown: async () => {} },
     nativeWorkbenchSurfaces: { hasBrowserTabs: () => false, destroyAll: async () => {} },
     desktopBrowser: { close: async () => {} },
@@ -332,7 +337,11 @@ function lifecycleFixture(options = {}) {
         calls.quitEvents.push(event)
         return event
       },
-      exit: (code) => { calls.exits.push(code) },
+      exit: (code) => {
+        assert.deepEqual(f.events.filter(row => row.name === 'quit_finalize_failed'), [],
+          'normal quit must finish without a missing fixture dependency')
+        calls.exits.push(code)
+      },
     },
   })
   return { ...f, lifecycleCalls: calls,
@@ -452,6 +461,31 @@ for (const value of [undefined, '1']) {
   await f.subject.applyWindowsInstaller()
   assert.equal(f.calls.launches, 1, 'telemetry storage failure must not block installer launch')
   assert.equal(f.calls.quit, 1)
+}
+
+for (const failure of [null, 'persistence', 'timeout', 'installer']) {
+  const disk = deferred()
+  const f = fixture({ spawnError: failure === 'installer' })
+  let paused = 0, resumed = 0
+  f.context.desktopAccounts.set('account-profile', { account: {
+    pauseForMaintenance() {
+      paused++
+      return { drained: disk.promise, resume() { resumed++ } }
+    },
+  } })
+  if (failure === 'timeout') f.context.windowsUpdateCoordinator = new WindowsUpdateCoordinator(20)
+  const updating = f.subject.applyWindowsInstaller()
+  await until(() => paused === 1, 'account persistence pause')
+  assert.equal(f.calls.stops, 0, 'Gateway shutdown waits for account writes')
+  assert.equal(f.calls.launches, 0, 'installer cannot run with pending account writes')
+  if (failure === 'persistence') disk.reject(new Error('synthetic account disk failure'))
+  else if (failure !== 'timeout') disk.resolve()
+  await updating
+  disk.resolve()
+  assert.equal(f.calls.launches, !failure || failure === 'installer' ? 1 : 0)
+  assert.equal(resumed, failure ? 1 : 0)
+  assert.equal(f.context.updateInstallHandoffReady, !failure)
+  assert.equal(f.context.desktopWriters.closed, !failure)
 }
 
 for (const code of ['signature_invalid', 'signature_unavailable']) {

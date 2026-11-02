@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Awaitable, Callable
+from enum import Enum
 from typing import Any, Final
 
 from opensquilla.gateway.adapters._generated_contract_bindings import (
@@ -27,6 +28,9 @@ PLATFORM_CONFIGURATION_CONTRACT_METHODS: Final = (
     "models.routing.get",
     "models.routing.set",
     "models.routing.resetRecommended",
+    "models.recommendations.get",
+    "models.recommendations.apply",
+    "models.recommendations.acknowledge",
 )
 
 
@@ -44,6 +48,13 @@ def validate_reset_recommended_params(params: Any) -> dict[str, Any]:
     return validate_generated_contract_params(
         "models.routing.resetRecommended", params, strict=True,
     )
+
+
+def validate_recommendation_params(method: str, params: Any) -> dict[str, Any]:
+    # Generated scalar fields are already strict. Enum fields accept their
+    # JSON strings here and become plain domain strings at this boundary.
+    values = validate_generated_contract_params(method, params)
+    return {key: value.value if isinstance(value, Enum) else value for key, value in values.items()}
 
 
 def register_platform_configuration_contract[ContextT, ResultT](
@@ -70,4 +81,5 @@ __all__ = [
     "PlatformConfigurationContractError",
     "register_platform_configuration_contract",
     "validate_reset_recommended_params",
+    "validate_recommendation_params",
 ]

@@ -150,6 +150,7 @@ export interface EnsembleCustomLineupView {
 }
 
 export interface EnsembleConfigSlice {
+  recommended_profiles?: Record<string, SavedEnsembleRecommendation>
   enabled?: boolean
   selection_mode?: string
   selection_configured?: boolean
@@ -170,6 +171,12 @@ export interface EnsembleConfigSlice {
   // report an explicit operator override instead of the static default.
   proposer_timeout_seconds?: number
   aggregator_timeout_seconds?: number
+}
+
+export interface SavedEnsembleRecommendation {
+  revision: string
+  proposers: Array<{ model: string; thinking_level: string | null }>
+  aggregator: { model: string; thinking_level: string | null }
 }
 
 interface EnsembleTierCandidate {
@@ -373,6 +380,7 @@ function uniqueCandidateViews(candidates: EnsembleCandidateView[]): EnsembleCand
 }
 
 export function useSetupEnsembleForm() {
+  const recommendedProfiles = ref<Record<string, SavedEnsembleRecommendation>>({})
   const enabled = ref(false)
   const selectionMode = ref(DEFAULT_SELECTION_MODE)
   const modelOptions = ref<string[]>([])
@@ -444,6 +452,7 @@ export function useSetupEnsembleForm() {
   }
 
   function initFromConfig(config: EnsembleConfigSlice) {
+    recommendedProfiles.value = JSON.parse(JSON.stringify(config.recommended_profiles || {}))
     enabled.value = config.enabled === true
     const usePlannedActivation = (
       config.enabled !== true && config.selection_configured === false
@@ -832,7 +841,13 @@ export function useSetupEnsembleForm() {
     modelOptions.value = []
     if (!candidates.value.some(candidate => candidate.enabled !== false)) {
       const profile = presetMode ? STATIC_B5_PROFILES[presetMode] : null
-      if (profile) candidates.value = customSeedFromProfile(profile)
+      if (profile) {
+        const saved = recommendedProfiles.value[profile.provider]
+        candidates.value = saved ? [
+          ...saved.proposers.map(row => ({ provider: profile.provider, model: row.model, role: 'proposer', thinking_level: row.thinking_level || '', source: 'custom' as const, enabled: true })),
+          { provider: profile.provider, model: saved.aggregator.model, role: 'aggregator', thinking_level: saved.aggregator.thinking_level || '', source: 'custom' as const, enabled: true },
+        ] : customSeedFromProfile(profile)
+      }
     }
   }
 
@@ -1035,11 +1050,12 @@ export function useSetupEnsembleForm() {
       )
         ? STATIC_B5_PROFILES[storedStaticMode]
         : null
+      const savedProfile = activeStaticProfile ? recommendedProfiles.value[activeStaticProfile.provider] : null
       const fixedProfile: EnsembleFixedProfileView | null = activeStaticProfile
         ? {
             providerLabel: activeStaticProfile.label,
-            proposers: activeStaticProfile.proposers.map(model => withCredential(activeStaticProfile.provider, model, 'openrouter_fixed', credentialStatus, true, 'proposer', activeStaticProfile.thinkingLevel || '')),
-            aggregator: withCredential(activeStaticProfile.provider, activeStaticProfile.aggregator, 'openrouter_fixed', credentialStatus, true, 'aggregator', activeStaticProfile.thinkingLevel || ''),
+            proposers: (savedProfile?.proposers || activeStaticProfile.proposers.map(model => ({ model, thinking_level: activeStaticProfile.thinkingLevel }))).map(row => withCredential(activeStaticProfile.provider, row.model, 'openrouter_fixed', credentialStatus, true, 'proposer', row.thinking_level || '')),
+            aggregator: withCredential(activeStaticProfile.provider, savedProfile?.aggregator.model || activeStaticProfile.aggregator, 'openrouter_fixed', credentialStatus, true, 'aggregator', savedProfile ? savedProfile.aggregator.thinking_level || '' : activeStaticProfile.thinkingLevel || ''),
             credential: credentialFor(activeStaticProfile.provider, credentialStatus),
           }
         : null
@@ -1098,7 +1114,7 @@ export function useSetupEnsembleForm() {
           && storedStaticMode !== providerStaticMode
         ),
         presetFacts: effectiveFacts(
-          activeStaticProfile ? activeStaticProfile.proposers.length : 4,
+          fixedProfile ? fixedProfile.proposers.length : 4,
           true,
         ),
         // Back-compat aliases (older panel/test names).

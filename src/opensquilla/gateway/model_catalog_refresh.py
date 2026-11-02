@@ -171,7 +171,7 @@ def _tokenrhythm_request(
             proxy=proxy_value,
         ),
         public_transport_fingerprint=tokenrhythm_public_transport_fingerprint(
-            proxy=proxy_value,
+            proxy=proxy_value, api_key=key,
         ),
     )
 
@@ -1225,10 +1225,14 @@ class TokenRhythmCatalogCoordinator:
 
         try:
             if source == "published":
+                from opensquilla.desktop_account import is_account_credential
+                account_options = ({"api_key": request.api_key}
+                                   if is_account_credential(request.api_key) else {})
                 published = await asyncio.wait_for(
                     fetch_tokenrhythm_published(
                         proxy=request.proxy,
                         timeout=TOKENRHYTHM_PUBLIC_TIMEOUT_SECONDS,
+                        **account_options,
                     ),
                     timeout=TOKENRHYTHM_PUBLIC_TIMEOUT_SECONDS,
                 )

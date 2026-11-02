@@ -44,6 +44,7 @@ def test_electron_runtime_yaml_parser_includes_empty_merge_source_dos_fix() -> N
         ("fast-uri", (3, 1, 9)),
         ("electron", (42, 11, 16)),
         ("http-cache-semantics", (4, 3, 0)),
+        ("minimatch", (11, 0, 2)),
     ],
 )
 def test_all_locked_parser_and_session_copies_include_security_fixes(
@@ -79,7 +80,8 @@ def test_installer_downloader_preserves_logger_api_without_vulnerable_dependenci
     # The proxy loader requires the legacy default logger export. Upgrade its
     # serializer and URI resolver within that supported API boundary.
     assert logger_override["."] == "3.3.0"
-    assert logger_override["fast-json-stringify"] == "5.16.1"
+    assert logger_override["fast-json-stringify"]["."] == "5.16.1"
+    assert logger_override["fast-json-stringify"]["fast-uri"] == "3.1.9"
     assert manifest["overrides"]["fast-json-stringify@5.16.1"]["fast-uri"] == "3.1.9"
     packages = _packages()
     agents = [package for path, package in packages.items() if path.endswith("/global-agent")]
@@ -123,15 +125,3 @@ def test_electron_build_dependencies_include_resource_exhaustion_fixes() -> None
             assert version >= (2, 1, 2)
         else:
             assert version >= (5, 0, 7)
-
-
-
-def test_minimatch_keeps_legacy_api_and_fixes_modern_globparts_amplification() -> None:
-    versions = {
-        _version_tuple(package["version"])
-        for path, package in _packages().items()
-        if path.endswith("/minimatch")
-    }
-    assert (3, 1, 5) in versions and (5, 1, 9) in versions
-    assert all(version in {(3, 1, 5), (5, 1, 9)} or version >= (11, 0, 1)
-               for version in versions)

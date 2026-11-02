@@ -48,7 +48,7 @@
       :range="range"
       :caption="chartCaption"
       :rows="chartRows"
-      @set-range="setRange"
+      @set-range="selectRange"
       @open-session="openSession"
     />
 
@@ -92,6 +92,7 @@
 <script setup lang="ts">
 import { inject, ref } from 'vue'
 import { useI18n } from 'vue-i18n'
+import { useRoute, useRouter } from 'vue-router'
 import UsageSummaryStats from '@/components/usage/UsageSummaryStats.vue'
 import UsageChart from '@/components/usage/UsageChart.vue'
 import UsageModelCards from '@/components/usage/UsageModelCards.vue'
@@ -100,10 +101,13 @@ import Icon from '@/components/Icon.vue'
 import ErrorState from '@/components/ErrorState.vue'
 import LoadingSpinner from '@/components/LoadingSpinner.vue'
 import { useUsageData } from '@/composables/usage/useUsageData'
+import { parseUsageRange } from '@/composables/usage/useUsagePreferences'
 import { SESSION_DIRECTORY_KEY } from '@/modules/sessionDirectory'
 import { OBSERVABILITY_KEY } from '@/modules/observability'
 
 const { t } = useI18n()
+const route = useRoute()
+const router = useRouter()
 const injectedSessionDirectory = inject(SESSION_DIRECTORY_KEY)
 if (!injectedSessionDirectory) throw new Error('SessionDirectory was not provided')
 const sessionDirectory = injectedSessionDirectory
@@ -150,7 +154,17 @@ const {
   rowBreakdownTotalTokens,
   rowBreakdownTotalCost,
   rowBreakdownAnyProrated,
-} = useUsageData(sessionDirectory, observability)
+} = useUsageData(sessionDirectory, observability, () =>
+  route.name === 'usage' ? parseUsageRange(route.query.range) : undefined)
+
+function selectRange(nextRange: string) {
+  setRange(nextRange)
+  // A menu/deep-link range is an entry selection. Once the user chooses a
+  // filter, resume the usual persisted preference (including error rollback).
+  if (route.query.range !== undefined) {
+    void router.replace({ query: { ...route.query, range: undefined } })
+  }
+}
 
 // Manual refresh shows a busy state; loadData (also the poll/mount handler) now
 // returns the refresh promise, so a local flag spans just the user-driven load.

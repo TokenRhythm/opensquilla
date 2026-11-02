@@ -12,6 +12,7 @@ from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 from typing import Literal, Protocol, cast
 
+from opensquilla.desktop_account import media_connection_operation
 from opensquilla.endpoint_identity import (
     base_url_allows_credential_reuse,
     credential_env_for_endpoint,
@@ -20,13 +21,14 @@ from opensquilla.provider.environment import environment_value
 from opensquilla.provider.failures import ProviderFailureKind
 
 ImageCredentialSource = Literal[
+    "account",
     "explicit",
     "env",
     "llm_fallback",
     "missing_env",
     "none",
 ]
-ImageCredentialOwner = Literal["image", "primary", "profile", "none"]
+ImageCredentialOwner = Literal["image", "primary", "profile", "model_service", "none"]
 ImageCredentialKind = Literal["direct", "env", "pool", "none"]
 PoolFailureReporter = Callable[
     [str, str, ProviderFailureKind, float | None],
@@ -154,9 +156,7 @@ def _missing_model_service_resolution(
         )
 
     pool_names = [
-        _text(name)
-        for name in (getattr(deployment, "api_key_env_pool", None) or [])
-        if _text(name)
+        _text(name) for name in (getattr(deployment, "api_key_env_pool", None) or []) if _text(name)
     ]
     env_key = _text(getattr(deployment, "api_key_env", ""))
     if pool_names:
@@ -224,9 +224,7 @@ def _model_service_resolution(
                     api_key=_text(getattr(resolved, "api_key", "")),
                     base_url=_text(getattr(resolved, "base_url", "")),
                     proxy=_text(getattr(resolved, "proxy", "")),
-                    provider_routing=dict(
-                        getattr(resolved, "provider_routing", {}) or {}
-                    ),
+                    provider_routing=dict(getattr(resolved, "provider_routing", {}) or {}),
                 )
             else:
                 inherited = ProviderConfig(
@@ -275,6 +273,7 @@ def _model_service_resolution(
                 )
             except NoCredentialsAvailable as exc:
                 raise CredentialPoolExhaustedError from exc
+
         if callable(gateway_pool_acquirer):
             pool_acquirer = acquire_pool_credential
 
@@ -290,6 +289,7 @@ def _model_service_resolution(
     return resolution, turn_metadata
 
 
+@media_connection_operation('image')
 def resolve_image_generation_credential(
     *,
     provider_id: str,
@@ -314,6 +314,28 @@ def resolve_image_generation_credential(
     provider = _text(provider_id).lower()
     endpoint = _text(effective_base_url) or _text(default_base_url)
     direct_key = _text(getattr(provider_config, "api_key", ""))
+    from opensquilla.desktop_account import OFFICIAL_BASE, account_credential
+
+    explicit = include_image_credentials and bool(
+        direct_key
+        or _image_env_was_authored(
+            gateway_config=gateway_config,
+            provider_id=provider,
+            provider_config=provider_config,
+        )
+    )
+    managed = account_credential(provider, kind="image", explicit=explicit)
+    if managed is not None:
+        return ImageGenerationCredentialResolution(
+            provider_id=provider,
+            source="account",
+            owner="model_service",
+            kind="direct",
+            available=managed.ready,
+            reason=managed.reason,
+            endpoint=OFFICIAL_BASE,
+            api_key=managed.secret,
+        )
     if include_image_credentials and direct_key:
         return ImageGenerationCredentialResolution(
             provider_id=provider,
@@ -431,12 +453,8 @@ def resolve_image_generation_credential(
             elif default_env_key and _text(environment_value(default_env_key)):
                 env_key = default_env_key
         pool_info = metadata.get("credential_pool")
-        is_pool = isinstance(pool_info, dict) or credential_source.startswith(
-            "profile_pool"
-        )
-        kind: ImageCredentialKind = (
-            "pool" if is_pool else ("env" if env_key else "direct")
-        )
+        is_pool = isinstance(pool_info, dict) or credential_source.startswith("profile_pool")
+        kind: ImageCredentialKind = "pool" if is_pool else ("env" if env_key else "direct")
         pool_failure_reporter = getattr(
             gateway_config,
             "_report_image_generation_profile_credential_failure",
@@ -461,9 +479,7 @@ def resolve_image_generation_credential(
     llm = llm_config
     if _text(getattr(llm, "provider", "")).lower() == provider:
         llm_endpoint = (
-            _text(getattr(llm, "base_url", ""))
-            if _field_was_set(llm, "base_url")
-            else ""
+            _text(getattr(llm, "base_url", "")) if _field_was_set(llm, "base_url") else ""
         ) or default_base_url
         if not base_url_allows_credential_reuse(llm_endpoint, endpoint):
             return ImageGenerationCredentialResolution(
@@ -543,11 +559,7 @@ def report_image_generation_pool_failure(
 ) -> None:
     """Report attributable pooled-key failures without exposing the secret."""
 
-    if (
-        resolution is None
-        or resolution.kind != "pool"
-        or not resolution.pool_session_key
-    ):
+    if resolution is None or resolution.kind != "pool" or not resolution.pool_session_key:
         return
     try:
         import httpx
@@ -574,11 +586,7 @@ def report_image_generation_pool_failure(
             resolution.provider_id,
             resolution.pool_session_key,
             kind,
-            (
-                retry_after_from_headers(status_code, headers)
-                if status_code is not None
-                else None
-            ),
+            (retry_after_from_headers(status_code, headers) if status_code is not None else None),
         )
     except Exception:
         # Credential bookkeeping must never replace the provider failure.

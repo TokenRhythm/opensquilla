@@ -1,3 +1,5 @@
+import { watch } from 'vue'
+import i18n from './i18n'
 import type { DesktopGatewayConnection } from './platform/types'
 import { getPlatform } from './platform'
 import type { SandboxUpgradeReport } from './platform/types'
@@ -18,23 +20,21 @@ function sandboxUpgradeNeedsAttention(report: SandboxUpgradeReport | null | unde
 }
 
 function runtimeMessage(state: RuntimeBannerState): string {
-  const chinese = (navigator.language || '').toLowerCase().startsWith('zh')
+  if (state.status === 'stopped') return ''
   if (sandboxUpgradeNeedsAttention(state.sandboxUpgrade)) {
-    return chinese
-      ? '沙箱设置升级未完成，当前运行仍可用；请查看日志并重启后重试。'
-      : 'Sandbox settings were not fully upgraded. The runtime is usable; check the log and retry after restarting.'
+    return i18n.global.t('desktopRuntime.sandboxUpgradeIncomplete')
   }
   if (state.status === 'error') {
-    return state.error || (chinese ? '本地运行时启动失败。' : 'The local runtime failed to start.')
+    return state.error || i18n.global.t('desktopRuntime.startFailed')
   }
-  if (state.status === 'ready') return ''
   if (state.status === 'starting') {
-    return chinese ? '正在启动本地运行时…' : 'Starting the local runtime…'
+    return i18n.global.t('desktopRuntime.starting')
   }
-  return chinese ? '正在准备本地运行时…' : 'Preparing the local runtime…'
+  return ''
 }
 
-function installDesktopRuntimeBanner(): void {
+/** Install after the application's initial locale has been loaded. */
+export function installDesktopRuntimeBanner(): () => void {
   const gateway = getPlatform().gateway
   const banner = document.getElementById('desktop-runtime-banner')
   const message = document.getElementById('desktop-runtime-message')
@@ -47,30 +47,49 @@ function installDesktopRuntimeBanner(): void {
     || !message
     || !retry
     || !reveal
-  ) return
+  ) return () => {}
+
+  let currentState: RuntimeBannerState | null = null
+  let disposed = false
 
   const render = (state: RuntimeBannerState): void => {
     const text = runtimeMessage(state)
-    const migrationAttention = sandboxUpgradeNeedsAttention(state.sandboxUpgrade)
-    banner.hidden = state.status === 'ready' && !migrationAttention
+    const migrationAttention = state.status !== 'stopped'
+      && sandboxUpgradeNeedsAttention(state.sandboxUpgrade)
+    banner.hidden = !text
     banner.dataset.state = migrationAttention ? 'migration-warning' : state.status
     message.textContent = text
+    retry.textContent = i18n.global.t('desktopRuntime.retry')
+    reveal.textContent = i18n.global.t('desktopRuntime.showLog')
     retry.hidden = state.status !== 'error' || migrationAttention
     reveal.hidden = state.status !== 'error' && !migrationAttention
   }
 
-  retry.addEventListener('click', () => {
+  const retryStartup = (): void => {
+    if (currentState?.status !== 'error') return
     retry.disabled = true
-    void gateway.retryStartup?.().finally(() => { retry.disabled = false })
-  })
-  reveal.addEventListener('click', () => { void gateway.revealLog?.() })
+    void gateway.retryStartup?.().catch(() => {}).finally(() => { retry.disabled = false })
+  }
+  const revealLog = (): void => { void gateway.revealLog?.() }
+  retry.addEventListener('click', retryStartup)
+  reveal.addEventListener('click', revealLog)
 
-  gateway.onConnection(state => {
+  const receive = (state: RuntimeBannerState): void => {
+    // The initial request may resolve after a newer shutdown notification.
+    if (disposed || (currentState && state.revision < currentState.revision)) return
+    currentState = state
     render(state)
-  })
-  void gateway.getConnection().then(state => {
-    render(state)
-  })
+  }
+  const unsubscribe = gateway.onConnection(receive)
+  const stopLocaleWatch = watch(i18n.global.locale, () => {
+    if (currentState) render(currentState)
+  }, { flush: 'sync' })
+  void gateway.getConnection().then(receive).catch(() => {})
+  return () => {
+    disposed = true
+    unsubscribe()
+    stopLocaleWatch()
+    retry.removeEventListener('click', retryStartup)
+    reveal.removeEventListener('click', revealLog)
+  }
 }
-
-installDesktopRuntimeBanner()

@@ -81,6 +81,14 @@ def resolve_llm_credential(
     if llm is None:
         return ResolvedLlmCredential()
 
+    from opensquilla.desktop_account import account_credential
+    managed = account_credential(str(getattr(llm, "provider", "")))
+    if managed is not None:
+        return ResolvedLlmCredential(api_key=managed.secret, source="account")
+
+    if getattr(llm, "credential_source", "manual") == "account":
+        return ResolvedLlmCredential(source="account_unavailable")
+
     runtime_secret_paths: set[str] = getattr(config, "_runtime_secret_paths", set())
     stored_api_key = str(getattr(llm, "api_key", "") or "")
     explicit_api_key = (
@@ -196,6 +204,27 @@ def resolve_llm_runtime_config(config: Any) -> LlmRuntimeConfig:
 
     llm = config.llm
     provider = str(llm.provider or "").strip().lower()
+    from opensquilla.desktop_account import OFFICIAL_BASE, account_credential
+    if not provider and not any(str(getattr(llm, key, "") or "").strip()
+                                for key in ("model", "api_key", "api_key_env", "base_url")):
+        selected = account_credential("tokenrhythm")
+        if selected is not None:
+            # The desktop's explicit account selection completes a fresh empty
+            # primary. Only non-sensitive references enter the config model.
+            from opensquilla.onboarding.provider_specs import get_provider_setup_spec
+            spec_defaults = get_provider_setup_spec("tokenrhythm")
+            llm.provider = provider = "tokenrhythm"
+            llm.model = spec_defaults.default_direct_model
+            llm.base_url = OFFICIAL_BASE
+            llm.credential_source = "account"
+    managed = account_credential(provider)
+    if managed is not None:
+        # No mutation: the persisted/manual deployment remains available when
+        # the operator explicitly switches back to their own API key.
+        return LlmRuntimeConfig(
+            provider=provider, model=llm.model, api_key=managed.secret,
+            base_url=OFFICIAL_BASE, proxy="", provider_routing={},
+        )
     try:
         spec = get_provider_spec(provider)
     except UnknownProviderError as exc:

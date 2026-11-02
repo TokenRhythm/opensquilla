@@ -137,13 +137,17 @@ def test_profile_import_retires_the_previous_onboarding_draft_after_admission() 
         "if (onboardingFlows.active) dismissOnboardingFlow(onboardingFlows.active)",
         refused,
     )
-    drain = migration.index("await waitForDesktopWriterOperations(1)")
+    pause = migration.index("accountPause = pauseAccountsForMaintenance(")
+    drain = re.search(r"await\s+Promise\.all\(\[(.*?)\]\)", migration, re.DOTALL)
+    assert drain is not None
+    assert "waitForDesktopWriterOperations(1)" in drain.group(1)
+    assert "accountPause.wait(" in drain.group(1)
     publish = migration.index("await beginMigrationReconciliationIntent(candidate)")
 
     # The non-modal window can coexist with Data Transfer. Retire its draft
     # before import changes the credential authority, but preserve it when the
     # import was refused or cancelled before obtaining exclusive admission.
-    assert admission < refused < dismissal < drain < publish
+    assert admission < refused < dismissal < pause < drain.start() < drain.end() < publish
     assert "dismissOnboardingFlow" not in migration[:admission]
     assert migration.index("return {", refused) < dismissal
 

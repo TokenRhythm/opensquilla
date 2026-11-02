@@ -157,6 +157,7 @@ function imageProviderLabel(): string {
 function imageCredentialTitle(): string {
   const provider = imageProviderLabel()
   const source = props.panel.form.imageCredentialSource
+  if (source === 'account') return t('account.accountSource')
   if (source === 'explicit') return t('setup.capabilities.imageCredentialDirectTitle')
   if (source === 'llm_fallback') {
     return t('setup.capabilities.imageCredentialLlmTitle', { provider })
@@ -174,6 +175,7 @@ function imageCredentialTitle(): string {
 function imageCredentialDetail(): string {
   const provider = imageProviderLabel()
   const source = props.panel.form.imageCredentialSource
+  if (source === 'account') return t(props.panel.form.imageKeyConfigured ? 'account.status.signed_in' : 'account.modelUnavailable')
   if (source === 'explicit') return t('setup.capabilities.imageCredentialDirectDetail')
   if (source === 'llm_fallback') {
     return t('setup.capabilities.imageCredentialLlmDetail', { provider })

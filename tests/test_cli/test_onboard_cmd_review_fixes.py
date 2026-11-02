@@ -19,6 +19,7 @@ from typer.testing import CliRunner
 from opensquilla.cli.main import app
 from opensquilla.config_version import LATEST_CONFIG_VERSION
 from opensquilla.onboarding.config_store import load_config
+from opensquilla.provider.recommendations import get_recommendation
 
 runner = CliRunner()
 _ANSI_RE = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
@@ -144,7 +145,7 @@ def test_onboard_provider_first_run_still_applies_recommended_router(
     tmp_path, monkeypatch
 ):
     # Fresh/unconfigured install: an omitted --router keeps today's first-run
-    # behavior and applies the recommended profile.
+    # behavior and materializes the current recommendation.
     target = tmp_path / "c.toml"
     monkeypatch.setenv("OPENSQUILLA_GATEWAY_CONFIG_PATH", str(target))
     monkeypatch.delenv("OPENSQUILLA_LLM_API_KEY", raising=False)
@@ -156,8 +157,14 @@ def test_onboard_provider_first_run_still_applies_recommended_router(
 
     assert result.exit_code == 0, result.output
     data = tomllib.loads(target.read_text(encoding="utf-8"))
-    assert data["squilla_router"]["tier_profile"] == "openrouter"
     cfg = load_config(target)
+    recommendation = get_recommendation(cfg, "openrouter", "router")
+    router = data["squilla_router"]
+    assert "tier_profile" not in router
+    assert router["recommendation_revision"] == recommendation["revision"]
+    for row in recommendation["rows"]:
+        assert router["tiers"][row["role"]]["provider"] == "openrouter"
+        assert router["tiers"][row["role"]]["model"] == row["model"]
     assert cfg.squilla_router.enabled is True
 
 
@@ -165,7 +172,7 @@ def test_onboard_provider_first_run_with_env_key_still_applies_router(
     tmp_path, monkeypatch
 ):
     # An env-absorbed credential must not make a fresh install look
-    # configured: the recommended profile still applies on first setup.
+    # configured: the current recommendation still applies on first setup.
     target = tmp_path / "c.toml"
     monkeypatch.setenv("OPENSQUILLA_GATEWAY_CONFIG_PATH", str(target))
     monkeypatch.setenv("OPENSQUILLA_LLM_API_KEY", "sk-from-env")
@@ -177,7 +184,15 @@ def test_onboard_provider_first_run_with_env_key_still_applies_router(
 
     assert result.exit_code == 0, result.output
     data = tomllib.loads(target.read_text(encoding="utf-8"))
-    assert data["squilla_router"]["tier_profile"] == "openrouter"
+    cfg = load_config(target)
+    recommendation = get_recommendation(cfg, "openrouter", "router")
+    router = data["squilla_router"]
+    assert "tier_profile" not in router
+    assert router["recommendation_revision"] == recommendation["revision"]
+    for row in recommendation["rows"]:
+        assert router["tiers"][row["role"]]["provider"] == "openrouter"
+        assert router["tiers"][row["role"]]["model"] == row["model"]
+    assert cfg.squilla_router.enabled is True
 
 
 # ---------------------------------------------------------------------------

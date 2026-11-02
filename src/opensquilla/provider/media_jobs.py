@@ -78,14 +78,25 @@ def job_record(
 
 
 def credential_fingerprint(api_key: str) -> str:
+    from opensquilla.desktop_account import account_credential_authority
+
     record = job_record("settings", "credential_salt")
     if record is None:
         record = job_record(
             "settings", "credential_salt", {"salt": secrets.token_hex(32)}, create_only=True
         )
         assert record is not None
+    salt = bytes.fromhex(record["salt"])
+    authority = account_credential_authority(api_key)
+    if authority is not None:
+        # Account jobs survive local lease rotation. The bridge already bound
+        # this lease to its service/account; never infer from the active login.
+        # This public identity needs no password KDF, but stays salted on disk
+        # and in a separate namespace from legacy/manual-key fingerprints.
+        identity = json.dumps(authority, separators=(",", ":")).encode()
+        return "account:" + hashlib.sha256(salt + identity).hexdigest()
     return hashlib.pbkdf2_hmac(
-        "sha256", api_key.encode(), bytes.fromhex(record["salt"]), 600_000
+        "sha256", api_key.encode(), salt, 600_000
     ).hex()
 
 

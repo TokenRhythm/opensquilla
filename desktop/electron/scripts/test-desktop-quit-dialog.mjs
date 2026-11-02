@@ -9,6 +9,7 @@ import { completeClosingDialogClick } from './fixtures/desktop-quit-acceptance/d
 import {
   buildDesktopQuitDialogHtml,
   escapeQuitDialogHtml,
+  normalizeDesktopQuitDialogPalette,
   parseDesktopQuitDialogResponse,
 } from '../dist/desktop-quit-dialog.js'
 
@@ -83,6 +84,26 @@ assert.match(html, /停止任务并退出/)
 assert.match(html, /send\('confirm'\)/)
 assert.match(html, /send\('cancel'\)/)
 assert.match(html, /document\.getElementById\('keep'\)\.focus\(\)/)
+
+const paletteTokens = ['--bg-surface', '--bg-hover', '--text', '--text-muted', '--border',
+  '--accent', '--accent-hover', '--accent-foreground']
+function themePalette(theme) {
+  const css = readFileSync(new URL(`../../../opensquilla-webui/src/themes/${theme}/tokens.css`, import.meta.url), 'utf8')
+  return Object.fromEntries(paletteTokens.map(token => [token, css.match(new RegExp(`${token}:\\s*(#[a-f0-9]{6});`, 'i'))[1]]))
+}
+// Startup/system-mode fallbacks must stay aligned with the actual WebUI tokens.
+for (const theme of ['light', 'dark']) {
+  for (const [token, color] of Object.entries(themePalette(theme))) assert.ok(html.includes(`${token}: ${color};`))
+}
+const customPalette = themePalette('synthwave')
+assert.deepEqual(normalizeDesktopQuitDialogPalette(customPalette), customPalette)
+for (const invalid of [null, [], {}, { ...customPalette, '--text': 'red; } body { display: none' },
+  { ...customPalette, '--accent': '</style><script>unsafe()</script>' }, { ...customPalette, '--text': null }]) {
+  assert.deepEqual(normalizeDesktopQuitDialogPalette(invalid), {})
+}
+assert.deepEqual(normalizeDesktopQuitDialogPalette({ ...customPalette, unsafe: 'ignored' }), customPalette)
+const customHtml = buildDesktopQuitDialogHtml({ title: 'Quit?', message: '', detail: '', keepRunning: 'Cancel', confirm: 'Quit' }, customPalette)
+for (const [token, color] of Object.entries(customPalette)) assert.ok(customHtml.includes(`${token}: ${color};`))
 
 const escaped = buildDesktopQuitDialogHtml({
   lang: 'en" onload="unsafe',
@@ -159,15 +180,27 @@ function runDialog(documentHtml) {
 // actual parent instead of centering on a large desktop's primary display.
 const main = ts.createSourceFile('main.js', readFileSync(new URL('../dist/main.js', import.meta.url), 'utf8'),
   ts.ScriptTarget.Latest, true, ts.ScriptKind.JS)
-let showSource
+let showSource, applyThemeSource
 function collect(node) {
   if (ts.isFunctionDeclaration(node) && node.name?.text === 'showDesktopQuitConfirmation') {
     showSource = node.getText(main)
   }
+  if (ts.isFunctionDeclaration(node) && node.name?.text === 'applyDesktopNativeTheme') applyThemeSource = node.getText(main)
   ts.forEachChild(node, collect)
 }
 collect(main)
 assert.ok(showSource)
+assert.ok(applyThemeSource)
+const themeEnv = { desktopQuitDialogPalette: {}, nativeTheme: { themeSource: 'system', shouldUseDarkColors: true },
+  normalizeDesktopQuitDialogPalette, mainWindow: null, onboardingWindow: null, desktopWindowBackgroundColor: () => '#202022' }
+const applyTheme = new Function('env', `with (env) { ${applyThemeSource}; return applyDesktopNativeTheme }`)(themeEnv)
+applyTheme('dark', customPalette)
+assert.deepEqual(themeEnv.desktopQuitDialogPalette, customPalette)
+applyTheme('system', customPalette)
+assert.deepEqual(themeEnv.desktopQuitDialogPalette, {}, 'System mode must not retain the previous fixed palette')
+assert.equal(themeEnv.nativeTheme.themeSource, 'system')
+applyTheme('light')
+assert.deepEqual(themeEnv.desktopQuitDialogPalette, {}, 'Older renderers without palette retain the native fallback')
 
 async function checkPlacement({ owner, area = { x: 0, y: 0, width: 1920, height: 1080 },
   destroyed = false, destroyBeforeReady = false, expected, platform = 'win32', sheetHeightLoss = 0 }) {
@@ -197,7 +230,8 @@ async function checkPlacement({ owner, area = { x: 0, y: 0, width: 1920, height:
     show() { this.shown++; this.contentSize[1] -= sheetHeightLoss }
     focus() {}
     close() { this.destroyed = true; this.emit('closed') }
-    async loadURL() {
+    async loadURL(url) {
+      assert.ok(decodeURIComponent(url).includes('--accent: #ff2fb9;'), 'The production wrapper forwards the cached app palette')
       if (destroyBeforeReady) destroyed = true
       this.emit('ready-to-show')
     }
@@ -205,6 +239,7 @@ async function checkPlacement({ owner, area = { x: 0, y: 0, width: 1920, height:
   const show = new Function('env', `with (env) { ${showSource}; return showDesktopQuitConfirmation }`)({
     BrowserWindow: Window, ipcMain, join, __dirname: '/fixture',
     process: { platform }, desktopLocale: 'en',
+    desktopQuitDialogPalette: customPalette,
     buildDesktopQuitDialogHtml, parseDesktopQuitDialogResponse, desktopLog() {},
     screen: { getDisplayMatching: bounds => { displays.push(bounds); return { workArea: area } } },
   })

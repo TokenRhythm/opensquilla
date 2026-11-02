@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict'
-import { mkdir, mkdtemp, writeFile } from 'node:fs/promises'
+import { mkdir, mkdtemp, readFile, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
@@ -8,6 +8,7 @@ import { completeClosingDialogClick } from './fixtures/desktop-quit-acceptance/d
 
 const manual = process.argv.includes('--manual')
 const themesOnly = process.argv.includes('--themes-only')
+const exitOnly = process.argv.includes('--exit-only')
 const locales = ['en', 'zh', 'ja', 'fr', 'de', 'es']
 const supportsBackgroundClose = process.platform === 'win32' || process.platform === 'darwin'
 const notApplicable = supportsBackgroundClose ? [] : [{
@@ -23,6 +24,30 @@ const profile = await mkdtemp(join(output, 'profile-'))
 const results = []
 let nativeApp
 const pause = ms => new Promise(resolve => setTimeout(resolve, ms))
+async function themePalette(theme) {
+  const css = await readFile(new URL(`../../../opensquilla-webui/src/themes/${theme}/tokens.css`, import.meta.url), 'utf8')
+  return Object.fromEntries(['--bg-surface', '--bg-hover', '--text', '--text-muted', '--border',
+    '--accent', '--accent-hover', '--accent-foreground'].map(token => [token,
+    css.match(new RegExp(`${token}:\\s*(#[a-f0-9]{6});`, 'i'))[1]]))
+}
+async function assertDialogPalette(prompt, palette) {
+  const rgb = token => `rgb(${palette[token].slice(1).match(/../g).map(hex => parseInt(hex, 16)).join(', ')})`
+  const color = (selector, property) => prompt.locator(selector).evaluate((node, name) => getComputedStyle(node)[name], property)
+  await prompt.mouse.move(1, 1)
+  assert.equal(await color('.card', 'backgroundColor'), rgb('--bg-surface'))
+  assert.equal(await color('.card', 'borderTopColor'), rgb('--border'))
+  assert.equal(await color('#title', 'color'), rgb('--text'))
+  assert.equal(await color('#message', 'color'), rgb('--text-muted'))
+  const primary = supportsBackgroundClose ? '#background' : '#confirm'
+  assert.equal(await color(primary, 'backgroundColor'), rgb('--accent'))
+  assert.equal(await color(primary, 'color'), rgb('--accent-foreground'))
+  assert.equal(await color(':focus', 'outlineColor'), rgb('--accent'))
+  await prompt.locator(primary).hover()
+  assert.equal(await color(primary, 'backgroundColor'), rgb('--accent-hover'))
+  await prompt.locator('#keep').hover()
+  assert.equal(await color('#keep', 'backgroundColor'), rgb('--bg-hover'))
+  await prompt.mouse.move(1, 1)
+}
 async function pressClosingKey(page, key) {
   try { await page.keyboard.press(key) }
   catch (error) {
@@ -154,6 +179,15 @@ try {
     await waitFor(async () => { const value = await state(); return value.resetGeneration > previousGeneration && !value.resetting
       && value.taskAlive && value.ticks > 0 && value.pages === 1 && !value.confirmationPending && value.phase === 'running' }, 'fresh synthetic session')
     await controller.locator('#behavior').selectOption(behavior)
+    // CDP can click the controller while macOS has another application active.
+    // Establish the same foreground owner as a real user before requesting a
+    // modal; never repair focus after the production dialog has opened.
+    await nativeApp.evaluate(({ app }) => {
+      app.focus({ steal: true })
+      globalThis.__opensquillaQuitAcceptance.owner.focus()
+    })
+    await waitFor(() => nativeApp.evaluate(() => globalThis.__opensquillaQuitAcceptance.owner.isFocused()),
+      'the reset owner is foreground before the user action')
   }
   async function canceled(label, click = '#keep', injectLateAck = false) {
     const prompt = await dialog()
@@ -176,11 +210,44 @@ try {
     assert.deepEqual(drafts, ['Do not lose this draft — 验收草稿'], `${label}: the actual Chromium document retains its draft`)
     return value
   }
+  async function verifyRealExit() {
+    // Finish with a real Electron exit, rather than only observing the
+    // adapter boundary used to reset the earlier dialog scenarios.
+    await command('remove-pages')
+    await command('configure', { activity: 'idle', cleanupFailure: true })
+    const finalTaskPid = (await state()).taskPid
+    assert.ok(Number.isSafeInteger(finalTaskPid) && finalTaskPid > 0)
+    await command('exit-on-quit')
+    const realExitStarted = performance.now()
+    await nativeApp.evaluate(() => {
+      setTimeout(() => { void globalThis.__opensquillaQuitAcceptance.command('quit') }, 50)
+    })
+    await waitFor(() => nativeProcess.exitCode !== null || nativeProcess.signalCode !== null,
+      'the actual Electron main process exits after unconfirmed cleanup', 17_000)
+    assert.equal(nativeProcess.exitCode, 0)
+    const realExitMs = Math.round(performance.now() - realExitStarted)
+    await waitFor(() => {
+      try { process.kill(finalTaskPid, 0); return false }
+      catch (error) { if (error.code === 'ESRCH') return true; throw error }
+    }, 'the synthetic child is gone after the real main-process exit')
+    const finalEvents = JSON.parse(await readFile(join(profile, 'events.json'), 'utf8'))
+    assert.equal(finalEvents.ledger.acceptedExit, 1)
+    assert.equal(finalEvents.ledger.errorBoxes.length, 0)
+    assert.ok(finalEvents.logs.some(entry => entry.event === 'fixture_exit_committed' && entry.realExit === true))
+    assert.ok(finalEvents.logs.some(entry => entry.event === 'quit_cleanup_finished' && entry.cleanupConfirmed === false))
+    results.push({ name: 'real-electron-exit-with-unconfirmed-cleanup', passed: true, elapsedMs: realExitMs })
+    nativeApp = null
+  }
   if (manual) {
     console.log(JSON.stringify({ mode: 'manual', title: 'OpenSquilla PR1793 Acceptance', output, profile,
       controls: 'Use the visible controller; dialogs execute production code. Stop fixture cleans its retained synthetic child.' }))
     await new Promise(resolve => nativeApp.process().once('exit', resolve))
     nativeApp = null
+  } else if (exitOnly) {
+    await verifyRealExit()
+    await writeFile(join(output, 'results.json'), JSON.stringify({ platform: process.platform, results, profile,
+      limits: 'Production quit/finalizer with a synthetic child and injected cleanup failure; verifies actual Electron exit, not full Gateway/package or dialog focus.' }, null, 2))
+    console.log(JSON.stringify({ passed: results.length, output, profile }))
   } else {
     await reset('background')
     const beforeBackground = await state()
@@ -220,8 +287,7 @@ try {
       assert.equal(actualNativeTheme.source, theme)
       assert.equal(actualNativeTheme.shouldUseDarkColors, theme === 'dark')
       await waitFor(async () => await prompt.evaluate(() => matchMedia('(prefers-color-scheme: dark)').matches) === (theme === 'dark'), 'the actual native theme reaches the confirmation renderer')
-      const backgroundColor = await prompt.locator('.card').evaluate(node => getComputedStyle(node).backgroundColor)
-      assert.equal(backgroundColor, theme === 'dark' ? 'rgb(32, 36, 43)' : 'rgb(255, 255, 255)')
+      await assertDialogPalette(prompt, await themePalette(theme))
       const variant = supportsBackgroundClose ? 'ask' : 'quit'
       await screenshot(prompt, `${variant}-${locale}-${theme}`)
       await pressClosingKey(prompt, 'Escape')
@@ -229,6 +295,38 @@ try {
       assert.equal((await state()).pages, 1)
       assert.equal((await state()).ledger.drain, 0)
       results.push({ name: `${variant}-${locale}-${theme}-escape`, passed: true, nativeTheme: actualNativeTheme })
+    }
+
+    for (const theme of ['arctic', 'crt-green', 'ember', 'miami', 'synthwave', 'terminal', 'vapor']) {
+      await reset('ask')
+      const palette = await themePalette(theme)
+      await command('configure', { theme: theme === 'miami' ? 'light' : 'dark', palette })
+      await controller.locator(supportsBackgroundClose ? '#closeMain' : '#quit').click()
+      const prompt = await dialog()
+      await assertDialogPalette(prompt, palette)
+      await screenshot(prompt, `ask-custom-${theme}`)
+      await pressClosingKey(prompt, 'Escape')
+      await waitFor(async () => !(await state()).confirmationPending, 'custom-theme Escape cancels')
+      assert.equal((await state()).ledger.drain, 0)
+      results.push({ name: `custom-${theme}-palette`, passed: true })
+    }
+
+    await reset('ask')
+    await command('configure', { theme: 'dark', palette: await themePalette('vapor') })
+    await command('configure', { theme: 'system' })
+    await controller.locator(supportsBackgroundClose ? '#closeMain' : '#quit').click()
+    {
+      const prompt = await dialog()
+      const dark = await nativeApp.evaluate(({ nativeTheme }) => nativeTheme.shouldUseDarkColors)
+      await assertDialogPalette(prompt, await themePalette(dark ? 'dark' : 'light'))
+      // Simulate a native scheme change inside this isolated Electron process;
+      // never change the user's macOS appearance preference.
+      await nativeApp.evaluate(({ nativeTheme }, source) => { nativeTheme.themeSource = source }, dark ? 'light' : 'dark')
+      await waitFor(async () => await prompt.evaluate(() => matchMedia('(prefers-color-scheme: dark)').matches) !== dark, 'open system-mode dialog follows native scheme')
+      await assertDialogPalette(prompt, await themePalette(dark ? 'light' : 'dark'))
+      await pressClosingKey(prompt, 'Escape')
+      await waitFor(async () => !(await state()).confirmationPending, 'system-theme Escape cancels')
+      results.push({ name: 'system-palette-reset-and-live-scheme', passed: true })
     }
 
     if (themesOnly) {
@@ -319,13 +417,16 @@ try {
       await controller.locator('#quit').click()
       prompt = await dialog()
       await clickClosingButton(prompt, '#confirm')
-      await waitFor(async () => (await state()).phase === 'failed', 'failed cleanup keeps recoverable fixture alive')
+      await waitFor(async () => (await state()).ledger.acceptedExit === 1 && !(await state()).taskAlive,
+        'unconfirmed cleanup still ends the owned child and commits exit')
       value = await state()
-      assert.equal(value.taskAlive, true)
-      assert.equal(value.ledger.acceptedExit, 0)
-      assert.equal(value.ledger.errorBoxes.length, 1)
-      assert.equal(value.ledger.errorBoxes[0].native, false, 'automated error box is explicitly adapted; manual mode supports the real native box')
-      results.push({ name: 'failed-cleanup-state', passed: true, nativeErrorBoxTested: false })
+      assert.equal(value.phase, 'committed')
+      assert.equal(value.taskAlive, false)
+      assert.equal(value.ledger.acceptedExit, 1)
+      assert.equal(value.ledger.errorBoxes.length, 0, 'ordinary quit never asks for another quit attempt')
+      assert.ok(value.logs.some(entry => entry.event === 'quit_cleanup_finished' && entry.cleanupConfirmed === false),
+        'exit does not turn incomplete cleanup into a successful receipt')
+      results.push({ name: 'unconfirmed-cleanup-commits-exit', passed: true })
 
       for (const locale of locales) {
         await reset('ask')
@@ -386,8 +487,11 @@ try {
       assert.equal(value.pages, 0, 'the real native page was closed')
       assert.equal(value.dialogCount, 1)
       results.push({ name: 'menu-quit-accept', passed: true })
+
+      await reset('ask')
+      await verifyRealExit()
       await writeFile(join(output, 'results.json'), JSON.stringify({ platform: process.platform, results, notApplicable, profile, final: value,
-        limits: 'Native production handlers/dialogs and real browser pages; Gateway/task activity and app exit are isolated fixture adapters. Native OS cleanup error box requires manual mode. Full Gateway/package acceptance is separate.' }, null, 2))
+        limits: 'Production quit handlers/dialogs with real browser pages and an isolated synthetic child; the final scenario exits the actual Electron main process. Gateway activity/cleanup remain fixture adapters. Full Gateway/package acceptance is separate.' }, null, 2))
       console.log(JSON.stringify({ passed: results.length, output, profile }))
     }
   }

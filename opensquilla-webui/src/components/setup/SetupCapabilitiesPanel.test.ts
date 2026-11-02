@@ -405,6 +405,19 @@ describe('SetupCapabilitiesPanel', () => {
     expect(input?.getAttribute('autocomplete')).toBe('off')
   })
 
+  it.each([true, false])('shows the selected image account without asking for a manual key (available=%s)', async available => {
+    i18n.global.locale.value = 'en'
+    const account = panel()
+    account.form.imageProvider = 'tokenrhythm'
+    account.form.imageKeyConfigured = available
+    account.form.imageCredentialSource = 'account'
+    const { el } = await mountPanel(account)
+    expect(el.textContent).toContain(i18n.global.t('account.accountSource'))
+    expect(el.textContent).toContain(i18n.global.t(available ? 'account.status.signed_in' : 'account.modelUnavailable'))
+    expect(el.querySelector('[name="setup_image_api_key"]')).toBeNull()
+    expect(el.querySelector('.capability-card__credential-source.is-missing')).toBeNull()
+  })
+
   it('keeps a dedicated image key summarized until the user chooses to replace it', async () => {
     i18n.global.locale.value = 'en'
     const direct = panel()

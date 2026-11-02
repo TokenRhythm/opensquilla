@@ -36,3 +36,29 @@ describe('recommended Router adapter', () => {
     expect(request).toHaveBeenCalledTimes(1)
   })
 })
+
+describe('remote recommendation adapter', () => {
+  const events = { subscribe: vi.fn(() => ({ close() {} })) }
+  it('requires all three capabilities and preserves the reviewed provider, kind and revision', async () => {
+    const request = vi.fn().mockResolvedValue({ mode: 'router', patched: ['squilla_router.tiers'], restart_required: false })
+    const adapter = createV4ProviderConfiguration({ request, supports: () => true }, events)
+    expect(adapter.recommendationsSupported).toBe(true)
+    await adapter.applyRecommendation!({ providerId: 'tokenrhythm', kind: 'router', revision: 'reviewed-content' })
+    expect(request).toHaveBeenCalledExactlyOnceWith('models.recommendations.apply', { providerId: 'tokenrhythm', kind: 'router', revision: 'reviewed-content' }, expect.objectContaining({ timeoutAction: 'reject', abortAction: 'reject' }))
+  })
+  it('rejects unsupported or malformed apply commands before sending', async () => {
+    const request = vi.fn()
+    const adapter = createV4ProviderConfiguration({ request, supports: () => false }, events)
+    expect(adapter.recommendationsSupported).toBe(false)
+    await expect(adapter.applyRecommendation!({ providerId: 'tokenrhythm', kind: 'ensemble', revision: 'one' })).rejects.toMatchObject({ code: 'unsupported' })
+    expect(request).not.toHaveBeenCalled()
+  })
+  it('validates passive recommendation reads and acknowledgement responses', async () => {
+    const request = vi.fn().mockResolvedValueOnce({ plans: [] }).mockResolvedValueOnce({ acknowledged: true }).mockResolvedValueOnce({ plans: [{ providerId: 'other' }] })
+    const adapter = createV4ProviderConfiguration({ request, supports: () => true }, events)
+    expect(await adapter.recommendations!()).toEqual({ plans: [] })
+    expect(await adapter.acknowledgeRecommendation!({ providerId: 'openrouter', kind: 'ensemble', revision: 'one' })).toEqual({ acknowledged: true })
+    await expect(adapter.recommendations!()).rejects.toThrow('Invalid model recommendations response')
+    expect(request.mock.calls.map(call => call[0])).toEqual(['models.recommendations.get', 'models.recommendations.acknowledge', 'models.recommendations.get'])
+  })
+})

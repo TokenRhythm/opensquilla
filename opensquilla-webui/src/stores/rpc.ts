@@ -104,6 +104,12 @@ export const useRpcStore = defineStore('rpc', () => {
   // Mirror the value explicitly at every transport/state boundary.
   const connectionGeneration = ref(0)
   const deliveryContext = ref<{ targetId: string; principal: unknown } | null>(null)
+  // A display lifetime, not an authorization token. Transport retries and a
+  // stopped descriptor keep it; a different target or Hello retires it.
+  const presentationScope = ref(0)
+  let presentationTarget: string | null = null
+  let presentationPrincipal: string | null = null
+  let desktopPresentationRuntime = ''
   // Tabs in this browser profile may recover their shared queue only after
   // both the salted target hash and Hello principal agree. Only a random salt
   // persists here; raw target credentials never enter the queue identity.
@@ -223,6 +229,28 @@ export const useRpcStore = defineStore('rpc', () => {
     unavailableMethods.value = new Set()
   }
 
+  function setPresentationTarget(target: string | null): void {
+    if (target === presentationTarget) return
+    presentationTarget = target
+    presentationPrincipal = null
+    presentationScope.value += 1
+  }
+
+  function observePresentationPrincipal(principal: unknown, catalogAvailable: boolean): void {
+    const p = principal && typeof principal === 'object'
+      ? principal as Record<string, unknown> : null
+    const authority = (value: unknown) => Array.isArray(value)
+      ? [...new Set(value.filter(item => typeof item === 'string'))].sort() : null
+    const next = p ? JSON.stringify([
+      p.role, p.authState, p.authenticated, p.isOwner, p.tokenPublicId, p.guestOwnerId,
+      authority(p.scopes), authority(p.capabilities), catalogAvailable,
+    ]) : null
+    if (presentationPrincipal !== null && next !== presentationPrincipal) {
+      presentationScope.value += 1
+    }
+    presentationPrincipal = next
+  }
+
   function beginDeliveryIntent(target: string | null): void {
     const intent = ++deliveryIntent
     deliveryTargetId = ''
@@ -257,6 +285,7 @@ export const useRpcStore = defineStore('rpc', () => {
 
   function connectBrowser(url: string, token?: string): void {
     const sameTarget = browserConnectionUrl === url && browserAuthToken === (token || '')
+    setPresentationTarget(JSON.stringify(['browser', url, token || '']))
     const provenAuth = sameTarget && state.value === 'connected' ? auth.value : null
     beginDeliveryIntent(JSON.stringify(['browser', url, token || '']))
     browserConnectionUrl = url
@@ -287,6 +316,7 @@ export const useRpcStore = defineStore('rpc', () => {
     runtimeStarting.value = payload.status === 'starting' && (!manual || state.value !== 'connected')
     const nextUrl = typeof payload.wsUrl === 'string' ? payload.wsUrl.trim() : ''
     const nextInstance = typeof payload.instanceId === 'string' ? payload.instanceId : ''
+    const nextRuntime = JSON.stringify([payload.profileFingerprint, nextInstance, payload.httpUrl])
     if (payload.status !== 'ready' || !nextUrl || !nextInstance) {
       deliveryProof = null
       deliveryContext.value = null
@@ -294,6 +324,9 @@ export const useRpcStore = defineStore('rpc', () => {
         error.value = payload.error || 'Gateway is not ready to connect'
         return
       }
+      // Shutdown withdraws credentials/WS admission for the same runtime. A
+      // profile switch or replacement runtime must not retain its display.
+      if (nextRuntime !== desktopPresentationRuntime) setPresentationTarget(null)
       connectionEndpoint.value = null
       desktopConnectionKey = ''
       if (desktopAuthToken) {
@@ -315,6 +348,8 @@ export const useRpcStore = defineStore('rpc', () => {
       : ''
     connectionEndpoint.value = nextUrl
     const nextKey = `${payload.profileFingerprint}\0${nextInstance}\0${nextUrl}`
+    desktopPresentationRuntime = nextRuntime
+    setPresentationTarget(JSON.stringify(['desktop', nextKey, nextAuthToken]))
     const explicitRestart = manual && (
       client.value?.lifecycle === 'stopped' || client.value?.lifecycle === 'blocked'
     )
@@ -367,6 +402,7 @@ export const useRpcStore = defineStore('rpc', () => {
         resumeSource.value = null
       }
       if (status.lifecycle === 'blocked') error.value = status.reason
+      if (status.lifecycle === 'blocked') setPresentationTarget(null)
       if (status.lifecycle === 'blocked' || status.lifecycle === 'stopped') {
         deliveryProof = null
         deliveryContext.value = null
@@ -392,9 +428,11 @@ export const useRpcStore = defineStore('rpc', () => {
       features?: { methods?: unknown; events?: unknown }
     }) => {
       error.value = null
+      observePresentationPrincipal(
+        data.auth?.principal,
+        Array.isArray(data.features?.methods) && data.features.methods.includes('workspaces.list'),
+      )
       policy.value = data.policy || null
-      auth.value = data.auth || null
-      proveDeliveryContext(auth.value)
       methods.value = Array.isArray(data.features?.methods)
         ? data.features.methods.filter((method): method is string => typeof method === 'string')
         : []
@@ -402,6 +440,10 @@ export const useRpcStore = defineStore('rpc', () => {
         ? data.features.events.filter((event): event is string => typeof event === 'string')
         : []
       unavailableMethods.value = new Set()
+      // Publish the principal after its features so synchronous display
+      // observers do not mistake a fresh Hello for a permission revocation.
+      auth.value = data.auth || null
+      proveDeliveryContext(auth.value)
     })
 
     rpc.on('_gap', (detail: unknown) => {
@@ -488,6 +530,7 @@ export const useRpcStore = defineStore('rpc', () => {
   function disconnect() {
     connectionDesired = false
     runtimeStarting.value = false
+    setPresentationTarget(null)
     beginDeliveryIntent(null)
     cancelDescriptorRecovery()
     client.value?.disconnect()
@@ -603,6 +646,7 @@ export const useRpcStore = defineStore('rpc', () => {
     resumeSource,
     connectionGeneration,
     deliveryContext,
+    presentationScope,
     isConnected,
     isConnecting,
     isLocalOwner,

@@ -181,6 +181,7 @@ export interface ImageFormValues {
 
 export type ImageTouchedField = 'apiKey' | 'apiKeyEnv' | 'baseUrl' | 'fallbacks'
 export type ImageCredentialSource =
+  | 'account'
   | 'explicit'
   | 'env'
   | 'llm_fallback'
@@ -204,7 +205,8 @@ interface ImageProviderDraft {
 function normalizeImageCredentialSource(value: unknown): ImageCredentialSource {
   const source = String(value || '').trim()
   if (
-    source === 'explicit'
+    source === 'account'
+    || source === 'explicit'
     || source === 'env'
     || source === 'llm_fallback'
     || source === 'missing_env'
@@ -477,24 +479,29 @@ export function useSetupCapabilitiesForm() {
           )
         : 'none'
       const reusableOption = imageCredentialOptions.get(spec.providerId)
-      const optionSource: ImageCredentialSource = reusableOption?.available === true
+      const optionSource: ImageCredentialSource = reusableOption?.available === true || reusableOption?.source === 'account'
         ? normalizeImageCredentialSource(reusableOption.source)
         : reusableOption?.source === 'missing_env'
           ? 'missing_env'
           : 'none'
-      const credentialSource: ImageCredentialSource = keyConfigured
-        ? 'explicit'
-        : statusSource !== 'none'
-          ? statusSource
-          : optionSource !== 'none'
-            ? optionSource
-          : authoredEnv
-            ? 'env'
-            : status.imageGenerationConfigured === true && isStatusProvider
-              ? 'configured'
-              : 'none'
-      const credentialConfigured = ['explicit', 'env', 'llm_fallback', 'configured']
-        .includes(credentialSource)
+      // An explicit account selection overrides a retained independent key,
+      // even while the account is unavailable. Match the backend's source.
+      const credentialSource: ImageCredentialSource = statusSource === 'account' || optionSource === 'account'
+        ? 'account'
+        : keyConfigured
+          ? 'explicit'
+          : statusSource !== 'none'
+            ? statusSource
+            : optionSource !== 'none'
+              ? optionSource
+              : authoredEnv
+                ? 'env'
+                : status.imageGenerationConfigured === true && isStatusProvider
+                  ? 'configured'
+                  : 'none'
+      const credentialConfigured = credentialSource === 'account'
+        ? (reusableOption?.available ?? (isStatusProvider && status.imageGenerationConfigured === true))
+        : ['explicit', 'env', 'llm_fallback', 'configured'].includes(credentialSource)
       imageProviderDrafts.set(spec.providerId, {
         primary: imageModelForDisplay(
           spec.providerId,
@@ -534,7 +541,7 @@ export function useSetupCapabilitiesForm() {
     spec: ProviderSpec | null | undefined,
   ): ImageProviderDraft {
     const option = imageCredentialOptions.get(spec?.providerId || '')
-    const credentialSource: ImageCredentialSource = option?.available === true
+    const credentialSource: ImageCredentialSource = option?.available === true || option?.source === 'account'
       ? normalizeImageCredentialSource(option.source)
       : option?.source === 'missing_env'
         ? 'missing_env'

@@ -337,3 +337,69 @@ async def test_child_preserves_physical_credential_failure_attribution(monkeypat
     events = [event async for event in child.run_turn("Child task")]
     assert any(isinstance(e, ErrorEvent) for e in events)
     assert reported == [("moonshot", "parent-pool-session", ProviderFailureKind.AUTH_INVALID)]
+
+
+@pytest.mark.parametrize("child", [False, True])
+@pytest.mark.parametrize("failure", ["empty", "timeout"])
+async def test_account_uncertain_failure_cannot_retry_parent_or_child(monkeypatch, child, failure):
+    from opensquilla import desktop_account as bridge
+
+    lease = "os_local_" + "x" * 43
+    calls = []
+    state = bridge.pin_account_state({
+        "source": "account", "selectedAccountId": "account", "accountId": "account",
+        "ready": True, "credential": lease,
+    })
+    monkeypatch.setattr(bridge, "_leases", {lease: "http://127.0.0.1:12345"})
+
+    def upstream(request):
+        calls.append(request)
+        assert request.url.host == "127.0.0.1"
+        assert request.headers["authorization"] == "Bearer " + lease
+        assert json.loads(request.content)["stream"] is True
+        return httpx.Response(200, content=b"") if failure == "empty" else (
+            httpx.Response(200, stream=_TimeoutBody())
+        )
+
+    monkeypatch.setattr(
+        httpx, "AsyncHTTPTransport", lambda **_kwargs: httpx.MockTransport(upstream),
+    )
+    try:
+        selector = ModelSelector(SelectorConfig(primary=ProviderConfig(
+            provider="tokenrhythm", model="qwen3.7-max", api_key="manual-key",
+        )))
+        metadata = {"router_tier_policy": "model", "routing_applied": True, "routed_tier": "c1"}
+        parent = Agent(
+            _SelectorFallbackProvider(selector.resolve(), selector, metadata),
+            AgentConfig(provider_id="tokenrhythm", model_id="qwen3.7-max", metadata=metadata),
+        )
+        agent = (
+            parent._make_child_agent(SubagentSpec(task="Child task"), depth=1) if child else parent
+        )
+        events = [event async for event in agent.run_turn("Reply briefly")]
+    finally:
+        bridge.reset_account_state(state)
+    assert len(calls) == 1
+    errors = [event for event in events if isinstance(event, ErrorEvent)]
+    assert len(errors) == 1 and errors[0].failure_kind == "bad_request"
+
+
+async def test_account_no_replay_decision_clears_compatibility_hint(monkeypatch):
+    from opensquilla.provider.types import ErrorEvent as ProviderErrorEvent
+
+    provider = OpenAIProvider(
+        api_key="os_local_" + "x" * 43, model="qwen3.7-max", provider_kind="tokenrhythm",
+    )
+
+    async def uncertain(*_args):
+        yield ProviderErrorEvent(
+            message="empty response", code="incomplete_stream", compatibility_recovery="non_stream",
+        )
+
+    # Exercise the outer account policy even if a compatibility implementation
+    # returns a recovery hint. Its no-replay business decision remains final.
+    monkeypatch.setattr(provider, "_stream_impl", uncertain)
+    events = [event async for event in provider._stream([], None, ChatConfig())]
+    assert len(events) == 1
+    assert events[0].code == "account_request_uncertain"
+    assert events[0].compatibility_recovery is None

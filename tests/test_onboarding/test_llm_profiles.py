@@ -17,7 +17,6 @@ from opensquilla.onboarding.mutations import (
 )
 from opensquilla.onboarding.status import get_onboarding_status
 from opensquilla.provider.deployment import resolve_provider_deployment
-from opensquilla.provider.preset_registry import get_preset
 
 
 def test_profile_upsert_redacts_secret_and_keeps_credential_sources() -> None:
@@ -778,22 +777,54 @@ def _curated_primary_switch_config(
 def test_curated_primary_activation_replaces_ladder_and_preserves_strategy(
     source, target, binding, enabled, cross_provider,
 ) -> None:
+    from opensquilla.provider.recommendations import get_recommendation
+
     cfg = _curated_primary_switch_config(
         source, target, binding=binding, enabled=enabled, cross_provider=cross_provider,
     )
+    for name, tier in cfg.squilla_router.tiers.items():
+        tier.update(
+            thinking_level="low", description=f"Saved {name} role",
+            temperature=0.25, supports_image=True,
+        )
+    cfg.squilla_router.tiers["c3"]["ensemble_enabled"] = True
     router_before = cfg.squilla_router.model_dump(mode="python")
     ensemble_before = cfg.llm_ensemble.model_dump(mode="python")
+    recommendation = get_recommendation(cfg, target, "router")
 
     activated = activate_llm_profile(cfg, provider_id=target).config
 
-    preset = get_preset(target)
-    assert preset is not None
-    defaults = preset.tier_defaults()
     router = activated.squilla_router
     assert router.preset_binding == "follow_primary"
-    assert router.tier_profile == (target if enabled and preset.persistable else None)
-    for name in ("c0", "c1", "c2", "c3"):
-        assert router.tiers[name] == defaults[name]
+    assert router.tier_profile is None
+    assert router.recommendation_revision == recommendation["revision"]
+    assert set(router.tiers) == set(router_before["tiers"])
+    model_fields = {"provider", "model", "thinking_level"}
+    for row in recommendation["rows"]:
+        name = row["role"]
+        assert router.tiers[name]["provider"] == row["provider"] == target
+        assert router.tiers[name]["model"] == row["model"]
+        assert router.tiers[name].get("thinking_level") == row["thinkingLevel"]
+        assert {
+            key: value for key, value in router.tiers[name].items() if key not in model_fields
+        } == {
+            key: value for key, value in router_before["tiers"][name].items()
+            if key not in model_fields
+        }
+    recommendation_fields = {"tiers", "tier_profile", "preset_binding", "recommendation_revision"}
+    assert {
+        key: value for key, value in router.model_dump(mode="python").items()
+        if key not in recommendation_fields
+    } == {
+        key: value for key, value in router_before.items() if key not in recommendation_fields
+    }
+    assert {f"squilla_router.{field}" for field in recommendation_fields} <= (
+        activated.force_persist_paths()
+    )
+    saved_router = activated.to_toml_dict()["squilla_router"]
+    assert saved_router["recommendation_revision"] == recommendation["revision"]
+    assert "tier_profile" not in saved_router
+    assert saved_router["preset_binding"] == "follow_primary"
     assert router.enabled is enabled
     assert router.cross_provider_tiers is cross_provider
     assert router.rollout_phase == "observe"

@@ -172,7 +172,7 @@ it('threads the independent model-routing control through ChatComposer and ChatV
     expect(viewSource).toContain('@set-session-routing-mode="setComposerSessionRoutingMode"')
     expect(viewSource).toContain('async function setComposerSessionRoutingMode(mode: ModelRoutingMode)')
     expect(viewSource).toContain('if (preparingHostSession.value || goalBusy.value) return')
-    expect(viewSource).toContain('await newTaskModel.selectRoutingMode(mode, chatSessionRouting.setMode)')
+    expect(viewSource).toContain('await applyManualComposerSelection(mode, () => newTaskModel.selectRoutingMode(mode, chatSessionRouting.setMode))')
     expect(viewSource).toContain('useChatSessionRouting')
     expect(viewSource).toContain('isDraft: isDraftSurface')
     expect(viewSource).toContain("return pendingSessionIntent.value === 'new_chat'")

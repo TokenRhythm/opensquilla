@@ -242,7 +242,7 @@ describe('useSetupCapabilitiesForm search provider switching', () => {
 })
 
 describe('useSetupCapabilitiesForm image hydration', () => {
-  it('enables the server recommendation and reuses a profile credential without a key field', () => {
+  it.each(['llm_fallback', 'account'] as const)('enables the recommendation with a %s credential without a key field', source => {
     const form = useSetupCapabilitiesForm()
     const tokenRhythm = {
       providerId: 'tokenrhythm',
@@ -260,7 +260,7 @@ describe('useSetupCapabilitiesForm image hydration', () => {
         credentialOptions: [{
           providerId: 'tokenrhythm',
           available: true,
-          source: 'llm_fallback',
+          source,
           owner: 'profile',
           kind: 'direct',
         }],
@@ -270,7 +270,7 @@ describe('useSetupCapabilitiesForm image hydration', () => {
     form.updateField('image', 'enabled', true)
 
     expect(form.selectedImageProvider.value).toBe('tokenrhythm')
-    expect(form.imageCredentialSourceValue.value).toBe('llm_fallback')
+    expect(form.imageCredentialSourceValue.value).toBe(source)
     expect(form.imageKeyConfiguredValue.value).toBe(true)
     expect(form.imagePayload()).toMatchObject({
       enabled: true,
@@ -596,6 +596,19 @@ describe('useSetupCapabilitiesForm image key state', () => {
 
     expect(broken.imageKeyConfiguredValue.value).toBe(false)
     expect(broken.imageCredentialSourceValue.value).toBe('missing_env')
+  })
+
+  it.each([true, false])('preserves the account source over a retained direct key (available=%s)', available => {
+    const form = useSetupCapabilitiesForm()
+    form.initImageFromConfig({ image_generation: { providers: { tokenrhythm: { api_key: 'retained-manual-key' } } } }, {
+      imageGenerationConfigured: available,
+      imageGenerationProvider: 'tokenrhythm',
+      imageGenerationPrimary: 'tokenrhythm/qwen-image-2.0',
+      imageGenerationSource: 'account',
+    }, [{ providerId: 'tokenrhythm', requiresApiKey: true }])
+    expect(form.imageCredentialSourceValue.value).toBe('account')
+    expect(form.imageKeyConfiguredValue.value).toBe(available)
+    expect(form.imagePayload()).not.toHaveProperty('credentialMode')
   })
 })
 

@@ -1,6 +1,7 @@
 <script setup lang="ts">
 import { computed, nextTick, onBeforeUnmount, ref, watch } from 'vue'
 import { useI18n } from 'vue-i18n'
+import AccountProviderCard from '@/components/setup/AccountProviderCard.vue'
 import Icon from '@/components/Icon.vue'
 import ControlSwitch from '@/components/ControlSwitch.vue'
 import SetupField from '@/components/SetupField.vue'
@@ -39,6 +40,10 @@ interface FieldSpec {
 }
 
 interface ProviderPanelContract {
+  accountSupported?: boolean
+  accountPrimary?: boolean
+  accountEditing?: boolean
+  accountReady?: boolean
   providerSummary: string
   providerSelected: string
   runtimeProviders: ProviderOption[]
@@ -134,6 +139,8 @@ const emit = defineEmits<{
   probeConfiguredProvider: [value: string]
   cancelConfiguredProviderProbe: [value: string]
   activateProvider: [providerId: string]
+  activateAccount: []
+  selectAccountProvider: []
   updateImageGenerationOptIn: [enabled: boolean]
 }>()
 
@@ -157,7 +164,7 @@ const dialogInvoker = ref<HTMLElement | null>(null)
 let dialogGeneration = 0
 
 const selectedProviderLabel = computed(() => (
-  props.panel.credentialPanel?.providerLabel || props.panel.providerSelected
+  props.panel.accountEditing ? 'TokenRhythm' : props.panel.credentialPanel?.providerLabel || props.panel.providerSelected
 ))
 
 const readyProviderCount = computed(() => (
@@ -185,7 +192,7 @@ const otherProviderFields = computed(() => allProviderFields.value.filter(
 ))
 
 function isEditingProvider(providerId: string): boolean {
-  return props.panel.providerSelected.trim().toLowerCase() === providerId.trim().toLowerCase()
+  return !props.panel.accountEditing && props.panel.providerSelected.trim().toLowerCase() === providerId.trim().toLowerCase()
 }
 
 function displayField(field: FieldSpec): FieldSpec {
@@ -268,6 +275,15 @@ function toggleAddPicker() {
   dialogGeneration += 1
   addOpen.value = true
   editorOpen.value = true
+}
+
+function selectAccount() {
+  if (providerBusy.value || props.saving) return
+  dialogInvoker.value = document.activeElement instanceof HTMLElement ? document.activeElement : null
+  editorOpen.value = true
+  addOpen.value = false
+  emit('selectAccountProvider')
+  focusProviderEditor()
 }
 
 function selectConfigured(providerId: string) {
@@ -868,6 +884,8 @@ const tokenRhythmCredentialReplacementRequired = computed(() => (
       </div>
     </div>
 
+    <AccountProviderCard v-if="panel.accountSupported" :active="panel.accountPrimary" :busy="providerBusy" @activate="emit('activateAccount')" @edit="selectAccount" />
+
     <TransitionGroup
       v-if="panel.configuredProviders.length > 0"
       name="provider-list"
@@ -1023,6 +1041,7 @@ const tokenRhythmCredentialReplacementRequired = computed(() => (
     <SetupProviderCredentialCard
       v-if="panel.credentialPanel"
       :panel="panel.credentialPanel"
+                  :managed="panel.accountEditing"
       @reveal="panel.credentialPanel.onReveal?.()"
       @hide-reveal="panel.credentialPanel.onHideReveal?.()"
       @replace="panel.credentialPanel.onReplace?.()"
@@ -1116,7 +1135,7 @@ const tokenRhythmCredentialReplacementRequired = computed(() => (
         {{ t('setup.provider.providerOptions', { provider: selectedProviderLabel }) }}
       </summary>
 
-      <section v-if="endpointFields.length" class="setup-provider-options__group setup-provider-endpoint">
+      <section v-if="endpointFields.length && !panel.accountEditing" class="setup-provider-options__group setup-provider-endpoint">
         <div class="setup-provider-options__head">
           <h5>{{ t('setup.provider.endpointTitle', { provider: selectedProviderLabel }) }}</h5>
           <p>{{ t('setup.provider.endpointDesc', { provider: selectedProviderLabel }) }}</p>
@@ -1329,14 +1348,14 @@ const tokenRhythmCredentialReplacementRequired = computed(() => (
                 </label>
 
                 <SetupProviderRecommendation
-                  v-if="tokenRhythmSelected"
+                  v-if="tokenRhythmSelected && !panel.accountEditing"
                   compact
                   :token-rhythm-selected="tokenRhythmSelected"
                   :credential-replacement-required="tokenRhythmCredentialReplacementRequired"
                 />
 
                 <section
-                  v-if="endpointFields.length"
+                  v-if="endpointFields.length && !panel.accountEditing"
                   class="setup-provider-modal__endpoint"
                   data-testid="setup-provider-modal-endpoint"
                 >
@@ -1360,6 +1379,7 @@ const tokenRhythmCredentialReplacementRequired = computed(() => (
                   compact
                   show-verification
                   :panel="panel.credentialPanel"
+                  :managed="panel.accountEditing"
                   @reveal="panel.credentialPanel.onReveal?.()"
                   @hide-reveal="panel.credentialPanel.onHideReveal?.()"
                   @replace="panel.credentialPanel.onReplace?.()"
@@ -1425,7 +1445,7 @@ const tokenRhythmCredentialReplacementRequired = computed(() => (
 
             <footer v-if="!addOpen && panel.providerSelected" class="setup-provider-modal__footer">
               <button
-                v-if="panel.profileSaveSupported && panelIsStoredProvider && selectedConfiguredProvider"
+                v-if="!panel.accountEditing && panel.profileSaveSupported && panelIsStoredProvider && selectedConfiguredProvider"
                 type="button"
                 class="btn btn--ghost setup-provider-modal__delete"
                 :disabled="providerBusy || saving"
@@ -1442,7 +1462,7 @@ const tokenRhythmCredentialReplacementRequired = computed(() => (
                 @click="cancelAndClose()"
               >{{ t('common.cancel') }}</button>
               <button
-                v-if="!panel.editingPrimary && (panel.primaryReady ?? panel.hasConfiguredPrimaryProvider) !== false"
+                v-if="!panel.accountEditing && !panel.editingPrimary && (panel.primaryReady ?? panel.hasConfiguredPrimaryProvider) !== false"
                 type="button"
                 class="btn"
                 data-testid="provider-save-and-activate"
@@ -1458,9 +1478,9 @@ const tokenRhythmCredentialReplacementRequired = computed(() => (
                 @click="emit('saveProvider')"
               >
                 <span v-if="saving" class="setup-connection__spinner" aria-hidden="true"></span>
-                {{ t((panel.primaryReady ?? panel.hasConfiguredPrimaryProvider) === false ? 'setup.provider.saveAndStart' : 'setup.provider.saveChanges') }}
+                {{ t(!panel.accountEditing && (panel.primaryReady ?? panel.hasConfiguredPrimaryProvider) === false ? 'setup.provider.saveAndStart' : 'setup.provider.saveChanges') }}
               </button>
-              <small v-if="!panel.editingPrimary && !panel.profileUpsertAndActivateSupported" class="setup-provider-card__activation-reason">{{ t('setup.provider.saveActivateUpgradeHint') }}</small>
+              <small v-if="!panel.accountEditing && !panel.editingPrimary && !panel.profileUpsertAndActivateSupported" class="setup-provider-card__activation-reason">{{ t('setup.provider.saveActivateUpgradeHint') }}</small>
             </footer>
 
           </section>

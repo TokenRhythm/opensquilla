@@ -147,6 +147,7 @@ class _VideoJobReceipt:
     base_url: str
     native_job_id: str
     credential_env: str = ""
+    account_authority: tuple[str, str] | None = field(default=None, repr=False)
     completed_result: Any | None = field(default=None, repr=False)
     completed_payload: str | None = field(default=None, repr=False)
     status_lock: asyncio.Lock = field(default_factory=asyncio.Lock, repr=False, compare=False)
@@ -1308,6 +1309,7 @@ def _persist_video_receipt(handle: str, receipt: _VideoJobReceipt) -> None:
             "base_url": receipt.base_url,
             "native_job_id": receipt.native_job_id,
             "credential_env": receipt.credential_env,
+            "account_authority": receipt.account_authority,
             "completed_result": result,
             "completed_payload": receipt.completed_payload,
         },
@@ -1322,6 +1324,16 @@ def _restore_video_receipts() -> None:
         if handle in _video_job_sessions:
             continue
         value = dict(value)
+        authority = value.get("account_authority")
+        if authority is not None:
+            if not (
+                isinstance(authority, (list, tuple))
+                and len(authority) == 2
+                and all(isinstance(part, str) and part for part in authority)
+            ):
+                raise ToolError("Saved video job credential binding is invalid")
+            # JSON arrays must compare identically to the runtime credential tuple.
+            value["account_authority"] = (authority[0], authority[1])
         if value.get("completed_result") is not None:
             result = dict(value["completed_result"])
             result["output_path"] = Path(result["output_path"])
@@ -1339,13 +1351,14 @@ def _remember_video_job(
     *,
     status_lock: asyncio.Lock | None = None,
     credential_fingerprint: str | None = None,
+    account_authority: tuple[str, str] | None = None,
 ) -> str:
     """Scope resumable jobs to the session that created them."""
 
     ctx = current_tool_context.get()
     if ctx is None or not ctx.session_key:
         return job_id
-    fingerprint = (
+    fingerprint = "" if account_authority is not None else (
         credential_fingerprint
         if credential_fingerprint is not None
         else _video_credential_fingerprint(api_key)
@@ -1358,6 +1371,7 @@ def _remember_video_job(
         base_url=base_url or VIDEO_GENERATION_OFFICIAL_BASE_URLS.get(provider, ""),
         native_job_id=job_id,
         credential_env=credential_env,
+        account_authority=account_authority,
         status_lock=status_lock if status_lock is not None else asyncio.Lock(),
     )
     with _video_job_sessions_lock:
@@ -1454,6 +1468,7 @@ def _video_job_access_allowed(
     provider: str,
     *,
     credential_fingerprint: str | None = None,
+    account_authority: tuple[str, str] | None = None,
 ) -> bool:
     ctx = current_tool_context.get()
     if ctx is None:
@@ -1465,6 +1480,8 @@ def _video_job_access_allowed(
     receipt = _video_job_receipt(job_id)
     if receipt is None or receipt.session_key != ctx.session_key or receipt.provider != provider:
         return False
+    if receipt.account_authority is not None or account_authority is not None:
+        return receipt.account_authority == account_authority
     fingerprint = (
         credential_fingerprint
         if credential_fingerprint is not None
@@ -1582,10 +1599,13 @@ async def video_generate(
     )
     target = _resolve_generated_video_path(filename, tool_name="video_generate")
     target.parent.mkdir(parents=True, exist_ok=True)
-    # Finish the KDF before submission so accepting a paid job only registers
-    # its receipt synchronously, including when cancellation follows acceptance.
-    credential_fingerprint = await asyncio.to_thread(
-        _video_credential_fingerprint, credential.api_key
+    # Account jobs belong to the stable service/account, not the local lease.
+    # Finish any manual-key KDF before submission so acceptance stays synchronous.
+    account_authority = getattr(credential, "account_authority", None)
+    credential_fingerprint = (
+        ""
+        if account_authority is not None
+        else await asyncio.to_thread(_video_credential_fingerprint, credential.api_key)
     )
     status_lock = asyncio.Lock()
     accepted_job_id: str | None = None
@@ -1610,6 +1630,7 @@ async def video_generate(
                 getattr(credential, "env_key", ""),
                 status_lock=status_lock,
                 credential_fingerprint=credential_fingerprint,
+                account_authority=account_authority,
             )
         return accepted_handle
 
@@ -1751,15 +1772,32 @@ async def video_status(job_id: str, filename: str | None = None) -> str:
                 raise ToolError(
                     f"{provider} credential for video generation is unavailable"
                 ) from exc
-        if credential.available and credential.api_key:
+        account_authority = getattr(credential, "account_authority", None)
+        if (
+            credential.available
+            and credential.api_key
+            and account_authority is None
+            and receipt.account_authority is None
+        ):
             credential_fingerprint = await asyncio.to_thread(
                 _video_credential_fingerprint, credential.api_key
             )
-        candidate_matches = (
-            credential_fingerprint is not None
-            and hmac.compare_digest(credential_fingerprint, receipt.credential_fingerprint)
-        )
-        if not candidate_matches and receipt.credential_env:
+        if receipt.account_authority is not None or account_authority is not None:
+            candidate_matches = bool(
+                credential.available
+                and credential.api_key
+                and receipt.account_authority == account_authority
+            )
+        else:
+            candidate_matches = (
+                credential_fingerprint is not None
+                and hmac.compare_digest(credential_fingerprint, receipt.credential_fingerprint)
+            )
+        if (
+            not candidate_matches
+            and receipt.account_authority is None
+            and receipt.credential_env
+        ):
             remembered_key = environment_value(receipt.credential_env).strip()
             if remembered_key:
                 if credential_fingerprint is None or remembered_key != credential.api_key:
@@ -1782,6 +1820,7 @@ async def video_status(job_id: str, filename: str | None = None) -> str:
         credential.api_key,
         provider,
         credential_fingerprint=credential_fingerprint,
+        account_authority=getattr(credential, "account_authority", None),
     ):
         raise ToolError("Video job is unavailable in this session")
     if filename is not None:

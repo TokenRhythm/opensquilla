@@ -27,7 +27,7 @@ export async function cleanupDesktopProcessTrees(
   options: DesktopProcessCleanupOptions,
 ): Promise<boolean> {
   const { launch, budget } = options
-  if (budget.remainingTotalMs <= 0) return false
+  if (budget.remainingTotalMs <= 0 || budget.disposalSignal.aborted) return false
   const args = launch.mode === 'bundled'
     ? ['--internal-child', 'process-tree', '--desktop-quit-cleanup']
     : ['run', '--no-sync', 'python', '-m', 'opensquilla.process_tree', '--desktop-quit-cleanup']
@@ -108,10 +108,18 @@ export async function cleanupDesktopProcessTrees(
       finish(false)
     }
   })
-  const result = await budget.termination(work)
-  if (!result.completed) {
+  // The outer quit deadline can win before this helper's timeout callback.
+  // Stop our own helper synchronously before Electron commits its exit.
+  const disposed = (): void => {
     stopHelper()
     finish(false)
   }
-  return result.completed && result.value
+  budget.disposalSignal.addEventListener('abort', disposed, { once: true })
+  try {
+    const result = await budget.termination(work)
+    if (!result.completed) disposed()
+    return result.completed && result.value
+  } finally {
+    budget.disposalSignal.removeEventListener('abort', disposed)
+  }
 }

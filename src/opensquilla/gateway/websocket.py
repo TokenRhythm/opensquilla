@@ -289,6 +289,7 @@ _CONCURRENT_OPTIONAL_READ_METHODS: frozenset[str] = frozenset(
         "cron.status",
         "cron.runs",
         "models.routing.get",
+        "models.recommendations.get",
         "onboarding.status",
         "sandbox.run_mode.preference.get",
         "sandbox.runtime.status",

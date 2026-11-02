@@ -372,7 +372,7 @@ def ensemble_activation_preview(config: Any) -> dict[str, Any]:
         patches.get("llm_ensemble.selection_mode")
         or getattr(ensemble, "selection_mode", "")
     )
-    static_profile = static_b5_profile(selection_mode)
+    static_profile = static_b5_profile(selection_mode, config)
     if static_profile is not None:
         return {
             "selection_mode": selection_mode,

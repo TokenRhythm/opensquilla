@@ -1272,12 +1272,16 @@ jobs:
         working-directory: desktop/electron
         run: |
           npm run test:local-build
+          npm run test:build-glob-compat
           node scripts/test-macos-keychain-patch.cjs
           node scripts/test-installer-progress-contract.mjs
           node --test scripts/test-electron-download-proxy.mjs
           node --test scripts/test-electron-download-tls.mjs
           node --test scripts/test-gateway-integrity.mjs
           node scripts/test-secret-storage-policy.mjs
+          node --test scripts/test-local-account-secrets.mjs
+          node --test scripts/test-desktop-keychain-free-startup.mjs scripts/test-tokenrhythm-account.mjs scripts/test-tokenrhythm-environment.mjs
+          node --test scripts/test-desktop-account-quit.mjs scripts/test-desktop-account-update.mjs scripts/test-desktop-account-cleanup.mjs scripts/test-desktop-account-migration.mjs
           node scripts/test-update-resolver.mjs
           node scripts/test-update-check-scheduler.mjs
           node scripts/test-windows-update-security.mjs
@@ -2391,6 +2395,10 @@ jobs:
         working-directory: desktop/electron
         shell: bash
         run: npm ci
+
+      - name: Verify desktop build glob compatibility
+        working-directory: desktop/electron
+        run: npm run test:build-glob-compat
 
       - name: Prepare and verify pinned Electron binary
         shell: bash

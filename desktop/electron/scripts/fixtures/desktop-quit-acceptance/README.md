@@ -12,6 +12,13 @@ From `desktop/electron`:
 node scripts/test-desktop-quit-native-acceptance.mjs --artifacts=C:\absolute\isolated\output
 ```
 
+To run only the actual main-process exit check with injected incomplete cleanup,
+independently of the dialog focus and geometry scenarios, add `--exit-only`.
+Use `--themes-only` for the light/dark locale matrix, all custom palettes, and
+the live native scheme change after returning to System. The runner puts the
+isolated owner in the foreground before each user action; it never fixes a
+production modal's focus after opening it.
+
 For manual native interaction, including the actual OS cleanup error box:
 
 ```powershell
@@ -35,17 +42,22 @@ reported as successful Linux tests.
 
 The ticking task is an actual child process created and retained by this
 fixture. Gateway activity, Gateway cleanup results, preferences, the tray-ready
-flag, and the application's final exit boundary are fixture adapters. The host
-stays open after that boundary so manual acceptance can reset it. This is not a
-real Gateway, packaged-runtime, provider or tray test. Automated cleanup failure
-records the production error-box copy without opening an OS modal;
-`--manual-native-errors` enables the real OS modal for manual verification.
+flag, and most application exit boundaries are fixture adapters. The host
+stays open after those boundaries so acceptance can reset it. The automated
+runner finishes with an actual Electron process exit after injected incomplete
+cleanup, and checks that the retained synthetic child is also gone. Ordinary
+quit must not show a cleanup failure dialog or ask the user to quit again.
+This is not a real Gateway, packaged-runtime, provider or tray test.
+`--manual-native-errors` enables native error dialogs for the separate signal
+shutdown policy.
 
 **Stop fixture** reaps the retained child and closes only this fixture. The
 automated runner also does this in its finalizer. Screenshots and geometry
 records are produced from actual confirmation BrowserWindows, not HTML mocks.
 The compact dialog is checked in English, Chinese, Japanese, French, German
-and Spanish, in both themes, plus long page counts and dialogs without pages.
+and Spanish, in both basic themes, plus custom theme colors, long page counts
+and dialogs without pages. Dialog colors are compared with the WebUI tokens,
+including button hover and keyboard focus treatments.
 Empty page warnings are omitted, including their accessibility references.
 The runner also checks native visibility, focus, modal ownership, show events,
 and placement inside the owner's display. Native bounds and event receipts are

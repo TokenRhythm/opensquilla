@@ -14,6 +14,26 @@ def setup_catalog() -> SetupCatalog:
 
 
 def setup_status(config: Any, *, is_owner: bool) -> SetupStatus:
+    from opensquilla.desktop_account import (
+        account_state_for_turn,
+        desktop_account_available,
+        pin_account_state,
+        reset_account_state,
+    )
+
+    if not desktop_account_available():
+        return _setup_status(config, is_owner=is_owner)
+    # Settings reloads immediately after desktop IPC source changes. Refresh
+    # the bridge once, then use one consistent snapshot for all projections;
+    # the short background cache may still describe the previous selection.
+    scope = pin_account_state(account_state_for_turn())
+    try:
+        return _setup_status(config, is_owner=is_owner)
+    finally:
+        reset_account_state(scope)
+
+
+def _setup_status(config: Any, *, is_owner: bool) -> SetupStatus:
     from opensquilla.onboarding.legacy_data import legacy_data_payload
     from opensquilla.onboarding.mutations import capability_resettable
     from opensquilla.onboarding.next_steps import env_recovery_commands
@@ -31,6 +51,55 @@ def setup_status(config: Any, *, is_owner: bool) -> SetupStatus:
         and credential.get("source") in {"explicit", "env"}
     )
     config_path = getattr(config, "config_path", None)
+    manual_connection: dict[str, Any] | None = None
+    from opensquilla.desktop_account import desktop_account_available, manual_credential_scope
+
+    if desktop_account_available():
+        import tomllib
+        from pathlib import Path
+
+        from opensquilla.onboarding.status import _llm_credential_status, _llm_profile_status
+
+        with manual_credential_scope():
+            manual_primary = _llm_credential_status(config)
+            manual_primary["revealAllowed"] = bool(
+                is_owner
+                and manual_primary.get("available")
+                and manual_primary.get("source") in {"explicit", "env"}
+            )
+            manual = next(
+                (
+                    row
+                    for row in _llm_profile_status(config.model_copy(deep=True))
+                    if row["provider"] == "tokenrhythm"
+                ),
+                {},
+            )
+        persisted: dict[str, Any] = {}
+        if config_path:
+            try:
+                persisted = tomllib.loads(Path(config_path).read_text())
+            except (OSError, ValueError):
+                pass
+        primary = persisted.get("llm", {})
+        profile = persisted.get("llm_profiles", {}).get("tokenrhythm", {})
+        # Account-only profiles have a reference, never a manual credential.
+        configured = bool(
+            (
+                primary
+                and primary.get("provider", "tokenrhythm") == "tokenrhythm"
+                and primary.get("credential_source") != "account"
+            )
+            or (profile and profile.get("credential_source") != "account")
+            or manual.get("ready")
+        )
+        manual_connection = {
+            **manual,
+            "configured": configured,
+            "credential": manual_primary,
+            "connectionId": "tokenrhythm:manual",
+        }
+
     return cast(
         SetupStatus,
         {
@@ -40,6 +109,7 @@ def setup_status(config: Any, *, is_owner: bool) -> SetupStatus:
             "llmSource": status.llm_source,
             "llmEnvKey": status.llm_env_key,
             "llmCredentialStatus": credential,
+            "tokenRhythmManual": manual_connection,
             "llmProfileStatus": list(status.llm_profile_status),
             "imageGenerationConfigured": status.image_generation_configured,
             "imageGenerationEnabled": status.image_generation_enabled,
@@ -81,8 +151,7 @@ def setup_status(config: Any, *, is_owner: bool) -> SetupStatus:
             "ensembleCredentialStatus": list(status.ensemble_credential_status),
             "needsOnboarding": status.needs_onboarding,
             "sections": {
-                name: section_status.value
-                for name, section_status in status.sections.items()
+                name: section_status.value for name, section_status in status.sections.items()
             },
             "sectionDetails": status.section_details,
             "envRecoveryCommands": env_recovery_commands(status),

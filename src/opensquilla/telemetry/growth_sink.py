@@ -426,8 +426,11 @@ class GrowthEventSink:
                 checkpoint=ConsentCheckpoint.ENQUEUE,
                 notice_version=notice_version,
             ) as permit:
+                if permit is None:
+                    return False
+
                 def transaction() -> bool:
-                    if permit is None or self._closed:
+                    if self._closed:
                         return False
                     identity_value = self._usage_identity_value()
                     if identity_value is None:
@@ -694,11 +697,12 @@ class GrowthEventSink:
             checkpoint=ConsentCheckpoint.ENQUEUE,
             notice_version=notice_version,
         ) as permit:
+            if permit is None:
+                return None
+
             def transaction() -> (
                 tuple[str, ClientLaunch, int] | Literal[RecordStatus.DUPLICATE] | None
             ):
-                if permit is None:
-                    return None
                 identity_value = self._usage_identity_value(create=True)
                 assert identity_value is not None
                 day = occurred_at.astimezone(UTC).date().isoformat()
