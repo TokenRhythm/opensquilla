@@ -109,13 +109,12 @@ onUnmounted(() => document.removeEventListener('pointerdown', outside))
             <span v-else-if="walletUnavailable" class="sidebar-account__hint sidebar-account__hint--warning" role="status">{{ t(wallet ? 'account.menu.balanceStale' : 'account.menu.balanceUnavailable') }}</span>
           </div>
           <div class="sidebar-account__usage" data-testid="sidebar-account-today-usage" :aria-busy="loading">
-            <span class="sidebar-account__caption sidebar-account__usage-label" :title="t('account.menu.todayUsageHint')">
+            <span class="sidebar-account__caption sidebar-account__usage-label">
               {{ t('account.menu.todayUsage') }}<Icon name="info" :size="13" aria-hidden="true" />
             </span>
             <span class="sidebar-account__tokens" :title="tokens === null ? undefined : tokens.toLocaleString(locale)">{{ approximate && tokens !== null ? '≈ ' : '' }}{{ tokenCount }}<small v-if="tokens !== null"> Tokens</small></span>
             <span v-if="loading" class="sidebar-account__hint" role="status">{{ t('shared.loading') }}</span>
             <span v-else-if="usageError" class="sidebar-account__hint" role="status">{{ t('account.menu.usageUnavailable') }}</span>
-            <span v-else-if="approximate" class="sidebar-account__hint">{{ t('account.menu.usageApproximate') }}</span>
           </div>
         </div>
         <div class="sidebar-account__divider" role="separator" />
