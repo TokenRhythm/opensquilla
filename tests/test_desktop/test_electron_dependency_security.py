@@ -123,3 +123,15 @@ def test_electron_build_dependencies_include_resource_exhaustion_fixes() -> None
             assert version >= (2, 1, 2)
         else:
             assert version >= (5, 0, 7)
+
+
+
+def test_minimatch_keeps_legacy_api_and_fixes_modern_globparts_amplification() -> None:
+    versions = {
+        _version_tuple(package["version"])
+        for path, package in _packages().items()
+        if path.endswith("/minimatch")
+    }
+    assert (3, 1, 5) in versions and (5, 1, 9) in versions
+    assert all(version in {(3, 1, 5), (5, 1, 9)} or version >= (11, 0, 1)
+               for version in versions)
