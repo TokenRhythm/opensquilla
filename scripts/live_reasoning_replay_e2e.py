@@ -23,6 +23,7 @@ import sys
 import tempfile
 import time
 from collections.abc import AsyncIterator, Callable, Iterator, Mapping
+from contextvars import ContextVar
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -266,6 +267,7 @@ class WireCall:
     content_encoding: str = "identity"
     encoded_response_bytes: int = 0
     decoded_response_bytes: int = 0
+    generation_proof: dict[str, Any] | None = field(default=None, repr=False)
 
     def observe_error(self, error: dict[str, Any]) -> None:
         code = str(error.get("code", ""))
@@ -500,6 +502,9 @@ class WireObserver:
         self.replay_checks: dict[str, Any] = {}
         self.blocked_unobserved_generation_requests = 0
         self.blocked_http_requests: list[dict[str, Any]] = []
+        self.generation_budget_scope: ContextVar[dict[str, Any] | None] = ContextVar(
+            "generation_budget_scope", default=None,
+        )
 
     @contextlib.contextmanager
     def observe(self) -> Iterator[None]:
@@ -522,6 +527,11 @@ class WireObserver:
                 call = WireCall(
                     request=json.loads(request.content), provider=matched_provider,
                 )
+                request_key = _payload_fingerprint(call.request)
+                scope = self.generation_budget_scope.get()
+                captured = scope.get("final_proof") if scope is not None else None
+                if captured is not None and captured[0] == request_key:
+                    call.generation_proof = dict(captured[1])
                 self.calls.append(call)
                 fault = (
                     self.summary_fault()
@@ -1082,6 +1092,166 @@ def wire_pressure_evidence(call: WireCall) -> dict[str, Any]:
     }
 
 
+def _payload_fingerprint(payload: Mapping[str, Any]) -> str:
+    """Identify one JSON payload without retaining its contents in the report."""
+    encoded = json.dumps(
+        payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"),
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+@contextlib.contextmanager
+def _capture_generation_budget_proofs(observer: WireObserver) -> Iterator[None]:
+    """Bind adapter generation proofs to the exact payload observed on the wire."""
+    from opensquilla.engine import context_budget
+    from opensquilla.provider.openai import OpenAIProvider
+    from opensquilla.session import compaction
+
+    original_build = OpenAIProvider._build_payload
+    original_stream = OpenAIProvider._stream_impl
+    original_coordinate = context_budget.coordinate_provider_context_budget
+    original_fit_summary = compaction._fit_summary_generation_allowance
+    prefit_attribute = "_harness_generation_prefit"
+
+    async def capture_stream(self, *args, **kwargs):
+        scope: dict[str, Any] = {}
+        stream = original_stream(self, *args, **kwargs)
+        try:
+            while True:
+                token = observer.generation_budget_scope.set(scope)
+                try:
+                    event = await anext(stream)
+                except StopAsyncIteration:
+                    return
+                finally:
+                    observer.generation_budget_scope.reset(token)
+                yield event
+        finally:
+            # Generators can be closed in a different task. Activate/reset
+            # context around each operation, never across a yielded event.
+            token = observer.generation_budget_scope.set(scope)
+            try:
+                await stream.aclose()
+            finally:
+                observer.generation_budget_scope.reset(token)
+
+    def capture_fit_summary(provider, messages, tools, config):
+        before = config.max_tokens
+        previous = getattr(config, prefit_attribute, None)
+        if previous is not None:
+            _require(before == previous[1], "compaction_request_configuration_changed")
+        original_fit_summary(provider, messages, tools, config)
+        _require(0 < config.max_tokens <= before, "compaction_request_configuration_changed")
+        # Pydantic model_copy preserves private sidecar attributes, including
+        # the copy that compaction creates for each actual provider attempt.
+        object.__setattr__(
+            config, prefit_attribute, (previous[0] if previous else before, config.max_tokens),
+        )
+
+    def capture_build(self, messages, tools, cfg):
+        scope = observer.generation_budget_scope.get()
+        if scope is not None:
+            scope.pop("built", None)
+            scope.pop("final_proof", None)
+        result = original_build(self, messages, tools, cfg)
+        if scope is None:
+            return result
+        payload, proof = result[0], result[4]
+        active_field = next(
+            (name for name in ("max_output_tokens", "max_completion_tokens", "max_tokens")
+             if name in payload),
+            None,
+        )
+        captured = dict(proof)
+        captured["generation_budget_field"] = active_field
+        prefit = getattr(cfg, prefit_attribute, None)
+        _require(prefit is None or cfg.max_tokens == prefit[1],
+                 "compaction_request_configuration_changed")
+        captured["configured_generation_tokens"] = cfg.max_tokens
+        captured["logical_generation_tokens"] = prefit[0] if prefit else cfg.max_tokens
+        # Retain the object until coordination: identical projected payloads
+        # can have different requested caps after capacity fitting.
+        scope["built"] = (payload, captured)
+        return result
+
+    def capture_coordinate(payload, **kwargs):
+        scope = observer.generation_budget_scope.get()
+        captured = scope.pop("built", None) if scope is not None else None
+        if scope is not None:
+            scope.pop("final_proof", None)
+        decision = original_coordinate(payload, **kwargs)
+        if (scope is not None and captured is not None and captured[0] is payload
+                and decision.action in {"send", "send_compacted"}
+                and isinstance(decision.payload, dict)):
+            final_payload = decision.payload or payload
+            scope["final_proof"] = (_payload_fingerprint(final_payload), dict(captured[1]))
+        return decision
+
+    with patch.object(OpenAIProvider, "_build_payload", capture_build), \
+            patch.object(OpenAIProvider, "_stream_impl", capture_stream), \
+            patch.object(compaction, "_fit_summary_generation_allowance", capture_fit_summary), \
+            patch.object(context_budget, "coordinate_provider_context_budget", capture_coordinate):
+        yield
+
+
+def _generation_budget_fields(call: WireCall) -> tuple[str, int]:
+    """Return the adapter-selected cap field and its positive wire value."""
+    fields = [name for name in ("max_output_tokens", "max_completion_tokens", "max_tokens")
+              if name in call.request]
+    _require(len(fields) == 1, "compaction_request_configuration_changed")
+    field = fields[0]
+    value = call.request[field]
+    _require(type(value) is int and not isinstance(value, bool) and value > 0,
+             "compaction_request_configuration_changed")
+    return field, value
+
+
+def _require_matching_generation_budgets(
+    calls: list[WireCall],
+    *,
+    requested_must_match: bool = False,
+    expected_requested: int | None = None,
+) -> list[int]:
+    """Check final wire caps against the production adapter proof."""
+    requested: list[int] = []
+    for call in calls:
+        field, value = _generation_budget_fields(call)
+        proof = call.generation_proof
+        _require(isinstance(proof, dict), "compaction_request_configuration_changed")
+        effective = proof.get("effective_generation_tokens")
+        requested_value = proof.get("requested_generation_tokens")
+        configured = proof.get("configured_generation_tokens")
+        logical = proof.get("logical_generation_tokens")
+        _require(
+            type(effective) is int and effective > 0
+            and type(requested_value) is int and requested_value > 0
+            and type(configured) is int and configured == requested_value
+            and type(logical) is int and logical >= configured
+            and effective <= requested_value
+            and value == effective,
+            "compaction_request_configuration_changed",
+        )
+        active_field = proof.get("generation_budget_field", field)
+        _require(active_field == field, "compaction_request_configuration_changed")
+        if expected_requested is not None:
+            _require(logical == expected_requested, "compaction_request_configuration_changed")
+        requested.append(logical)
+    if requested_must_match:
+        _require(all(value == requested[0] for value in requested),
+                 "compaction_request_configuration_changed")
+    return requested
+
+
+def _expected_compaction_generation_budget(
+    options: CompactionCaseOptions, variant: str, turn: int,
+) -> int:
+    if turn > 0 and variant == "truncated":
+        return 1
+    if turn > 0 and variant == "long_reasoning":
+        return options.max_output_tokens or 8192
+    return options.max_output_tokens if options.max_output_tokens is not None else 4096
+
+
 def _compaction_tool_history_representation(call: WireCall) -> str:
     """Validate native or quoted pairs without conflating their wire representations."""
     pending: dict[str, int] = {}
@@ -1404,6 +1574,7 @@ async def _run_compaction_case(
 
     with contextlib.ExitStack() as stack:
         stack.enter_context(observer.observe())
+        stack.enter_context(_capture_generation_budget_proofs(observer))
         stack.callback(add_compaction_listener(observe_compaction_event))
         for turn, prompt in enumerate(prompts):
             storage = SessionStorage(str(db))
@@ -1466,6 +1637,12 @@ async def _run_compaction_case(
                         options.preflight_ratio is None and not options.native_pressure
                     ):
                         config.preflight_compact_ratio = 0.2
+                expected_generation = _expected_compaction_generation_budget(options, variant, turn)
+                _require(
+                    type(expected_generation) is int and expected_generation > 0
+                    and config.llm.max_tokens == expected_generation,
+                    "compaction_request_configuration_changed",
+                )
                 selector_config = SelectorConfig(
                     primary=ProviderConfig(
                         provider=provider,
@@ -1531,6 +1708,9 @@ async def _run_compaction_case(
                         all(call.request.get("model") == model for call in observer.calls),
                         "parent_request_model_mismatch",
                     )
+                    _require_matching_generation_budgets(
+                        observer.calls[call_start:], expected_requested=expected_generation,
+                    )
                     parent = observer.calls[-1]
                     generated_label = _compaction_generated_label(
                         parent.response.get("content") or ""
@@ -1589,6 +1769,9 @@ async def _run_compaction_case(
                 active_entries = await manager.get_transcript(key)
                 active = _canonical_message_digests(active_entries)
                 if variant == "truncated":
+                    _require_matching_generation_budgets(
+                        stage_calls, expected_requested=expected_generation,
+                    )
                     observed["length_observed"] = bool(
                         compact and compact.finish_reason == "length"
                     )
@@ -1780,8 +1963,6 @@ async def _run_compaction_case(
                     "reasoning_effort",
                     "enable_thinking",
                     "preserve_thinking",
-                    "max_tokens",
-                    "max_completion_tokens",
                 ):
                     _require(
                         all(call.request.get(name) == resumed.request.get(name)
@@ -1793,6 +1974,16 @@ async def _run_compaction_case(
                             parent.request.get(name) == compact.request.get(name),
                             "compaction_request_configuration_changed",
                         )
+                # A wire mutation invalidates the complete payload proof too.
+                # Prefer the dedicated model/source diagnostics above, then
+                # check every call admitted by the stage shape requirement.
+                _require_matching_generation_budgets(
+                    [*summary_calls, resumed], expected_requested=expected_generation,
+                )
+                if variant not in {"model_switch", "long_reasoning", "replay_off"}:
+                    _require_matching_generation_budgets(
+                        [parent, compact], requested_must_match=True,
+                    )
                 common = 0
                 for left, right in zip(
                     parent.request.get("messages", []), compact_messages, strict=False

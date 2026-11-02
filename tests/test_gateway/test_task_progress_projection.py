@@ -45,6 +45,9 @@ def test_task_summary_ignores_unknown_plan_result_status():
     assert "plan_result" not in result
 
 
+# Keep the real Goal RPC/SQLite stack's three-second completion budget outside
+# the parallel CI worker pool; tool dispatch and projection assertions stay real.
+@pytest.mark.ci_serial
 @pytest.mark.parametrize("create_before_discovery", [False, True])
 async def test_discovered_progress_projects_ordinary_task_and_naturally_created_and_edited_goal(
     tmp_path, create_before_discovery,
@@ -129,6 +132,9 @@ async def test_discovered_progress_projects_ordinary_task_and_naturally_created_
         assert checked == [1, 2]
 
 
+# The emitter controls the race; unrelated CI workers must not consume the
+# durable task's three-second completion budget.
+@pytest.mark.ci_serial
 @pytest.mark.parametrize("replace_goal", [False, True])
 async def test_progress_cannot_publish_goal_cleared_before_observer_runs(
     tmp_path, replace_goal,
