@@ -232,7 +232,7 @@ _DASHSCOPE_MAX_CACHE_MARKERS = 4
 _DASHSCOPE_CACHE_MARKER_ROLES = {"system", "user", "assistant", "tool"}
 
 
-def _is_inert_post_terminal_stream_frame(
+def _post_terminal_stream_violation(
     *,
     chunk: Mapping[str, Any],
     raw_choices: list[Any],
@@ -240,23 +240,20 @@ def _is_inert_post_terminal_stream_frame(
     terminal_native_finish_reason_present: bool,
     terminal_native_finish_reason: Any,
     policy: OpenAICompatPolicy,
-) -> bool:
-    """Accept only a provider-declared, state-free terminal epilogue.
+) -> tuple[str, str] | None:
+    """Identify the first state change in a provider-declared terminal epilogue.
 
-    OpenAI's usage trailer normally has ``choices: []``.  A small number of
-    compatible gateways instead repeat choice zero with a semantically empty
-    delta while attaching usage/cost metadata.  (Some spell that no-op as
-    ``{"content": "", "role": "assistant"}``.)  Routing the duplicate through
-    the ordinary choice parser would make a second terminal look like mutable
-    response state.  Keep the exception narrow and fail closed on any content,
-    tool, reasoning, index, role, or finish-reason change.
+    OpenAI's usage trailer normally has ``choices: []``. Some compatible
+    gateways repeat choice zero with a semantically empty delta and usage/cost
+    metadata. Keep that exception narrow; return a field path and a fixed rule
+    name for diagnostics, never a provider-supplied value.
     """
-
     allowed_chunk_keys = _OPENAI_STREAM_USAGE_ONLY_KEYS.union(
         policy.post_terminal_metadata_keys
     )
     if set(chunk).difference(allowed_chunk_keys):
-        return False
+        key = next(key for key in chunk if key not in allowed_chunk_keys)
+        return (f"$.{_stream_diagnostic_key(key)}", "unexpected_fields")
 
     usage_present = "usage" in chunk
     usage_payload = chunk.get("usage")
@@ -267,18 +264,21 @@ def _is_inert_post_terminal_stream_frame(
         and policy.allow_post_terminal_null_usage_noop_choice
     )
     if usage_present and not has_usage and not has_null_usage_noop:
-        return False
+        return ("usage", "invalid_type")
 
     if not raw_choices:
-        return has_usage or policy.allow_post_terminal_empty_choices
+        if has_usage or has_null_usage_noop or policy.allow_post_terminal_empty_choices:
+            return None
+        return ("choices", "empty_without_usage")
     if not policy.allow_post_terminal_noop_choice or len(raw_choices) != 1:
-        return False
+        return ("choices", "noop_choice_not_allowed")
 
     choice = raw_choices[0]
     if not isinstance(choice, Mapping):
-        return False
+        return ("choices[0]", "invalid_type")
     if set(choice).difference(_OPENAI_STREAM_NOOP_CHOICE_KEYS):
-        return False
+        key = next(key for key in choice if key not in _OPENAI_STREAM_NOOP_CHOICE_KEYS)
+        return (f"choices[0].{_stream_diagnostic_key(key)}", "unexpected_fields")
 
     choice_index = choice.get("index", 0)
     if (
@@ -286,44 +286,114 @@ def _is_inert_post_terminal_stream_frame(
         or isinstance(choice_index, bool)
         or choice_index != 0
     ):
-        return False
+        return ("choices[0].index", "not_choice_zero")
 
     if "delta" not in choice:
-        return False
+        return ("choices[0].delta", "missing")
     delta = choice["delta"]
     if not isinstance(delta, Mapping):
-        return False
+        return ("choices[0].delta", "invalid_type")
     if set(delta).difference(_OPENAI_STREAM_NOOP_DELTA_KEYS):
-        return False
+        key = next(key for key in delta if key not in _OPENAI_STREAM_NOOP_DELTA_KEYS)
+        return (f"choices[0].delta.{_stream_diagnostic_key(key)}", "unexpected_fields")
     if delta.get("content") not in (None, ""):
-        return False
+        return ("choices[0].delta.content", "nonempty")
     if delta.get("role") not in (None, "assistant"):
-        return False
+        return ("choices[0].delta.role", "not_assistant")
     if _has_native_tool_payload(delta.get("tool_calls")):
-        return False
+        return ("choices[0].delta.tool_calls", "native_tool_payload")
 
     repeated_finish = choice.get("finish_reason")
     if repeated_finish is not None and repeated_finish != terminal_finish_reason:
-        return False
+        return ("choices[0].finish_reason", "changed")
 
     repeated_native_present = "native_finish_reason" in choice
     if repeated_native_present != terminal_native_finish_reason_present:
-        return False
+        return ("choices[0].native_finish_reason", "presence_changed")
     if (
         repeated_native_present
         and choice["native_finish_reason"] != terminal_native_finish_reason
     ):
-        return False
+        return ("choices[0].native_finish_reason", "changed")
 
-    # A choice with neither usage nor a repeated finish is normally not a
-    # meaningful terminal epilogue. TokenRhythm explicitly opts into its
-    # observed ``usage: null`` spacer, which is still subject to every no-op
-    # choice and top-level key validation above.
-    return (
-        has_usage
-        or repeated_finish == terminal_finish_reason
-        or has_null_usage_noop
-    )
+    if has_usage or repeated_finish == terminal_finish_reason or has_null_usage_noop:
+        return None
+    return ("choices[0]", "missing_usage_or_repeated_finish")
+
+
+_STREAM_DIAGNOSTIC_FIELDS = _OPENAI_STREAM_USAGE_ONLY_KEYS.union(
+    _OPENAI_STREAM_NOOP_CHOICE_KEYS,
+    _OPENAI_STREAM_NOOP_DELTA_KEYS,
+    {
+        "billing_pending", "cost_cny", "reasoning_available", "trace_id", "provider",
+        "reasoning", "reasoning_content", "reasoning_details", "refusal", "message",
+        "function_call", "logprobs", "prompt_tokens", "completion_tokens", "total_tokens",
+        "prompt_tokens_details", "completion_tokens_details", "cost", "cost_details",
+    },
+)
+_STREAM_DIAGNOSTIC_ENUMS = frozenset(
+    {"assistant", "user", "system", "tool", "stop", "length", "tool_calls",
+     "function_call", "content_filter", "end_turn", "eos_token"},
+)
+
+
+def _stream_diagnostic_key(key: Any) -> str:
+    # Even field names can carry provider-controlled prose or secrets.
+    if isinstance(key, str) and key in _STREAM_DIAGNOSTIC_FIELDS:
+        return key
+    digest = hashlib.sha256(str(key).encode("utf-8", errors="replace")).hexdigest()
+    return "unknown_" + digest[:12]
+
+
+def _stream_diagnostic_fields(value: Any) -> dict[str, Any]:
+    """Bound wire-field shapes; unknown keys and arbitrary values stay private."""
+    result: dict[str, Any] = {"type": type(value).__name__}
+    if isinstance(value, (Mapping, list, str)):
+        result["size"] = len(value)
+    if not isinstance(value, Mapping):
+        return result
+    fields: dict[str, Any] = {}
+    for key in list(value)[:24]:
+        label = _stream_diagnostic_key(key)
+        item = value[key]
+        shape: dict[str, Any] = {"type": type(item).__name__}
+        if isinstance(item, (Mapping, list, str)):
+            shape["size"] = len(item)
+        if key in {"role", "finish_reason", "native_finish_reason"}:
+            if isinstance(item, str) and item in _STREAM_DIAGNOSTIC_ENUMS:
+                shape["enum"] = item
+        if key == "index":
+            shape["is_zero"] = isinstance(item, int) and not isinstance(item, bool) and item == 0
+        fields[label] = shape
+    result["fields"] = fields
+    return result
+
+
+def _post_terminal_stream_diagnostic(
+    *,
+    chunk: Mapping[str, Any],
+    terminal_finish_reason: str,
+    terminal_native_finish_reason_present: bool,
+    terminal_native_finish_reason: Any,
+    violation: tuple[str, str],
+) -> dict[str, Any]:
+    raw_choices = chunk.get("choices")
+    choice = raw_choices[0] if isinstance(raw_choices, list) and raw_choices else None
+    return {
+        "field": violation[0],
+        "rule": violation[1],
+        "chunk": _stream_diagnostic_fields(chunk),
+        "choice": _stream_diagnostic_fields(choice),
+        "delta": _stream_diagnostic_fields(
+            choice.get("delta") if isinstance(choice, Mapping) else None,
+        ),
+        "usage": _stream_diagnostic_fields(chunk.get("usage")),
+        "terminal": _stream_diagnostic_fields({
+            "finish_reason": terminal_finish_reason,
+            **({"native_finish_reason": terminal_native_finish_reason}
+               if terminal_native_finish_reason_present else {}),
+        }),
+    }
 
 
 def _truncate_tool_status_output(output: str) -> str:
@@ -4066,6 +4136,8 @@ class OpenAIProvider:
         terminal_finish_reason: str | None = None
         terminal_native_finish_reason_present = False
         terminal_native_finish_reason: Any = None
+        stream_frame_index = 0
+        terminal_frame_index: int | None = None
         active_choice_seen = False
         response_ids: set[str] = set()
 
@@ -4322,6 +4394,7 @@ class OpenAIProvider:
                     async for line in response.aiter_lines():
                         if not line.startswith("data:"):
                             continue
+                        stream_frame_index += 1
                         data_str = line[5:]
                         if data_str.startswith(" "):
                             data_str = data_str[1:]
@@ -4433,7 +4506,7 @@ class OpenAIProvider:
                             return
                         if choice_terminal_seen:
                             assert terminal_finish_reason is not None
-                            if not _is_inert_post_terminal_stream_frame(
+                            violation = _post_terminal_stream_violation(
                                 chunk=chunk,
                                 raw_choices=raw_choices,
                                 terminal_finish_reason=terminal_finish_reason,
@@ -4444,13 +4517,43 @@ class OpenAIProvider:
                                     terminal_native_finish_reason
                                 ),
                                 policy=self._compat,
-                            ):
+                            )
+                            if violation is not None:
+                                stream_diagnostic = _post_terminal_stream_diagnostic(
+                                    chunk=chunk,
+                                    terminal_finish_reason=terminal_finish_reason,
+                                    terminal_native_finish_reason_present=(
+                                        terminal_native_finish_reason_present
+                                    ),
+                                    terminal_native_finish_reason=(
+                                        terminal_native_finish_reason
+                                    ),
+                                    violation=violation,
+                                )
+                                log.warning(
+                                    "provider.invalid_stream_order",
+                                    provider=self._provider_kind,
+                                    model=self._model,
+                                    call_id=trace.call_id,
+                                    frame_index=stream_frame_index,
+                                    terminal_frame_index=terminal_frame_index,
+                                    stream_field=(
+                                        violation[0].removeprefix("$.").replace("[0]", ".0")
+                                    ),
+                                    reason_code=violation[1],
+                                    choices_count=len(raw_choices),
+                                    usage_present="usage" in chunk,
+                                    usage_is_null=chunk.get("usage") is None,
+                                )
                                 trace.record_error(
                                     code="invalid_stream_order",
                                     message="Provider mutated state after finish_reason",
                                     metadata={
                                         "phase": "stream",
                                         "cache_shape": cache_shape,
+                                        "frame_index": stream_frame_index,
+                                        "terminal_frame_index": terminal_frame_index,
+                                        "stream_diagnostic": stream_diagnostic,
                                     },
                                 )
                                 yield stream_error(
@@ -5072,6 +5175,7 @@ class OpenAIProvider:
 
                             if finish:
                                 choice_terminal_seen = True
+                                terminal_frame_index = stream_frame_index
                                 terminal_finish_reason = finish
                                 terminal_native_finish_reason_present = (
                                     "native_finish_reason" in choice
