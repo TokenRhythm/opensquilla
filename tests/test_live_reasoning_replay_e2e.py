@@ -107,6 +107,38 @@ def test_wire_parser_retains_explicit_empty_reasoning():
     assert call.response["reasoning_content"] == ""
 
 
+def _budget_call(wire: int, requested: int, effective: int, *, field: str = "max_tokens"):
+    return harness.WireCall(
+        request={field: wire},
+        generation_proof={
+            "requested_generation_tokens": requested,
+            "effective_generation_tokens": effective,
+            "generation_budget_field": field,
+        },
+    )
+
+
+def test_compaction_budget_check_allows_capacity_fit_but_rejects_config_drift():
+    fitted = _budget_call(3403, 4096, 3403)
+    ordinary = _budget_call(4096, 4096, 4096)
+    harness._require_matching_generation_budgets([fitted, ordinary], requested_must_match=True)
+
+    drifted = _budget_call(3403, 8192, 3403)
+    with pytest.raises(harness.ReplayCheckError, match="compaction_request_configuration_changed"):
+        harness._require_matching_generation_budgets([fitted, drifted], requested_must_match=True)
+
+
+@pytest.mark.parametrize("call", [
+    harness.WireCall(request={"max_tokens": None}),
+    harness.WireCall(request={"max_tokens": True}),
+    harness.WireCall(request={"max_tokens": 0}),
+    harness.WireCall(request={"max_tokens": 1, "max_completion_tokens": 1}),
+])
+def test_compaction_budget_check_rejects_invalid_or_ambiguous_wire_caps(call):
+    with pytest.raises(harness.ReplayCheckError, match="compaction_request_configuration_changed"):
+        harness._require_matching_generation_budgets([call])
+
+
 def test_wire_diagnostics_expose_shapes_and_allowlisted_error_codes_only():
     secret = "synthetic-secret-that-must-not-leak"
     call = harness.WireCall(

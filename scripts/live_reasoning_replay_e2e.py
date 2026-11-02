@@ -266,6 +266,7 @@ class WireCall:
     content_encoding: str = "identity"
     encoded_response_bytes: int = 0
     decoded_response_bytes: int = 0
+    generation_proof: dict[str, Any] | None = field(default=None, repr=False)
 
     def observe_error(self, error: dict[str, Any]) -> None:
         code = str(error.get("code", ""))
@@ -500,6 +501,7 @@ class WireObserver:
         self.replay_checks: dict[str, Any] = {}
         self.blocked_unobserved_generation_requests = 0
         self.blocked_http_requests: list[dict[str, Any]] = []
+        self.generation_proofs: dict[str, list[dict[str, Any]]] = {}
 
     @contextlib.contextmanager
     def observe(self) -> Iterator[None]:
@@ -522,6 +524,10 @@ class WireObserver:
                 call = WireCall(
                     request=json.loads(request.content), provider=matched_provider,
                 )
+                request_key = _payload_fingerprint(call.request)
+                proofs = self.generation_proofs.get(request_key)
+                if proofs:
+                    call.generation_proof = proofs.pop()
                 self.calls.append(call)
                 fault = (
                     self.summary_fault()
@@ -1082,6 +1088,95 @@ def wire_pressure_evidence(call: WireCall) -> dict[str, Any]:
     }
 
 
+def _payload_fingerprint(payload: Mapping[str, Any]) -> str:
+    """Identify one JSON payload without retaining its contents in the report."""
+    encoded = json.dumps(
+        payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"),
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+@contextlib.contextmanager
+def _capture_generation_budget_proofs(observer: WireObserver) -> Iterator[None]:
+    """Bind adapter generation proofs to the exact payload observed on the wire."""
+    from opensquilla.engine import context_budget
+    from opensquilla.provider.openai import OpenAIProvider
+
+    built: dict[str, list[dict[str, Any]]] = {}
+    original_build = OpenAIProvider._build_payload
+    original_coordinate = context_budget.coordinate_provider_context_budget
+
+    def capture_build(self, *args, **kwargs):
+        result = original_build(self, *args, **kwargs)
+        payload, proof = result[0], result[4]
+        active_field = next(
+            (name for name in ("max_output_tokens", "max_completion_tokens", "max_tokens")
+             if name in payload),
+            None,
+        )
+        captured = dict(proof)
+        captured["generation_budget_field"] = active_field
+        built.setdefault(_payload_fingerprint(payload), []).append(captured)
+        return result
+
+    def capture_coordinate(payload, **kwargs):
+        key = _payload_fingerprint(payload)
+        proofs = built.get(key)
+        proof = proofs[0] if proofs else None
+        decision = original_coordinate(payload, **kwargs)
+        if proof is not None and isinstance(decision.payload, dict):
+            proofs.pop(0)
+            final_payload = decision.payload or payload
+            observer.generation_proofs.setdefault(
+                _payload_fingerprint(final_payload), [],
+            ).append(dict(proof))
+        return decision
+
+    with patch.object(OpenAIProvider, "_build_payload", capture_build), \
+            patch.object(context_budget, "coordinate_provider_context_budget", capture_coordinate):
+        yield
+
+
+def _generation_budget_fields(call: WireCall) -> tuple[str, int]:
+    """Return the adapter-selected cap field and its positive wire value."""
+    fields = [name for name in ("max_output_tokens", "max_completion_tokens", "max_tokens")
+              if name in call.request]
+    _require(len(fields) == 1, "compaction_request_configuration_changed")
+    field = fields[0]
+    value = call.request[field]
+    _require(type(value) is int and not isinstance(value, bool) and value > 0,
+             "compaction_request_configuration_changed")
+    return field, value
+
+
+def _require_matching_generation_budgets(
+    calls: list[WireCall],
+    *,
+    requested_must_match: bool = False,
+) -> list[int]:
+    """Check final wire caps against the production adapter proof."""
+    requested: list[int] = []
+    for call in calls:
+        field, value = _generation_budget_fields(call)
+        proof = call.generation_proof
+        _require(isinstance(proof, dict), "compaction_request_configuration_changed")
+        effective = proof.get("effective_generation_tokens")
+        requested_value = proof.get("requested_generation_tokens")
+        _require(
+            type(effective) is int and effective > 0
+            and type(requested_value) is int and requested_value > 0
+            and value == effective,
+            "compaction_request_configuration_changed",
+        )
+        active_field = proof.get("generation_budget_field", field)
+        _require(active_field == field, "compaction_request_configuration_changed")
+        requested.append(requested_value)
+    if requested_must_match:
+        _require(all(value == requested[0] for value in requested),
+                 "compaction_request_configuration_changed")
+    return requested
+
+
 def _compaction_tool_history_representation(call: WireCall) -> str:
     """Validate native or quoted pairs without conflating their wire representations."""
     pending: dict[str, int] = {}
@@ -1404,6 +1499,7 @@ async def _run_compaction_case(
 
     with contextlib.ExitStack() as stack:
         stack.enter_context(observer.observe())
+        stack.enter_context(_capture_generation_budget_proofs(observer))
         stack.callback(add_compaction_listener(observe_compaction_event))
         for turn, prompt in enumerate(prompts):
             storage = SessionStorage(str(db))
@@ -1780,8 +1876,6 @@ async def _run_compaction_case(
                     "reasoning_effort",
                     "enable_thinking",
                     "preserve_thinking",
-                    "max_tokens",
-                    "max_completion_tokens",
                 ):
                     _require(
                         all(call.request.get(name) == resumed.request.get(name)
@@ -1793,6 +1887,15 @@ async def _run_compaction_case(
                             parent.request.get(name) == compact.request.get(name),
                             "compaction_request_configuration_changed",
                         )
+                _require_matching_generation_budgets(
+                    [*summary_calls, resumed], requested_must_match=True,
+                )
+                if variant not in {"model_switch", "long_reasoning", "replay_off"}:
+                    parent_requested = _require_matching_generation_budgets([parent, compact])
+                    _require(
+                        parent_requested[1] <= parent_requested[0],
+                        "compaction_request_configuration_changed",
+                    )
                 common = 0
                 for left, right in zip(
                     parent.request.get("messages", []), compact_messages, strict=False
