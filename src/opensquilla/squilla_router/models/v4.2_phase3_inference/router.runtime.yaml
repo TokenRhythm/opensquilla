@@ -8,9 +8,9 @@ tier_mapping:
 
 tier_registry:
   S: [qwen/qwen3.7-flash]                 # Fast direct-answer tier for trivial turns and short acknowledgements.
-  M: [deepseek/deepseek-v4-flash-0731]     # Default general tier for normal Q&A, editing, and bounded coding tasks.
-  L: [deepseek/deepseek-v4-pro-0813]       # Reasoning tier for debugging, multi-step analysis, and structured planning.
-  XL: [z-ai/glm-5.3]                     # Highest GLM tier for architecture, high-risk work, and hard recovery turns.
+  M: [deepseek/deepseek-v4-flash]     # Default general tier for normal Q&A, editing, and bounded coding tasks.
+  L: [deepseek/deepseek-v4-pro]       # Reasoning tier for debugging, multi-step analysis, and structured planning.
+  XL: [moonshotai/kimi-k3]                     # Highest Kimi K3 tier for architecture, high-risk work, and hard recovery turns.
 
 tier_explanations:
   S:
@@ -20,18 +20,18 @@ tier_explanations:
     expected_controls: "No explicit thinking; P0 prompt hint may shorten responses."
   M:
     route_class: R1
-    model: deepseek/deepseek-v4-flash-0731
+    model: deepseek/deepseek-v4-flash
     intent: "General-purpose default for routine product, coding, writing, and comparison tasks with bounded complexity."
     expected_controls: "Light or default thinking; P1 prompt policy unless the task is clearly trivial or high risk."
   L:
     route_class: R2
-    model: deepseek/deepseek-v4-pro-0813
+    model: deepseek/deepseek-v4-pro
     intent: "Reasoning tier for debugging, multi-signal diagnosis, multi-step implementation plans, and non-trivial technical analysis."
     expected_controls: "High thinking; P1/P2 prompt policy depending on flags and difficulty."
   XL:
     route_class: R3
-    model: z-ai/glm-5.3
-    intent: "Highest GLM tier for architecture design, cross-system tradeoffs, high-risk production decisions, and complex recovery turns."
+    model: moonshotai/kimi-k3
+    intent: "Highest Kimi K3 tier for architecture design, cross-system tradeoffs, high-risk production decisions, and complex recovery turns."
     expected_controls: "High thinking; P1/P2 prompt policy depending on flags and difficulty."
 
 thresholds:

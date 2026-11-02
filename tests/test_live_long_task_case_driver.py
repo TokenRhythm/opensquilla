@@ -368,6 +368,7 @@ def test_gateway_config_contains_env_names_but_not_credential_values(
     assert 'api_key_env = "TOKENRHYTHM_API_KEY"' in rendered
     assert "http://127.0.0.1:12345/v1" in rendered
     assert "enabled = true" in rendered
+    assert 'strategy = "legacy_v4_phase3"' in rendered
 
 
 @pytest.fixture

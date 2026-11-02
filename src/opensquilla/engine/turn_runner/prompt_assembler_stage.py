@@ -104,6 +104,7 @@ class RunPipelineRequest:
     prev_assistant_text: str | None = None
     prev_assistant_usage: dict[str, Any] | None = None
     history_user_texts: list[str] | None = None
+    model_router_context: dict[str, Any] | None = field(default=None, repr=False)
     history_capacity_estimated_tokens: int = 0
     history_capacity_message_count: int = 0
     history_capacity_estimate_complete: bool = True
@@ -577,6 +578,7 @@ class PromptAssemblerStage:
             prev_assistant_text=router_context.get("prev_assistant_text"),
             prev_assistant_usage=router_context.get("prev_assistant_usage"),
             history_user_texts=router_context.get("history_user_texts"),
+            model_router_context=router_context,
             history_capacity_estimated_tokens=max(
                 0,
                 int(router_context.get("history_capacity_estimated_tokens") or 0),

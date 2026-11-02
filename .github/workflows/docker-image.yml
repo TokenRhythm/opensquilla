@@ -81,7 +81,13 @@ jobs:
           fi
 
       - name: Hydrate router assets
-        run: git lfs pull --include="src/opensquilla/squilla_router/models/**"
+        run: git lfs pull --include="src/opensquilla/squilla_router/models/**,src/opensquilla/squilla_router/lightgbm_model/assets/**"
+
+      - name: Verify LightGBM router assets
+        run: |
+          if [[ -f src/opensquilla/squilla_router/lightgbm_model/model.py ]]; then
+            PYTHONPATH=src python3 -c "from opensquilla.squilla_router.lightgbm_model import validate_artifacts; print(validate_artifacts())"
+          fi
 
       # The Dockerfile hard-fails on LFS pointer files; failing here first
       # gives a clearer error than a mid-build SystemExit.

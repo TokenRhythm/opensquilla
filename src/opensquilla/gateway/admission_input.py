@@ -4,7 +4,12 @@ from __future__ import annotations
 
 from typing import Any, cast
 
-from opensquilla.application.turn_admission import AdmitTurn, InitialRoutingMode, PendingInputGuard
+from opensquilla.application.turn_admission import (
+    AdmitTurn,
+    InitialRoutingMode,
+    PendingInputGuard,
+    RouterControlEvent,
+)
 from opensquilla.application.turn_input import (
     IncomingTurnSource,
     MemoryCapturePolicy,
@@ -46,6 +51,22 @@ def _initial_model_pin(params: dict[str, Any], camel: str, snake: str) -> str | 
     if values and any(value != values[0] for value in values[1:]):
         raise ValueError(f"{camel} and {snake} must match")
     return values[0] if values else None
+
+
+def _router_control_event(params: dict[str, Any]) -> RouterControlEvent | None:
+    values: list[str | None] = []
+    for name in ("routerControlEvent", "router_control_event"):
+        if name not in params:
+            continue
+        value = params[name]
+        if value is not None and (
+            not isinstance(value, str) or value not in {"new_task", "redo"}
+        ):
+            raise ValueError("routerControlEvent must be new_task or redo")
+        values.append(value)
+    if values and any(value != values[0] for value in values[1:]):
+        raise ValueError("routerControlEvent and router_control_event must match")
+    return cast(RouterControlEvent | None, values[0] if values else None)
 
 
 def normalized_source_hint(params: dict[str, Any]) -> dict[str, Any]:
@@ -310,6 +331,7 @@ def decode_admit_turn(
     # The durable receipt identifies original material, not the shared guarded
     # text shown for every large paste. Application normalization runs later.
     fingerprint = dict(fingerprint_params or params)
+    router_control_event = _router_control_event(params)
     initial_model = _initial_model_pin(params, "initialModel", "initial_model")
     initial_provider = _initial_model_pin(params, "initialProvider", "initial_provider")
     if initial_provider is not None and initial_model is None:
@@ -317,6 +339,7 @@ def decode_admit_turn(
     for camel, snake, value in (
         ("initialModel", "initial_model", initial_model),
         ("initialProvider", "initial_provider", initial_provider),
+        ("routerControlEvent", "router_control_event", router_control_event),
     ):
         fingerprint.pop(camel, None)
         fingerprint.pop(snake, None)
@@ -395,6 +418,7 @@ def decode_admit_turn(
         initial_routing_mode=cast(InitialRoutingMode | None, routing),
         initial_model=initial_model,
         initial_provider=initial_provider,
+        router_control_event=router_control_event,
         pending_input=pending_input,
         required_services=_required_services(params),
     )

@@ -52,6 +52,9 @@ jobs:
       - name: Install dependencies
         run: uv sync --extra dev --extra recommended --frozen
 
+      - name: Prepare router assets
+        uses: ./.github/actions/prepare-router-assets
+
       - name: Fail if OpenRouter secret is missing
         shell: bash
         run: |

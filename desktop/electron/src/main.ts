@@ -17157,7 +17157,15 @@ app.on('before-quit', (event) => {
         : budget.termination(Promise.allSettled(
           accountEntries.flatMap(entry => [
             Promise.resolve().then(() => entry.account.close()),
-            Promise.resolve().then(() => entry.proxy.close()),
+            Promise.resolve().then(async () => {
+              // Gateway status reads still use the loopback bridge while it
+              // drains. Closing the listener first can stall Windows connects
+              // and prevent the Gateway from releasing its profile ownership.
+              // Account admission/persistence closes immediately above; only
+              // the bridge listener survives within the existing quit budget.
+              await budget.cleanup(childCleanup)
+              await entry.proxy.close()
+            }),
           ]),
         )).then(result => {
           const accountsStopped = result.completed && result.value.every(item => item.status === 'fulfilled')

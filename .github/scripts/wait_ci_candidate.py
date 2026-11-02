@@ -29,6 +29,8 @@ def api_failure(
 ) -> tuple[str, bool]:
     if isinstance(error, subprocess.TimeoutExpired):
         return "command-timeout", True
+    if error.returncode != 1:
+        return f"cli-exit-{error.returncode}", False
     stderr = error.stderr if isinstance(error.stderr, str) else ""
     # HTTP failures take precedence even if their response mentions a timeout.
     status = re.search(r"\bHTTP (\d{3})\b", stderr)
@@ -44,7 +46,13 @@ def api_failure(
                  r"\bClient\.Timeout exceeded while awaiting headers\b|"
                  r"\bnet/http: timeout awaiting response headers\b", stderr, re.IGNORECASE):
         return "network-timeout", True
-    return "unknown-cli-failure", False
+    if re.search(r"\bx509\b|certificate verify failed", stderr, re.IGNORECASE):
+        return "certificate-error", False
+    # gh uses exit 1 for general API failures, including transport errors whose
+    # wording varies across platforms. These are read-only metadata requests:
+    # bound unknown failures by the same retry/deadline limits as named errors.
+    # Other exits (including cancellation and authentication) remain terminal.
+    return "unknown-cli-failure", error.returncode == 1
 
 
 def remaining_wait(deadline: float) -> float:
@@ -77,7 +85,7 @@ def api(endpoint: str, *, pages: bool = False, deadline: float | None = None) ->
         except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as exc:
             reason, retryable = api_failure(exc)
             # This helper only reads Actions metadata. Never echo its captured
-            # response/body or retry authentication, validation or unknown errors.
+            # response/body or retry known authentication/validation failures.
             if attempt == 2 or not retryable:
                 raise MetadataApiError(
                     f"GitHub Actions metadata request failed: {reason}; "

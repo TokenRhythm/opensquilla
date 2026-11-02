@@ -54,6 +54,13 @@ ALLOWED_SKILL_REFERENCE_WHEEL_PATHS = frozenset(
         "opensquilla/skills/bundled/pptx/references/python_pptx.md",
     }
 )
+LIGHTGBM_ASSET_PREFIX = "opensquilla/squilla_router/lightgbm_model/assets"
+LIGHTGBM_ASSET_RELS = (
+    "artifact_manifest.json",
+    "model_manifest.json",
+    "intent/model.txt.gz",
+    "tier/model.txt.gz",
+)
 ROUTER_ASSET_RELS = (
     "v4.2_phase3_inference/PROVENANCE.md",
     "v4.2_phase3_inference/artifact_manifest.json",
@@ -62,6 +69,7 @@ ROUTER_ASSET_RELS = (
     "v4.2_phase3_inference/mlp/model.onnx",
     "v4.2_phase3_inference/features/tfidf.pkl",
     "v4.2_phase3_inference/bge_onnx/model.onnx",
+    "v4.2_phase3_inference/bge_onnx/tokenizer.json",
 )
 REQUIRED_RUNTIME_MODULE_RELS = (
     "opensquilla/cli/main.py",
@@ -262,19 +270,66 @@ def python_runtime_asset_url(asset_name: str, runtime_release: str) -> str:
 
 
 def required_router_assets(model_root: Path) -> tuple[Path, ...]:
-    return tuple(model_root / rel for rel in ROUTER_ASSET_RELS)
+    return (
+        *(model_root / rel for rel in ROUTER_ASSET_RELS),
+        *(model_root.parent / "lightgbm_model" / "assets" / rel for rel in LIGHTGBM_ASSET_RELS),
+    )
 
 
 def check_router_assets(model_root: Path) -> RouterAssetCheck:
     missing_files: list[Path] = []
     pointer_files: list[Path] = []
-    for path in required_router_assets(model_root):
+    paths = list(required_router_assets(model_root))
+    records: dict[Path, dict] = {}
+    for asset_root in (
+        (model_root / "v4.2_phase3_inference").resolve(),
+        (model_root.parent / "lightgbm_model/assets").resolve(),
+    ):
+        manifest_path = asset_root / "artifact_manifest.json"
+        if manifest_path.is_file():
+            manifest_bytes = manifest_path.read_bytes()
+            if not manifest_bytes.startswith(LFS_POINTER_LINE.encode()):
+                try:
+                    manifest = json.loads(manifest_bytes)
+                    if manifest["schema_version"] != 1 or not manifest["files"]:
+                        raise ValueError("unsupported or empty asset manifest")
+                    for record in manifest["files"]:
+                        relative = record["path"]
+                        path = (asset_root / relative).resolve()
+                        if (
+                            not isinstance(relative, str)
+                            or "\\" in relative
+                            or Path(relative).is_absolute()
+                            or ".." in Path(relative).parts
+                            or path == asset_root
+                            or not path.is_relative_to(asset_root)
+                            or path in records
+                            or not isinstance(record["size_bytes"], int)
+                            or isinstance(record["size_bytes"], bool)
+                            or record["size_bytes"] < 0
+                            or len(record["sha256"]) != 64
+                            or any(char not in "0123456789abcdef" for char in record["sha256"])
+                        ):
+                            raise ValueError("unsafe or incomplete asset record")
+                        records[path] = record
+                        paths.append(path)
+                except (ValueError, KeyError, TypeError, AttributeError) as exc:
+                    raise SystemExit(f"Invalid router artifact manifest: {manifest_path}") from exc
+    for path in dict.fromkeys(paths):
         if not path.is_file():
             missing_files.append(path)
             continue
-        first_line = path.read_text(encoding="utf-8", errors="ignore").splitlines()
-        if first_line and first_line[0].strip() == LFS_POINTER_LINE:
+        with path.open("rb") as handle:
+            prefix = handle.read(len(LFS_POINTER_LINE))
+        if prefix == LFS_POINTER_LINE.encode():
             pointer_files.append(path)
+            continue
+        record = records.get(path.resolve())
+        if record is not None:
+            with path.open("rb") as handle:
+                digest = hashlib.file_digest(handle, "sha256").hexdigest()
+            if path.stat().st_size != record["size_bytes"] or digest != record["sha256"]:
+                raise SystemExit(f"Router artifact integrity mismatch: {path}")
     return RouterAssetCheck(tuple(missing_files), tuple(pointer_files))
 
 
@@ -299,7 +354,10 @@ def _is_allowed_runtime_markdown(path: str) -> bool:
         and parts[1:] == ["licenses", "THIRD_PARTY_NOTICES.md"]
     ):
         return True
-    if name == ROUTER_PROVENANCE_WHEEL_PATH:
+    if name in {
+        ROUTER_PROVENANCE_WHEEL_PATH,
+        "opensquilla/squilla_router/lightgbm_model/PROVENANCE.md",
+    }:
         return True
     if name == TOKENJUICE_PROVENANCE_WHEEL_PATH:
         return True
@@ -353,8 +411,15 @@ def forbidden_release_text_hits(wheel_path: Path) -> list[str]:
 
 def missing_router_assets_in_wheel(wheel_path: Path) -> list[str]:
     expected = {f"{WHEEL_ROUTER_PREFIX}/{rel}" for rel in ROUTER_ASSET_RELS}
+    expected.update(f"{LIGHTGBM_ASSET_PREFIX}/{rel}" for rel in LIGHTGBM_ASSET_RELS)
     with ZipFile(wheel_path) as archive:
         names = set(archive.namelist())
+        manifest_path = f"{LIGHTGBM_ASSET_PREFIX}/artifact_manifest.json"
+        if manifest_path in names:
+            manifest = json.loads(archive.read(manifest_path))
+            expected.update(
+                f"{LIGHTGBM_ASSET_PREFIX}/{entry['path']}" for entry in manifest["files"]
+            )
     return sorted(expected - names)
 
 

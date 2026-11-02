@@ -398,7 +398,8 @@ max_pending_per_session = 64
 enabled = true           # V4 model router
 auto_thinking = true
 rollout_phase = "full"
-strategy = "v4_phase3"
+strategy = "lightgbm_model"
+tier_policy = "model"
 # Optional provider tier profile. Leave unset to preserve the built-in
 # TokenRhythm defaults below. If set, it must match [llm].provider; the router
 # does not switch providers at runtime.
@@ -435,8 +436,8 @@ supports_image = false
 
 [squilla_router.tiers.c1]
 provider = "tokenrhythm"
-model = "deepseek-flash"
-description = "Default DeepSeek Flash route for normal agent work, coding assistance, debugging, and moderate analysis"
+model = "deepseek-v4-flash-0731"
+description = "Default DeepSeek V4 Flash 0731 route for normal agent work, coding assistance, debugging, and moderate analysis"
 supports_image = false
 
 [squilla_router.tiers.c2]
@@ -447,8 +448,8 @@ supports_image = false
 
 [squilla_router.tiers.c3]
 provider = "tokenrhythm"
-model = "glm-5.3"
-description = "Highest-tier GLM 5.3 route for difficult planning, deep review, complex debugging, and high-stakes synthesis"
+model = "kimi-k3"
+description = "Highest-tier Kimi K3 route for difficult planning, deep review, complex debugging, and high-stakes synthesis"
 supports_image = false
 ensemble_enabled = false
 

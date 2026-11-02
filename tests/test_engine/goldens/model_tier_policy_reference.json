@@ -1,0 +1,3304 @@
+[
+  [
+    "new_task",
+    "c0",
+    "c0",
+    "T0",
+    "P0",
+    false,
+    {
+      "source": "fallback",
+      "run_status": "not_run",
+      "final": "new_task",
+      "reason": "no_active_task",
+      "prediction": null,
+      "probabilities": null,
+      "confidence": null
+    },
+    {
+      "source": "classifier",
+      "run_status": "ran",
+      "final": "c0",
+      "reason": "classifier_selected",
+      "prediction": "c0",
+      "probabilities": {
+        "c0": 1.0,
+        "c1": 0.0,
+        "c2": 0.0,
+        "c3": 0.0
+      },
+      "confidence": 1.0
+    },
+    1,
+    null,
+    {
+      "high_risk": false,
+      "debug": false,
+      "repo_arch": false,
+      "strict_format": false,
+      "long_context": false
+    }
+  ],
+  [
+    "new_task",
+    "c0",
+    "c0",
+    "T0",
+    "P0",
+    false,
+    {
+      "source": "fallback",
+      "run_status": "not_run",
+      "final": "new_task",
+      "reason": "no_active_task",
+      "prediction": null,
+      "probabilities": null,
+      "confidence": null
+    },
+    {
+      "source": "classifier",
+      "run_status": "ran",
+      "final": "c0",
+      "reason": "classifier_selected",
+      "prediction": "c0",
+      "probabilities": {
+        "c0": 1.0,
+        "c1": 0.0,
+        "c2": 0.0,
+        "c3": 0.0
+      },
+      "confidence": 1.0
+    },
+    1,
+    null,
+    {
+      "high_risk": false,
+      "debug": false,
+      "repo_arch": false,
+      "strict_format": false,
+      "long_context": false
+    }
+  ],
+  [
+    "new_task",
+    "c0",
+    "c0",
+    "T0",
+    "P0",
+    false,
+    {
+      "source": "fallback",
+      "run_status": "not_run",
+      "final": "new_task",
+      "reason": "no_active_task",
+      "prediction": null,
+      "probabilities": null,
+      "confidence": null
+    },
+    {
+      "source": "classifier",
+      "run_status": "ran",
+      "final": "c0",
+      "reason": "classifier_selected",
+      "prediction": "c0",
+      "probabilities": {
+        "c0": 1.0,
+        "c1": 0.0,
+        "c2": 0.0,
+        "c3": 0.0
+      },
+      "confidence": 1.0
+    },
+    1,
+    null,
+    {
+      "high_risk": false,
+      "debug": false,
+      "repo_arch": false,
+      "strict_format": false,
+      "long_context": false
+    }
+  ],
+  [
+    "continue",
+    "c0",
+    "c0",
+    "T2",
+    "P1",
+    false,
+    {
+      "source": "classifier",
+      "run_status": "ran",
+      "final": "continue",
+      "reason": "classifier_selected",
+      "prediction": "continue",
+      "probabilities": {
+        "new_task": 0.0,
+        "continue": 1.0,
+        "redo": 0.0
+      },
+      "confidence": 1.0
+    },
+    {
+      "source": "not_run",
+      "run_status": "not_run",
+      "final": "c0",
+      "reason": "model_continue_keeps_previous_tier",
+      "prediction": null,
+      "probabilities": null,
+      "confidence": null
+    },
+    3,
+    "generation-start",
+    {
+      "high_risk": false,
+      "debug": false,
+      "repo_arch": false,
+      "strict_format": false,
+      "long_context": false
+    }
+  ],
+  [
+    "redo",
+    "c1",
+    "c1",
+    "T2",
+    "P1",
+    false,
+    {
+      "source": "classifier",
+      "run_status": "ran",
+      "final": "redo",
+      "reason": "classifier_selected",
+      "prediction": "redo",
+      "probabilities": {
+        "new_task": 0.0,
+        "continue": 0.0,
+        "redo": 1.0
+      },
+      "confidence": 1.0
+    },
+    {
+      "source": "not_run",
+      "run_status": "not_run",
+      "final": "c1",
+      "reason": "model_redo_upgrades_previous_tier",
+      "prediction": null,
+      "probabilities": null,
+      "confidence": null
+    },
+    3,
+    "generation-start",
+    {
+      "high_risk": false,
+      "debug": false,
+      "repo_arch": false,
+      "strict_format": false,
+      "long_context": false
+    }
+  ],
+  [
+    "new_task",
+    "c0",
+    "c0",
+    "T0",
+    "P0",
+    false,
+    {
+      "source": "classifier",
+      "run_status": "ran",
+      "final": "new_task",
+      "reason": "classifier_selected",
+      "prediction": "new_task",
+      "probabilities": {
+        "new_task": 1.0,
+        "continue": 0.0,
+        "redo": 0.0
+      },
+      "confidence": 1.0
+    },
+    {
+      "source": "classifier",
+      "run_status": "ran",
+      "final": "c0",
+      "reason": "classifier_selected",
+      "prediction": "c0",
+      "probabilities": {
+        "c0": 1.0,
+        "c1": 0.0,
+        "c2": 0.0,
+        "c3": 0.0
+      },
+      "confidence": 1.0
+    },
+    1,
+    "generation-start",
+    {
+      "high_risk": false,
+      "debug": false,
+      "repo_arch": false,
+      "strict_format": false,
+      "long_context": false
+    }
+  ],
+  [
+    "continue",
+    "c1",
+    "c1",
+    "T2",
+    "P1",
+    false,
+    {
+      "source": "classifier",
+      "run_status": "ran",
+      "final": "continue",
+      "reason": "classifier_selected",
+      "prediction": "continue",
+      "probabilities": {
+        "new_task": 0.0,
+        "continue": 1.0,
+        "redo": 0.0
+      },
+      "confidence": 1.0
+    },
+    {
+      "source": "not_run",
+      "run_status": "not_run",
+      "final": "c1",
+      "reason": "model_continue_keeps_previous_tier",
+      "prediction": null,
+      "probabilities": null,
+      "confidence": null
+    },
+    3,
+    "generation-start",
+    {
+      "high_risk": false,
+      "debug": false,
+      "repo_arch": false,
+      "strict_format": false,
+      "long_context": false
+    }
+  ],
+  [
+    "redo",
+    "c2",
+    "c2",
+    "T2",
+    "P1",
+    false,
+    {
+      "source": "classifier",
+      "run_status": "ran",
+      "final": "redo",
+      "reason": "classifier_selected",
+      "prediction": "redo",
+      "probabilities": {
+        "new_task": 0.0,
+        "continue": 0.0,
+        "redo": 1.0
+      },
+      "confidence": 1.0
+    },
+    {
+      "source": "not_run",
+      "run_status": "not_run",
+      "final": "c2",
+      "reason": "model_redo_upgrades_previous_tier",
+      "prediction": null,
+      "probabilities": null,
+      "confidence": null
+    },
+    3,
+    "generation-start",
+    {
+      "high_risk": false,
+      "debug": false,
+      "repo_arch": false,
+      "strict_format": false,
+      "long_context": false
+    }
+  ],
+  [
+    "new_task",
+    "c0",
+    "c0",
+    "T0",
+    "P0",
+    false,
+    {
+      "source": "classifier",
+      "run_status": "ran",
+      "final": "new_task",
+      "reason": "classifier_selected",
+      "prediction": "new_task",
+      "probabilities": {
+        "new_task": 1.0,
+        "continue": 0.0,
+        "redo": 0.0
+      },
+      "confidence": 1.0
+    },
+    {
+      "source": "classifier",
+      "run_status": "ran",
+      "final": "c0",
+      "reason": "classifier_selected",
+      "prediction": "c0",
+      "probabilities": {
+        "c0": 1.0,
+        "c1": 0.0,
+        "c2": 0.0,
+        "c3": 0.0
+      },
+      "confidence": 1.0
+    },
+    1,
+    "generation-start",
+    {
+      "high_risk": false,
+      "debug": false,
+      "repo_arch": false,
+      "strict_format": false,
+      "long_context": false
+    }
+  ],
+  [
+    "continue",
+    "c2",
+    "c2",
+    "T2",
+    "P1",
+    false,
+    {
+      "source": "classifier",
+      "run_status": "ran",
+      "final": "continue",
+      "reason": "classifier_selected",
+      "prediction": "continue",
+      "probabilities": {
+        "new_task": 0.0,
+        "continue": 1.0,
+        "redo": 0.0
+      },
+      "confidence": 1.0
+    },
+    {
+      "source": "not_run",
+      "run_status": "not_run",
+      "final": "c2",
+      "reason": "model_continue_keeps_previous_tier",
+      "prediction": null,
+      "probabilities": null,
+      "confidence": null
+    },
+    3,
+    "generation-start",
+    {
+      "high_risk": false,
+      "debug": false,
+      "repo_arch": false,
+      "strict_format": false,
+      "long_context": false
+    }
+  ],
+  [
+    "redo",
+    "c3",
+    "c3",
+    "T3",
+    "P1",
+    false,
+    {
+      "source": "classifier",
+      "run_status": "ran",
+      "final": "redo",
+      "reason": "classifier_selected",
+      "prediction": "redo",
+      "probabilities": {
+        "new_task": 0.0,
+        "continue": 0.0,
+        "redo": 1.0
+      },
+      "confidence": 1.0
+    },
+    {
+      "source": "not_run",
+      "run_status": "not_run",
+      "final": "c3",
+      "reason": "model_redo_upgrades_previous_tier",
+      "prediction": null,
+      "probabilities": null,
+      "confidence": null
+    },
+    3,
+    "generation-start",
+    {
+      "high_risk": false,
+      "debug": false,
+      "repo_arch": false,
+      "strict_format": false,
+      "long_context": false
+    }
+  ],
+  [
+    "new_task",
+    "c0",
+    "c0",
+    "T0",
+    "P0",
+    false,
+    {
+      "source": "classifier",
+      "run_status": "ran",
+      "final": "new_task",
+      "reason": "classifier_selected",
+      "prediction": "new_task",
+      "probabilities": {
+        "new_task": 1.0,
+        "continue": 0.0,
+        "redo": 0.0
+      },
+      "confidence": 1.0
+    },
+    {
+      "source": "classifier",
+      "run_status": "ran",
+      "final": "c0",
+      "reason": "classifier_selected",
+      "prediction": "c0",
+      "probabilities": {
+        "c0": 1.0,
+        "c1": 0.0,
+        "c2": 0.0,
+        "c3": 0.0
+      },
+      "confidence": 1.0
+    },
+    1,
+    "generation-start",
+    {
+      "high_risk": false,
+      "debug": false,
+      "repo_arch": false,
+      "strict_format": false,
+      "long_context": false
+    }
+  ],
+  [
+    "continue",
+    "c3",
+    "c3",
+    "T3",
+    "P1",
+    false,
+    {
+      "source": "classifier",
+      "run_status": "ran",
+      "final": "continue",
+      "reason": "classifier_selected",
+      "prediction": "continue",
+      "probabilities": {
+        "new_task": 0.0,
+        "continue": 1.0,
+        "redo": 0.0
+      },
+      "confidence": 1.0
+    },
+    {
+      "source": "not_run",
+      "run_status": "not_run",
+      "final": "c3",
+      "reason": "model_continue_keeps_previous_tier",
+      "prediction": null,
+      "probabilities": null,
+      "confidence": null
+    },
+    3,
+    "generation-start",
+    {
+      "high_risk": false,
+      "debug": false,
+      "repo_arch": false,
+      "strict_format": false,
+      "long_context": false
+    }
+  ],
+  [
+    "redo",
+    "c3",
+    "c3",
+    "T3",
+    "P1",
+    false,
+    {
+      "source": "classifier",
+      "run_status": "ran",
+      "final": "redo",
+      "reason": "classifier_selected",
+      "prediction": "redo",
+      "probabilities": {
+        "new_task": 0.0,
+        "continue": 0.0,
+        "redo": 1.0
+      },
+      "confidence": 1.0
+    },
+    {
+      "source": "not_run",
+      "run_status": "not_run",
+      "final": "c3",
+      "reason": "model_redo_upgrades_previous_tier",
+      "prediction": null,
+      "probabilities": null,
+      "confidence": null
+    },
+    3,
+    "generation-start",
+    {
+      "high_risk": false,
+      "debug": false,
+      "repo_arch": false,
+      "strict_format": false,
+      "long_context": false
+    }
+  ],
+  [
+    "new_task",
+    "c0",
+    "c0",
+    "T0",
+    "P0",
+    false,
+    {
+      "source": "classifier",
+      "run_status": "ran",
+      "final": "new_task",
+      "reason": "classifier_selected",
+      "prediction": "new_task",
+      "probabilities": {
+        "new_task": 1.0,
+        "continue": 0.0,
+        "redo": 0.0
+      },
+      "confidence": 1.0
+    },
+    {
+      "source": "classifier",
+      "run_status": "ran",
+      "final": "c0",
+      "reason": "classifier_selected",
+      "prediction": "c0",
+      "probabilities": {
+        "c0": 1.0,
+        "c1": 0.0,
+        "c2": 0.0,
+        "c3": 0.0
+      },
+      "confidence": 1.0
+    },
+    1,
+    "generation-start",
+    {
+      "high_risk": false,
+      "debug": false,
+      "repo_arch": false,
+      "strict_format": false,
+      "long_context": false
+    }
+  ],
+  [
+    "new_task",
+    "c0",
+    "c0",
+    "T0",
+    "P0",
+    false,
+    {
+      "source": "fallback",
+      "run_status": "not_run",
+      "final": "new_task",
+      "reason": "no_active_task",
+      "prediction": null,
+      "probabilities": null,
+      "confidence": null
+    },
+    {
+      "source": "classifier",
+      "run_status": "ran",
+      "final": "c0",
+      "reason": "classifier_selected",
+      "prediction": "c0",
+      "probabilities": {
+        "c0": 1.0,
+        "c1": 0.0,
+        "c2": 0.0,
+        "c3": 0.0
+      },
+      "confidence": 1.0
+    },
+    1,
+    null,
+    {
+      "high_risk": false,
+      "debug": false,
+      "repo_arch": false,
+      "strict_format": false,
+      "long_context": false
+    }
+  ],
+  [
+    "new_task",
+    "c0",
+    "c0",
+    "T0",
+    "P0",
+    false,
+    {
+      "source": "fallback",
+      "run_status": "not_run",
+      "final": "new_task",
+      "reason": "no_active_task",
+      "prediction": null,
+      "probabilities": null,
+      "confidence": null
+    },
+    {
+      "source": "classifier",
+      "run_status": "ran",
+      "final": "c0",
+      "reason": "classifier_selected",
+      "prediction": "c0",
+      "probabilities": {
+        "c0": 1.0,
+        "c1": 0.0,
+        "c2": 0.0,
+        "c3": 0.0
+      },
+      "confidence": 1.0
+    },
+    1,
+    null,
+    {
+      "high_risk": false,
+      "debug": false,
+      "repo_arch": false,
+      "strict_format": false,
+      "long_context": false
+    }
+  ],
+  [
+    "new_task",
+    "c0",
+    "c0",
+    "T0",
+    "P2",
+    false,
+    {
+      "source": "fallback",
+      "run_status": "not_run",
+      "final": "new_task",
+      "reason": "no_active_task",
+      "prediction": null,
+      "probabilities": null,
+      "confidence": null
+    },
+    {
+      "source": "classifier",
+      "run_status": "ran",
+      "final": "c0",
+      "reason": "classifier_selected",
+      "prediction": "c0",
+      "probabilities": {
+        "c0": 1.0,
+        "c1": 0.0,
+        "c2": 0.0,
+        "c3": 0.0
+      },
+      "confidence": 1.0
+    },
+    1,
+    null,
+    {
+      "high_risk": true,
+      "debug": false,
+      "repo_arch": false,
+      "strict_format": false,
+      "long_context": false
+    }
+  ],
+  [
+    "new_task",
+    "c0",
+    "c0",
+    "T0",
+    "P0",
+    false,
+    {
+      "source": "fallback",
+      "run_status": "not_run",
+      "final": "new_task",
+      "reason": "no_active_task",
+      "prediction": null,
+      "probabilities": null,
+      "confidence": null
+    },
+    {
+      "source": "classifier",
+      "run_status": "ran",
+      "final": "c0",
+      "reason": "classifier_selected",
+      "prediction": "c0",
+      "probabilities": {
+        "c0": 1.0,
+        "c1": 0.0,
+        "c2": 0.0,
+        "c3": 0.0
+      },
+      "confidence": 1.0
+    },
+    1,
+    null,
+    {
+      "high_risk": false,
+      "debug": false,
+      "repo_arch": true,
+      "strict_format": false,
+      "long_context": false
+    }
+  ],
+  [
+    "new_task",
+    "c0",
+    "c0",
+    "T0",
+    "P2",
+    false,
+    {
+      "source": "fallback",
+      "run_status": "not_run",
+      "final": "new_task",
+      "reason": "no_active_task",
+      "prediction": null,
+      "probabilities": null,
+      "confidence": null
+    },
+    {
+      "source": "classifier",
+      "run_status": "ran",
+      "final": "c0",
+      "reason": "classifier_selected",
+      "prediction": "c0",
+      "probabilities": {
+        "c0": 1.0,
+        "c1": 0.0,
+        "c2": 0.0,
+        "c3": 0.0
+      },
+      "confidence": 1.0
+    },
+    1,
+    null,
+    {
+      "high_risk": false,
+      "debug": false,
+      "repo_arch": false,
+      "strict_format": true,
+      "long_context": false
+    }
+  ],
+  [
+    "new_task",
+    "c0",
+    "c0",
+    "T0",
+    "P2",
+    false,
+    {
+      "source": "fallback",
+      "run_status": "not_run",
+      "final": "new_task",
+      "reason": "no_active_task",
+      "prediction": null,
+      "probabilities": null,
+      "confidence": null
+    },
+    {
+      "source": "classifier",
+      "run_status": "ran",
+      "final": "c0",
+      "reason": "classifier_selected",
+      "prediction": "c0",
+      "probabilities": {
+        "c0": 1.0,
+        "c1": 0.0,
+        "c2": 0.0,
+        "c3": 0.0
+      },
+      "confidence": 1.0
+    },
+    1,
+    null,
+    {
+      "high_risk": false,
+      "debug": true,
+      "repo_arch": false,
+      "strict_format": false,
+      "long_context": false
+    }
+  ],
+  [
+    "new_task",
+    "c0",
+    "c0",
+    "T0",
+    "P2",
+    false,
+    {
+      "source": "fallback",
+      "run_status": "not_run",
+      "final": "new_task",
+      "reason": "no_active_task",
+      "prediction": null,
+      "probabilities": null,
+      "confidence": null
+    },
+    {
+      "source": "classifier",
+      "run_status": "ran",
+      "final": "c0",
+      "reason": "classifier_selected",
+      "prediction": "c0",
+      "probabilities": {
+        "c0": 1.0,
+        "c1": 0.0,
+        "c2": 0.0,
+        "c3": 0.0
+      },
+      "confidence": 1.0
+    },
+    1,
+    null,
+    {
+      "high_risk": false,
+      "debug": false,
+      "repo_arch": false,
+      "strict_format": false,
+      "long_context": true
+    }
+  ],
+  [
+    "new_task",
+    "c0",
+    "c0",
+    "T0",
+    "P2",
+    false,
+    {
+      "source": "fallback",
+      "run_status": "not_run",
+      "final": "new_task",
+      "reason": "no_active_task",
+      "prediction": null,
+      "probabilities": null,
+      "confidence": null
+    },
+    {
+      "source": "classifier",
+      "run_status": "ran",
+      "final": "c0",
+      "reason": "classifier_selected",
+      "prediction": "c0",
+      "probabilities": {
+        "c0": 1.0,
+        "c1": 0.0,
+        "c2": 0.0,
+        "c3": 0.0
+      },
+      "confidence": 1.0
+    },
+    1,
+    null,
+    {
+      "high_risk": false,
+      "debug": false,
+      "repo_arch": false,
+      "strict_format": false,
+      "long_context": true
+    }
+  ],
+  [
+    "new_task",
+    "c0",
+    "c0",
+    "T0",
+    "P2",
+    false,
+    {
+      "source": "fallback",
+      "run_status": "not_run",
+      "final": "new_task",
+      "reason": "no_active_task",
+      "prediction": null,
+      "probabilities": null,
+      "confidence": null
+    },
+    {
+      "source": "classifier",
+      "run_status": "ran",
+      "final": "c0",
+      "reason": "classifier_selected",
+      "prediction": "c0",
+      "probabilities": {
+        "c0": 1.0,
+        "c1": 0.0,
+        "c2": 0.0,
+        "c3": 0.0
+      },
+      "confidence": 1.0
+    },
+    1,
+    null,
+    {
+      "high_risk": false,
+      "debug": false,
+      "repo_arch": false,
+      "strict_format": false,
+      "long_context": true
+    }
+  ],
+  [
+    "new_task",
+    "c0",
+    "c0",
+    "T0",
+    "P2",
+    false,
+    {
+      "source": "fallback",
+      "run_status": "not_run",
+      "final": "new_task",
+      "reason": "no_active_task",
+      "prediction": null,
+      "probabilities": null,
+      "confidence": null
+    },
+    {
+      "source": "classifier",
+      "run_status": "ran",
+      "final": "c0",
+      "reason": "classifier_selected",
+      "prediction": "c0",
+      "probabilities": {
+        "c0": 1.0,
+        "c1": 0.0,
+        "c2": 0.0,
+        "c3": 0.0
+      },
+      "confidence": 1.0
+    },
+    1,
+    null,
+    {
+      "high_risk": false,
+      "debug": false,
+      "repo_arch": false,
+      "strict_format": false,
+      "long_context": true
+    }
+  ],
+  [
+    "new_task",
+    "c1",
+    "c1",
+    "T1",
+    "P1",
+    false,
+    {
+      "source": "fallback",
+      "run_status": "not_run",
+      "final": "new_task",
+      "reason": "no_active_task",
+      "prediction": null,
+      "probabilities": null,
+      "confidence": null
+    },
+    {
+      "source": "classifier",
+      "run_status": "ran",
+      "final": "c1",
+      "reason": "classifier_selected",
+      "prediction": "c1",
+      "probabilities": {
+        "c0": 0.0,
+        "c1": 1.0,
+        "c2": 0.0,
+        "c3": 0.0
+      },
+      "confidence": 1.0
+    },
+    1,
+    null,
+    {
+      "high_risk": false,
+      "debug": false,
+      "repo_arch": false,
+      "strict_format": false,
+      "long_context": false
+    }
+  ],
+  [
+    "new_task",
+    "c1",
+    "c1",
+    "T1",
+    "P1",
+    false,
+    {
+      "source": "fallback",
+      "run_status": "not_run",
+      "final": "new_task",
+      "reason": "no_active_task",
+      "prediction": null,
+      "probabilities": null,
+      "confidence": null
+    },
+    {
+      "source": "classifier",
+      "run_status": "ran",
+      "final": "c1",
+      "reason": "classifier_selected",
+      "prediction": "c1",
+      "probabilities": {
+        "c0": 0.0,
+        "c1": 1.0,
+        "c2": 0.0,
+        "c3": 0.0
+      },
+      "confidence": 1.0
+    },
+    1,
+    null,
+    {
+      "high_risk": false,
+      "debug": false,
+      "repo_arch": false,
+      "strict_format": false,
+      "long_context": false
+    }
+  ],
+  [
+    "new_task",
+    "c1",
+    "c1",
+    "T1",
+    "P2",
+    false,
+    {
+      "source": "fallback",
+      "run_status": "not_run",
+      "final": "new_task",
+      "reason": "no_active_task",
+      "prediction": null,
+      "probabilities": null,
+      "confidence": null
+    },
+    {
+      "source": "classifier",
+      "run_status": "ran",
+      "final": "c1",
+      "reason": "classifier_selected",
+      "prediction": "c1",
+      "probabilities": {
+        "c0": 0.0,
+        "c1": 1.0,
+        "c2": 0.0,
+        "c3": 0.0
+      },
+      "confidence": 1.0
+    },
+    1,
+    null,
+    {
+      "high_risk": true,
+      "debug": false,
+      "repo_arch": false,
+      "strict_format": false,
+      "long_context": false
+    }
+  ],
+  [
+    "new_task",
+    "c1",
+    "c1",
+    "T1",
+    "P1",
+    false,
+    {
+      "source": "fallback",
+      "run_status": "not_run",
+      "final": "new_task",
+      "reason": "no_active_task",
+      "prediction": null,
+      "probabilities": null,
+      "confidence": null
+    },
+    {
+      "source": "classifier",
+      "run_status": "ran",
+      "final": "c1",
+      "reason": "classifier_selected",
+      "prediction": "c1",
+      "probabilities": {
+        "c0": 0.0,
+        "c1": 1.0,
+        "c2": 0.0,
+        "c3": 0.0
+      },
+      "confidence": 1.0
+    },
+    1,
+    null,
+    {
+      "high_risk": false,
+      "debug": false,
+      "repo_arch": true,
+      "strict_format": false,
+      "long_context": false
+    }
+  ],
+  [
+    "new_task",
+    "c1",
+    "c1",
+    "T1",
+    "P2",
+    false,
+    {
+      "source": "fallback",
+      "run_status": "not_run",
+      "final": "new_task",
+      "reason": "no_active_task",
+      "prediction": null,
+      "probabilities": null,
+      "confidence": null
+    },
+    {
+      "source": "classifier",
+      "run_status": "ran",
+      "final": "c1",
+      "reason": "classifier_selected",
+      "prediction": "c1",
+      "probabilities": {
+        "c0": 0.0,
+        "c1": 1.0,
+        "c2": 0.0,
+        "c3": 0.0
+      },
+      "confidence": 1.0
+    },
+    1,
+    null,
+    {
+      "high_risk": false,
+      "debug": false,
+      "repo_arch": false,
+      "strict_format": true,
+      "long_context": false
+    }
+  ],
+  [
+    "new_task",
+    "c1",
+    "c1",
+    "T1",
+    "P2",
+    false,
+    {
+      "source": "fallback",
+      "run_status": "not_run",
+      "final": "new_task",
+      "reason": "no_active_task",
+      "prediction": null,
+      "probabilities": null,
+      "confidence": null
+    },
+    {
+      "source": "classifier",
+      "run_status": "ran",
+      "final": "c1",
+      "reason": "classifier_selected",
+      "prediction": "c1",
+      "probabilities": {
+        "c0": 0.0,
+        "c1": 1.0,
+        "c2": 0.0,
+        "c3": 0.0
+      },
+      "confidence": 1.0
+    },
+    1,
+    null,
+    {
+      "high_risk": false,
+      "debug": true,
+      "repo_arch": false,
+      "strict_format": false,
+      "long_context": false
+    }
+  ],
+  [
+    "new_task",
+    "c1",
+    "c1",
+    "T1",
+    "P2",
+    false,
+    {
+      "source": "fallback",
+      "run_status": "not_run",
+      "final": "new_task",
+      "reason": "no_active_task",
+      "prediction": null,
+      "probabilities": null,
+      "confidence": null
+    },
+    {
+      "source": "classifier",
+      "run_status": "ran",
+      "final": "c1",
+      "reason": "classifier_selected",
+      "prediction": "c1",
+      "probabilities": {
+        "c0": 0.0,
+        "c1": 1.0,
+        "c2": 0.0,
+        "c3": 0.0
+      },
+      "confidence": 1.0
+    },
+    1,
+    null,
+    {
+      "high_risk": false,
+      "debug": false,
+      "repo_arch": false,
+      "strict_format": false,
+      "long_context": true
+    }
+  ],
+  [
+    "new_task",
+    "c1",
+    "c1",
+    "T1",
+    "P2",
+    false,
+    {
+      "source": "fallback",
+      "run_status": "not_run",
+      "final": "new_task",
+      "reason": "no_active_task",
+      "prediction": null,
+      "probabilities": null,
+      "confidence": null
+    },
+    {
+      "source": "classifier",
+      "run_status": "ran",
+      "final": "c1",
+      "reason": "classifier_selected",
+      "prediction": "c1",
+      "probabilities": {
+        "c0": 0.0,
+        "c1": 1.0,
+        "c2": 0.0,
+        "c3": 0.0
+      },
+      "confidence": 1.0
+    },
+    1,
+    null,
+    {
+      "high_risk": false,
+      "debug": false,
+      "repo_arch": false,
+      "strict_format": false,
+      "long_context": true
+    }
+  ],
+  [
+    "new_task",
+    "c1",
+    "c1",
+    "T1",
+    "P2",
+    false,
+    {
+      "source": "fallback",
+      "run_status": "not_run",
+      "final": "new_task",
+      "reason": "no_active_task",
+      "prediction": null,
+      "probabilities": null,
+      "confidence": null
+    },
+    {
+      "source": "classifier",
+      "run_status": "ran",
+      "final": "c1",
+      "reason": "classifier_selected",
+      "prediction": "c1",
+      "probabilities": {
+        "c0": 0.0,
+        "c1": 1.0,
+        "c2": 0.0,
+        "c3": 0.0
+      },
+      "confidence": 1.0
+    },
+    1,
+    null,
+    {
+      "high_risk": false,
+      "debug": false,
+      "repo_arch": false,
+      "strict_format": false,
+      "long_context": true
+    }
+  ],
+  [
+    "new_task",
+    "c1",
+    "c1",
+    "T1",
+    "P2",
+    false,
+    {
+      "source": "fallback",
+      "run_status": "not_run",
+      "final": "new_task",
+      "reason": "no_active_task",
+      "prediction": null,
+      "probabilities": null,
+      "confidence": null
+    },
+    {
+      "source": "classifier",
+      "run_status": "ran",
+      "final": "c1",
+      "reason": "classifier_selected",
+      "prediction": "c1",
+      "probabilities": {
+        "c0": 0.0,
+        "c1": 1.0,
+        "c2": 0.0,
+        "c3": 0.0
+      },
+      "confidence": 1.0
+    },
+    1,
+    null,
+    {
+      "high_risk": false,
+      "debug": false,
+      "repo_arch": false,
+      "strict_format": false,
+      "long_context": true
+    }
+  ],
+  [
+    "new_task",
+    "c2",
+    "c2",
+    "T2",
+    "P1",
+    false,
+    {
+      "source": "fallback",
+      "run_status": "not_run",
+      "final": "new_task",
+      "reason": "no_active_task",
+      "prediction": null,
+      "probabilities": null,
+      "confidence": null
+    },
+    {
+      "source": "classifier",
+      "run_status": "ran",
+      "final": "c2",
+      "reason": "classifier_selected",
+      "prediction": "c2",
+      "probabilities": {
+        "c0": 0.0,
+        "c1": 0.0,
+        "c2": 1.0,
+        "c3": 0.0
+      },
+      "confidence": 1.0
+    },
+    1,
+    null,
+    {
+      "high_risk": false,
+      "debug": false,
+      "repo_arch": false,
+      "strict_format": false,
+      "long_context": false
+    }
+  ],
+  [
+    "new_task",
+    "c2",
+    "c2",
+    "T2",
+    "P1",
+    false,
+    {
+      "source": "fallback",
+      "run_status": "not_run",
+      "final": "new_task",
+      "reason": "no_active_task",
+      "prediction": null,
+      "probabilities": null,
+      "confidence": null
+    },
+    {
+      "source": "classifier",
+      "run_status": "ran",
+      "final": "c2",
+      "reason": "classifier_selected",
+      "prediction": "c2",
+      "probabilities": {
+        "c0": 0.0,
+        "c1": 0.0,
+        "c2": 1.0,
+        "c3": 0.0
+      },
+      "confidence": 1.0
+    },
+    1,
+    null,
+    {
+      "high_risk": false,
+      "debug": false,
+      "repo_arch": false,
+      "strict_format": false,
+      "long_context": false
+    }
+  ],
+  [
+    "new_task",
+    "c2",
+    "c2",
+    "T3",
+    "P2",
+    false,
+    {
+      "source": "fallback",
+      "run_status": "not_run",
+      "final": "new_task",
+      "reason": "no_active_task",
+      "prediction": null,
+      "probabilities": null,
+      "confidence": null
+    },
+    {
+      "source": "classifier",
+      "run_status": "ran",
+      "final": "c2",
+      "reason": "classifier_selected",
+      "prediction": "c2",
+      "probabilities": {
+        "c0": 0.0,
+        "c1": 0.0,
+        "c2": 1.0,
+        "c3": 0.0
+      },
+      "confidence": 1.0
+    },
+    1,
+    null,
+    {
+      "high_risk": true,
+      "debug": false,
+      "repo_arch": false,
+      "strict_format": false,
+      "long_context": false
+    }
+  ],
+  [
+    "new_task",
+    "c2",
+    "c2",
+    "T2",
+    "P1",
+    false,
+    {
+      "source": "fallback",
+      "run_status": "not_run",
+      "final": "new_task",
+      "reason": "no_active_task",
+      "prediction": null,
+      "probabilities": null,
+      "confidence": null
+    },
+    {
+      "source": "classifier",
+      "run_status": "ran",
+      "final": "c2",
+      "reason": "classifier_selected",
+      "prediction": "c2",
+      "probabilities": {
+        "c0": 0.0,
+        "c1": 0.0,
+        "c2": 1.0,
+        "c3": 0.0
+      },
+      "confidence": 1.0
+    },
+    1,
+    null,
+    {
+      "high_risk": false,
+      "debug": false,
+      "repo_arch": true,
+      "strict_format": false,
+      "long_context": false
+    }
+  ],
+  [
+    "new_task",
+    "c2",
+    "c2",
+    "T2",
+    "P2",
+    false,
+    {
+      "source": "fallback",
+      "run_status": "not_run",
+      "final": "new_task",
+      "reason": "no_active_task",
+      "prediction": null,
+      "probabilities": null,
+      "confidence": null
+    },
+    {
+      "source": "classifier",
+      "run_status": "ran",
+      "final": "c2",
+      "reason": "classifier_selected",
+      "prediction": "c2",
+      "probabilities": {
+        "c0": 0.0,
+        "c1": 0.0,
+        "c2": 1.0,
+        "c3": 0.0
+      },
+      "confidence": 1.0
+    },
+    1,
+    null,
+    {
+      "high_risk": false,
+      "debug": false,
+      "repo_arch": false,
+      "strict_format": true,
+      "long_context": false
+    }
+  ],
+  [
+    "new_task",
+    "c2",
+    "c2",
+    "T3",
+    "P2",
+    false,
+    {
+      "source": "fallback",
+      "run_status": "not_run",
+      "final": "new_task",
+      "reason": "no_active_task",
+      "prediction": null,
+      "probabilities": null,
+      "confidence": null
+    },
+    {
+      "source": "classifier",
+      "run_status": "ran",
+      "final": "c2",
+      "reason": "classifier_selected",
+      "prediction": "c2",
+      "probabilities": {
+        "c0": 0.0,
+        "c1": 0.0,
+        "c2": 1.0,
+        "c3": 0.0
+      },
+      "confidence": 1.0
+    },
+    1,
+    null,
+    {
+      "high_risk": false,
+      "debug": true,
+      "repo_arch": false,
+      "strict_format": false,
+      "long_context": false
+    }
+  ],
+  [
+    "new_task",
+    "c2",
+    "c2",
+    "T3",
+    "P2",
+    false,
+    {
+      "source": "fallback",
+      "run_status": "not_run",
+      "final": "new_task",
+      "reason": "no_active_task",
+      "prediction": null,
+      "probabilities": null,
+      "confidence": null
+    },
+    {
+      "source": "classifier",
+      "run_status": "ran",
+      "final": "c2",
+      "reason": "classifier_selected",
+      "prediction": "c2",
+      "probabilities": {
+        "c0": 0.0,
+        "c1": 0.0,
+        "c2": 1.0,
+        "c3": 0.0
+      },
+      "confidence": 1.0
+    },
+    1,
+    null,
+    {
+      "high_risk": false,
+      "debug": false,
+      "repo_arch": false,
+      "strict_format": false,
+      "long_context": true
+    }
+  ],
+  [
+    "new_task",
+    "c2",
+    "c2",
+    "T3",
+    "P2",
+    false,
+    {
+      "source": "fallback",
+      "run_status": "not_run",
+      "final": "new_task",
+      "reason": "no_active_task",
+      "prediction": null,
+      "probabilities": null,
+      "confidence": null
+    },
+    {
+      "source": "classifier",
+      "run_status": "ran",
+      "final": "c2",
+      "reason": "classifier_selected",
+      "prediction": "c2",
+      "probabilities": {
+        "c0": 0.0,
+        "c1": 0.0,
+        "c2": 1.0,
+        "c3": 0.0
+      },
+      "confidence": 1.0
+    },
+    1,
+    null,
+    {
+      "high_risk": false,
+      "debug": false,
+      "repo_arch": false,
+      "strict_format": false,
+      "long_context": true
+    }
+  ],
+  [
+    "new_task",
+    "c2",
+    "c2",
+    "T3",
+    "P2",
+    false,
+    {
+      "source": "fallback",
+      "run_status": "not_run",
+      "final": "new_task",
+      "reason": "no_active_task",
+      "prediction": null,
+      "probabilities": null,
+      "confidence": null
+    },
+    {
+      "source": "classifier",
+      "run_status": "ran",
+      "final": "c2",
+      "reason": "classifier_selected",
+      "prediction": "c2",
+      "probabilities": {
+        "c0": 0.0,
+        "c1": 0.0,
+        "c2": 1.0,
+        "c3": 0.0
+      },
+      "confidence": 1.0
+    },
+    1,
+    null,
+    {
+      "high_risk": false,
+      "debug": false,
+      "repo_arch": false,
+      "strict_format": false,
+      "long_context": true
+    }
+  ],
+  [
+    "new_task",
+    "c2",
+    "c2",
+    "T3",
+    "P2",
+    false,
+    {
+      "source": "fallback",
+      "run_status": "not_run",
+      "final": "new_task",
+      "reason": "no_active_task",
+      "prediction": null,
+      "probabilities": null,
+      "confidence": null
+    },
+    {
+      "source": "classifier",
+      "run_status": "ran",
+      "final": "c2",
+      "reason": "classifier_selected",
+      "prediction": "c2",
+      "probabilities": {
+        "c0": 0.0,
+        "c1": 0.0,
+        "c2": 1.0,
+        "c3": 0.0
+      },
+      "confidence": 1.0
+    },
+    1,
+    null,
+    {
+      "high_risk": false,
+      "debug": false,
+      "repo_arch": false,
+      "strict_format": false,
+      "long_context": true
+    }
+  ],
+  [
+    "new_task",
+    "c3",
+    "c3",
+    "T3",
+    "P1",
+    false,
+    {
+      "source": "fallback",
+      "run_status": "not_run",
+      "final": "new_task",
+      "reason": "no_active_task",
+      "prediction": null,
+      "probabilities": null,
+      "confidence": null
+    },
+    {
+      "source": "classifier",
+      "run_status": "ran",
+      "final": "c3",
+      "reason": "classifier_selected",
+      "prediction": "c3",
+      "probabilities": {
+        "c0": 0.0,
+        "c1": 0.0,
+        "c2": 0.0,
+        "c3": 1.0
+      },
+      "confidence": 1.0
+    },
+    1,
+    null,
+    {
+      "high_risk": false,
+      "debug": false,
+      "repo_arch": false,
+      "strict_format": false,
+      "long_context": false
+    }
+  ],
+  [
+    "new_task",
+    "c3",
+    "c3",
+    "T3",
+    "P1",
+    false,
+    {
+      "source": "fallback",
+      "run_status": "not_run",
+      "final": "new_task",
+      "reason": "no_active_task",
+      "prediction": null,
+      "probabilities": null,
+      "confidence": null
+    },
+    {
+      "source": "classifier",
+      "run_status": "ran",
+      "final": "c3",
+      "reason": "classifier_selected",
+      "prediction": "c3",
+      "probabilities": {
+        "c0": 0.0,
+        "c1": 0.0,
+        "c2": 0.0,
+        "c3": 1.0
+      },
+      "confidence": 1.0
+    },
+    1,
+    null,
+    {
+      "high_risk": false,
+      "debug": false,
+      "repo_arch": false,
+      "strict_format": false,
+      "long_context": false
+    }
+  ],
+  [
+    "new_task",
+    "c3",
+    "c3",
+    "T3",
+    "P2",
+    false,
+    {
+      "source": "fallback",
+      "run_status": "not_run",
+      "final": "new_task",
+      "reason": "no_active_task",
+      "prediction": null,
+      "probabilities": null,
+      "confidence": null
+    },
+    {
+      "source": "classifier",
+      "run_status": "ran",
+      "final": "c3",
+      "reason": "classifier_selected",
+      "prediction": "c3",
+      "probabilities": {
+        "c0": 0.0,
+        "c1": 0.0,
+        "c2": 0.0,
+        "c3": 1.0
+      },
+      "confidence": 1.0
+    },
+    1,
+    null,
+    {
+      "high_risk": true,
+      "debug": false,
+      "repo_arch": false,
+      "strict_format": false,
+      "long_context": false
+    }
+  ],
+  [
+    "new_task",
+    "c3",
+    "c3",
+    "T3",
+    "P1",
+    false,
+    {
+      "source": "fallback",
+      "run_status": "not_run",
+      "final": "new_task",
+      "reason": "no_active_task",
+      "prediction": null,
+      "probabilities": null,
+      "confidence": null
+    },
+    {
+      "source": "classifier",
+      "run_status": "ran",
+      "final": "c3",
+      "reason": "classifier_selected",
+      "prediction": "c3",
+      "probabilities": {
+        "c0": 0.0,
+        "c1": 0.0,
+        "c2": 0.0,
+        "c3": 1.0
+      },
+      "confidence": 1.0
+    },
+    1,
+    null,
+    {
+      "high_risk": false,
+      "debug": false,
+      "repo_arch": true,
+      "strict_format": false,
+      "long_context": false
+    }
+  ],
+  [
+    "new_task",
+    "c3",
+    "c3",
+    "T3",
+    "P2",
+    false,
+    {
+      "source": "fallback",
+      "run_status": "not_run",
+      "final": "new_task",
+      "reason": "no_active_task",
+      "prediction": null,
+      "probabilities": null,
+      "confidence": null
+    },
+    {
+      "source": "classifier",
+      "run_status": "ran",
+      "final": "c3",
+      "reason": "classifier_selected",
+      "prediction": "c3",
+      "probabilities": {
+        "c0": 0.0,
+        "c1": 0.0,
+        "c2": 0.0,
+        "c3": 1.0
+      },
+      "confidence": 1.0
+    },
+    1,
+    null,
+    {
+      "high_risk": false,
+      "debug": false,
+      "repo_arch": false,
+      "strict_format": true,
+      "long_context": false
+    }
+  ],
+  [
+    "new_task",
+    "c3",
+    "c3",
+    "T3",
+    "P2",
+    false,
+    {
+      "source": "fallback",
+      "run_status": "not_run",
+      "final": "new_task",
+      "reason": "no_active_task",
+      "prediction": null,
+      "probabilities": null,
+      "confidence": null
+    },
+    {
+      "source": "classifier",
+      "run_status": "ran",
+      "final": "c3",
+      "reason": "classifier_selected",
+      "prediction": "c3",
+      "probabilities": {
+        "c0": 0.0,
+        "c1": 0.0,
+        "c2": 0.0,
+        "c3": 1.0
+      },
+      "confidence": 1.0
+    },
+    1,
+    null,
+    {
+      "high_risk": false,
+      "debug": true,
+      "repo_arch": false,
+      "strict_format": false,
+      "long_context": false
+    }
+  ],
+  [
+    "new_task",
+    "c3",
+    "c3",
+    "T3",
+    "P2",
+    false,
+    {
+      "source": "fallback",
+      "run_status": "not_run",
+      "final": "new_task",
+      "reason": "no_active_task",
+      "prediction": null,
+      "probabilities": null,
+      "confidence": null
+    },
+    {
+      "source": "classifier",
+      "run_status": "ran",
+      "final": "c3",
+      "reason": "classifier_selected",
+      "prediction": "c3",
+      "probabilities": {
+        "c0": 0.0,
+        "c1": 0.0,
+        "c2": 0.0,
+        "c3": 1.0
+      },
+      "confidence": 1.0
+    },
+    1,
+    null,
+    {
+      "high_risk": false,
+      "debug": false,
+      "repo_arch": false,
+      "strict_format": false,
+      "long_context": true
+    }
+  ],
+  [
+    "new_task",
+    "c3",
+    "c3",
+    "T3",
+    "P2",
+    false,
+    {
+      "source": "fallback",
+      "run_status": "not_run",
+      "final": "new_task",
+      "reason": "no_active_task",
+      "prediction": null,
+      "probabilities": null,
+      "confidence": null
+    },
+    {
+      "source": "classifier",
+      "run_status": "ran",
+      "final": "c3",
+      "reason": "classifier_selected",
+      "prediction": "c3",
+      "probabilities": {
+        "c0": 0.0,
+        "c1": 0.0,
+        "c2": 0.0,
+        "c3": 1.0
+      },
+      "confidence": 1.0
+    },
+    1,
+    null,
+    {
+      "high_risk": false,
+      "debug": false,
+      "repo_arch": false,
+      "strict_format": false,
+      "long_context": true
+    }
+  ],
+  [
+    "new_task",
+    "c3",
+    "c3",
+    "T3",
+    "P2",
+    false,
+    {
+      "source": "fallback",
+      "run_status": "not_run",
+      "final": "new_task",
+      "reason": "no_active_task",
+      "prediction": null,
+      "probabilities": null,
+      "confidence": null
+    },
+    {
+      "source": "classifier",
+      "run_status": "ran",
+      "final": "c3",
+      "reason": "classifier_selected",
+      "prediction": "c3",
+      "probabilities": {
+        "c0": 0.0,
+        "c1": 0.0,
+        "c2": 0.0,
+        "c3": 1.0
+      },
+      "confidence": 1.0
+    },
+    1,
+    null,
+    {
+      "high_risk": false,
+      "debug": false,
+      "repo_arch": false,
+      "strict_format": false,
+      "long_context": true
+    }
+  ],
+  [
+    "new_task",
+    "c3",
+    "c3",
+    "T3",
+    "P2",
+    false,
+    {
+      "source": "fallback",
+      "run_status": "not_run",
+      "final": "new_task",
+      "reason": "no_active_task",
+      "prediction": null,
+      "probabilities": null,
+      "confidence": null
+    },
+    {
+      "source": "classifier",
+      "run_status": "ran",
+      "final": "c3",
+      "reason": "classifier_selected",
+      "prediction": "c3",
+      "probabilities": {
+        "c0": 0.0,
+        "c1": 0.0,
+        "c2": 0.0,
+        "c3": 1.0
+      },
+      "confidence": 1.0
+    },
+    1,
+    null,
+    {
+      "high_risk": false,
+      "debug": false,
+      "repo_arch": false,
+      "strict_format": false,
+      "long_context": true
+    }
+  ],
+  [
+    "continue",
+    "c3",
+    "c0",
+    "T3",
+    "P1",
+    false,
+    {
+      "source": "classifier",
+      "run_status": "ran",
+      "final": "continue",
+      "reason": "classifier_selected",
+      "prediction": "continue",
+      "probabilities": {
+        "new_task": 0.0,
+        "continue": 1.0,
+        "redo": 0.0
+      },
+      "confidence": 1.0
+    },
+    {
+      "source": "not_run",
+      "run_status": "not_run",
+      "final": "c0",
+      "reason": "model_continue_keeps_previous_tier",
+      "prediction": null,
+      "probabilities": null,
+      "confidence": null
+    },
+    3,
+    "generation-start",
+    {
+      "high_risk": false,
+      "debug": false,
+      "repo_arch": false,
+      "strict_format": false,
+      "long_context": false
+    }
+  ],
+  [
+    "continue",
+    "c1",
+    "c1",
+    "T2",
+    "P2",
+    false,
+    {
+      "source": "classifier",
+      "run_status": "ran",
+      "final": "continue",
+      "reason": "classifier_selected",
+      "prediction": "continue",
+      "probabilities": {
+        "new_task": 0.0,
+        "continue": 1.0,
+        "redo": 0.0
+      },
+      "confidence": 1.0
+    },
+    {
+      "source": "not_run",
+      "run_status": "not_run",
+      "final": "c1",
+      "reason": "model_continue_keeps_previous_tier",
+      "prediction": null,
+      "probabilities": null,
+      "confidence": null
+    },
+    3,
+    "generation-start",
+    {
+      "high_risk": false,
+      "debug": false,
+      "repo_arch": false,
+      "strict_format": false,
+      "long_context": true
+    }
+  ],
+  [
+    "redo",
+    "c3",
+    "c1",
+    "T3",
+    "P1",
+    false,
+    {
+      "source": "classifier",
+      "run_status": "ran",
+      "final": "redo",
+      "reason": "classifier_selected",
+      "prediction": "redo",
+      "probabilities": {
+        "new_task": 0.0,
+        "continue": 0.0,
+        "redo": 1.0
+      },
+      "confidence": 1.0
+    },
+    {
+      "source": "not_run",
+      "run_status": "not_run",
+      "final": "c1",
+      "reason": "model_redo_upgrades_previous_tier",
+      "prediction": null,
+      "probabilities": null,
+      "confidence": null
+    },
+    3,
+    "generation-start",
+    {
+      "high_risk": false,
+      "debug": false,
+      "repo_arch": false,
+      "strict_format": false,
+      "long_context": false
+    }
+  ],
+  [
+    "redo",
+    "c2",
+    "c2",
+    "T3",
+    "P2",
+    false,
+    {
+      "source": "classifier",
+      "run_status": "ran",
+      "final": "redo",
+      "reason": "classifier_selected",
+      "prediction": "redo",
+      "probabilities": {
+        "new_task": 0.0,
+        "continue": 0.0,
+        "redo": 1.0
+      },
+      "confidence": 1.0
+    },
+    {
+      "source": "not_run",
+      "run_status": "not_run",
+      "final": "c2",
+      "reason": "model_redo_upgrades_previous_tier",
+      "prediction": null,
+      "probabilities": null,
+      "confidence": null
+    },
+    3,
+    "generation-start",
+    {
+      "high_risk": false,
+      "debug": false,
+      "repo_arch": false,
+      "strict_format": false,
+      "long_context": true
+    }
+  ],
+  [
+    "new_task",
+    "c3",
+    "c0",
+    "T3",
+    "P1",
+    false,
+    {
+      "source": "classifier",
+      "run_status": "ran",
+      "final": "new_task",
+      "reason": "classifier_selected",
+      "prediction": "new_task",
+      "probabilities": {
+        "new_task": 1.0,
+        "continue": 0.0,
+        "redo": 0.0
+      },
+      "confidence": 1.0
+    },
+    {
+      "source": "classifier",
+      "run_status": "ran",
+      "final": "c0",
+      "reason": "classifier_selected",
+      "prediction": "c0",
+      "probabilities": {
+        "c0": 1.0,
+        "c1": 0.0,
+        "c2": 0.0,
+        "c3": 0.0
+      },
+      "confidence": 1.0
+    },
+    1,
+    "generation-start",
+    {
+      "high_risk": false,
+      "debug": false,
+      "repo_arch": false,
+      "strict_format": false,
+      "long_context": false
+    }
+  ],
+  [
+    "new_task",
+    "c0",
+    "c0",
+    "T0",
+    "P2",
+    false,
+    {
+      "source": "classifier",
+      "run_status": "ran",
+      "final": "new_task",
+      "reason": "classifier_selected",
+      "prediction": "new_task",
+      "probabilities": {
+        "new_task": 1.0,
+        "continue": 0.0,
+        "redo": 0.0
+      },
+      "confidence": 1.0
+    },
+    {
+      "source": "classifier",
+      "run_status": "ran",
+      "final": "c0",
+      "reason": "classifier_selected",
+      "prediction": "c0",
+      "probabilities": {
+        "c0": 1.0,
+        "c1": 0.0,
+        "c2": 0.0,
+        "c3": 0.0
+      },
+      "confidence": 1.0
+    },
+    1,
+    "generation-start",
+    {
+      "high_risk": false,
+      "debug": false,
+      "repo_arch": false,
+      "strict_format": false,
+      "long_context": true
+    }
+  ],
+  [
+    "new_task",
+    "c0",
+    "c0",
+    "T0",
+    "P0",
+    true,
+    {
+      "source": "rule",
+      "run_status": "not_run",
+      "final": "new_task",
+      "reason": "explicit_new_task_control",
+      "prediction": null,
+      "probabilities": null,
+      "confidence": null
+    },
+    {
+      "source": "classifier",
+      "run_status": "ran",
+      "final": "c0",
+      "reason": "classifier_selected",
+      "prediction": "c0",
+      "probabilities": {
+        "c0": 1.0,
+        "c1": 0.0,
+        "c2": 0.0,
+        "c3": 0.0
+      },
+      "confidence": 1.0
+    },
+    1,
+    "current-input",
+    {
+      "high_risk": false,
+      "debug": false,
+      "repo_arch": false,
+      "strict_format": false,
+      "long_context": false
+    }
+  ],
+  [
+    "new_task",
+    "c0",
+    "c0",
+    "T0",
+    "P0",
+    true,
+    {
+      "source": "rule",
+      "run_status": "not_run",
+      "final": "new_task",
+      "reason": "explicit_new_task_control",
+      "prediction": null,
+      "probabilities": null,
+      "confidence": null
+    },
+    {
+      "source": "classifier",
+      "run_status": "ran",
+      "final": "c0",
+      "reason": "classifier_selected",
+      "prediction": "c0",
+      "probabilities": {
+        "c0": 1.0,
+        "c1": 0.0,
+        "c2": 0.0,
+        "c3": 0.0
+      },
+      "confidence": 1.0
+    },
+    1,
+    "current-input",
+    {
+      "high_risk": false,
+      "debug": false,
+      "repo_arch": false,
+      "strict_format": false,
+      "long_context": false
+    }
+  ],
+  [
+    "new_task",
+    "c0",
+    "c0",
+    "T0",
+    "P0",
+    true,
+    {
+      "source": "rule",
+      "run_status": "not_run",
+      "final": "new_task",
+      "reason": "explicit_new_task_control",
+      "prediction": null,
+      "probabilities": null,
+      "confidence": null
+    },
+    {
+      "source": "classifier",
+      "run_status": "ran",
+      "final": "c0",
+      "reason": "classifier_selected",
+      "prediction": "c0",
+      "probabilities": {
+        "c0": 1.0,
+        "c1": 0.0,
+        "c2": 0.0,
+        "c3": 0.0
+      },
+      "confidence": 1.0
+    },
+    1,
+    "current-input",
+    {
+      "high_risk": false,
+      "debug": false,
+      "repo_arch": false,
+      "strict_format": false,
+      "long_context": false
+    }
+  ],
+  [
+    "new_task",
+    "c0",
+    "c0",
+    "T0",
+    "P0",
+    true,
+    {
+      "source": "rule",
+      "run_status": "not_run",
+      "final": "new_task",
+      "reason": "explicit_new_task_control",
+      "prediction": null,
+      "probabilities": null,
+      "confidence": null
+    },
+    {
+      "source": "classifier",
+      "run_status": "ran",
+      "final": "c0",
+      "reason": "classifier_selected",
+      "prediction": "c0",
+      "probabilities": {
+        "c0": 1.0,
+        "c1": 0.0,
+        "c2": 0.0,
+        "c3": 0.0
+      },
+      "confidence": 1.0
+    },
+    1,
+    "current-input",
+    {
+      "high_risk": false,
+      "debug": false,
+      "repo_arch": false,
+      "strict_format": false,
+      "long_context": false
+    }
+  ],
+  [
+    "new_task",
+    "c0",
+    "c0",
+    "T0",
+    "P0",
+    false,
+    {
+      "source": "fallback",
+      "run_status": "not_run",
+      "final": "new_task",
+      "reason": "redo_without_active_task",
+      "prediction": null,
+      "probabilities": null,
+      "confidence": null
+    },
+    {
+      "source": "classifier",
+      "run_status": "ran",
+      "final": "c0",
+      "reason": "classifier_selected",
+      "prediction": "c0",
+      "probabilities": {
+        "c0": 1.0,
+        "c1": 0.0,
+        "c2": 0.0,
+        "c3": 0.0
+      },
+      "confidence": 1.0
+    },
+    1,
+    null,
+    {
+      "high_risk": false,
+      "debug": false,
+      "repo_arch": false,
+      "strict_format": false,
+      "long_context": false
+    }
+  ],
+  [
+    "redo",
+    "c2",
+    "c2",
+    "T2",
+    "P1",
+    false,
+    {
+      "source": "rule",
+      "run_status": "not_run",
+      "final": "redo",
+      "reason": "explicit_redo_control",
+      "prediction": null,
+      "probabilities": null,
+      "confidence": null
+    },
+    {
+      "source": "not_run",
+      "run_status": "not_run",
+      "final": "c2",
+      "reason": "model_redo_upgrades_previous_tier",
+      "prediction": null,
+      "probabilities": null,
+      "confidence": null
+    },
+    3,
+    "generation-start",
+    {
+      "high_risk": false,
+      "debug": false,
+      "repo_arch": false,
+      "strict_format": false,
+      "long_context": false
+    }
+  ],
+  [
+    "new_task",
+    "c0",
+    "c0",
+    "T0",
+    "P0",
+    false,
+    {
+      "source": "fallback",
+      "run_status": "not_run",
+      "final": "new_task",
+      "reason": "redo_without_active_task",
+      "prediction": null,
+      "probabilities": null,
+      "confidence": null
+    },
+    {
+      "source": "classifier",
+      "run_status": "ran",
+      "final": "c0",
+      "reason": "classifier_selected",
+      "prediction": "c0",
+      "probabilities": {
+        "c0": 1.0,
+        "c1": 0.0,
+        "c2": 0.0,
+        "c3": 0.0
+      },
+      "confidence": 1.0
+    },
+    1,
+    null,
+    {
+      "high_risk": false,
+      "debug": false,
+      "repo_arch": false,
+      "strict_format": false,
+      "long_context": false
+    }
+  ],
+  [
+    "redo",
+    "c2",
+    "c2",
+    "T2",
+    "P1",
+    false,
+    {
+      "source": "rule",
+      "run_status": "not_run",
+      "final": "redo",
+      "reason": "explicit_redo_control",
+      "prediction": null,
+      "probabilities": null,
+      "confidence": null
+    },
+    {
+      "source": "not_run",
+      "run_status": "not_run",
+      "final": "c2",
+      "reason": "model_redo_upgrades_previous_tier",
+      "prediction": null,
+      "probabilities": null,
+      "confidence": null
+    },
+    3,
+    "generation-start",
+    {
+      "high_risk": false,
+      "debug": false,
+      "repo_arch": false,
+      "strict_format": false,
+      "long_context": false
+    }
+  ],
+  [
+    "continue",
+    "c1",
+    "c1",
+    "T2",
+    "P1",
+    false,
+    {
+      "source": "classifier",
+      "run_status": "ran",
+      "final": "continue",
+      "reason": "classifier_selected",
+      "prediction": "continue",
+      "probabilities": {
+        "new_task": 0.0,
+        "continue": 1.0,
+        "redo": 0.0
+      },
+      "confidence": 1.0
+    },
+    {
+      "source": "not_run",
+      "run_status": "not_run",
+      "final": "c1",
+      "reason": "model_continue_keeps_previous_tier",
+      "prediction": null,
+      "probabilities": null,
+      "confidence": null
+    },
+    3,
+    "generation-start",
+    {
+      "high_risk": false,
+      "debug": false,
+      "repo_arch": false,
+      "strict_format": false,
+      "long_context": false
+    }
+  ],
+  [
+    "continue",
+    "c1",
+    "c1",
+    "T2",
+    "P1",
+    false,
+    {
+      "source": "classifier",
+      "run_status": "ran",
+      "final": "continue",
+      "reason": "classifier_selected",
+      "prediction": "continue",
+      "probabilities": {
+        "new_task": 0.0,
+        "continue": 1.0,
+        "redo": 0.0
+      },
+      "confidence": 1.0
+    },
+    {
+      "source": "not_run",
+      "run_status": "not_run",
+      "final": "c1",
+      "reason": "model_continue_keeps_previous_tier",
+      "prediction": null,
+      "probabilities": null,
+      "confidence": null
+    },
+    3,
+    "generation-start",
+    {
+      "high_risk": false,
+      "debug": false,
+      "repo_arch": false,
+      "strict_format": false,
+      "long_context": false
+    }
+  ],
+  [
+    "continue",
+    "c1",
+    "c1",
+    "T2",
+    "P1",
+    false,
+    {
+      "source": "classifier",
+      "run_status": "ran",
+      "final": "continue",
+      "reason": "classifier_selected",
+      "prediction": "continue",
+      "probabilities": {
+        "new_task": 0.0,
+        "continue": 1.0,
+        "redo": 0.0
+      },
+      "confidence": 1.0
+    },
+    {
+      "source": "not_run",
+      "run_status": "not_run",
+      "final": "c1",
+      "reason": "model_continue_keeps_previous_tier",
+      "prediction": null,
+      "probabilities": null,
+      "confidence": null
+    },
+    3,
+    "generation-start",
+    {
+      "high_risk": false,
+      "debug": false,
+      "repo_arch": false,
+      "strict_format": false,
+      "long_context": false
+    }
+  ],
+  [
+    "continue",
+    "c1",
+    "c1",
+    "T2",
+    "P1",
+    false,
+    {
+      "source": "classifier",
+      "run_status": "ran",
+      "final": "continue",
+      "reason": "classifier_selected",
+      "prediction": "continue",
+      "probabilities": {
+        "new_task": 0.0,
+        "continue": 1.0,
+        "redo": 0.0
+      },
+      "confidence": 1.0
+    },
+    {
+      "source": "not_run",
+      "run_status": "not_run",
+      "final": "c1",
+      "reason": "model_continue_keeps_previous_tier",
+      "prediction": null,
+      "probabilities": null,
+      "confidence": null
+    },
+    3,
+    "generation-start",
+    {
+      "high_risk": false,
+      "debug": false,
+      "repo_arch": false,
+      "strict_format": false,
+      "long_context": false
+    }
+  ],
+  [
+    "new_task",
+    "c0",
+    "c0",
+    "T2",
+    "P1",
+    false,
+    {
+      "source": "classifier",
+      "run_status": "ran",
+      "final": "new_task",
+      "reason": "classifier_selected",
+      "prediction": "new_task",
+      "probabilities": {
+        "new_task": 0.3333334,
+        "continue": 0.3333333,
+        "redo": 0.3333333
+      },
+      "confidence": 0.3333334
+    },
+    {
+      "source": "classifier",
+      "run_status": "ran",
+      "final": "c0",
+      "reason": "classifier_selected",
+      "prediction": "c0",
+      "probabilities": {
+        "c0": 0.26,
+        "c1": 0.25,
+        "c2": 0.25,
+        "c3": 0.24
+      },
+      "confidence": 0.26
+    },
+    1,
+    "generation-start",
+    {
+      "high_risk": false,
+      "debug": false,
+      "repo_arch": false,
+      "strict_format": false,
+      "long_context": false
+    }
+  ],
+  [
+    "continue",
+    "c1",
+    "c1",
+    "T2",
+    "P1",
+    false,
+    {
+      "source": "classifier",
+      "run_status": "ran",
+      "final": "continue",
+      "reason": "classifier_selected",
+      "prediction": "continue",
+      "probabilities": {
+        "new_task": 0.5,
+        "continue": 0.5,
+        "redo": 0.0
+      },
+      "confidence": 0.5
+    },
+    {
+      "source": "not_run",
+      "run_status": "not_run",
+      "final": "c1",
+      "reason": "model_continue_keeps_previous_tier",
+      "prediction": null,
+      "probabilities": null,
+      "confidence": null
+    },
+    3,
+    "generation-start",
+    {
+      "high_risk": false,
+      "debug": false,
+      "repo_arch": false,
+      "strict_format": false,
+      "long_context": false
+    }
+  ],
+  [
+    "redo",
+    "c2",
+    "c2",
+    "T2",
+    "P1",
+    false,
+    {
+      "source": "classifier",
+      "run_status": "ran",
+      "final": "redo",
+      "reason": "classifier_selected",
+      "prediction": "redo",
+      "probabilities": {
+        "new_task": 0.5,
+        "continue": 0.0,
+        "redo": 0.5
+      },
+      "confidence": 0.5
+    },
+    {
+      "source": "not_run",
+      "run_status": "not_run",
+      "final": "c2",
+      "reason": "model_redo_upgrades_previous_tier",
+      "prediction": null,
+      "probabilities": null,
+      "confidence": null
+    },
+    3,
+    "generation-start",
+    {
+      "high_risk": false,
+      "debug": false,
+      "repo_arch": false,
+      "strict_format": false,
+      "long_context": false
+    }
+  ],
+  [
+    "new_task",
+    "c0",
+    "c0",
+    "T2",
+    "P1",
+    false,
+    {
+      "source": "fallback",
+      "run_status": "not_run",
+      "final": "new_task",
+      "reason": "no_active_task",
+      "prediction": null,
+      "probabilities": null,
+      "confidence": null
+    },
+    {
+      "source": "classifier",
+      "run_status": "ran",
+      "final": "c0",
+      "reason": "classifier_selected",
+      "prediction": "c0",
+      "probabilities": {
+        "c0": 0.25,
+        "c1": 0.25,
+        "c2": 0.25,
+        "c3": 0.25
+      },
+      "confidence": 0.25
+    },
+    1,
+    null,
+    {
+      "high_risk": false,
+      "debug": false,
+      "repo_arch": false,
+      "strict_format": false,
+      "long_context": false
+    }
+  ],
+  [
+    "continue",
+    "c2",
+    "c2",
+    "T2",
+    "P1",
+    false,
+    {
+      "source": "fallback",
+      "run_status": "error",
+      "final": "continue",
+      "reason": "classifier_error:RuntimeError",
+      "prediction": null,
+      "probabilities": null,
+      "confidence": null
+    },
+    {
+      "source": "not_run",
+      "run_status": "not_run",
+      "final": "c2",
+      "reason": "model_continue_keeps_previous_tier",
+      "prediction": null,
+      "probabilities": null,
+      "confidence": null
+    },
+    3,
+    "generation-start",
+    {
+      "high_risk": false,
+      "debug": false,
+      "repo_arch": false,
+      "strict_format": false,
+      "long_context": false
+    }
+  ],
+  [
+    "new_task",
+    "c1",
+    "c1",
+    "T2",
+    "P1",
+    false,
+    {
+      "source": "fallback",
+      "run_status": "not_run",
+      "final": "new_task",
+      "reason": "no_active_task",
+      "prediction": null,
+      "probabilities": null,
+      "confidence": null
+    },
+    {
+      "source": "fallback",
+      "run_status": "error",
+      "final": "c1",
+      "reason": "classifier_error:RuntimeError",
+      "prediction": null,
+      "probabilities": null,
+      "confidence": null
+    },
+    1,
+    null,
+    {
+      "high_risk": false,
+      "debug": false,
+      "repo_arch": false,
+      "strict_format": false,
+      "long_context": false
+    }
+  ],
+  [
+    "continue",
+    "c2",
+    "c2",
+    "T2",
+    "P1",
+    false,
+    {
+      "source": "fallback",
+      "run_status": "error",
+      "final": "continue",
+      "reason": "invalid_classifier_result",
+      "prediction": null,
+      "probabilities": null,
+      "confidence": null
+    },
+    {
+      "source": "not_run",
+      "run_status": "not_run",
+      "final": "c2",
+      "reason": "model_continue_keeps_previous_tier",
+      "prediction": null,
+      "probabilities": null,
+      "confidence": null
+    },
+    3,
+    "generation-start",
+    {
+      "high_risk": false,
+      "debug": false,
+      "repo_arch": false,
+      "strict_format": false,
+      "long_context": false
+    }
+  ],
+  [
+    "new_task",
+    "c2",
+    "c2",
+    "T2",
+    "P1",
+    false,
+    {
+      "source": "classifier",
+      "run_status": "ran",
+      "final": "new_task",
+      "reason": "classifier_selected",
+      "prediction": "new_task",
+      "probabilities": {
+        "new_task": 1.0,
+        "continue": 0.0,
+        "redo": 0.0
+      },
+      "confidence": 1.0
+    },
+    {
+      "source": "fallback",
+      "run_status": "error",
+      "final": "c2",
+      "reason": "invalid_classifier_result",
+      "prediction": null,
+      "probabilities": null,
+      "confidence": null
+    },
+    1,
+    "generation-start",
+    {
+      "high_risk": false,
+      "debug": false,
+      "repo_arch": false,
+      "strict_format": false,
+      "long_context": false
+    }
+  ],
+  [
+    "continue",
+    "c1",
+    "c1",
+    "T2",
+    "P1",
+    false,
+    {
+      "source": "classifier",
+      "run_status": "ran",
+      "final": "continue",
+      "reason": "classifier_selected",
+      "prediction": "continue",
+      "probabilities": {
+        "new_task": 0.0,
+        "continue": 1.0,
+        "redo": 0.0
+      },
+      "confidence": 1.0
+    },
+    {
+      "source": "not_run",
+      "run_status": "not_run",
+      "final": "c1",
+      "reason": "model_continue_keeps_previous_tier",
+      "prediction": null,
+      "probabilities": null,
+      "confidence": null
+    },
+    3,
+    "generation-start",
+    {
+      "high_risk": false,
+      "debug": false,
+      "repo_arch": false,
+      "strict_format": false,
+      "long_context": false
+    }
+  ],
+  [
+    "continue",
+    "c2",
+    "c2",
+    "T3",
+    "P2",
+    false,
+    {
+      "source": "classifier",
+      "run_status": "ran",
+      "final": "continue",
+      "reason": "classifier_selected",
+      "prediction": "continue",
+      "probabilities": {
+        "new_task": 0.0,
+        "continue": 1.0,
+        "redo": 0.0
+      },
+      "confidence": 1.0
+    },
+    {
+      "source": "not_run",
+      "run_status": "not_run",
+      "final": "c2",
+      "reason": "model_continue_keeps_previous_tier",
+      "prediction": null,
+      "probabilities": null,
+      "confidence": null
+    },
+    3,
+    "generation-start",
+    {
+      "high_risk": false,
+      "debug": false,
+      "repo_arch": false,
+      "strict_format": false,
+      "long_context": true
+    }
+  ]
+]

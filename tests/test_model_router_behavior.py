@@ -102,9 +102,18 @@ def make_context(
     raw_message: str | None = None,
     attachments: list[dict] | None = None,
 ) -> TurnContext:
-    # Pin the packaged OpenRouter ladder so tier transitions can be asserted
-    # against its distinct per-tier models.
-    config = GatewayConfig(llm={"provider": "openrouter"})
+    # These classifier/rule tests exercise the explicitly retained legacy mode.
+    # Pin its historical deployments rather than depending on the new model pool.
+    config = GatewayConfig(
+        llm={"provider": "openrouter"},
+        squilla_router={"strategy": "legacy_v4_phase3"},
+    )
+    for tier, model in {
+        "c1": "deepseek/deepseek-v4-flash-0731",
+        "c2": "deepseek/deepseek-v4-pro-0813",
+        "c3": "z-ai/glm-5.3",
+    }.items():
+        config.squilla_router.tiers[tier]["model"] = model
     config.squilla_router.rollout_phase = rollout_phase
     return TurnContext(
         message=message,
@@ -1496,7 +1505,7 @@ async def test_tokenrhythm_default_image_route_uses_configured_catalog_vision(
         "_get_strategy",
         lambda _config: pytest.fail("image routing should not invoke text strategy"),
     )
-    config = GatewayConfig()
+    config = GatewayConfig(squilla_router={"strategy": "legacy_v4_phase3"})
     assert config.squilla_router.tiers["c0"]["model"] == "qwen3.7-flash"
     config.squilla_router.tiers["c0"]["supports_image"] = False
     ctx = TurnContext(
@@ -1518,8 +1527,8 @@ async def test_tokenrhythm_default_image_route_uses_configured_catalog_vision(
     assert routed.metadata["routed_model_vision_support"] == "supported"
     assert routed.metadata["router_fallback_chain"] == [
         {
-            "tier": "c1",
-            "model": "deepseek-flash",
+            "tier": "c3",
+            "model": "kimi-k3",
             "vision_support": "supported",
             "provider": "tokenrhythm",
         }

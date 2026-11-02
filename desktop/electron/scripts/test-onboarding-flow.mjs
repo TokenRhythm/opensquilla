@@ -10,6 +10,10 @@ import { _electron as electron } from 'playwright'
 import { desktopRouterConfigTomlLines } from '../dist/desktop-router-config.js'
 import { DESKTOP_GATEWAY_STARTUP_TIMEOUT_MS } from '../dist/gateway-lifecycle.js'
 import { parse, stringify } from 'smol-toml'
+import {
+  closeElectronWithDeadline,
+  requestElectronQuitWithConfirmation,
+} from './e2e-shutdown-helpers.mjs'
 import { LocalAccountSecrets } from '../dist/local-account-secrets.js'
 import { renderUnconfiguredDesktopConfig } from '../dist/desktop-unconfigured-profile.js'
 
@@ -445,6 +449,15 @@ async function assertSubmitActionsDoNotOverlap(page) {
   }
 }
 
+async function pauseClockAtCurrentTime(page) {
+  const now = Date.now()
+  // Freeze Date across the pause RPC so host scheduling cannot make its target
+  // stale, then let Date advance with the manually controlled timers again.
+  await page.clock.setFixedTime(now)
+  await page.clock.pauseAt(now)
+  await page.clock.setSystemTime(now)
+}
+
 async function verifyBootPhaseTimer(app) {
   const page = await bootWindow(app)
   const phase = page.locator('#phase')
@@ -473,9 +486,7 @@ async function verifyBootPhaseTimer(app) {
   // The boot window sits behind the setup invitation, where Chromium may throttle
   // its 100 ms timer. Drive elapsed time explicitly instead of racing a brief
   // wall-clock reset window, and install before reload so every timer is owned.
-  const bootClockOrigin = Date.now()
-  await page.clock.install({ time: bootClockOrigin })
-  await page.clock.pauseAt(bootClockOrigin + 1_000)
+  await pauseClockAtCurrentTime(page)
   await page.reload({ waitUntil: 'domcontentloaded' })
   await waitForBootProgress(page, persistedProgress)
   await waitFor(async () => (
@@ -859,9 +870,7 @@ async function verifySubmitFeedbackAndSingleFlight() {
     // gateway-owned shell lifecycle.
     await loadBootContractWindow(app)
     await verifyBootPhaseTimer(app)
-    const submitClockOrigin = Date.now()
-    await page.clock.install({ time: submitClockOrigin })
-    await page.clock.pauseAt(submitClockOrigin + 1_000)
+    await pauseClockAtCurrentTime(page)
     const apiKey = page.locator('#apiKey')
     await apiKey.fill('synthetic-submit-key')
     await page.locator('#onboardingLocale').selectOption('de')
@@ -1330,6 +1339,7 @@ const observeRenderer = (candidate) => {
 }
 for (const candidate of app.windows()) observeRenderer(candidate)
 app.on('window', observeRenderer)
+let providerClientFailed = false
 
 try {
   const page = await setupWindow(app)
@@ -1426,7 +1436,7 @@ try {
   assert.equal(await page.locator('#modelSummary').isVisible(), true)
   assert.equal(await page.locator('#modelEditor').isVisible(), false)
   assert.equal(await page.locator('#modelSummaryLabel').innerText(), '推荐模型')
-  assert.equal(await page.locator('#modelSummaryValue').innerText(), 'deepseek-flash')
+  assert.equal(await page.locator('#modelSummaryValue').innerText(), 'deepseek-v4-flash-0731')
   assert.deepEqual(
     await page.evaluate(() => [
       getComputedStyle(document.getElementById('providerSelectLabel')).fontSize,
@@ -1536,7 +1546,7 @@ try {
 
   assert.equal(await page.locator('#provider').inputValue(), 'tokenrhythm')
   assert.equal(await page.locator('#baseUrl').inputValue(), 'https://tokenrhythm.studio/v1')
-  assert.equal(await page.locator('#model').inputValue(), 'deepseek-flash')
+  assert.equal(await page.locator('#model').inputValue(), 'deepseek-v4-flash-0731')
   assert.equal(await page.locator('#modelRoutingMode').inputValue(), 'squilla_router')
   assert.equal(await page.locator('#routerMode').inputValue(), 'recommended')
 
@@ -1601,7 +1611,7 @@ try {
   assert.equal(await page.locator('#modelRoutingMode').inputValue(), 'squilla_router')
   assert.equal(await page.locator('#routerMode').inputValue(), 'recommended')
   assert.equal(await page.locator('#modelSummary').isVisible(), true)
-  assert.equal(await page.locator('#modelSummaryValue').innerText(), 'deepseek-flash')
+  assert.equal(await page.locator('#modelSummaryValue').innerText(), 'deepseek-v4-flash-0731')
   await page.locator('#apiKey').fill('synthetic-tokenrhythm-key')
   assert.equal(await page.locator('.inline-search-section').isVisible(), true)
   assert.equal(await page.locator('#inlineSearchHeading').innerText(), 'Choose web search')
@@ -1708,11 +1718,11 @@ try {
   const remainingGrowthSpool = await readDirectoryOrEmpty(join(earlySpoolRoot, 'growth'))
   assert.equal(remainingGrowthSpool.some(isManagedTelemetrySpoolEntry), false)
   assert.equal(credential.routerDefaultTier, 'c1')
-  assert.equal(credential.model, 'deepseek-flash')
+  assert.equal(credential.model, 'deepseek-v4-flash-0731')
   assert.equal(credential.routerTiers.c0.model, 'qwen3.7-flash')
-  assert.equal(credential.routerTiers.c1.model, 'deepseek-flash')
+  assert.equal(credential.routerTiers.c1.model, 'deepseek-v4-flash-0731')
   assert.equal(credential.routerTiers.c2.model, 'deepseek-v4-pro-0813')
-  assert.equal(credential.routerTiers.c3.model, 'glm-5.3')
+  assert.equal(credential.routerTiers.c3.model, 'kimi-k3')
   assert.equal(Object.hasOwn(credential.routerTiers.c0, 'supportsImage'), false)
   assert.equal(Object.hasOwn(credential.routerTiers.c1, 'supportsImage'), false)
   assert.equal(Object.hasOwn(credential.routerTiers.c2, 'supportsImage'), false)
@@ -1721,23 +1731,23 @@ try {
   assert.equal(credential.routerTiers.image_model.model, 'kimi-k2.6')
   assert.equal(Object.hasOwn(credential.routerTiers.image_model, 'supportsImage'), false)
   assert.match(config, /\[squilla_router\]\nenabled = true/)
-  assert.match(config, /\[llm\][\s\S]*?model = "deepseek-flash"/)
+  assert.match(config, /\[llm\][\s\S]*?model = "deepseek-v4-flash-0731"/)
   assert.match(config, /\[squilla_router\.tiers\.c0\]\nprovider = "tokenrhythm"\nmodel = "qwen3.7-flash"/)
-  assert.match(config, /\[squilla_router\.tiers\.c1\]\nprovider = "tokenrhythm"\nmodel = "deepseek-flash"/)
+  assert.match(config, /\[squilla_router\.tiers\.c1\]\nprovider = "tokenrhythm"\nmodel = "deepseek-v4-flash-0731"/)
   assert.match(config, /\[squilla_router\.tiers\.c2\]\nprovider = "tokenrhythm"\nmodel = "deepseek-v4-pro-0813"/)
-  assert.match(config, /\[squilla_router\.tiers\.c3\][\s\S]*?model = "glm-5.3"[\s\S]*?ensemble_enabled = false/)
+  assert.match(config, /\[squilla_router\.tiers\.c3\][\s\S]*?model = "kimi-k3"[\s\S]*?ensemble_enabled = false/)
   assert.doesNotMatch(config, /thinking_level\s*=/)
   assert.doesNotMatch(config, /supports_image\s*=/)
   assert.match(config, /\[llm_ensemble\]\nenabled = false/)
   assert.equal(successfulProbeServer.requests.length, 0,
     'saving complete, untested configuration must not make a provider request')
 
-  const readyConnection = await waitFor(async () => {
-    const connection = await desktopPage.evaluate(
-      () => window.opensquillaDesktop?.getGatewayConnection?.(),
-    )
-    return connection?.status === 'ready' ? connection : null
-  }, 'ready Desktop Gateway descriptor')
+  assert.equal(await readyDesktopWindow(app), desktopPage,
+    'Gateway readiness must preserve the original local Desktop renderer')
+  const readyConnection = await desktopPage.evaluate(
+    () => window.opensquillaDesktop?.getGatewayConnection?.(),
+  )
+  assert.equal(readyConnection?.status, 'ready')
   assert.match(readyConnection.httpUrl, /^http:\/\/127\.0\.0\.1:\d+$/)
   assert.equal(
     readyConnection.wsUrl,
@@ -1878,7 +1888,7 @@ try {
   const reset = await saveDesktop({ routerResetToRecommended: true,
     routerTiers: { c1: { provider: 'tokenrhythm', model: 'untrusted-renderer-model' } } })
   assert.equal(reset.routerPresetBinding, 'follow_primary')
-  assert.equal(reset.routerTiers.c1.model, 'deepseek-flash')
+  assert.equal(reset.routerTiers.c1.model, 'deepseek-v4-flash-0731')
   assert.match(await readFile(routerConfigPath, 'utf8'), /preset_binding = "follow_primary"/)
 
   // Switching a generated Desktop profile must follow config.toml ownership,
@@ -1925,11 +1935,29 @@ try {
     screenshotPath: screenshotPath || null,
   }, null, 2))
 } catch (error) {
+  providerClientFailed = true
   await reportOnboardingFailure(app, 'provider-client', error)
   throw error
 } finally {
-  await app.close().catch(() => {})
+  const shutdown = await closeElectronWithDeadline({
+    app,
+    phase: 'onboarding-provider-client',
+    requestClose: options => requestElectronQuitWithConfirmation(app, {
+      ...options, requireConfirmation: false,
+    }),
+    diagnostics: async () => {
+      const readLog = async name => redactDiagnosticText((
+        await readFile(join(userDataDir, 'logs', name), 'utf8').catch(() => '<log unavailable>')
+      ).slice(-24_000))
+      const [desktopLogTail, gatewayLogTail] = await Promise.all([
+        readLog('desktop.log'), readLog('gateway.log'),
+      ])
+      return { desktopLogTail, gatewayLogTail }
+    },
+  })
   await successfulProbeServer.close().catch(() => {})
   await rm(userDataRoot, { recursive: true, force: true }).catch(() => {})
+  // The helper reports cleanup failures; keep an earlier assertion primary.
+  if (!shutdown.closed && !providerClientFailed) throw shutdown.error
 }
 console.log('PASS onboarding provider-client')

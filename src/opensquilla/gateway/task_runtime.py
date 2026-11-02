@@ -608,6 +608,7 @@ def _reusable_route_envelope(envelope: RouteEnvelope) -> RouteEnvelope:
 
     metadata = dict(envelope.metadata)
     metadata.pop("selected_skills", None)
+    metadata.pop("router_model_control_event", None)
     metadata.pop("office_candidate", None)
     metadata.pop("annotation_selection", None)
     authority = metadata.get("activation_authority")
@@ -4998,7 +4999,9 @@ class TaskRuntime:
                         ]
                     if metadata.get("plan_run_id"):
                         turn_context["plan_run_id"] = metadata["plan_run_id"]
-                    for field in ("target_turn_id", "promoted_from_turn_id"):
+                    for field in (
+                        "target_turn_id", "promoted_from_turn_id", "router_model_control_event",
+                    ):
                         value = metadata.get(field)
                         if isinstance(value, str) and value:
                             turn_context[field] = value
@@ -5782,6 +5785,8 @@ class TaskRuntime:
         details = target_task.details if isinstance(target_task.details, dict) else {}
         metadata_raw = details.get("metadata")
         metadata = dict(metadata_raw) if isinstance(metadata_raw, dict) else {}
+        # Promoted steering is a new turn, not recovery of an explicit router control.
+        metadata.pop("router_model_control_event", None)
         # Promoted steering is a new turn, not recovery of the original Office edit.
         metadata.pop("office_candidate", None)
         metadata.pop("annotation_selection", None)
@@ -7722,7 +7727,9 @@ class TaskRuntime:
         client_request_id = metadata.get("client_request_id")
         if isinstance(client_request_id, str) and client_request_id:
             context["client_request_id"] = client_request_id
-        for context_field in ("target_turn_id", "promoted_from_turn_id"):
+        for context_field in (
+            "target_turn_id", "promoted_from_turn_id", "router_model_control_event",
+        ):
             value = metadata.get(context_field)
             if isinstance(value, str) and value:
                 context[context_field] = value

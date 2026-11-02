@@ -67,6 +67,10 @@ _PRESETS_SUBDIR = "presets"
 PREVIOUS_RECOMMENDED_TEXT_MODELS: dict[str, frozenset[tuple[str, ...]]] = {
     "openrouter": frozenset({
         (
+            "qwen/qwen3.7-flash", "deepseek/deepseek-v4-flash-0731",
+            "deepseek/deepseek-v4-pro-0813", "z-ai/glm-5.3",
+        ),
+        (
             "deepseek/deepseek-v4-flash", "deepseek/deepseek-v4-pro",
             "z-ai/glm-5.2", "z-ai/glm-5.2",
         ),
@@ -76,6 +80,7 @@ PREVIOUS_RECOMMENDED_TEXT_MODELS: dict[str, frozenset[tuple[str, ...]]] = {
         ),
     }),
     "tokenrhythm": frozenset({
+        ("qwen3.7-flash", "deepseek-flash", "deepseek-v4-pro-0813", "glm-5.3"),
         ("deepseek-v4-flash", "deepseek-v4-pro", "kimi-k2.7-code", "glm-5.1"),
         ("deepseek-v4-flash", "deepseek-v4-pro", "kimi-k2.7-code", "glm-5.2"),
         ("qwen3.7-flash", "deepseek-v4-flash-0731", "glm-5.2", "glm-5.2"),

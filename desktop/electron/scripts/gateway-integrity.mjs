@@ -4,6 +4,7 @@ import { join } from 'node:path'
 
 export const gatewayBuildRecord = 'gateway-build.json'
 const routerRelative = 'squilla_router/models/v4.2_phase3_inference'
+const lightgbmRelative = 'squilla_router/lightgbm_model/assets'
 const lfsHeader = 'version https://git-lfs.github.com/spec/v1'
 const rebuild = 'Run npm run build:web && npm run build:gateway before prepared packaging.'
 
@@ -104,6 +105,7 @@ export function assertGatewayResources(repoRoot, runtimeRoot) {
   ]))
   assertInventory(actualRegistry, expectedRegistry, 'frozen migration registry')
   assertRouterIntegrity(join(packageDir, routerRelative), join(repoRoot, 'src', 'opensquilla', routerRelative))
+  assertRouterIntegrity(join(packageDir, lightgbmRelative), join(repoRoot, 'src', 'opensquilla', lightgbmRelative))
 }
 
 export function gatewayInputs(repoRoot) {

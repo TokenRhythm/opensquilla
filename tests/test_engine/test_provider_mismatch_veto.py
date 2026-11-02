@@ -156,7 +156,7 @@ class _FixedStrategy:
 
 
 def _config(mode: str, *, rollout_phase: str = "full") -> GatewayConfig:
-    config = GatewayConfig()
+    config = GatewayConfig(squilla_router={"strategy": "legacy_v4_phase3"})
     config.llm.provider = "mainprov"
     config.llm.model = "dummy-base-model"
     config.squilla_router.enabled = True

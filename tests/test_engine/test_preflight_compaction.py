@@ -795,7 +795,7 @@ async def test_preflight_retained_ref_uses_verified_pixel_reserve(tmp_path: Path
     mock_sm = MagicMock()
     mock_sm.compact = AsyncMock(return_value="summary")
     mock_sm.get_transcript = AsyncMock(return_value=[entry])
-    config = GatewayConfig()
+    config = GatewayConfig(squilla_router={"strategy": "legacy_v4_phase3"})
     config.attachments.media_root = str(media_root)
     runner = TurnRunner(provider_selector=MagicMock(), session_manager=mock_sm, config=config)
     await runner._maybe_preflight_compact(
@@ -1409,7 +1409,8 @@ async def test_run_forwards_routed_provider_and_model_to_preflight() -> None:
     selector = _FakeProviderSelector()
     runner = TurnRunner(
         provider_selector=selector,
-        config=GatewayConfig(),
+        # This fixture isolates physical preflight without durable routing state.
+        config=GatewayConfig(squilla_router={"enabled": False}),
         model_catalog=ModelCatalog(),
     )
     seen: dict[str, object] = {}

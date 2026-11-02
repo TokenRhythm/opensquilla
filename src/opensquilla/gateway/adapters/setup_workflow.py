@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from typing import Any, cast
 
 from opensquilla.application.setup_workflow import SetupCatalog, SetupStatus
@@ -170,7 +171,9 @@ class GatewaySetupWorkflowPort:
         return setup_catalog()
 
     async def load_setup_status(self) -> SetupStatus:
-        return setup_status(self._config, is_owner=self._is_owner)
+        # Account bridge refreshes and profile reads are synchronous I/O. Keep
+        # shutdown/RPC handling responsive while retaining one scoped snapshot.
+        return await asyncio.to_thread(setup_status, self._config, is_owner=self._is_owner)
 
 
 __all__ = [

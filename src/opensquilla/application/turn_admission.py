@@ -26,6 +26,7 @@ from opensquilla.session_key import canonicalize_session_key
 type TurnAdmissionSurface = Literal["webchat", "session"]
 type InitialCollaborationMode = Literal["default", "plan"]
 type InitialRoutingMode = Literal["direct", "router", "ensemble"]
+type RouterControlEvent = Literal["new_task", "redo"]
 
 
 class AcceptedCollaboration(TypedDict):
@@ -163,6 +164,8 @@ class AdmitTurn:
     initial_routing_mode: InitialRoutingMode | None = None
     initial_model: str | None = None
     initial_provider: str | None = None
+    # Trusted structured control, independent of message text and session lifecycle.
+    router_control_event: RouterControlEvent | None = None
     pending_input: PendingInputGuard | None = None
     # Optional external capabilities that must be ready before durable
     # acceptance. This is an internal producer hint: ordinary chat remains

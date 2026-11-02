@@ -139,7 +139,7 @@ def _tokenrhythm_shared_c3_router() -> dict[str, Any]:
     assert preset is not None
     tiers = preset.tier_defaults()
     tiers["c3"]["ensemble_enabled"] = True
-    return {"preset_binding": "custom", "tiers": tiers}
+    return {"strategy": "legacy_v4_phase3", "preset_binding": "custom", "tiers": tiers}
 
 
 def _static_b5_config(**ensemble_overrides: Any) -> GatewayConfig:
@@ -282,7 +282,7 @@ async def test_static_tokenrhythm_b5_wraps_when_active_provider_is_keyed(
     ("routed_tier", "expected_model", "expect_ensemble"),
     [
         ("c0", "qwen3.7-flash", False),
-        ("c1", "deepseek-flash", False),
+        ("c1", "deepseek-v4-flash-0731", False),
         ("c2", "deepseek-v4-pro-0813", False),
         # Shared C3 triggers the global plan without replacing the configured
         # direct/fallback selector head.
@@ -339,7 +339,7 @@ async def test_tokenrhythm_router_uses_ensemble_only_for_c3(
         assert provider.profile_name == "static_tokenrhythm_b5"
         assert provider.fallback_model == "deepseek-v4-flash-0731"
         assert turn.model == "deepseek-v4-flash-0731"
-        assert turn.metadata["routed_model_before_ensemble"] == "glm-5.3"
+        assert turn.metadata["routed_model_before_ensemble"] == "kimi-k3"
         assert turn.metadata["ensemble_activation_source"] == "router_tier"
         assert turn.metadata["ensemble_tier_binding"] == "shared"
         assert turn.metadata["ensemble_selection_mode"] == "static_tokenrhythm_b5"
@@ -1995,7 +1995,7 @@ async def test_tokenrhythm_c3_uses_fixed_model_without_ensemble_credential(
     assert calls == []
     assert selector.current_config.model == "deepseek-v4-flash-0731"
     assert turn.model == "deepseek-v4-flash-0731"
-    assert turn.metadata["routed_model_before_ensemble"] == "glm-5.3"
+    assert turn.metadata["routed_model_before_ensemble"] == "kimi-k3"
     assert turn.metadata["ensemble_wrap_skipped_reason"] == (
         "static_tokenrhythm_b5_no_credential"
     )

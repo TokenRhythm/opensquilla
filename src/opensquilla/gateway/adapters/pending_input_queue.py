@@ -211,7 +211,10 @@ class GatewayPendingInputQueueAdapter:
                 if value is not None:
                     params["displayText"] = value
                 break
-        for field in ("initialModel", "initial_model", "initialProvider", "initial_provider"):
+        for field in (
+            "initialModel", "initial_model", "initialProvider", "initial_provider",
+            "routerControlEvent", "router_control_event",
+        ):
             if field in raw:
                 params[field] = raw[field]
         for field in (
