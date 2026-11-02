@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import importlib.util
+import json
 import sys
 from pathlib import Path
 
@@ -46,11 +47,18 @@ def test_rejects_an_artifact_over_budget(tmp_path: Path) -> None:
         MODULE.verify_artifact_sizes(tmp_path, "test", budgets=_budgets())
 
 
-def test_release_budgets_include_fixed_offline_chinese_font_allowance() -> None:
+def test_release_budgets_include_fixed_font_and_router_asset_allowances() -> None:
+    manifest_path = Path(
+        "src/opensquilla/squilla_router/lightgbm_model/assets/artifact_manifest.json"
+    )
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    resource_bytes = sum(item["size_bytes"] for item in manifest["files"])
+    allowance = resource_bytes + manifest_path.stat().st_size
+    assert allowance == MODULE.LIGHTGBM_ASSET_ALLOWANCE == 24_212_758
     assert [item.maximum_bytes for item in MODULE.ASSET_BUDGETS["macos"]] == [
-        400_886_040,
-        405_301_192,
+        400_886_040 + allowance,
+        405_301_192 + allowance,
     ]
     assert [item.maximum_bytes for item in MODULE.ASSET_BUDGETS["windows"]] == [
-        423_062_346
+        423_062_346 + allowance
     ]
