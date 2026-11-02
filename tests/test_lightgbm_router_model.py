@@ -98,6 +98,35 @@ def test_runtime_identity_does_not_require_distribution_metadata(model):
             runtime.close()
 
 
+@pytest.mark.parametrize("metadata_available", [True, False])
+def test_missing_lightgbm_module_version_does_not_break_inference(
+    model, monkeypatch, metadata_available,
+):
+    from importlib.metadata import PackageNotFoundError, version
+
+    import lightgbm
+
+    expected_version = version("lightgbm") if metadata_available else "unknown"
+    router_input = {"current_request": "Explain binary search."}
+    expected = model.predict(router_input)
+    monkeypatch.delattr(lightgbm, "__version__")
+    metadata_result = (
+        {"return_value": expected_version}
+        if metadata_available
+        else {"side_effect": PackageNotFoundError("frozen package")}
+    )
+    with patch("importlib.metadata.version", **metadata_result):
+        runtime = LightGBMRouterModel()
+        try:
+            assert runtime.identity["runtime_versions"]["lightgbm"] == expected_version
+            actual = runtime.predict(router_input)
+            assert actual.intent_probabilities == expected.intent_probabilities
+            assert actual.tier_probabilities == expected.tier_probabilities
+            assert actual.feature_vector_hash == expected.feature_vector_hash
+        finally:
+            runtime.close()
+
+
 def test_full_features_and_outputs_match_frozen_source(model):
     import numpy as np
 
