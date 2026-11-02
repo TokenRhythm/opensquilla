@@ -149,6 +149,41 @@ function failedGateway(h, { hangs = false } = {}) {
   }
 }
 
+for (const platform of ['win32', 'darwin', 'linux']) {
+  test(`account bridge stays reachable while Gateway drains on ${platform}`, async () => {
+    const h = harness()
+    const gatewayDrain = deferred()
+    const child = { pid: 12345 }
+    let exited = false
+    h.env.process.platform = platform
+    h.env.gatewayProcessTreeTerminations = new Map()
+    h.env.gatewayProcess = child
+    h.env.gatewayState.owned = true
+    h.env.hasGatewayProcessExited = () => exited
+    h.env.liveLifecycleOwnedGatewayProcesses = () => exited ? [] : [child]
+    h.env.quitOwnedGateway = async () => {
+      h.events.push('gateway-close')
+      await gatewayDrain.promise
+      exited = true
+      return true
+    }
+    h.accountDrain.resolve()
+    h.quit()
+    try {
+      await new Promise(resolve => setImmediate(resolve))
+      assert.ok(h.events.includes('gateway-close'))
+      assert.ok(h.events.includes('account-close'), 'account writes drain immediately')
+      assert.equal(h.events.includes('proxy-close'), false, 'Gateway may still read account state')
+    } finally {
+      gatewayDrain.resolve()
+      await h.env.quitGatewayDrainPromise
+    }
+    assert.ok(h.events.includes('proxy-close'))
+    assert.ok(h.events.includes('exit:0'))
+    assert.deepEqual(h.errors, [])
+  })
+}
+
 test('ordinary Quit cannot force exit while account persistence is unfinished', async () => {
   const h = harness({ budgetMs: 30 })
   failedGateway(h)
