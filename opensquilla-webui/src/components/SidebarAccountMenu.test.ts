@@ -167,6 +167,23 @@ describe('sidebar account summary', () => {
     expect(usage.textContent).not.toContain('—')
   })
 
+  it('keeps the usage summary compact without a separate approximation hint', async () => {
+    const { host } = await mount()
+    await open(host)
+    const usage = host.querySelector('[data-testid="sidebar-account-today-usage"]')!
+    const label = usage.querySelector('.sidebar-account__usage-label')!
+    expect(label.textContent).toContain('今日用量')
+    expect(label.hasAttribute('title')).toBe(false)
+    expect(label.querySelector('.icon svg')).not.toBeNull()
+    expect(usage.textContent).not.toContain('≈')
+    expect(usage.textContent).not.toContain('近似用量')
+
+    mock.usage!.approximate.value = true
+    await nextTick()
+    expect(usage.textContent).toContain('≈')
+    expect(usage.textContent).not.toContain('近似用量')
+  })
+
   it('keeps settings reachable without logging in', async () => {
     const { host, props } = await mount(state({ status: 'signed_out', profile: null, wallet: null, walletStatus: 'idle', keyStatus: 'missing' }))
     await open(host)
