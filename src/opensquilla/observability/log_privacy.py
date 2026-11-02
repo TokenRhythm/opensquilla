@@ -27,14 +27,14 @@ _IDENTIFIERS = frozenset("""
     sqlite_error_name sqlite_version
     degraded_reason skip_reason method operation mode
     session_key session_id turn_id trace_id task_id run_id parent_run_id agent_id
-    conn_id connection_id request_id response_id message_id user_message_id
+    conn_id connection_id request_id response_id message_id user_message_id call_id
     tool_call_id compaction_id decision_id operation_id workspace_id surface_id error_id
     tool_profile tool_choice tool_name tool model provider model_id
     provider_id resolved_model routed_model baseline_model provider_after_rewrite
     target_provider target_model target_source target_fingerprint route tier
     routed_tier routing_source skill skill_name skills_invoked
     skill_catalog_ids alias_resolution_chain activation_mode input_mode run_kind
-    channel channel_id transport protocol backend platform architecture version
+    channel channel_id transport protocol backend platform architecture version stream_field
     format summary_format summary_source coverage_status
     cost_source thinking_mode retrieval_mode cache_mode daily_notes_policy_reason
     vision_followup_gate_decision vision_followup_gate_source

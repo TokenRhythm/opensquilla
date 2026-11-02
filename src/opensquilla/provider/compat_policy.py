@@ -283,7 +283,8 @@ class OpenAICompatPolicy:
     # new/different finish reason); providers must opt in explicitly.
     allow_post_terminal_noop_choice: bool = False
 
-    # TokenRhythm may insert one semantically empty choice with ``usage: null``
+    # TokenRhythm may insert an empty choices list or one semantically empty
+    # choice with ``usage: null``
     # between finish_reason and its real usage/billing trailer.  This is a
     # distinct, narrower opt-in: the decoder still rejects content, reasoning,
     # tools, a different index, or any changed finish reason on that frame.
