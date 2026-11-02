@@ -31,6 +31,8 @@ _VISION_GATE_STATIC_DECISIONS = {"disabled", "current_image", "not_applicable"}
 _VISION_GATE_STATIC_REASONS = {"candidate_window_expired"}
 
 RoutingSource = Literal[
+    "model_tier_policy",
+    "router_control_hold",
     "v4_phase3",
     "v4_unavailable",
     "cache",

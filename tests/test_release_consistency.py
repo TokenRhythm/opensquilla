@@ -1104,7 +1104,13 @@ def test_release_workflow_hydrates_and_smokes_desktop_router_runtime() -> None:
                 end = min(end, pos)
         job = workflow[start:end]
         assert "lfs: true" in job
-        assert 'git lfs pull --include="src/opensquilla/squilla_router/models/**"' in job
+        includes = re.search(r'git lfs pull --include="([^\"]+)"', job)
+        assert includes is not None
+        assert {
+            "src/opensquilla/squilla_router/models/**",
+            "src/opensquilla/squilla_router/lightgbm_model/assets/**",
+        }.issubset(includes.group(1).split(","))
+        assert job.index("validate_artifacts()") < job.index("npm run build:gateway")
         assert "npm run build:gateway" in job
         assert "npm run verify:package" in job
         assert "npm run verify:gateway-smoke" in job

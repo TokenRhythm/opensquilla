@@ -44,7 +44,7 @@ def classify_router_runtime_error(error: BaseException | str | None) -> str:
 
     text = _error_text(error)
     lower = text.lower()
-    if "missing v4 bundle files" in lower:
+    if "missing v4 bundle files" in lower or "missing lightgbm" in lower:
         return ROUTER_ASSETS_MISSING
     if (
         "libomp.dylib" in lower
@@ -93,7 +93,7 @@ def router_runtime_hint(kind: str) -> str:
         return (
             "Bundled SquillaRouter assets are missing. Reinstall "
             "`opensquilla[recommended]`, or if running from source, run "
-            '`git lfs pull --include="src/opensquilla/squilla_router/models/**"`.'
+            '`git lfs pull --include="src/opensquilla/squilla_router/**"`.'
         )
     if kind == ROUTER_PYTHON_DEPENDENCY_MISSING:
         return (

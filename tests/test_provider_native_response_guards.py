@@ -2,12 +2,19 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 from dataclasses import replace
 from typing import Any
 
 import httpx
 import pytest
 
+import opensquilla.provider.openai as openai_module
+from opensquilla.observability.log_privacy import (
+    PrivateLogFormatter,
+    private_log_event,
+    scrub_log_artifact,
+)
 from opensquilla.provider.compat_policy import compat_policy_for_kind
 from opensquilla.provider.openai import OpenAIProvider
 from opensquilla.provider.types import (
@@ -788,6 +795,135 @@ def test_openai_stream_rejects_tool_mutation_after_finish_reason(
     _assert_not_committed(events, "invalid_stream_order")
 
 
+@pytest.mark.parametrize(
+    ("epilogue", "expected_field", "expected_rule"),
+    [
+        (
+            {"choices": [{"index": 0, "delta": {"content": "private response text"}}]},
+            "choices[0].delta.content",
+            "nonempty",
+        ),
+        (
+            {"choices": [{"index": 0, "delta": {"reasoning_content": "private response text"}}]},
+            "choices[0].delta.reasoning_content",
+            "unexpected_fields",
+        ),
+        (
+            {"choices": [], "message": "private response text"},
+            "$.message",
+            "unexpected_fields",
+        ),
+        (
+            {"choices": [{"index": 0, "delta": {}, "logprobs": "private response text"}]},
+            "choices[0].logprobs",
+            "unexpected_fields",
+        ),
+        (
+            {"choices": []},
+            "choices",
+            "empty_without_usage",
+        ),
+    ],
+    ids=["content", "reasoning", "top-level-field", "choice-field", "empty-without-usage"],
+)
+def test_invalid_stream_order_logs_redacted_field_diagnostic(
+    monkeypatch: pytest.MonkeyPatch,
+    epilogue: dict[str, Any],
+    expected_field: str,
+    expected_rule: str,
+) -> None:
+    records: list[dict[str, Any]] = []
+
+    class _Logger:
+        def info(self, _event: str, **_kwargs: Any) -> None:
+            return None
+
+        def debug(self, _event: str, **_kwargs: Any) -> None:
+            return None
+
+        def warning(self, event: str, **kwargs: Any) -> None:
+            records.append({"event": event, **kwargs})
+
+    monkeypatch.setattr(openai_module, "log", _Logger())
+    _patch_body(
+        monkeypatch,
+        _sse(
+            {"choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]},
+            epilogue,
+        ),
+    )
+
+    events = _collect(OpenAIProvider(
+        api_key="test", model="test-model", provider_kind="tokenrhythm",
+    ))
+
+    _assert_not_committed(events, "invalid_stream_order")
+    assert len(records) == 1
+    record = private_log_event(None, "warning", records[0])
+    log_record = logging.LogRecord(
+        "opensquilla.provider.openai", logging.WARNING, "", 0, "", (), None,
+    )
+    log_record._opensquilla_log_metadata = record
+    formatted = PrivateLogFormatter().format(log_record)
+    record = json.loads(scrub_log_artifact(formatted))
+    assert record["event"] == "provider.invalid_stream_order"
+    assert record["stream_field"] == expected_field.removeprefix("$.").replace("[0]", ".0")
+    assert record["reason_code"] == expected_rule
+    assert record["frame_index"] == 2
+    assert record["terminal_frame_index"] == 1
+    assert record["call_id"].startswith("llm-")
+    assert record["choices_count"] == len(epilogue["choices"])
+    assert record["usage_present"] == ("usage" in epilogue)
+    assert record["usage_is_null"] is True
+    assert "private response text" not in repr(records)
+
+
+def test_stream_violation_diagnostic_omits_arbitrary_values_and_field_names() -> None:
+    private = "synthetic-private-marker"
+    choice = {
+        "index": private,
+        "delta": {
+            "content": private * 10_000,
+            "role": private,
+            "tool_calls": [{"function": {"arguments": private}}],
+            private: private,
+        },
+        "finish_reason": private,
+        "native_finish_reason": private,
+        private: private,
+    }
+    chunk = {
+        "id": private,
+        "model": private,
+        "choices": [choice],
+        "usage": {"prompt_tokens": private, private: private},
+        **{f"{private}-{index}": private for index in range(100)},
+    }
+    violation = openai_module._post_terminal_stream_violation(
+        chunk=chunk,
+        raw_choices=[choice],
+        terminal_finish_reason="stop",
+        terminal_native_finish_reason_present=True,
+        terminal_native_finish_reason=private,
+        policy=compat_policy_for_kind("tokenrhythm"),
+    )
+    assert violation is not None
+    assert violation[0].startswith("$.unknown_")
+    diagnostic = openai_module._post_terminal_stream_diagnostic(
+        chunk=chunk,
+        terminal_finish_reason="stop",
+        terminal_native_finish_reason_present=True,
+        terminal_native_finish_reason=private,
+        violation=violation,
+    )
+
+    encoded = json.dumps(diagnostic)
+    assert private not in encoded
+    assert len(encoded) < 10_000
+    assert diagnostic["terminal"]["fields"]["finish_reason"]["enum"] == "stop"
+    assert diagnostic["delta"]["fields"]["content"]["size"] == len(private) * 10_000
+
+
 def test_openai_stream_post_terminal_empty_choices_must_be_usage_only(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -991,6 +1127,84 @@ def test_tokenrhythm_ignores_post_terminal_null_usage_noop_before_receipt(
     assert done[0].cost_source == "provider_billed"
     assert done[0].billing_receipt is not None
     assert done[0].billing_receipt.amount_nanos == 1_000
+
+
+@pytest.mark.parametrize("with_tool", [False, True], ids=["text", "tool"])
+@pytest.mark.parametrize("after_receipt", [False, True], ids=["before-receipt", "after-receipt"])
+def test_tokenrhythm_empty_null_usage_tail_preserves_completion_and_receipt(
+    monkeypatch: pytest.MonkeyPatch,
+    with_tool: bool,
+    after_receipt: bool,
+) -> None:
+    delta: dict[str, Any] = {"content": "OK"}
+    if with_tool:
+        delta["tool_calls"] = [{
+            "index": 0,
+            "id": "lookup-call",
+            "type": "function",
+            "function": {"name": "lookup", "arguments": '{"q":"example"}'},
+        }]
+    finish_reason = "tool_calls" if with_tool else "stop"
+    spacer = {"choices": [], "usage": None}
+    receipt = {
+        "choices": [],
+        "usage": {
+            "prompt_tokens": 3,
+            "completion_tokens": 2,
+            "completion_tokens_details": {"reasoning_tokens": 1},
+        },
+        "billing_pending": False,
+        "cost_cny": "0.000001",
+    }
+    tail = [receipt, spacer] if after_receipt else [spacer, receipt]
+    _patch_body(
+        monkeypatch,
+        _sse(
+            {"choices": [{"index": 0, "delta": delta, "finish_reason": None}]},
+            {"choices": [{"index": 0, "delta": {}, "finish_reason": finish_reason}]},
+            *tail,
+        ),
+    )
+
+    events = _collect(OpenAIProvider(
+        api_key="test", model="test-model", provider_kind="tokenrhythm",
+        base_url="https://tokenrhythm.studio/v1",
+    ))
+
+    assert not any(isinstance(event, ErrorEvent) for event in events)
+    assert [event.text for event in events if isinstance(event, TextDeltaEvent)] == ["OK"]
+    ends = [event for event in events if isinstance(event, ToolUseEndEvent)]
+    assert len(ends) == int(with_tool)
+    if with_tool:
+        assert ends[0].tool_use_id == "lookup-call"
+        assert ends[0].arguments == {"q": "example"}
+    dones = [event for event in events if isinstance(event, DoneEvent)]
+    assert len(dones) == 1
+    assert dones[0].stop_reason == finish_reason
+    assert (dones[0].input_tokens, dones[0].output_tokens, dones[0].reasoning_tokens) == (3, 2, 1)
+    assert dones[0].cost_source == "provider_billed"
+    assert dones[0].billing_receipt is not None
+    assert dones[0].billing_receipt.amount_nanos == 1_000
+
+
+@pytest.mark.parametrize("provider_kind", ["openai", "openrouter"])
+def test_empty_null_usage_tail_requires_explicit_provider_policy(
+    monkeypatch: pytest.MonkeyPatch,
+    provider_kind: str,
+) -> None:
+    _patch_body(
+        monkeypatch,
+        _sse(
+            {"choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]},
+            {"choices": [], "usage": None},
+        ),
+    )
+
+    events = _collect(OpenAIProvider(
+        api_key="test", model="test-model", provider_kind=provider_kind,
+    ))
+
+    _assert_not_committed(events, "invalid_stream_order")
 
 
 def test_tokenrhythm_one_token_length_epilogue_accepts_billing_metadata(
@@ -1323,15 +1537,21 @@ def test_post_terminal_tool_payload_or_malformed_value_is_rejected(
         "top-level-message",
     ],
 )
+@pytest.mark.parametrize("null_usage", [False, True], ids=["with-usage", "null-usage"])
 def test_tokenrhythm_post_terminal_epilogue_rejects_state_changes(
     monkeypatch: pytest.MonkeyPatch,
     epilogue: dict[str, Any],
+    null_usage: bool,
 ) -> None:
     _patch_body(
         monkeypatch,
         _sse(
             {"choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]},
-            epilogue,
+            (
+                {**epilogue, "usage": None}
+                if null_usage and isinstance(epilogue.get("usage"), dict)
+                else epilogue
+            ),
         ),
     )
 

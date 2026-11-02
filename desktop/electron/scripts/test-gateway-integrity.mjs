@@ -20,6 +20,16 @@ function fixture(t) {
     schema_version: 1,
     files: [{ path: 'model.onnx', size_bytes: 5, sha256: fileHash(join(repo, router, 'model.onnx')) }],
   }))
+  const lightgbm = 'src/opensquilla/squilla_router/lightgbm_model/assets'
+  for (const path of ['intent/model.txt.gz', 'tier/model.txt.gz', 'preprocess/model.onnx']) {
+    write(`${lightgbm}/${path}`, 'model')
+  }
+  write(`${lightgbm}/artifact_manifest.json`, JSON.stringify({
+    schema_version: 1,
+    files: ['intent/model.txt.gz', 'tier/model.txt.gz', 'preprocess/model.onnx'].map(path => ({
+      path, size_bytes: 5, sha256: fileHash(join(repo, lightgbm, path)),
+    })),
+  }))
   write('src/opensquilla/gateway/boot.py', 'current gateway')
   // Same numeric prefix is legal: compare full IDs, not max version or count.
   write('migrations/V010__one.py', 'first migration')
@@ -49,6 +59,8 @@ function fixture(t) {
     }])),
   }))
   cpSync(join(repo, router), join(packageDir, 'squilla_router/models/v4.2_phase3_inference'), { recursive: true })
+  cpSync(join(repo, lightgbm), join(packageDir, 'squilla_router/lightgbm_model/assets'), { recursive: true })
+  write('runtime/opensquilla-gateway/_internal/lightgbm/VERSION.txt', '4.7.0\n')
   write('runtime/opensquilla-gateway/opensquilla-gateway.exe', 'unsigned gateway')
   write('runtime/dependency-inventory.json', JSON.stringify({
     schemaVersion: 1, kind: 'pyinstaller', lockSha256: fileHash(join(repo, 'uv.lock')),
@@ -69,6 +81,28 @@ test('prepared output and a separately copied final bundle match source', (t) =>
   verifyGatewayIntegrity(repo, bundle)
   assert.throws(() => verifyGatewayIntegrity(repo, bundle, { prepared: true }), /prepared Gateway outputs/)
 })
+
+for (const fault of ['missing', 'directory', 'empty', 'invalid']) {
+  test(`LightGBM VERSION.txt ${fault} fails in prepared and final outputs`, (t) => {
+    const { repo, runtime } = fixture(t)
+    const path = join(runtime, 'opensquilla-gateway', '_internal', 'lightgbm', 'VERSION.txt')
+    if (fault === 'missing' || fault === 'directory') rmSync(path)
+    if (fault === 'directory') mkdirSync(path)
+    if (fault === 'empty') writeFileSync(path, ' \r\n')
+    if (fault === 'invalid') writeFileSync(path, 'unknown\n')
+    for (const prepared of [true, false]) {
+      assert.throws(() => verifyGatewayIntegrity(repo, runtime, { prepared }), /LightGBM VERSION\.txt/)
+    }
+  })
+}
+
+for (const version of ['4.7.0\n', '4.7.0\r\n', '4.8.0.dev1\n']) {
+  test(`LightGBM version ${JSON.stringify(version)} is accepted`, (t) => {
+    const { repo, runtime } = fixture(t)
+    writeFileSync(join(runtime, 'opensquilla-gateway', '_internal', 'lightgbm', 'VERSION.txt'), version)
+    assertGatewayResources(repo, runtime)
+  })
+}
 
 for (const fault of ['missing', 'incomplete', 'changed']) {
   test(`frozen migration registry ${fault} is rejected`, (t) => {
@@ -158,3 +192,14 @@ test('old provenance cannot be reused for a modified executable', (t) => {
   write('runtime/opensquilla-gateway/opensquilla-gateway.exe', 'stale executable')
   assert.throws(() => verifyGatewayIntegrity(repo, runtime, { prepared: true }), /prepared Gateway outputs/)
 })
+
+for (const asset of ['intent/model.txt.gz', 'tier/model.txt.gz', 'preprocess/model.onnx']) {
+  test(`LightGBM ${asset} missing or corrupt is rejected`, (t) => {
+    const { repo, runtime, packageDir } = fixture(t)
+    const path = join(packageDir, 'squilla_router/lightgbm_model/assets', asset)
+    writeFileSync(path, 'other')
+    assert.throws(() => assertGatewayResources(repo, runtime), /Router/)
+    rmSync(path)
+    assert.throws(() => assertGatewayResources(repo, runtime), /Router/)
+  })
+}

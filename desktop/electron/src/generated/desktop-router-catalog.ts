@@ -11,8 +11,8 @@ export const ROUTER_PROFILES: Record<string, Record<string, RouterTier>> = {
     },
     "c1": {
       "provider": "tokenrhythm",
-      "model": "deepseek-flash",
-      "description": "Default DeepSeek Flash route for normal agent work, coding assistance, debugging, and moderate analysis"
+      "model": "deepseek-v4-flash-0731",
+      "description": "Default DeepSeek V4 Flash 0731 route for normal agent work, coding assistance, debugging, and moderate analysis"
     },
     "c2": {
       "provider": "tokenrhythm",
@@ -21,8 +21,8 @@ export const ROUTER_PROFILES: Record<string, Record<string, RouterTier>> = {
     },
     "c3": {
       "provider": "tokenrhythm",
-      "model": "glm-5.3",
-      "description": "Highest-tier GLM 5.3 route for difficult planning, deep review, complex debugging, and high-stakes synthesis",
+      "model": "kimi-k3",
+      "description": "Highest-tier Kimi K3 route for difficult planning, deep review, complex debugging, and high-stakes synthesis",
       "ensembleEnabled": false
     },
     "image_model": {
@@ -41,20 +41,20 @@ export const ROUTER_PROFILES: Record<string, Record<string, RouterTier>> = {
     },
     "c1": {
       "provider": "openrouter",
-      "model": "deepseek/deepseek-v4-flash-0731",
-      "description": "Default DeepSeek V4 Flash 0731 route for normal agent work, coding assistance, debugging, and moderate analysis",
+      "model": "deepseek/deepseek-v4-flash",
+      "description": "Default DeepSeek V4 Flash route for normal agent work, coding assistance, debugging, and moderate analysis",
       "thinkingLevel": "high"
     },
     "c2": {
       "provider": "openrouter",
-      "model": "deepseek/deepseek-v4-pro-0813",
-      "description": "Stronger DeepSeek V4 Pro 0813 route for multi-step coding, structured reasoning, larger context synthesis, and harder analysis",
+      "model": "deepseek/deepseek-v4-pro",
+      "description": "Stronger DeepSeek V4 Pro route for multi-step coding, structured reasoning, larger context synthesis, and harder analysis",
       "thinkingLevel": "high"
     },
     "c3": {
       "provider": "openrouter",
-      "model": "z-ai/glm-5.3",
-      "description": "Highest-tier GLM 5.3 route for difficult planning, deep review, complex debugging, and high-stakes synthesis",
+      "model": "moonshotai/kimi-k3",
+      "description": "Highest-tier Kimi K3 route for difficult planning, deep review, complex debugging, and high-stakes synthesis",
       "thinkingLevel": "high"
     },
     "image_model": {

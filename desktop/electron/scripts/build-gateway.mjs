@@ -23,6 +23,7 @@ const caRuntimeHookPath = join(scriptDir, 'pyinstaller_runtime_hooks', 'ensure_c
 const controlUiDistDir = join(repoRoot, 'opensquilla-webui', 'dist')
 const controlUiVerifier = join(repoRoot, 'opensquilla-webui', 'scripts', 'verify-dist.mjs')
 const routerBundleDir = join(repoRoot, 'src', 'opensquilla', 'squilla_router', 'models', 'v4.2_phase3_inference')
+const lightgbmModelDir = join(repoRoot, 'src', 'opensquilla', 'squilla_router', 'lightgbm_model', 'assets')
 // The V4 router ships its implementation as a copied runtime_src tree and
 // imports it only after validating the bundle.  PyInstaller cannot resolve
 // that delayed `src.router.*` import from the normal repository search path;
@@ -320,6 +321,7 @@ function recordStage(stage, started) {
 assertControlUiArtifactReady()
 assertRouterAssetsReady()
 assertRouterIntegrity(routerBundleDir)
+assertRouterIntegrity(lightgbmModelDir)
 const buildInputs = gatewayInputs(repoRoot)
 
 rmSync(runtimeGatewayDir, { recursive: true, force: true })
@@ -362,6 +364,10 @@ const lightgbmBinaryArgs = addBinaryArg(
   pythonPackageFile('lightgbm', platformLightgbmLibraryPath()),
   platformLightgbmBundleDir(),
 )
+// LightGBM defines __version__ only when this adjacent package data exists.
+// Its PyInstaller hook collects native libraries, and --copy-metadata collects
+// dist-info; neither includes the VERSION.txt read by lightgbm.__init__.
+const lightgbmVersionPath = pythonPackageFile('lightgbm', 'VERSION.txt')
 const macOpenMpBinaryArgs = process.platform === 'darwin'
   ? addBinaryArg(pythonPackageFile('sklearn', join('.dylibs', 'libomp.dylib')), '.')
   : []
@@ -457,6 +463,10 @@ const args = [
   caRuntimeHookPath,
   '--add-data',
   `${join(tokenizerCacheDir, tokenizerCacheKey)}${addDataSeparator}tiktoken-cache`,
+  '--add-data',
+  `${lightgbmModelDir}${addDataSeparator}opensquilla/squilla_router/lightgbm_model/assets`,
+  '--add-data',
+  `${lightgbmVersionPath}${addDataSeparator}lightgbm`,
   '--add-data',
   `${join(repoRoot, 'migrations')}${addDataSeparator}opensquilla/_migrations`,
   '--add-data',

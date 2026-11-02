@@ -203,7 +203,9 @@ def test_retired_environment_values_are_not_validated(monkeypatch):
 
 def test_explicit_base_model_path_is_used_even_when_named_learned(tmp_path, monkeypatch):
     path = tmp_path / "router" / "learned" / "explicit-base"
-    cfg = GatewayConfig(squilla_router={"v4_bundle_dir": str(path)})
+    cfg = GatewayConfig(squilla_router={
+        "strategy": "legacy_v4_phase3", "v4_bundle_dir": str(path),
+    })
     constructor = Mock()
     monkeypatch.setattr("opensquilla.squilla_router.v4_phase3.V4Phase3Strategy", constructor)
     monkeypatch.setattr(router_step, "_strategy", None)
@@ -244,6 +246,8 @@ async def test_first_route_never_accesses_historical_learning_state(
     monkeypatch.setenv("OPENSQUILLA_STATE_DIR", str(home))
     config_path = home / "config.toml"
     payload = _legacy_payload()
+    # This fixture exercises the retired v4 factory and its historical-state isolation.
+    payload["squilla_router"]["strategy"] = "legacy_v4_phase3"
     payload["squilla_router"].pop("v4_bundle_dir")
     _write(config_path, payload)
 

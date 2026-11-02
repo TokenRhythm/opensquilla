@@ -449,6 +449,10 @@ def test_managed_dormant_foreign_draft_does_not_gain_unapproved_routes(
 _PREVIOUS_MODELS = {
     "openrouter": (
         (
+            "qwen/qwen3.7-flash", "deepseek/deepseek-v4-flash-0731",
+            "deepseek/deepseek-v4-pro-0813", "z-ai/glm-5.3",
+        ),
+        (
             "deepseek/deepseek-v4-flash", "deepseek/deepseek-v4-pro",
             "z-ai/glm-5.2", "z-ai/glm-5.2",
         ),
@@ -458,6 +462,7 @@ _PREVIOUS_MODELS = {
         ),
     ),
     "tokenrhythm": (
+        ("qwen3.7-flash", "deepseek-flash", "deepseek-v4-pro-0813", "glm-5.3"),
         ("deepseek-v4-flash", "deepseek-v4-pro", "kimi-k2.7-code", "glm-5.1"),
         ("deepseek-v4-flash", "deepseek-v4-pro", "kimi-k2.7-code", "glm-5.2"),
         ("qwen3.7-flash", "deepseek-v4-flash-0731", "glm-5.2", "glm-5.2"),
@@ -721,9 +726,9 @@ def test_full_default_tree_round_trips_via_to_toml_dict(tmp_path: Path) -> None:
     assert set(tiers) == {"c0", "c1", "c2", "c3", "image_model"}
     expected_models = {
         "c0": "qwen3.7-flash",
-        "c1": "deepseek-flash",
+        "c1": "deepseek-v4-flash-0731",
         "c2": "deepseek-v4-pro-0813",
-        "c3": "glm-5.3",
+        "c3": "kimi-k3",
         "image_model": "kimi-k2.6",
     }
     for name, tier in tiers.items():

@@ -6,6 +6,7 @@ from types import SimpleNamespace
 
 import httpx
 import pytest
+import structlog
 
 from scripts.live_usage_matrix import (
     ENDPOINTS,
@@ -14,6 +15,20 @@ from scripts.live_usage_matrix import (
     reconcile_videos,
     resume_video_delivery,
 )
+
+
+@pytest.fixture(autouse=True)
+def _restore_structlog_configuration():
+    """Keep the live driver's quiet logging policy inside each offline test."""
+    was_configured = structlog.is_configured()
+    previous_config = structlog.get_config()
+    try:
+        yield
+    finally:
+        if was_configured:
+            structlog.configure(**previous_config)
+        else:
+            structlog.reset_defaults()
 
 
 async def _accepted_case(

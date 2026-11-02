@@ -1280,6 +1280,19 @@ def test_darwin_recovery_test_keeps_macos_python_without_native_e2e(
     assert "macos_recovery_test_changed" in plan["reason_codes"]
 
 
+@pytest.mark.parametrize("path", [
+    "src/opensquilla/squilla_router/lightgbm_model/_vendor/features/runtime.py",
+    "src/opensquilla/squilla_router/lightgbm_model/assets/model_manifest.json",
+    "tests/test_lightgbm_router_model.py",
+])
+def test_router_model_changes_keep_apple_silicon_parity(
+    tmp_path: Path, suite_config: dict[str, Any], path: str,
+) -> None:
+    plan = _plan(tmp_path, suite_config, path)
+    assert "macos-recovery" in plan["required_suites"]
+    assert _platform_cells(plan, "macos-recovery") == {("macos-latest", "recovery")}
+
+
 def test_macos_recovery_test_routing_is_covered_by_suite_digest(
     suite_config: dict[str, Any],
 ) -> None:

@@ -1,7 +1,9 @@
-"""Opt-in same-interpreter comparison using the existing offline Gateway fixture.
+"""Opt-in same-Python-version comparison using the offline Gateway fixture.
 
 Source directories must already exist. This tool never creates checkouts or reads
-provider credentials. Durations cover process-to-health and Default send-to-done,
+provider credentials. By default dependency inputs must match; an explicit
+baseline interpreter allows each source to use its own locked environment.
+Durations cover process-to-health and Default send-to-done,
 including local client/runtime overhead; they are not model TTFT measurements.
 """
 
@@ -43,14 +45,18 @@ def verify_source_identity(root: Path, sha: str, *, archived: bool = False) -> N
         raise ValueError("source must be the requested exact clean Git checkout")
 
 
-def validate_sources(baseline: Path, candidate: Path, samples: int) -> None:
+def validate_sources(
+    baseline: Path, candidate: Path, samples: int, *, separate_environments: bool = False,
+) -> None:
     if not 1 <= samples <= 10:
         raise ValueError("samples must be between 1 and 10")
     for root in (baseline, candidate):
         if not (root / "src/opensquilla/gateway/boot.py").is_file():
             raise ValueError("source root must contain the Gateway package")
     for name in ("uv.lock", "pyproject.toml"):
-        if (baseline / name).read_bytes() != (candidate / name).read_bytes():
+        if not separate_environments and (
+            (baseline / name).read_bytes() != (candidate / name).read_bytes()
+        ):
             raise ValueError(f"comparison requires identical {name}")
 
 
@@ -68,14 +74,55 @@ def sample_environment(root: Path, profile: Path) -> dict[str, str]:
     return env
 
 
+def _dependency_inputs(root: Path) -> dict[str, str]:
+    return {
+        name: hashlib.sha256((root / name).read_bytes()).hexdigest()
+        for name in ("uv.lock", "pyproject.toml")
+    }
+
+
+def _interpreter_identity(executable: str) -> dict[str, Any]:
+    # Isolated startup excludes inherited PYTHONPATH and user-site packages.
+    # Prefix is compared privately and never included in the report.
+    code = (
+        "import json,platform,sys; "
+        "print(json.dumps({'version':list(sys.version_info[:3]),"
+        "'implementation':sys.implementation.name,'machine':platform.machine(),"
+        "'prefix':sys.prefix}))"
+    )
+    return json.loads(subprocess.check_output([executable, "-I", "-c", code], text=True))
+
+
 def compare(
     *, baseline: Path, candidate: Path, baseline_sha: str, candidate_sha: str, samples: int,
+    baseline_python: Path | None = None,
 ) -> dict[str, Any]:
-    validate_sources(baseline, candidate, samples)
+    validate_sources(
+        baseline, candidate, samples, separate_environments=baseline_python is not None,
+    )
     if not all(re.fullmatch(r"[0-9a-f]{40}", sha) for sha in (baseline_sha, candidate_sha)):
         raise ValueError("source SHAs must be full lowercase commit hashes")
     verify_source_identity(baseline, baseline_sha, archived=True)
     verify_source_identity(candidate, candidate_sha)
+    dependency_inputs = {
+        label: _dependency_inputs(root)
+        for label, root in (("baseline", baseline), ("candidate", candidate))
+    }
+    interpreters = {"baseline": str(baseline_python or sys.executable), "candidate": sys.executable}
+    identities = {
+        label: _interpreter_identity(executable) for label, executable in interpreters.items()
+    }
+    for field in ("version", "implementation", "machine"):
+        if identities["baseline"][field] != identities["candidate"][field]:
+            raise ValueError(f"comparison requires identical Python {field}")
+    if (
+        dependency_inputs["baseline"] != dependency_inputs["candidate"]
+        and Path(identities["baseline"]["prefix"]).resolve()
+        == Path(identities["candidate"]["prefix"]).resolve()
+    ):
+        raise ValueError("different dependency inputs require separate Python environments")
+    for identity in identities.values():
+        identity.pop("prefix")
     harness = candidate / "tests/functional/test_gateway_silent_reply_process_e2e.py"
     rows: dict[str, list[dict[str, float | int]]] = {"baseline": [], "candidate": []}
     with tempfile.TemporaryDirectory(prefix="opensquilla-gateway-timing-") as temporary:
@@ -88,7 +135,7 @@ def compare(
                 profile = scratch / f"{label}-{index}"
                 env = sample_environment(root, profile)
                 result = subprocess.run(
-                    [sys.executable, str(harness), "--sample-dir", str(profile / "sample"),
+                    [interpreters[label], str(harness), "--sample-dir", str(profile / "sample"),
                      "--source-root", str(root)],
                     cwd=root, env=env, capture_output=True, text=True, timeout=90,
                 )
@@ -114,6 +161,8 @@ def compare(
     }
     return {
         "baseline_sha": baseline_sha, "candidate_sha": candidate_sha,
+        "dependency_mode": "per-source-environments" if baseline_python else "shared-environment",
+        "dependency_inputs": dependency_inputs, "interpreters": identities,
         "uv_lock_sha256": hashlib.sha256((candidate / "uv.lock").read_bytes()).hexdigest(),
         "pyproject_sha256": hashlib.sha256((candidate / "pyproject.toml").read_bytes()).hexdigest(),
         "samples_per_source": samples, "samples": rows, "median_ms": medians,
@@ -130,12 +179,17 @@ def main() -> None:
     parser.add_argument("--candidate-root", type=Path, required=True)
     parser.add_argument("--baseline-sha", required=True)
     parser.add_argument("--candidate-sha", required=True)
+    parser.add_argument(
+        "--baseline-python", type=Path,
+        help="Baseline's separately installed locked environment (same Python version)",
+    )
     parser.add_argument("--samples", type=int, default=3)
     parser.add_argument("--output", type=Path, required=True)
     args = parser.parse_args()
     report = compare(
         baseline=args.baseline_root.resolve(), candidate=args.candidate_root.resolve(),
         baseline_sha=args.baseline_sha, candidate_sha=args.candidate_sha, samples=args.samples,
+        baseline_python=args.baseline_python,
     )
     args.output.parent.mkdir(parents=True, exist_ok=True)
     args.output.write_text(json.dumps(report, indent=2) + "\n", encoding="utf-8")

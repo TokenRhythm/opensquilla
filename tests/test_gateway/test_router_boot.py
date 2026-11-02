@@ -2138,7 +2138,7 @@ async def test_start_gateway_server_wires_cron_failure_dispatcher(
         await services.close()
 
 
-def test_router_boot_validation_does_not_load_heavy_runtime(
+def test_legacy_router_boot_validation_does_not_load_heavy_runtime(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -2147,6 +2147,7 @@ def test_router_boot_validation_does_not_load_heavy_runtime(
     (bundle_dir / "router.runtime.yaml").write_text("v4: {}\n", encoding="utf-8")
 
     config = GatewayConfig()
+    config.squilla_router.strategy = "legacy_v4_phase3"
     config.squilla_router.v4_bundle_dir = str(bundle_dir)
     config.squilla_router.require_router_runtime = True
 
@@ -2162,8 +2163,9 @@ def test_router_boot_validation_does_not_load_heavy_runtime(
     validate_squilla_router_runtime(config)
 
 
-def test_router_boot_validation_still_fails_when_required_bundle_missing(tmp_path: Path) -> None:
+def test_legacy_router_boot_validation_fails_when_required_bundle_missing(tmp_path: Path) -> None:
     config = GatewayConfig()
+    config.squilla_router.strategy = "legacy_v4_phase3"
     config.squilla_router.v4_bundle_dir = str(tmp_path / "missing")
     config.squilla_router.require_router_runtime = True
 
@@ -2820,3 +2822,48 @@ def test_explicit_full_default_keeps_sandbox_capability_for_safe_mode() -> None:
     assert settings.run_mode == "safe"
     assert settings.sandbox is True
     assert settings.security_grading is True
+
+
+@pytest.mark.parametrize("saved_strategy", [None, "v4_phase3"])
+def test_model_router_boot_validates_configured_bundle_without_loading_models(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, saved_strategy: str | None,
+) -> None:
+    from opensquilla.squilla_router import lightgbm_model
+
+    calls = []
+    router = {"strategy": saved_strategy} if saved_strategy is not None else {}
+    config = GatewayConfig(squilla_router=router)
+    assert config.squilla_router.strategy == "lightgbm_model"
+    config.squilla_router.lightgbm_model_dir = str(tmp_path / "frozen-model")
+    monkeypatch.setattr(
+        lightgbm_model, "validate_artifacts",
+        lambda root: calls.append(root),
+    )
+    validate_squilla_router_runtime(config)
+    assert calls == [tmp_path / "frozen-model"]
+
+
+def test_model_router_boot_missing_bundle_fails_closed(tmp_path: Path) -> None:
+    from opensquilla.squilla_router.lightgbm_model import LightGBMModelError
+
+    config = GatewayConfig()
+    config.squilla_router.lightgbm_model_dir = str(tmp_path / "missing-model")
+    with pytest.raises(LightGBMModelError) as caught:
+        validate_squilla_router_runtime(config)
+    assert caught.value.fail_closed
+
+
+@pytest.mark.parametrize("saved_strategy", [None, "v4_phase3"])
+def test_model_policy_migration_keeps_disabled_router_off(saved_strategy, monkeypatch):
+    from opensquilla.squilla_router import lightgbm_model
+
+    router = {"enabled": False}
+    if saved_strategy is not None:
+        router["strategy"] = saved_strategy
+    config = GatewayConfig(squilla_router=router)
+    monkeypatch.setattr(
+        lightgbm_model, "validate_artifacts",
+        lambda _: pytest.fail("Disabled router must not load model resources"),
+    )
+    validate_squilla_router_runtime(config)
+    assert config.squilla_router.enabled is False

@@ -1,12 +1,12 @@
 <template>
   <Teleport to="body">
-    <div class="settings-overlay" :class="{ 'settings-overlay--account': section === 'account' }" @click.self="requestClose($event)">
+    <div class="settings-overlay" @click.self="requestClose($event)">
       <Transition name="settings-pop" appear @after-leave="onLeaveComplete">
       <section
         v-if="visible"
         ref="modalRef"
         class="settings-modal"
-        :class="{ 'settings-modal--categories': showCategories, 'settings-modal--account': section === 'account' }"
+        :class="{ 'settings-modal--categories': showCategories }"
         role="dialog"
         aria-modal="true"
         aria-labelledby="settings-modal-title"
@@ -1146,17 +1146,6 @@ onUnmounted(() => {
   height: min(85vh, 100%);
   overflow: hidden;
   width: min(1200px, 100%);
-}
-
-/* The account overview uses the tall settings sheet shown in its reference. */
-@media (min-width: 769px) {
-  .settings-overlay--account {
-    padding: 8px 18px;
-  }
-
-  .settings-modal--account {
-    height: min(97vh, 100%);
-  }
 }
 
 /* Symmetric modal motion: slides up + fades in on open, slides down + fades out

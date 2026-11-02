@@ -61,8 +61,10 @@ class TurnContext:
         return self.raw_message if self.raw_message is not None else self.message
 
 
-async def run_pipeline(ctx: TurnContext, steps: list[TurnStep]) -> TurnContext:
-    """Execute pipeline steps in order. Failures are logged and skipped (fail-open).
+async def run_pipeline(
+    ctx: TurnContext, steps: list[TurnStep], *, required_steps: tuple[str, ...] = (),
+) -> TurnContext:
+    """Execute steps in order; required step failures stop the pipeline.
 
     For each step we append one :class:`PipelineStepRecord` to
     ``ctx.metadata["pipeline_steps"]``:
@@ -99,6 +101,8 @@ async def run_pipeline(ctx: TurnContext, steps: list[TurnStep]) -> TurnContext:
                     fallback_reason=str(exc),
                 )
             )
+            if step_name in required_steps:
+                raise
             continue
 
         applied = bool(ctx.metadata.get(f"{step_name}__applied", True))

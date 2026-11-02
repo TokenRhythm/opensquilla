@@ -785,6 +785,7 @@ def test_attachment_capacity_config_is_single_call_with_configured_vision_c2(
         turn_hard_deadline_seconds=e2e.ATTACHMENT_CAPACITY_AGENT_TIMEOUT_SECONDS,
         llm_context_window_tokens=e2e.ATTACHMENT_CAPACITY_CONTEXT_WINDOW_TOKENS,
         model_supports_vision_override=str(tiers["c2"]["model"]),
+        router_strategy="legacy_v4_phase3",
     )
 
     data = tomllib.loads(config_path.read_text(encoding="utf-8"))
@@ -796,6 +797,7 @@ def test_attachment_capacity_config_is_single_call_with_configured_vision_c2(
     assert data["task_runtime"]["turn_hard_deadline_s"] == 75.0
     assert data["naming"]["enabled"] is False
     assert "image_model" not in data["squilla_router"]["tiers"]
+    assert data["squilla_router"]["strategy"] == "legacy_v4_phase3"
     assert data["squilla_router"]["tiers"]["c2"] == tiers["c2"]
     assert str(tiers["c2"]["model"]).strip()
     assert tiers["c2"]["image_only"] is False

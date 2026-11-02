@@ -69,6 +69,8 @@ def _stop_process(process: subprocess.Popen[str]) -> tuple[str, str]:
     return process.communicate(timeout=5.0)
 
 
+# Preserve the real five-second exit contract without competing pytest workers.
+@pytest.mark.ci_serial
 def test_invalid_api_key_exits_promptly_with_nonzero_status(tmp_path: Path) -> None:
     response_sent = threading.Event()
     request_count = 0
@@ -111,18 +113,18 @@ def test_invalid_api_key_exits_promptly_with_nonzero_status(tmp_path: Path) -> N
     assert env["OPENSQUILLA_TEST_PROFILE_LOCK_ROOT"] == "1"
     stack_dump_path = tmp_path / "agent-child-stacks.txt"
     stack_dump_path.touch()
-    # Record one bounded stack snapshot without filling the child's stderr pipe.
-    # Only include it in the test report if the process fails to make progress.
+    # Capture faults and the threads present when app() exits without an async
+    # frame walker racing code-object collection during normal imports.
     child_code = (
         "import faulthandler\n"
         f"with open({str(stack_dump_path)!r}, 'w', encoding='utf-8') as stack_dump:\n"
-        "    faulthandler.dump_traceback_later(\n"
-        f"        {_REQUEST_START_TIMEOUT_SECONDS / 2!r}, file=stack_dump)\n"
+        "    faulthandler.enable(file=stack_dump)\n"
         "    try:\n"
         "        from opensquilla.cli.main import app\n"
         "        app()\n"
         "    finally:\n"
-        "        faulthandler.cancel_dump_traceback_later()\n"
+        "        faulthandler.dump_traceback(file=stack_dump)\n"
+        "        faulthandler.disable()\n"
     )
     process = subprocess.Popen(
         [
@@ -143,18 +145,22 @@ def test_invalid_api_key_exits_promptly_with_nonzero_status(tmp_path: Path) -> N
 
     try:
         if not response_sent.wait(timeout=_REQUEST_START_TIMEOUT_SECONDS):
+            returncode_at_timeout = process.poll()
             stdout, stderr = _stop_process(process)
             pytest.fail(
                 "agent CLI did not reach the local provider within the startup limit\n"
+                f"return code before cleanup: {returncode_at_timeout!r}\n"
                 f"stdout:\n{stdout}\nstderr:\n{stderr}\n"
                 f"child stacks:\n{stack_dump_path.read_text(encoding='utf-8', errors='replace')}"
             )
         try:
             stdout, stderr = process.communicate(timeout=_POST_RESPONSE_EXIT_TIMEOUT_SECONDS)
         except subprocess.TimeoutExpired:
+            returncode_at_timeout = process.poll()
             stdout, stderr = _stop_process(process)
             pytest.fail(
-                "agent CLI remained alive after the provider returned HTTP 401\n"
+                "agent CLI did not finish after the provider returned HTTP 401\n"
+                f"return code before cleanup: {returncode_at_timeout!r}\n"
                 f"stdout:\n{stdout}\nstderr:\n{stderr}\n"
                 f"child stacks:\n{stack_dump_path.read_text(encoding='utf-8', errors='replace')}"
             )
