@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import base64
 import copy
 import hashlib
@@ -14,6 +15,7 @@ import httpx
 import pytest
 from PIL import Image
 
+from opensquilla.provider.types import ChatConfig
 from scripts import live_reasoning_replay_e2e as harness
 
 
@@ -107,13 +109,18 @@ def test_wire_parser_retains_explicit_empty_reasoning():
     assert call.response["reasoning_content"] == ""
 
 
-def _budget_call(wire: int, requested: int, effective: int, *, field: str = "max_tokens"):
+def _budget_call(
+    wire: int, requested: int, effective: int, *, field: str = "max_tokens",
+    logical: int | None = None, configured: int | None = None,
+):
     return harness.WireCall(
         request={field: wire},
         generation_proof={
             "requested_generation_tokens": requested,
             "effective_generation_tokens": effective,
             "generation_budget_field": field,
+            "configured_generation_tokens": requested if configured is None else configured,
+            "logical_generation_tokens": requested if logical is None else logical,
         },
     )
 
@@ -137,6 +144,215 @@ def test_compaction_budget_check_allows_capacity_fit_but_rejects_config_drift():
 def test_compaction_budget_check_rejects_invalid_or_ambiguous_wire_caps(call):
     with pytest.raises(harness.ReplayCheckError, match="compaction_request_configuration_changed"):
         harness._require_matching_generation_budgets([call])
+
+
+@pytest.mark.parametrize("drifted", [2048, 8192])
+def test_compaction_budget_check_rejects_all_calls_drifting_together(drifted):
+    calls = [_budget_call(min(drifted, 3403), drifted, min(drifted, 3403)) for _ in range(2)]
+    with pytest.raises(harness.ReplayCheckError, match="compaction_request_configuration_changed"):
+        harness._require_matching_generation_budgets(calls, expected_requested=4096)
+
+
+@pytest.mark.parametrize("call", [
+    _budget_call(8192, 4096, 8192),
+    _budget_call(3403, 4096, 3403, configured=2048),
+    _budget_call(3072, 3072, 3072, logical=2048),
+])
+def test_compaction_budget_check_rejects_inconsistent_generation_proof(call):
+    with pytest.raises(harness.ReplayCheckError, match="compaction_request_configuration_changed"):
+        harness._require_matching_generation_budgets([call])
+
+
+def _install_budget_capture_stubs(monkeypatch, stream):
+    from opensquilla.engine import context_budget
+    from opensquilla.provider.openai import OpenAIProvider
+
+    def build(self, messages, tools, cfg):
+        effective = min(cfg.max_tokens, 3403)
+        return ({"max_tokens": effective}, None, None, None, {
+            "requested_generation_tokens": cfg.max_tokens,
+            "effective_generation_tokens": effective,
+        })
+
+    def coordinate(payload, *, action="send"):
+        if action == "raise":
+            raise ValueError("synthetic coordinator failure")
+        return context_budget.ContextBudgetDecision(action, payload, None, "synthetic")
+
+    monkeypatch.setattr(OpenAIProvider, "_build_payload", build)
+    monkeypatch.setattr(OpenAIProvider, "_stream_impl", stream)
+    monkeypatch.setattr(context_budget, "coordinate_provider_context_budget", coordinate)
+    return object.__new__(OpenAIProvider), context_budget
+
+
+@pytest.mark.asyncio
+async def test_generation_proof_ignores_projection_and_checks_payload_identity(monkeypatch):
+    async def stream(self, *, coordinate_copy=False, mutate_wire=False):
+        payload = self._build_payload([], None, ChatConfig(max_tokens=8192))[0]
+        await asyncio.to_thread(
+            context_budget.coordinate_provider_context_budget,
+            dict(payload) if coordinate_copy else payload,
+        )
+        if mutate_wire:
+            payload["max_tokens"] += 1
+        async with httpx.AsyncClient() as client:
+            await client.post("https://example.invalid/chat/completions", json=payload)
+        yield None
+
+    provider, context_budget = _install_budget_capture_stubs(monkeypatch, stream)
+    observer = harness.WireObserver(
+        "https://example.invalid",
+        httpx.MockTransport(lambda request: httpx.Response(200, json={})),
+    )
+    with observer.observe(), harness._capture_generation_budget_proofs(observer):
+        # A projection with identical final payload bytes.
+        provider._build_payload([], None, ChatConfig(max_tokens=4096))
+        async for _ in provider._stream_impl():
+            pass
+        async for _ in provider._stream_impl(coordinate_copy=True):
+            pass
+        async for _ in provider._stream_impl(mutate_wire=True):
+            pass
+    assert observer.calls[0].generation_proof["requested_generation_tokens"] == 8192
+    assert observer.calls[1].generation_proof is None
+    assert observer.calls[2].generation_proof is None
+    with pytest.raises(harness.ReplayCheckError, match="compaction_request_configuration_changed"):
+        harness._require_matching_generation_budgets(
+            [_budget_call(3403, 4096, 3403), observer.calls[0]], requested_must_match=True,
+        )
+
+
+@pytest.mark.asyncio
+async def test_generation_proofs_stay_with_concurrent_streams_and_reused_payloads(monkeypatch):
+    first_ready, second_ready, first_sent = asyncio.Event(), asyncio.Event(), asyncio.Event()
+
+    async def stream(self, requested):
+        if requested == 8192:
+            await first_ready.wait()
+        payload = self._build_payload([], None, ChatConfig(max_tokens=requested))[0]
+        await asyncio.to_thread(context_budget.coordinate_provider_context_budget, payload)
+        if requested == 4096:
+            first_ready.set()
+            await second_ready.wait()
+        else:
+            second_ready.set()
+            await first_sent.wait()
+        async with httpx.AsyncClient() as client:
+            for _ in range(2):  # Adapter retries can reuse the same built payload.
+                await client.post("https://example.invalid/chat/completions", json=payload)
+        if requested == 4096:
+            first_sent.set()
+        yield None
+
+    provider, context_budget = _install_budget_capture_stubs(monkeypatch, stream)
+    observer = harness.WireObserver(
+        "https://example.invalid",
+        httpx.MockTransport(lambda request: httpx.Response(200, json={})),
+    )
+
+    async def run(requested):
+        async for _ in provider._stream_impl(requested):
+            pass
+
+    with observer.observe(), harness._capture_generation_budget_proofs(observer):
+        await asyncio.gather(run(4096), run(8192))
+    assert [call.generation_proof["requested_generation_tokens"] for call in observer.calls] == [
+        4096, 4096, 8192, 8192,
+    ]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("action", ["budget_limited", "invalid_request", "raise"])
+async def test_rejected_generation_coordination_cannot_reuse_earlier_proof(monkeypatch, action):
+    async def stream(self):
+        payload = self._build_payload([], None, ChatConfig(max_tokens=4096))[0]
+        await asyncio.to_thread(context_budget.coordinate_provider_context_budget, payload)
+        payload = self._build_payload([], None, ChatConfig(max_tokens=8192))[0]
+        try:
+            await asyncio.to_thread(
+                context_budget.coordinate_provider_context_budget, payload, action=action,
+            )
+        except ValueError:
+            pass
+        async with httpx.AsyncClient() as client:
+            await client.post("https://example.invalid/chat/completions", json=payload)
+        yield None
+
+    provider, context_budget = _install_budget_capture_stubs(monkeypatch, stream)
+    observer = harness.WireObserver(
+        "https://example.invalid",
+        httpx.MockTransport(lambda request: httpx.Response(200, json={})),
+    )
+    with observer.observe(), harness._capture_generation_budget_proofs(observer):
+        async for _ in provider._stream_impl():
+            pass
+    assert observer.calls[0].generation_proof is None
+    assert observer.generation_budget_scope.get() is None
+
+
+@pytest.mark.asyncio
+async def test_summary_prefit_proof_survives_attempt_copy_and_rejects_later_drift(monkeypatch):
+    from opensquilla.session import compaction
+
+    def fit_summary(provider, messages, tools, config):
+        config.max_tokens = 3072
+
+    async def stream(self, cfg):
+        payload = self._build_payload([], None, cfg)[0]
+        await asyncio.to_thread(context_budget.coordinate_provider_context_budget, payload)
+        async with httpx.AsyncClient() as client:
+            await client.post("https://example.invalid/chat/completions", json=payload)
+        yield None
+
+    provider, context_budget = _install_budget_capture_stubs(monkeypatch, stream)
+    monkeypatch.setattr(compaction, "_fit_summary_generation_allowance", fit_summary)
+    observer = harness.WireObserver(
+        "https://example.invalid",
+        httpx.MockTransport(lambda request: httpx.Response(200, json={})),
+    )
+    summary_config = ChatConfig(max_tokens=4096)
+    with observer.observe(), harness._capture_generation_budget_proofs(observer):
+        await asyncio.to_thread(
+            compaction._fit_summary_generation_allowance, provider, [], None, summary_config,
+        )
+        attempt_config = summary_config.model_copy(update={"provider_request_correlation": None})
+        async for _ in provider._stream_impl(attempt_config):
+            pass
+        async for _ in provider._stream_impl(ChatConfig(max_tokens=4096)):
+            pass
+        for drifted in (2048, 8192):
+            with pytest.raises(
+                harness.ReplayCheckError, match="compaction_request_configuration_changed",
+            ):
+                async for _ in provider._stream_impl(
+                    attempt_config.model_copy(update={"max_tokens": drifted}),
+                ):
+                    pass
+    harness._require_matching_generation_budgets(
+        observer.calls, expected_requested=4096, requested_must_match=True,
+    )
+    assert observer.calls[0].generation_proof["requested_generation_tokens"] == 3072
+    assert observer.calls[0].generation_proof["logical_generation_tokens"] == 4096
+
+
+@pytest.mark.asyncio
+async def test_generation_proof_scope_does_not_leak_across_yield_or_cross_task_close(monkeypatch):
+    closed_in_scope = []
+
+    async def stream(self):
+        try:
+            yield None
+        finally:
+            closed_in_scope.append(observer.generation_budget_scope.get() is not None)
+
+    provider, _ = _install_budget_capture_stubs(monkeypatch, stream)
+    observer = harness.WireObserver("https://example.invalid")
+    with harness._capture_generation_budget_proofs(observer):
+        captured = provider._stream_impl()
+        await anext(captured)
+        assert observer.generation_budget_scope.get() is None
+        await asyncio.create_task(captured.aclose())
+    assert closed_in_scope == [True]
 
 
 def test_wire_diagnostics_expose_shapes_and_allowlisted_error_codes_only():

@@ -23,6 +23,7 @@ import sys
 import tempfile
 import time
 from collections.abc import AsyncIterator, Callable, Iterator, Mapping
+from contextvars import ContextVar
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -501,7 +502,9 @@ class WireObserver:
         self.replay_checks: dict[str, Any] = {}
         self.blocked_unobserved_generation_requests = 0
         self.blocked_http_requests: list[dict[str, Any]] = []
-        self.generation_proofs: dict[str, list[dict[str, Any]]] = {}
+        self.generation_budget_scope: ContextVar[dict[str, Any] | None] = ContextVar(
+            "generation_budget_scope", default=None,
+        )
 
     @contextlib.contextmanager
     def observe(self) -> Iterator[None]:
@@ -525,9 +528,10 @@ class WireObserver:
                     request=json.loads(request.content), provider=matched_provider,
                 )
                 request_key = _payload_fingerprint(call.request)
-                proofs = self.generation_proofs.get(request_key)
-                if proofs:
-                    call.generation_proof = proofs.pop()
+                scope = self.generation_budget_scope.get()
+                captured = scope.get("final_proof") if scope is not None else None
+                if captured is not None and captured[0] == request_key:
+                    call.generation_proof = dict(captured[1])
                 self.calls.append(call)
                 fault = (
                     self.summary_fault()
@@ -1101,13 +1105,57 @@ def _capture_generation_budget_proofs(observer: WireObserver) -> Iterator[None]:
     """Bind adapter generation proofs to the exact payload observed on the wire."""
     from opensquilla.engine import context_budget
     from opensquilla.provider.openai import OpenAIProvider
+    from opensquilla.session import compaction
 
-    built: dict[str, list[dict[str, Any]]] = {}
     original_build = OpenAIProvider._build_payload
+    original_stream = OpenAIProvider._stream_impl
     original_coordinate = context_budget.coordinate_provider_context_budget
+    original_fit_summary = compaction._fit_summary_generation_allowance
+    prefit_attribute = "_harness_generation_prefit"
 
-    def capture_build(self, *args, **kwargs):
-        result = original_build(self, *args, **kwargs)
+    async def capture_stream(self, *args, **kwargs):
+        scope: dict[str, Any] = {}
+        stream = original_stream(self, *args, **kwargs)
+        try:
+            while True:
+                token = observer.generation_budget_scope.set(scope)
+                try:
+                    event = await anext(stream)
+                except StopAsyncIteration:
+                    return
+                finally:
+                    observer.generation_budget_scope.reset(token)
+                yield event
+        finally:
+            # Generators can be closed in a different task. Activate/reset
+            # context around each operation, never across a yielded event.
+            token = observer.generation_budget_scope.set(scope)
+            try:
+                await stream.aclose()
+            finally:
+                observer.generation_budget_scope.reset(token)
+
+    def capture_fit_summary(provider, messages, tools, config):
+        before = config.max_tokens
+        previous = getattr(config, prefit_attribute, None)
+        if previous is not None:
+            _require(before == previous[1], "compaction_request_configuration_changed")
+        original_fit_summary(provider, messages, tools, config)
+        _require(0 < config.max_tokens <= before, "compaction_request_configuration_changed")
+        # Pydantic model_copy preserves private sidecar attributes, including
+        # the copy that compaction creates for each actual provider attempt.
+        object.__setattr__(
+            config, prefit_attribute, (previous[0] if previous else before, config.max_tokens),
+        )
+
+    def capture_build(self, messages, tools, cfg):
+        scope = observer.generation_budget_scope.get()
+        if scope is not None:
+            scope.pop("built", None)
+            scope.pop("final_proof", None)
+        result = original_build(self, messages, tools, cfg)
+        if scope is None:
+            return result
         payload, proof = result[0], result[4]
         active_field = next(
             (name for name in ("max_output_tokens", "max_completion_tokens", "max_tokens")
@@ -1116,23 +1164,32 @@ def _capture_generation_budget_proofs(observer: WireObserver) -> Iterator[None]:
         )
         captured = dict(proof)
         captured["generation_budget_field"] = active_field
-        built.setdefault(_payload_fingerprint(payload), []).append(captured)
+        prefit = getattr(cfg, prefit_attribute, None)
+        _require(prefit is None or cfg.max_tokens == prefit[1],
+                 "compaction_request_configuration_changed")
+        captured["configured_generation_tokens"] = cfg.max_tokens
+        captured["logical_generation_tokens"] = prefit[0] if prefit else cfg.max_tokens
+        # Retain the object until coordination: identical projected payloads
+        # can have different requested caps after capacity fitting.
+        scope["built"] = (payload, captured)
         return result
 
     def capture_coordinate(payload, **kwargs):
-        key = _payload_fingerprint(payload)
-        proofs = built.get(key)
-        proof = proofs[0] if proofs else None
+        scope = observer.generation_budget_scope.get()
+        captured = scope.pop("built", None) if scope is not None else None
+        if scope is not None:
+            scope.pop("final_proof", None)
         decision = original_coordinate(payload, **kwargs)
-        if proof is not None and isinstance(decision.payload, dict):
-            proofs.pop(0)
+        if (scope is not None and captured is not None and captured[0] is payload
+                and decision.action in {"send", "send_compacted"}
+                and isinstance(decision.payload, dict)):
             final_payload = decision.payload or payload
-            observer.generation_proofs.setdefault(
-                _payload_fingerprint(final_payload), [],
-            ).append(dict(proof))
+            scope["final_proof"] = (_payload_fingerprint(final_payload), dict(captured[1]))
         return decision
 
     with patch.object(OpenAIProvider, "_build_payload", capture_build), \
+            patch.object(OpenAIProvider, "_stream_impl", capture_stream), \
+            patch.object(compaction, "_fit_summary_generation_allowance", capture_fit_summary), \
             patch.object(context_budget, "coordinate_provider_context_budget", capture_coordinate):
         yield
 
@@ -1153,6 +1210,7 @@ def _require_matching_generation_budgets(
     calls: list[WireCall],
     *,
     requested_must_match: bool = False,
+    expected_requested: int | None = None,
 ) -> list[int]:
     """Check final wire caps against the production adapter proof."""
     requested: list[int] = []
@@ -1162,19 +1220,36 @@ def _require_matching_generation_budgets(
         _require(isinstance(proof, dict), "compaction_request_configuration_changed")
         effective = proof.get("effective_generation_tokens")
         requested_value = proof.get("requested_generation_tokens")
+        configured = proof.get("configured_generation_tokens")
+        logical = proof.get("logical_generation_tokens")
         _require(
             type(effective) is int and effective > 0
             and type(requested_value) is int and requested_value > 0
+            and type(configured) is int and configured == requested_value
+            and type(logical) is int and logical >= configured
+            and effective <= requested_value
             and value == effective,
             "compaction_request_configuration_changed",
         )
         active_field = proof.get("generation_budget_field", field)
         _require(active_field == field, "compaction_request_configuration_changed")
-        requested.append(requested_value)
+        if expected_requested is not None:
+            _require(logical == expected_requested, "compaction_request_configuration_changed")
+        requested.append(logical)
     if requested_must_match:
         _require(all(value == requested[0] for value in requested),
                  "compaction_request_configuration_changed")
     return requested
+
+
+def _expected_compaction_generation_budget(
+    options: CompactionCaseOptions, variant: str, turn: int,
+) -> int:
+    if turn > 0 and variant == "truncated":
+        return 1
+    if turn > 0 and variant == "long_reasoning":
+        return options.max_output_tokens or 8192
+    return options.max_output_tokens if options.max_output_tokens is not None else 4096
 
 
 def _compaction_tool_history_representation(call: WireCall) -> str:
@@ -1562,6 +1637,12 @@ async def _run_compaction_case(
                         options.preflight_ratio is None and not options.native_pressure
                     ):
                         config.preflight_compact_ratio = 0.2
+                expected_generation = _expected_compaction_generation_budget(options, variant, turn)
+                _require(
+                    type(expected_generation) is int and expected_generation > 0
+                    and config.llm.max_tokens == expected_generation,
+                    "compaction_request_configuration_changed",
+                )
                 selector_config = SelectorConfig(
                     primary=ProviderConfig(
                         provider=provider,
@@ -1596,6 +1677,9 @@ async def _run_compaction_case(
                         tool_context=ToolContext(is_owner=True, workspace_dir=config.workspace_dir),
                     )
                 ]
+                _require_matching_generation_budgets(
+                    observer.calls[call_start:], expected_requested=expected_generation,
+                )
                 # run() clears its per-turn flags in finally. Retain the actual
                 # lifecycle evidence instead of sampling those cleared flags.
                 started_phases = [
@@ -1888,13 +1972,11 @@ async def _run_compaction_case(
                             "compaction_request_configuration_changed",
                         )
                 _require_matching_generation_budgets(
-                    [*summary_calls, resumed], requested_must_match=True,
+                    [*summary_calls, resumed], expected_requested=expected_generation,
                 )
                 if variant not in {"model_switch", "long_reasoning", "replay_off"}:
-                    parent_requested = _require_matching_generation_budgets([parent, compact])
-                    _require(
-                        parent_requested[1] <= parent_requested[0],
-                        "compaction_request_configuration_changed",
+                    _require_matching_generation_budgets(
+                        [parent, compact], requested_must_match=True,
                     )
                 common = 0
                 for left, right in zip(
