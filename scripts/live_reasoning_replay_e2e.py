@@ -1677,9 +1677,6 @@ async def _run_compaction_case(
                         tool_context=ToolContext(is_owner=True, workspace_dir=config.workspace_dir),
                     )
                 ]
-                _require_matching_generation_budgets(
-                    observer.calls[call_start:], expected_requested=expected_generation,
-                )
                 # run() clears its per-turn flags in finally. Retain the actual
                 # lifecycle evidence instead of sampling those cleared flags.
                 started_phases = [
@@ -1710,6 +1707,9 @@ async def _run_compaction_case(
                     _require(
                         all(call.request.get("model") == model for call in observer.calls),
                         "parent_request_model_mismatch",
+                    )
+                    _require_matching_generation_budgets(
+                        observer.calls[call_start:], expected_requested=expected_generation,
                     )
                     parent = observer.calls[-1]
                     generated_label = _compaction_generated_label(
@@ -1769,6 +1769,9 @@ async def _run_compaction_case(
                 active_entries = await manager.get_transcript(key)
                 active = _canonical_message_digests(active_entries)
                 if variant == "truncated":
+                    _require_matching_generation_budgets(
+                        stage_calls, expected_requested=expected_generation,
+                    )
                     observed["length_observed"] = bool(
                         compact and compact.finish_reason == "length"
                     )
@@ -1971,6 +1974,9 @@ async def _run_compaction_case(
                             parent.request.get(name) == compact.request.get(name),
                             "compaction_request_configuration_changed",
                         )
+                # A wire mutation invalidates the complete payload proof too.
+                # Prefer the dedicated model/source diagnostics above, then
+                # check every call admitted by the stage shape requirement.
                 _require_matching_generation_budgets(
                     [*summary_calls, resumed], expected_requested=expected_generation,
                 )
