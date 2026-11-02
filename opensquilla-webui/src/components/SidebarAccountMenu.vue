@@ -112,9 +112,11 @@ onUnmounted(() => document.removeEventListener('pointerdown', outside))
             <span class="sidebar-account__caption sidebar-account__usage-label">
               {{ t('account.menu.todayUsage') }}<Icon name="info" :size="13" aria-hidden="true" />
             </span>
-            <span class="sidebar-account__tokens" :title="tokens === null ? undefined : tokens.toLocaleString(locale)">{{ approximate && tokens !== null ? '≈ ' : '' }}{{ tokenCount }}<small v-if="tokens !== null"> Tokens</small></span>
-            <span v-if="loading" class="sidebar-account__hint" role="status">{{ t('shared.loading') }}</span>
-            <span v-else-if="usageError" class="sidebar-account__hint" role="status">{{ t('account.menu.usageUnavailable') }}</span>
+            <span class="sidebar-account__usage-value" :title="usageError ? t('account.menu.usageUnavailable') : tokens === null ? undefined : tokens.toLocaleString(locale)">
+              <span class="sidebar-account__tokens">{{ approximate && tokens !== null ? '≈ ' : '' }}{{ tokenCount }}<small v-if="tokens !== null"> Tokens</small></span>
+              <span v-if="loading" class="sidebar-account__usage-status" role="status">{{ t('shared.loading') }}</span>
+              <span v-else-if="usageError" class="sidebar-account__usage-status" role="status">{{ t('account.menu.usageUnavailable') }}</span>
+            </span>
           </div>
         </div>
         <div class="sidebar-account__divider" role="separator" />
@@ -152,9 +154,13 @@ onUnmounted(() => document.removeEventListener('pointerdown', outside))
 .sidebar-account__menu button:focus-visible, .sidebar-fn-item:focus-visible { outline: 2px solid var(--accent); outline-offset: -2px; }
 .sidebar-account__menu .sidebar-account__recharge { flex-shrink: 0; gap: 2px; max-width: 50%; min-height: 32px; padding: 4px 8px; border: 1px solid var(--border); font-size: var(--fs-xs); }
 .sidebar-account__recharge :deep(svg) { flex-shrink: 0; }
-.sidebar-account__usage { display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: 6px; padding: 12px 14px; }
-.sidebar-account__usage-label { display: inline-flex; align-items: center; gap: 4px; }
-.sidebar-account__tokens { font-size: var(--fs-sm); font-weight: 600; font-variant-numeric: tabular-nums; overflow-wrap: anywhere; }
+/* Reserve both rows so async usage updates never move this bottom-anchored
+   menu, and long translated labels cannot crowd out the token count. */
+.sidebar-account__usage { display: flex; flex-direction: column; align-items: stretch; gap: 4px; padding: 12px 14px; }
+.sidebar-account__usage-label { display: inline-flex; align-items: center; flex-shrink: 0; gap: 4px; white-space: nowrap; }
+.sidebar-account__usage-value { display: flex; align-items: center; justify-content: flex-end; gap: 6px; min-width: 0; min-height: 24px; overflow: hidden; white-space: nowrap; }
+.sidebar-account__usage-status { min-width: 0; overflow: hidden; text-overflow: ellipsis; font-size: var(--fs-xs); line-height: 1.5; color: var(--text-muted); }
+.sidebar-account__tokens { flex-shrink: 0; font-size: var(--fs-sm); line-height: 1.5; font-weight: 600; font-variant-numeric: tabular-nums; }
 .sidebar-account__tokens small { font-size: var(--fs-xs); font-weight: 400; color: var(--text-muted); }
 .sidebar-account__hint { display: block; flex-basis: 100%; margin-top: 2px; font-size: var(--fs-xs); line-height: 1.5; color: var(--text-muted); }
 .sidebar-account__hint--warning { color: var(--warn); }
