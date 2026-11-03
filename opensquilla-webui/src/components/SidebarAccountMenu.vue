@@ -158,7 +158,7 @@ onUnmounted(() => document.removeEventListener('pointerdown', outside))
           <div class="sidebar-account__wallet-row">
             <div class="sidebar-account__wallet-balance">
               <div class="sidebar-account__balance-label">
-                <span v-show="!walletStatus" class="sidebar-account__caption">{{ t('account.available') }}</span>
+                <span class="sidebar-account__caption" :class="{ 'is-hidden': walletStatus }">{{ t('account.available') }}</span>
                 <span class="sidebar-account__hint" :class="{ 'sidebar-account__hint--warning': (walletUnavailable || failure) && !walletLoading }" data-testid="sidebar-account-wallet-status" :role="failure && !walletLoading ? 'alert' : 'status'" :title="walletStatus || undefined">{{ walletStatus }}</span>
               </div>
               <strong data-testid="sidebar-account-balance" :aria-busy="walletLoading" :title="balance">{{ balance }}</strong>
@@ -212,15 +212,18 @@ onUnmounted(() => document.removeEventListener('pointerdown', outside))
 .sidebar-account__identity strong { font-weight: 600; }
 .sidebar-account__wallet { margin: 0 12px; padding: 8px 12px; background: var(--account-wallet-bg, var(--bg-surface-2)); border-radius: var(--radius-md); }
 .sidebar-account__caption { color: var(--text-muted); font-size: var(--fs-xs); line-height: 1.5; }
-.sidebar-account__wallet-row { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
-.sidebar-account__wallet-balance { display: flex; flex-direction: column; gap: 4px; min-width: 0; }
-.sidebar-account__balance-label { height: 18px; line-height: 18px; }
+.sidebar-account__wallet-row { display: flex; flex-wrap: wrap; align-items: center; gap: 4px 8px; }
+.sidebar-account__wallet-balance { display: flex; flex: 1 1 6rem; flex-direction: column; gap: 4px; min-width: 0; }
+/* Keep room for the translated caption while refresh status occupies its place. */
+.sidebar-account__balance-label { display: grid; grid-template-columns: minmax(0, 1fr); line-height: 18px; }
+.sidebar-account__balance-label > span { grid-area: 1 / 1; align-self: start; }
+.sidebar-account__balance-label .is-hidden { visibility: hidden; }
 .sidebar-account__wallet-balance strong { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: var(--fs-md); line-height: 24px; font-weight: 600; font-variant-numeric: tabular-nums; }
 .sidebar-account__menu button { display: flex; align-items: center; border: 0; background: transparent; color: var(--text); border-radius: var(--radius-sm); cursor: pointer; font: inherit; text-align: left; }
 .sidebar-account__menu button:disabled { opacity: .5; cursor: default; }
 .sidebar-account__menu button:not(:disabled):hover { background: var(--bg-hover); }
 .sidebar-account__menu button:focus-visible, .sidebar-fn-item:focus-visible, .sidebar-account__login:focus-visible, .sidebar-account__settings:focus-visible { outline: 2px solid var(--accent); outline-offset: -2px; }
-.sidebar-account__menu .sidebar-account__recharge { flex-shrink: 0; gap: 4px; max-width: 50%; height: 28px; padding: 0 8px; border: 1px solid var(--border); font-size: var(--fs-xs); line-height: 18px; white-space: nowrap; transition: background-color var(--dur-fast) var(--ease-standard), border-color var(--dur-fast) var(--ease-standard); }
+.sidebar-account__menu .sidebar-account__recharge { flex-shrink: 0; gap: 4px; max-width: 100%; margin-inline-start: auto; height: 28px; padding: 0 8px; border: 1px solid var(--border); font-size: var(--fs-xs); line-height: 18px; white-space: nowrap; transition: background-color var(--dur-fast) var(--ease-standard), border-color var(--dur-fast) var(--ease-standard); }
 .sidebar-account__menu .sidebar-account__recharge:not(:disabled):hover { background: var(--bg-hover); border-color: var(--text-faint, var(--text-muted)); }
 .sidebar-account__menu .sidebar-account__recharge:not(:disabled):active { background: color-mix(in srgb, var(--text) 12%, var(--account-wallet-bg, var(--bg-surface-2))); border-color: var(--text-muted); }
 .sidebar-account__recharge-arrow { flex: 0 0 12px; height: 12px; background: currentColor; mask: url('@/assets/account/recharge-arrow.png') center / contain no-repeat; }
