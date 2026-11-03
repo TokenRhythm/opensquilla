@@ -62,6 +62,13 @@ def test_wheel_contains_complete_verified_lightgbm_bundle(isolated_core_wheel: P
     import gzip
     import hashlib
     import json
+    import runpy
+
+    release = runpy.run_path(str(REPO_ROOT / "scripts/build_wheelhouse_zip.py"))
+    assert release["check_router_assets"](
+        REPO_ROOT / "src/opensquilla/squilla_router/models"
+    ).ok
+    assert release["missing_router_assets_in_wheel"](isolated_core_wheel) == []
 
     prefix = "opensquilla/squilla_router/lightgbm_model"
     with zipfile.ZipFile(isolated_core_wheel) as wheel:

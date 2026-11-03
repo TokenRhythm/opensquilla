@@ -1067,7 +1067,7 @@ def _router_preflight_fixture(tmp_path: Path, asset="new"):
     payload = b'{"frozen": true}'
     for root, names in (
         (legacy, ["bge_onnx/model.onnx", "bge_onnx/tokenizer.json"]),
-        (current, [nested]),
+        (current, [nested, "intent/model.int8.onnx", "intent/standard_scaler88.joblib"]),
     ):
         records = []
         for name in names:
@@ -1081,12 +1081,18 @@ def _router_preflight_fixture(tmp_path: Path, asset="new"):
         (root / "artifact_manifest.json").write_text(
             json.dumps({"schema_version": 1, "files": records}), encoding="utf-8",
         )
-    target = current / nested if asset == "new" else legacy / "bge_onnx" / asset
+    if asset == "new" or asset.startswith("intent/"):
+        target = current / (nested if asset == "new" else asset)
+    else:
+        target = legacy / "bge_onnx" / asset
     target.unlink()
     return module, model_root, target, payload
 
 
-@pytest.mark.parametrize("asset", ["new", "model.onnx", "tokenizer.json"])
+@pytest.mark.parametrize("asset", [
+    "new", "model.onnx", "tokenizer.json",
+    "intent/model.int8.onnx", "intent/standard_scaler88.joblib",
+])
 def test_router_preflight_checks_every_manifest_asset(tmp_path: Path, asset) -> None:
     module, model_root, nested_asset, payload = _router_preflight_fixture(tmp_path, asset)
     assert nested_asset in module.check_router_assets(model_root).missing_files
@@ -1097,7 +1103,10 @@ def test_router_preflight_checks_every_manifest_asset(tmp_path: Path, asset) -> 
     assert nested_asset in module.check_router_assets(model_root).pointer_files
 
 
-@pytest.mark.parametrize("asset", ["new", "model.onnx", "tokenizer.json"])
+@pytest.mark.parametrize("asset", [
+    "new", "model.onnx", "tokenizer.json",
+    "intent/model.int8.onnx", "intent/standard_scaler88.joblib",
+])
 def test_router_preflight_rejects_tampered_manifest_asset(tmp_path: Path, asset) -> None:
     module, model_root, nested_asset, _ = _router_preflight_fixture(tmp_path, asset)
     nested_asset.parent.mkdir(parents=True, exist_ok=True)
