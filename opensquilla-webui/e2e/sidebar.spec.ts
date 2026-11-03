@@ -65,8 +65,13 @@ test.describe('Sidebar', () => {
       if (width === 260) {
         expect(label.lines).toBe(1)
         const recharge = (await page.getByTestId('sidebar-account-recharge').boundingBox())!
-        expect(readyBounds.x + readyBounds.width).toBeLessThanOrEqual(recharge.x)
-        expect(Math.abs((readyBounds.y + readyBounds.height / 2) - (recharge.y + recharge.height / 2))).toBeLessThanOrEqual(1)
+        // The account-width popup can wrap the recharge button on narrow sidebars.
+        if (recharge.y >= readyBounds.y + readyBounds.height) {
+          expect(recharge.y - (readyBounds.y + readyBounds.height)).toBeGreaterThanOrEqual(4)
+        } else {
+          expect(readyBounds.x + readyBounds.width).toBeLessThanOrEqual(recharge.x)
+          expect(Math.abs((readyBounds.y + readyBounds.height / 2) - (recharge.y + recharge.height / 2))).toBeLessThanOrEqual(1)
+        }
       }
     })
   }

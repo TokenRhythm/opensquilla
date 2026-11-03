@@ -204,7 +204,8 @@ onUnmounted(() => document.removeEventListener('pointerdown', outside))
 .sidebar-account__avatar { flex: 0 0 28px; height: 28px; display: grid; place-items: center; border-radius: var(--radius-full); background: var(--bg-hover); font-size: var(--fs-sm); font-weight: 600; }
 .sidebar-account__avatar img { display: block; width: 100%; height: 100%; object-fit: contain; border-radius: inherit; }
 .sidebar-account__name { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; text-align: left; }
-.sidebar-account__menu { position: absolute; bottom: calc(100% + 8px); left: 0; box-sizing: border-box; width: 100%; max-height: calc(100dvh - 80px); overflow-y: auto; padding: 8px 0; background: var(--bg); border: 0; border-radius: var(--radius-lg); box-shadow: var(--shadow-lg); z-index: 50; }
+/* Anchor the popup to the account column, excluding the separate settings button. */
+.sidebar-account__menu { position: absolute; grid-area: 1 / 1 / 2 / 2; bottom: calc(100% + 8px); left: 0; box-sizing: border-box; width: 100%; max-height: calc(100dvh - 80px); overflow-y: auto; padding: 8px 0; background: var(--bg); border: 0; border-radius: var(--radius-lg); box-shadow: var(--shadow-lg); z-index: 50; }
 .sidebar-account__identity { display: flex; align-items: center; gap: 10px; padding: 8px 16px 12px; font-size: var(--fs-md); }
 .sidebar-account__identity .sidebar-account__avatar { flex-basis: 36px; height: 36px; }
 .sidebar-account__identity strong { font-weight: 600; }
