@@ -138,7 +138,8 @@ describe('sidebar account summary', () => {
     expect(balance.textContent).not.toContain('0.00')
     expect(usage.textContent).toContain('暂不可用')
     expect(usage.textContent).not.toMatch(/\b0\b/)
-    expect(button(host, 'sidebar-account-settings').disabled).toBe(false)
+    expect(button(host, 'sidebar-footer-settings').disabled).toBe(false)
+    expect(host.querySelector('[role="menu"]')?.textContent).not.toContain('设置')
   })
 
   it('retains a stale balance while local usage can continue updating', async () => {
@@ -259,10 +260,15 @@ describe('sidebar account summary', () => {
   })
 
   it('offers direct sign-in from the signed-out capsule', async () => {
-    const { host, router } = await mount(state({ status: 'signed_out', profile: null, wallet: null, walletStatus: 'idle', keyStatus: 'missing' }))
+    const { host, props, router } = await mount(state({ status: 'signed_out', profile: null, wallet: null, walletStatus: 'idle', keyStatus: 'missing' }))
     const login = button(host, 'sidebar-account-login')
     expect(login.textContent).toContain('登录/注册')
-    expect(host.querySelectorAll('button')).toHaveLength(1)
+    const settings = button(host, 'sidebar-footer-settings')
+    expect(login.nextElementSibling).toBe(settings)
+    expect(settings.getAttribute('aria-label')).toBe('设置')
+    settings.click()
+    expect(props.onSettings).toHaveBeenCalledOnce()
+    expect(mock.account.action).not.toHaveBeenCalled()
     expect(host.querySelector('[role="menu"]')).toBeNull()
     login.click()
     await vi.waitFor(() => expect(router.currentRoute.value.path).toBe('/settings/account'))

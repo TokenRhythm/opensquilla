@@ -1,5 +1,6 @@
 import { fileURLToPath } from 'node:url'
 import { expect, type Page, type WebSocketRoute } from '@playwright/test'
+import type { TokenRhythmAccountState } from '../../../contracts/desktop/tokenrhythm-account'
 import { helloOkResponse } from './gateway-fixture'
 import {
   chatHistoryPayload,
@@ -190,12 +191,13 @@ async function installPreferences(page: Page, scenario: Required<Pick<
   }, scenario)
 }
 
-async function installDesktopUpdateBridge(
+export async function installDesktopUpdateBridge(
   page: Page,
   initialPatch: Partial<TopbarUpdateState>,
+  account?: TokenRhythmAccountState,
 ) {
   const initial = completeUpdateState(initialPatch)
-  await page.addInitScript((initialState: TopbarUpdateState) => {
+  await page.addInitScript(({ initialState, account }) => {
     let state = { ...initialState }
     const listeners = new Set<(payload: unknown) => void>()
     const gateway = {
@@ -223,6 +225,15 @@ async function installDesktopUpdateBridge(
 
     ;(window as BrowserUpdateBridge).__opensquillaTopbarE2E = { pushUpdate: publish }
     window.opensquillaDesktop = {
+      ...(account ? {
+        getAccountState: async () => account,
+        accountAction: async () => account,
+        onAccountState(callback: (value: TokenRhythmAccountState) => void) {
+          const publish = (event: Event) => callback((event as CustomEvent<TokenRhythmAccountState>).detail)
+          window.addEventListener('fixture-account-state', publish)
+          return () => window.removeEventListener('fixture-account-state', publish)
+        },
+      } : {}),
       getOsLocale: async () => 'en-US',
       isAutoUpdateEnabled: async () => true,
       isDesktopUpdateManaged: async () => true,
@@ -262,7 +273,7 @@ async function installDesktopUpdateBridge(
       onBootStatus: () => () => undefined,
       onBootError: () => () => undefined,
     }
-  }, initial)
+  }, { initialState: initial, account })
 }
 
 async function installStaticRoutes(

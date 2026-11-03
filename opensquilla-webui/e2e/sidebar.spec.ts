@@ -1,5 +1,7 @@
 import { test, expect, type Page } from '@playwright/test'
 import { installSidebarFixture, SIDEBAR_SESSIONS } from './support/sidebar-fixture'
+import { installDesktopUpdateBridge } from './support/topbar-fixture'
+import type { TokenRhythmAccountState } from '../../contracts/desktop/tokenrhythm-account'
 
 const CONTROL_URL = '/control/'
 const RAW_KEY_PATTERN = /agent:[a-z0-9_-]+:[a-z0-9_-]+:/i
@@ -20,6 +22,54 @@ test.describe('Sidebar', () => {
   test.beforeEach(async ({ page }) => {
     await page.addInitScript(() => localStorage.setItem('opensquilla-locale', 'en'))
   })
+
+  for (const width of [240, 260]) {
+    test(`wallet caption clears the balance across a refresh at ${width}px`, async ({ page }) => {
+      const account: TokenRhythmAccountState = {
+        revision: 1, status: 'signed_in', profile: null, keyStatus: 'ready',
+        wallet: {
+          currency: 'CNY', asOf: '2026-01-01T00:00:00Z',
+          balances: { available: '1241.62', bonus: '0', recharge: '1241.62', debt: '0', frozen: '0' },
+        },
+        walletStatus: 'loading', errorCode: null, walletErrorCode: null,
+        source: 'manual', selectedAccountId: null, pendingRevocation: false,
+        loginExpiresAt: null, mediaSources: { image: 'inherit', video: 'inherit' },
+      }
+      await installSidebarFixture(page)
+      await installDesktopUpdateBridge(page, {}, account)
+      await page.addInitScript(width => {
+        localStorage.setItem('opensquilla.sidebar.width.v1', JSON.stringify({ version: 1, width, source: 'custom' }))
+      }, width)
+      await page.setViewportSize({ width: 1440, height: 900 })
+      await page.goto(CONTROL_URL)
+      await page.getByTestId('sidebar-account-trigger').click()
+      expect(Math.round((await page.locator('.sidebar').boundingBox())!.width)).toBe(width)
+      const amount = page.getByTestId('sidebar-account-balance')
+      await expect(amount).toHaveAttribute('aria-busy', 'true')
+      const pendingBounds = (await amount.boundingBox())!
+      await page.evaluate(detail => {
+        window.dispatchEvent(new CustomEvent('fixture-account-state', { detail }))
+      }, { ...account, revision: 2, walletStatus: 'ready' })
+      await expect(amount).toHaveAttribute('aria-busy', 'false')
+      const caption = page.getByText('Available balance', { exact: true })
+      await expect(caption).toBeVisible()
+      await expect(amount).toContainText('1,241.62')
+      const label = await caption.evaluate(element => {
+        const range = document.createRange()
+        range.selectNodeContents(element)
+        return { bottom: range.getBoundingClientRect().bottom, lines: range.getClientRects().length }
+      })
+      const readyBounds = (await amount.boundingBox())!
+      expect(label.bottom).toBeLessThanOrEqual(readyBounds.y)
+      expect(Math.abs(readyBounds.y - pendingBounds.y)).toBeLessThanOrEqual(1)
+      if (width === 260) {
+        expect(label.lines).toBe(1)
+        const recharge = (await page.getByTestId('sidebar-account-recharge').boundingBox())!
+        expect(readyBounds.x + readyBounds.width).toBeLessThanOrEqual(recharge.x)
+        expect(Math.abs((readyBounds.y + readyBounds.height / 2) - (recharge.y + recharge.height / 2))).toBeLessThanOrEqual(1)
+      }
+    })
+  }
 
   test('desktop separator resizes, persists, and collapses only on pointer release', async ({ page }) => {
     await page.addInitScript(() => {

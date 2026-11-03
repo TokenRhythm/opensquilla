@@ -227,16 +227,8 @@ try {
   // can race a still-settling draft ChatView canonicalization on slower
   // Windows runners and be replaced by /chat/new even though the renderer is
   // healthy; opening Settings through the shell also proves it is interactive.
-  // Account-capable clients place Settings inside the account menu; clients
-  // without that capability retain the direct footer entry.
-  const settingsEntry = page.locator(
-    '[data-testid="sidebar-account-trigger"]:visible, '
-    + 'button.sidebar-fn-item[data-icon="settings"]:visible',
-  ).first()
-  await settingsEntry.waitFor({ state: 'visible', timeout: 20_000 })
-  const accountMenu = await settingsEntry.getAttribute('data-testid') === 'sidebar-account-trigger'
-  await settingsEntry.click()
-  if (accountMenu) await page.getByTestId('sidebar-account-settings').click()
+  assert.equal(await page.locator('.sidebar-core [data-icon="settings"]').count(), 0)
+  await page.getByTestId('sidebar-footer-settings').click({ timeout: 20_000 })
   await page.waitForURL(url => url.pathname.includes('/settings'), {
     timeout: 20_000,
   })

@@ -869,33 +869,25 @@ describe('SettingsDialog keyboard focus loop', () => {
 })
 
 describe('SettingsDialog exit protection', () => {
-  it.each(['docked', 'collapsed'])('restores the visible account trigger after its %s menu item unmounts', async (layout) => {
+  it('restores focus to the footer Settings button when its original invoker unmounts', async () => {
     const controls = mockCatalog()
     controls.saveAllPending.value = false
     controls.hasUnsavedChanges.value = false
     catalogApi.dirtySections.value = []
     const sidebar = document.createElement('div')
     sidebar.className = 'sidebar-foot'
-    sidebar.innerHTML = '<button data-testid="sidebar-account-trigger">Account</button>'
-    const dockedTrigger = sidebar.querySelector<HTMLButtonElement>('button')!
-    const collapsedTrigger = document.createElement('button')
-    collapsedTrigger.dataset.testid = 'sidebar-account-trigger'
-    const opener = document.createElement('button')
-    opener.dataset.testid = 'sidebar-toggle-collapsed'
-    opener.style.display = 'none'
-    const menuItem = document.createElement('button')
-    menuItem.textContent = 'Settings'
-    document.body.append(sidebar, collapsedTrigger, opener, menuItem)
-    if (layout === 'collapsed') sidebar.setAttribute('inert', '')
-    else collapsedTrigger.hidden = true
-    menuItem.focus()
+    sidebar.innerHTML = '<button data-testid="sidebar-account-trigger">Account</button><button data-testid="sidebar-footer-settings" data-icon="settings">Settings</button>'
+    const settings = sidebar.querySelector<HTMLButtonElement>('[data-icon="settings"]')!
+    const initialInvoker = document.createElement('button')
+    document.body.append(sidebar, initialInvoker)
+    initialInvoker.focus()
     await mountDialog()
-    menuItem.remove()
+    initialInvoker.remove()
 
     document.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true }))
     await nextTick()
 
-    expect(document.activeElement).toBe(layout === 'collapsed' ? collapsedTrigger : dockedTrigger)
+    expect(document.activeElement).toBe(settings)
   })
 
   it.each(['inert', 'hidden', 'cold'])('restores the sidebar opener when the Settings entry is %s', async (state) => {
@@ -905,7 +897,7 @@ describe('SettingsDialog exit protection', () => {
     catalogApi.dirtySections.value = []
     const sidebar = document.createElement('div')
     sidebar.className = 'sidebar-foot'
-    sidebar.innerHTML = '<button data-icon="settings">Settings</button>'
+    sidebar.innerHTML = '<button data-testid="sidebar-footer-settings" data-icon="settings">Settings</button>'
     const invoker = sidebar.querySelector<HTMLButtonElement>('button')!
     const opener = document.createElement('button')
     opener.dataset.testid = 'sidebar-toggle-collapsed'
