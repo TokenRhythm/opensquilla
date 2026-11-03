@@ -184,6 +184,13 @@ export class TokenRhythmAccount {
       && login.request.accountId === this.saved.tokens?.accountId
       && login.request.sessionId === this.saved.tokens?.sessionId) this.primaryActivation = login.request
   }
+  /** A discarded renderer cannot replay its login default in the next document. */
+  invalidatePrimaryActivation(): void {
+    // Metadata only: lifecycle invalidation also runs while maintenance/quit
+    // closes public admission. Authentication and saved source choices survive.
+    this.suppressPrimaryActivation()
+    try { this.publish() } catch { /* The old renderer may already be gone. */ }
+  }
   async cancelPrimaryActivation(id?: string): Promise<TokenRhythmAccountState> {
     this.assertOpen()
     if (id !== undefined) {

@@ -2,6 +2,7 @@ import { app, BrowserWindow, clipboard, dialog, Menu, ipcMain, nativeTheme, net 
 import electronUpdater from 'electron-updater'
 import { parse as parseToml } from 'smol-toml'
 import { TokenRhythmAccount, AccountError, accountPrimaryActivation, pauseAccountsForMaintenance, type AccountMaintenancePause } from './tokenrhythm-account.js'
+import { bindAccountPrimaryActivationLifecycle } from './account-primary-activation-lifecycle.js'
 import { TokenRhythmModelProxy } from './tokenrhythm-model-proxy.js'
 import { resolveAccountOrigin } from './tokenrhythm-environment.js'
 import { LocalAccountSecrets, LOCAL_ACCOUNT_FILE } from './local-account-secrets.js'
@@ -10351,6 +10352,9 @@ async function createMainWindow(): Promise<BrowserWindow> {
     },
   })
   mainWindow = window
+  bindAccountPrimaryActivationLifecycle(window.webContents, () => {
+    for (const { account } of desktopAccounts.values()) account.invalidatePrimaryActivation()
+  })
   // Observe fullscreen before a background task opens the first sidebar page.
   nativeWorkbenchSurfaces.observeWindow(window)
   desktopStartupLog('window_created')

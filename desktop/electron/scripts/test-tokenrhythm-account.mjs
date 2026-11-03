@@ -4,10 +4,12 @@ import { chmod, mkdir, mkdtemp, readFile, readdir, rm, writeFile } from 'node:fs
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { createHash } from 'node:crypto'
+import { EventEmitter } from 'node:events'
 import { TokenRhythmAccount, describeAccountDevice, pauseAccountsForMaintenance } from '../dist/tokenrhythm-account.js'
 import { TokenRhythmModelProxy, allowedModelRoute } from '../dist/tokenrhythm-model-proxy.js'
 import { LocalAccountSecrets, LOCAL_ACCOUNT_FILE } from '../dist/local-account-secrets.js'
 import { requestAccountLogin } from '../dist/account-login-recovery.js'
+import { bindAccountPrimaryActivationLifecycle } from '../dist/account-primary-activation-lifecycle.js'
 const scope = 'profile.read wallet.read managed_key.read managed_key.obtain session.revoke offline_access'
 const until = async fn => { for(let i=0;i<200;i++){if(fn())return;await new Promise(r=>setTimeout(r,5))}throw Error('condition timeout') }
 test('account device labels use the OS product version and distinguish Windows 11', () => {
@@ -414,6 +416,84 @@ test('closed admission rejects source choices without clearing the pending defau
  const closed=f.account.snapshot()
  await assert.rejects(()=>f.account.selectSource('manual'),/ACCOUNT_CLOSING/)
  assert.deepEqual(f.account.snapshot(),closed)
+})
+
+test('only committed main-document navigation retires a login default and preserves account choices', async t => {
+ const f=await fixture(t);await f.login();await f.account.selectSource('account')
+ await f.account.logout();f.setIdentity('b');await f.login()
+ const request=f.account.snapshot().primaryActivation
+ const saved=await readFile(join(f.directory,'account.enc'),'utf8')
+ const contents=new EventEmitter()
+ bindAccountPrimaryActivationLifecycle(contents,()=>f.account.invalidatePrimaryActivation())
+ contents.emit('did-navigate-in-page',{},'opensquilla://desktop/control/settings',true)
+ contents.emit('did-frame-navigate',{},'about:blank',200,'OK',false,1,2)
+ contents.emit('did-start-navigation',{},'opensquilla://desktop/control',false,true)
+ const cancelled={defaultPrevented:false,preventDefault(){this.defaultPrevented=true}}
+ cancelled.preventDefault();contents.emit('will-navigate',cancelled,'opensquilla://desktop/control')
+ assert.deepEqual(f.account.snapshot().primaryActivation,request)
+ contents.emit('did-navigate',{},'opensquilla://desktop/control',200,'OK')
+ // A newly mounted renderer reads this host snapshot with no replayable offer.
+ const remounted=f.account.snapshot()
+ assert.equal(remounted.primaryActivation,null)
+ assert.equal(remounted.status,'signed_in')
+ assert.equal(remounted.profile.accountId,'b')
+ assert.equal(remounted.source,'account')
+ assert.equal(remounted.selectedAccountId,'a')
+ assert.equal(await readFile(join(f.directory,'account.enc'),'utf8'),saved)
+ await assert.rejects(()=>f.account.selectSource('account',request),/ACCOUNT_PRIMARY_ACTIVATION_STALE/)
+ await f.account.verify(true);assert.equal(f.account.snapshot().primaryActivation,null)
+})
+
+for(const lifecycle of ['render-process-gone','destroyed']){
+ test(`${lifecycle} retires defaults during maintenance even when renderer delivery throws`,async t=>{
+  const f=await fixture(t);await f.login()
+  const request=f.account.snapshot().primaryActivation
+  const contents=new EventEmitter()
+  bindAccountPrimaryActivationLifecycle(contents,()=>f.account.invalidatePrimaryActivation())
+  const pause=f.account.pauseForMaintenance();await pause.drained
+  const onState=f.deps.onState
+  f.deps.onState=()=>{throw new Error('renderer frame is gone')}
+  assert.doesNotThrow(()=>contents.emit(lifecycle,{}, {reason:'crashed'}))
+  assert.equal(f.account.snapshot().primaryActivation,null)
+  assert.equal(f.account.snapshot().status,'signed_in')
+  f.deps.onState=onState
+  pause.resume();await until(()=>!f.account.admissionClosed);await f.account.verify(true)
+  assert.equal(f.account.snapshot().primaryActivation,null)
+  await assert.rejects(()=>f.account.selectSource('account',request),/ACCOUNT_PRIMARY_ACTIVATION_STALE/)
+ })
+}
+
+test('renderer lifecycle suppresses a pending OAuth default without cancelling its login',async t=>{
+ let release,entered=false
+ const gate=new Promise(resolve=>{release=resolve})
+ const f=await fixture(t,{beforeFetch:async(url,init)=>{
+  if(new URL(url).pathname==='/api/oauth/token' && new URLSearchParams(init.body).get('grant_type')==='authorization_code'){entered=true;await gate}
+ }})
+ const contents=new EventEmitter()
+ bindAccountPrimaryActivationLifecycle(contents,()=>f.account.invalidatePrimaryActivation())
+ await browserCallback(f);await until(()=>entered)
+ contents.emit('did-navigate',{},'opensquilla://desktop/control',200,'OK')
+ release();await f.account.loginCompletionPromise
+ assert.equal(f.account.snapshot().status,'signed_in')
+ assert.equal(f.account.snapshot().primaryActivation,null)
+ assert.equal(f.account.snapshot().source,'manual')
+})
+
+test('renderer destruction invalidates every account while normal admission is closing',async t=>{
+ const first=await fixture(t),second=await fixture(t)
+ await first.login();await second.login()
+ const contents=new EventEmitter()
+ bindAccountPrimaryActivationLifecycle(contents,()=>{
+  for(const account of [first.account,second.account]) account.invalidatePrimaryActivation()
+ })
+ first.deps.onState=()=>{throw new Error('destroyed frame')}
+ const closing=first.account.close()
+ assert.doesNotThrow(()=>contents.emit('destroyed'))
+ assert.equal(first.account.snapshot().primaryActivation,null)
+ assert.equal(second.account.snapshot().primaryActivation,null)
+ assert.equal(second.account.snapshot().status,'signed_in')
+ first.deps.onState=undefined
+ await closing
 })
 test('restart restores encrypted login and validates before exposing a lease',async t=>{
  const f=await fixture(t);await f.login();await f.account.selectSource('account');const old=(await f.account.runtimeState()).credential;f.account.close()
