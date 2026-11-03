@@ -1597,10 +1597,10 @@
       "recommendations": {
         "router": "推荐分层",
         "ensemble": "推荐融合方案",
-        "updateAvailable": "有新推荐",
+        "updateAvailable": "推荐方案有更新",
         "previewRouter": "先预览模型分层，确认后替换；保持当前使用模式。",
         "previewEnsemble": "先预览候选与汇总模型，确认后替换；保持当前使用模式。",
-        "available": "{provider} 有新的{kind}可用。",
+        "available": "{provider} 推荐方案有更新（{kind}）。",
         "unchanged": "当前配置保持不变，确认替换后才使用推荐。",
         "title": "使用 {provider} {kind}？",
         "description": "请核对下方完整替换内容。当前使用模式和另一套方案保持不变。",

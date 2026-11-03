@@ -58,6 +58,7 @@ class _Instance:
     entries: dict[str, dict[str, Any]] = field(default_factory=dict)
     notified: dict[str, list[str]] = field(default_factory=dict)
     last_attempt: float | None = None
+    checked_in_process: bool = False
     lock: threading.RLock = field(default_factory=threading.RLock)
     refresh_lock: threading.Lock = field(default_factory=threading.Lock)
     stop: threading.Event = field(default_factory=threading.Event)
@@ -94,6 +95,11 @@ def recommendation_notified(
     instance = _instance(config)
     with instance.lock:
         return revision in instance.notified.get(key, ())
+
+
+def recommendation_model_choices(rows: list[dict[str, Any]]) -> list[tuple[str, str, str]]:
+    """Compare executable model choices independently of thinking settings."""
+    return sorted((row["role"], row["provider"], row["model"]) for row in rows)
 
 
 def mark_recommendation_notified(
@@ -158,8 +164,23 @@ def refresh_recommendations(*, config: Any, force: bool = False) -> bool:
                 instance.entries.get(key, {}).get("revision") != entry["revision"]
                 for key, entry in updates.items()
             )
+            for key, entry in updates.items():
+                previous = instance.entries.get(key)
+                revisions = instance.notified.get(key, [])
+                if (
+                    previous is not None
+                    and previous["revision"] in revisions
+                    and entry["revision"] not in revisions
+                    and recommendation_model_choices(previous["rows"])
+                    == recommendation_model_choices(entry["rows"])
+                ):
+                    # A thinking-only revision must not repeat an acknowledged
+                    # model-update notice, even when that plan was not applied.
+                    revisions.append(entry["revision"])
+                    del revisions[:-_MAX_NOTIFIED_REVISIONS]
             instance.entries.update(updates)
             instance.last_attempt = time.time()
+            instance.checked_in_process = True
             _save(instance)
         return changed
     finally:
@@ -167,9 +188,9 @@ def refresh_recommendations(*, config: Any, force: bool = False) -> bool:
 
 
 def start_background_recommendation_refresh(*, config: Any) -> threading.Thread | None:
-    """Start one daemon worker per state directory, honoring the persisted 24h TTL.
+    """Check once per process at startup, then every 24h in a daemon worker.
 
-    Returns immediately; a warm cache waits for the remaining TTL. Repeated calls
+    Returns immediately; even a warm disk cache gets a startup check. Repeated calls
     reuse the same worker and update the config reference used for privacy checks.
     No worker is started under pytest/CI or when passive networking is disabled.
     """
@@ -198,14 +219,15 @@ def _background_worker(instance: _Instance) -> None:
     try:
         while not instance.stop.is_set():
             with instance.lock:
-                delay = _remaining_ttl(instance)
+                startup_check = not instance.checked_in_process
+                delay = 0.0 if startup_check else _remaining_ttl(instance)
             if instance.stop.wait(delay):
                 return
             with instance.lock:
                 config = instance.config
             if _network_disabled(config) or not _uses_recommended_provider(config):
                 return
-            refresh_recommendations(config=config)
+            refresh_recommendations(config=config, force=startup_check)
             # A concurrently running explicit refresh may own the attempt. Do
             # not spin while it is in flight or if a clock moved backwards.
             if instance.stop.wait(1.0):

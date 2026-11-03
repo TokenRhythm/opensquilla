@@ -426,6 +426,7 @@ class GatewayModelRoutingPolicyPort:
         from opensquilla.onboarding.recommendation_policy import current_recommendation_rows
         from opensquilla.provider.recommendations import (
             get_recommendation,
+            recommendation_model_choices,
             recommendation_notified,
             start_background_recommendation_refresh,
         )
@@ -444,9 +445,11 @@ class GatewayModelRoutingPolicyPort:
                     "source": plan["source"],
                     "rows": rows,
                     "currentRows": current_rows,
+                    # Thinking controls remain in the preview and revision, but
+                    # only a change of model selection warrants an update notice.
                     "hasUpdate": plan["source"] == "remote" and (
-                        sorted(current_rows, key=lambda row: row["role"])
-                        != sorted(rows, key=lambda row: row["role"])
+                        recommendation_model_choices(current_rows)
+                        != recommendation_model_choices(rows)
                     ),
                     "notified": recommendation_notified(
                         config, provider_id, kind, plan["revision"],

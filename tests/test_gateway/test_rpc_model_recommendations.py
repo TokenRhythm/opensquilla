@@ -106,6 +106,65 @@ async def test_get_compares_canonical_rows_and_never_announces_bundled_changes(
 
 
 @pytest.mark.parametrize("kind", ["router", "ensemble"])
+async def test_thinking_only_changes_remain_reviewable_without_an_update_notice(
+    config: GatewayConfig, plans: Any, kind: str,
+) -> None:
+    from opensquilla.onboarding.recommendation_policy import current_recommendation_rows
+
+    plan = plans["tokenrhythm", kind]
+    for row in plan["rows"]:
+        row["thinkingLevel"] = "high"
+    ctx = _ctx(config)
+    await _handle_models_recommendations_apply(_params(kind), ctx)
+    saved_rows = current_recommendation_rows(ctx.config, "tokenrhythm", kind)
+    before = ctx.config.model_dump(mode="python")
+
+    plan["revision"] = "b" * 64
+    for row in plan["rows"]:
+        row["thinkingLevel"] = "low"
+    result = await _handle_models_recommendations_get({}, ctx)
+    preview = next(
+        entry for entry in result["plans"]
+        if entry["providerId"] == "tokenrhythm" and entry["kind"] == kind
+    )
+
+    assert preview["hasUpdate"] is False
+    assert preview["currentRows"] == saved_rows
+    assert preview["rows"] == plan["rows"]
+    assert preview["revision"] == "b" * 64
+    assert ctx.config.model_dump(mode="python") == before
+
+    await _handle_models_recommendations_apply(_params(kind, revision="b" * 64), ctx)
+    assert current_recommendation_rows(ctx.config, "tokenrhythm", kind) == plan["rows"]
+    reloaded = GatewayConfig.load(config.config_path)
+    assert current_recommendation_rows(reloaded, "tokenrhythm", kind) == plan["rows"]
+
+
+@pytest.mark.parametrize("kind", ["router", "ensemble"])
+@pytest.mark.parametrize("change", ["model", "provider", "role", "removed_model"])
+async def test_get_announces_changes_to_model_selection(
+    config: GatewayConfig, plans: Any, monkeypatch: pytest.MonkeyPatch, kind: str, change: str,
+) -> None:
+    current = {key: copy.deepcopy(plan["rows"]) for key, plan in plans.items()}
+    rows = current["tokenrhythm", kind]
+    if change == "role":
+        rows[0]["role"], rows[-1]["role"] = rows[-1]["role"], rows[0]["role"]
+    elif change == "removed_model":
+        rows.pop()
+    else:
+        rows[0][change] = "synthetic-previous" if change == "model" else "openrouter"
+    monkeypatch.setattr(
+        "opensquilla.onboarding.recommendation_policy.current_recommendation_rows",
+        lambda _config, provider, kind: current[provider, kind],
+    )
+
+    result = await _handle_models_recommendations_get({}, _ctx(config))
+
+    updates = [(plan["providerId"], plan["kind"]) for plan in result["plans"] if plan["hasUpdate"]]
+    assert updates == [("tokenrhythm", kind)]
+
+
+@pytest.mark.parametrize("kind", ["router", "ensemble"])
 @pytest.mark.parametrize("mode", ["direct", "router", "ensemble"])
 async def test_apply_persists_only_selected_plan_and_preserves_mode(
     config: GatewayConfig, plans: Any, kind: str, mode: str,
