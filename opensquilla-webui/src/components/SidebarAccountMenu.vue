@@ -155,14 +155,12 @@ onUnmounted(() => document.removeEventListener('pointerdown', outside))
       </div>
       <div :id="summaryId" role="presentation" class="sidebar-account__summary">
         <div class="sidebar-account__wallet">
+          <div class="sidebar-account__balance-label">
+            <span class="sidebar-account__caption" :class="{ 'is-hidden': walletStatus }">{{ t('account.available') }}</span>
+            <span class="sidebar-account__hint" :class="{ 'sidebar-account__hint--warning': (walletUnavailable || failure) && !walletLoading }" data-testid="sidebar-account-wallet-status" :role="failure && !walletLoading ? 'alert' : 'status'" :title="walletStatus || undefined">{{ walletStatus }}</span>
+          </div>
           <div class="sidebar-account__wallet-row">
-            <div class="sidebar-account__wallet-balance">
-              <div class="sidebar-account__balance-label">
-                <span class="sidebar-account__caption" :class="{ 'is-hidden': walletStatus }">{{ t('account.available') }}</span>
-                <span class="sidebar-account__hint" :class="{ 'sidebar-account__hint--warning': (walletUnavailable || failure) && !walletLoading }" data-testid="sidebar-account-wallet-status" :role="failure && !walletLoading ? 'alert' : 'status'" :title="walletStatus || undefined">{{ walletStatus }}</span>
-              </div>
-              <strong data-testid="sidebar-account-balance" :aria-busy="walletLoading" :title="balance">{{ balance }}</strong>
-            </div>
+            <strong class="sidebar-account__wallet-balance" data-testid="sidebar-account-balance" :aria-busy="walletLoading" :title="balance">{{ balance }}</strong>
             <button type="button" role="menuitem" tabindex="-1" class="sidebar-account__recharge" data-testid="sidebar-account-recharge" @click="account.openLink('recharge')">
               {{ t('account.menu.recharge') }}<span class="sidebar-account__recharge-arrow" aria-hidden="true" />
             </button>
@@ -212,13 +210,12 @@ onUnmounted(() => document.removeEventListener('pointerdown', outside))
 .sidebar-account__identity strong { font-weight: 600; }
 .sidebar-account__wallet { margin: 0 12px; padding: 8px 12px; background: var(--account-wallet-bg, var(--bg-surface-2)); border-radius: var(--radius-md); }
 .sidebar-account__caption { color: var(--text-muted); font-size: var(--fs-xs); line-height: 1.5; }
-.sidebar-account__wallet-row { display: flex; flex-wrap: wrap; align-items: center; gap: 4px 8px; }
-.sidebar-account__wallet-balance { display: flex; flex: 1 1 6rem; flex-direction: column; gap: 4px; min-width: 0; }
+.sidebar-account__wallet-row { display: flex; flex-wrap: wrap; align-items: center; gap: 4px 8px; margin-top: 4px; }
 /* Keep room for the translated caption while refresh status occupies its place. */
 .sidebar-account__balance-label { display: grid; grid-template-columns: minmax(0, 1fr); line-height: 18px; }
 .sidebar-account__balance-label > span { grid-area: 1 / 1; align-self: start; }
 .sidebar-account__balance-label .is-hidden { visibility: hidden; }
-.sidebar-account__wallet-balance strong { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: var(--fs-md); line-height: 24px; font-weight: 600; font-variant-numeric: tabular-nums; }
+.sidebar-account__wallet-balance { max-width: 100%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: var(--fs-md); line-height: 24px; font-weight: 600; font-variant-numeric: tabular-nums; }
 .sidebar-account__menu button { display: flex; align-items: center; border: 0; background: transparent; color: var(--text); border-radius: var(--radius-sm); cursor: pointer; font: inherit; text-align: left; }
 .sidebar-account__menu button:disabled { opacity: .5; cursor: default; }
 .sidebar-account__menu button:not(:disabled):hover { background: var(--bg-hover); }
