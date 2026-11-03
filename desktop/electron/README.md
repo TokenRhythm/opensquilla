@@ -219,13 +219,22 @@ After a matching successful Gateway build, use
 `npm run dist:local:test:prepared` to rebuild only the desktop shell and installer.
 Windows test packaging runs on Windows, targets x64 NSIS and is unsigned.
 The `Windows Test Installer` workflow builds the same package on Windows
-when a `test-windows-*` tag is pushed. It uploads `windows-uat-test-installer`
-without creating a GitHub Release or accessing the release signing environment.
-Use a `test-windows-production-*` tag for a production-origin test installer;
-its artifact is `windows-production-test-installer`. Other `test-windows-*`
-tags retain UAT. Manual dispatch also offers an `account_environment` choice
-once the workflow is on the default branch.
-After building, a small Linux job mirrors the installer and its SHA256 file to
+when manually dispatched or when a `test-windows-*` tag is pushed. Manual dispatch
+defaults to `account_environment: auto`: the default branch (`main`) builds and
+verifies UAT first, then builds a production-origin test installer after the UAT
+pipeline succeeds. Other branches default to UAT only. A
+`test-windows-production-*` tag also runs UAT followed by production; other
+`test-windows-*` tags build UAT only. Explicit `uat` selects only UAT, while
+explicit `production` always requires the UAT pipeline to succeed first.
+Both environments use the same source commit. A UAT failure or cancellation
+prevents production from starting. The gate covers package construction and
+verification, not live account/API testing; use the production test installer
+for actual production-environment trials.
+The artifacts are `windows-uat-test-installer` and
+`windows-production-test-installer`, with separate filenames and download links.
+These builds do not create a GitHub Release or access the release signing
+environment, and ordinary pushes to `main` do not trigger test installers.
+After each build, a small Linux job mirrors the installer and its SHA256 file to
 the existing OSS bucket under `releases/test/windows/<run-id>-<attempt>/`
 (respecting `ALIYUN_OSS_PREFIX`). Its job summary includes verified public
 download links. It reuses the release mirror's OSS variables and secrets;

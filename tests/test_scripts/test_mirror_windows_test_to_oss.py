@@ -157,7 +157,7 @@ def test_cleanup_failure_preserves_download_links_and_reports_warning(
 
 def test_workflow_only_mirrors_successful_build_and_keeps_credentials_in_upload_step():
     workflow = yaml.safe_load(
-        Path(".github/workflows/windows-test-installer.yml").read_text(encoding="utf-8")
+        Path(".github/workflows/windows-test-installer-build.yml").read_text(encoding="utf-8")
     )
     job = workflow["jobs"]["mirror-to-oss"]
     assert job["needs"] == "build"
@@ -177,7 +177,42 @@ def test_workflow_only_mirrors_successful_build_and_keeps_credentials_in_upload_
         if step.get("uses", "").startswith("actions/upload-artifact@")
     )
     assert artifact_upload["with"]["name"] == "${{ steps.target.outputs.artifact_name }}"
-    assert "test-windows-production-" in build["env"]["OPENSQUILLA_TEST_ENVIRONMENT"]
+    assert build["env"]["OPENSQUILLA_TEST_ENVIRONMENT"] == "${{ inputs.account_environment }}"
+    target = next(step for step in build["steps"] if step.get("id") == "target")
+    assert "Account environment must be uat or production" in target["run"]
+    checkout = next(
+        step for step in job["steps"] if step.get("uses", "").startswith("actions/checkout@")
+    )
+    assert checkout["with"]["ref"] == "${{ github.sha }}"
     upload = job["steps"][-1]
     assert "mirror-windows-test-to-oss.py" in upload["run"]
     assert "secrets.ALIYUN_OSS_ACCESS_KEY_SECRET" in upload["env"]["OSS_ACCESS_KEY_SECRET"]
+
+
+def test_production_test_installer_requires_successful_uat_from_the_same_workflow():
+    workflow = yaml.safe_load(
+        Path(".github/workflows/windows-test-installer.yml").read_text(encoding="utf-8")
+    )
+    # PyYAML's YAML 1.1 loader treats the GitHub Actions `on` key as True.
+    triggers = workflow[True]
+    assert triggers["push"] == {"tags": ["test-windows-*"]}
+    selection = triggers["workflow_dispatch"]["inputs"]["account_environment"]
+    assert selection["default"] == "auto"
+    assert selection["options"] == ["auto", "uat", "production"]
+    jobs = workflow["jobs"]
+    uat = jobs["build-uat"]
+    production = jobs["build-production"]
+    assert uat["needs"] == "resolve"
+    assert production["needs"] == ["resolve", "build-uat"]
+    # Keep the implicit success() guard: a failed/skipped/cancelled UAT must block production.
+    assert production["if"] == "needs.resolve.outputs.account_environment == 'production'"
+    assert (
+        uat["uses"] == production["uses"] == "./.github/workflows/windows-test-installer-build.yml"
+    )
+    assert uat["with"] == {"account_environment": "uat"}
+    assert production["with"] == {"account_environment": "production"}
+    for job in (uat, production):
+        assert job["secrets"] == {
+            "ALIYUN_OSS_ACCESS_KEY_ID": "${{ secrets.ALIYUN_OSS_ACCESS_KEY_ID }}",
+            "ALIYUN_OSS_ACCESS_KEY_SECRET": "${{ secrets.ALIYUN_OSS_ACCESS_KEY_SECRET }}",
+        }
