@@ -16,14 +16,20 @@ The ONNX file and 2,695-byte scaler are ordinary binary Git resources.
 `assets/intent/golden_vectors.json` records synthetic source-runtime input
 hashes and exact quantized-candidate outputs. These are not FP32 equivalence
 claims: the experiment's original FP32 logit tolerance was not met.
-The six candidate cases also include separately measured AVX2 and Apple M5 ARM64
-probability vectors under ORT 1.24.4, CPU-only, one intra/inter-op thread and
-`session.x64quantprecision=1`. Repeated runs reproduced these vectors exactly.
-Tests require a measured vector within 1e-6, identical prepared-input hashes,
-and unchanged intent labels and final policy decisions. This avoids a broad
-probability tolerance: the maximum native-reference differences were 0.0061261
-on AVX2 and 0.080843 on ARM64. These finite fixtures do not guarantee identical
-probabilities or accuracy on arbitrary inputs or unmeasured CPU implementations.
+The six candidate cases also include separately measured AVX2, Apple M5 and
+Apple M1 (Virtual) ARM64 probability vectors under ORT 1.24.4, CPU-only, one
+intra/inter-op thread and `session.x64quantprecision=1`. M5 and AVX2 repeated
+runs reproduced their vectors exactly. The complete M1 matrix was captured on
+macOS 26.6.2 with numpy 2.5.3 in
+[CI job 125986706486](https://github.com/TokenRhythm/opensquilla/actions/runs/41655999956/job/125986706486).
+It differs from both M5 and the original source, despite identical input hashes.
+Tests require the entire six-case matrix to match one measured kernel profile
+within 1e-6; they do not equate ARM64 with a single CPU implementation or select
+a different profile per case. Prepared-input hashes, intent labels and final
+policy decisions remain strict. Maximum native-reference differences were
+0.0061261 on AVX2, 0.080843 on M5 and 0.045091 on M1. These finite fixtures do
+not guarantee identical probabilities or accuracy on arbitrary inputs or
+unmeasured CPU implementations.
 `assets/source_parity_cases.json` and `runtime_compatibility.json` retain the
 historical LightGBM pair measurements below; their intent distributions are
 historical only. The tier fixtures, weights, feature pipeline and calibration

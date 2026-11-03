@@ -170,6 +170,25 @@ def test_full_features_and_outputs_match_frozen_source(model):
         (default_model_root() / "intent/golden_vectors.json").read_text(encoding="utf-8")
     )["cases"]}
     predictions = {case["name"]: model.predict(case["input"]) for case in reference["cases"]}
+    profile_names = ("arm64", "arm64_m1") if arm64 else ("native", "x86_avx2")
+
+    def profile_probabilities(profile, name):
+        golden = intents[name]
+        return (golden["probabilities"] if profile == "native"
+                else golden["runtime_probabilities"][profile])
+
+    # One measured kernel profile must explain the whole six-case matrix.
+    # Architecture alone does not identify the ARM implementation (M1 vs M5).
+    profile_errors = {
+        profile: max(
+            abs(prediction.intent_probabilities[label]
+                - profile_probabilities(profile, name)[label])
+            for name, prediction in predictions.items()
+            for label in prediction.intent_probabilities
+        )
+        for profile in profile_names
+    }
+    selected_profile = min(profile_errors, key=profile_errors.__getitem__)
     processor = platform.processor()
     if platform.system() == "Darwin":
         processor = subprocess.run(
@@ -180,6 +199,7 @@ def test_full_features_and_outputs_match_frozen_source(model):
     print("BERT intent runtime evidence: " + json.dumps({
         "machine": platform.machine(), "platform": platform.platform(), "processor": processor,
         "runtime_versions": model.identity["runtime_versions"],
+        "selected_profile": selected_profile, "profile_max_errors": profile_errors,
         "cases": {name: prediction.intent_probabilities
                   for name, prediction in predictions.items()},
     }, sort_keys=True))
@@ -211,18 +231,10 @@ def test_full_features_and_outputs_match_frozen_source(model):
             values = getattr(prediction, target + "_probabilities")
             expected = intent_expected if target == "intent" else case["tier_probabilities"]
             if target == "intent":
-                # Match a measured candidate vector, not a wide cross-CPU range.
-                profiles = intents[case["name"]]["runtime_probabilities"]
-                candidates = ([profiles["arm64"]] if arm64
-                              else [intent_expected, profiles["x86_avx2"]])
-                closest = min(
-                    candidates, key=lambda candidate: max(
-                        abs(values[label] - candidate[label]) for label in values
-                    ),
-                )
+                measured = profile_probabilities(selected_profile, case["name"])
                 np.testing.assert_allclose(
-                    list(values.values()), [closest[label] for label in values],
-                    rtol=0, atol=1e-6, err_msg=case["name"],
+                    list(values.values()), [measured[label] for label in values],
+                    rtol=0, atol=1e-6, err_msg=f'{case["name"]} ({selected_profile})',
                 )
             else:
                 np.testing.assert_allclose(
@@ -425,14 +437,13 @@ def test_predict_reuses_numeric88_for_long_json(model, monkeypatch):
 
     monkeypatch.setattr(lightgbm380, "extract_numeric88", extract_once)
     monkeypatch.setattr(numeric, "extract_numeric88", extract_once)
-    router_input = {
-        "current_request": json.dumps([{"name": "item", "value": index} for index in range(1200)]),
-    }
+    # Empty objects expose the full-text regex scan that previously ran twice.
+    router_input = {"current_request": "Inspect this JSON: " + json.dumps([{}] * 9600)}
     prediction = model.predict(router_input)
-    assert len(router_input["current_request"]) > 38_000
+    assert len(router_input["current_request"]) == 38_419
     assert len(calls) == 1
     assert prediction.intent_decision == "new_task"
-    assert prediction.tier_decision == "C1"
+    assert prediction.tier_decision == "C0"
 
 
 def test_tier_only_prediction_survives_broken_intent(model, monkeypatch):

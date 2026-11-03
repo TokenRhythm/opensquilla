@@ -16,7 +16,7 @@ from pathlib import Path
 from typing import Any
 
 MODEL_SET_ID = "router-bert60-int8-intent-lightgbm-tier-v1"
-MANIFEST_HASH = "sha256:fd12bd784933733f6cc8bf82b414d88d07a6b0bb1a4cb79b9de251c794664fb4"
+MANIFEST_HASH = "sha256:c4f351198392e17019255679d37cf5b5980570b1208c174056760da618f0b958"
 _LEGACY_MANIFEST_HASH = "sha256:29fb79337458c4f35d3e0d1148fbdb1175c20069a5fa8ee6441633b0e2eee357"
 FEATURE_SCHEMA_VERSION = "lightgbm_380.v1"
 INTENT_LABELS = ("new_task", "continue", "redo")

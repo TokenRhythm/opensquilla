@@ -18,7 +18,7 @@ class AssetBudget:
 # The mandatory router bundle uses a quantized BERT intent head and LightGBM tier head.
 # Its artifact manifest records 76,723,309 resource bytes plus 3,803 manifest
 # bytes. Keep this fixed allowance separate from candidate sizes and shared BGE assets.
-LIGHTGBM_ASSET_ALLOWANCE = 76_727_112
+LIGHTGBM_ASSET_ALLOWANCE = 76_728_123
 
 
 ASSET_BUDGETS: dict[str, tuple[AssetBudget, ...]] = {

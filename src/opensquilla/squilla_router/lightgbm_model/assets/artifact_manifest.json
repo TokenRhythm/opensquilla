@@ -4,7 +4,7 @@
     {
       "path": "bundles/intent.json",
       "size_bytes": 1407,
-      "sha256": "2a3bc063aafd9e1ca4452a99203140f81bf145916890ace6c94bde2106308b7c"
+      "sha256": "e2673a3aaeacb4bc04bb8e4e40aa1fb745445a4277ffdfc422c31d481745781b"
     },
     {
       "path": "bundles/tier.json",
@@ -18,8 +18,8 @@
     },
     {
       "path": "intent/golden_vectors.json",
-      "size_bytes": 5255,
-      "sha256": "4ba69bfaa94ff38270b960a989cb9da01783108787ebf0fe66f617bb18d63923"
+      "size_bytes": 6266,
+      "sha256": "1d662d4fe07b912dbea4cc0a5c6f874ca1303736cf21222d226f74aac1e7c738"
     },
     {
       "path": "intent/model.int8.onnx",
@@ -34,7 +34,7 @@
     {
       "path": "model_manifest.json",
       "size_bytes": 6947,
-      "sha256": "fd12bd784933733f6cc8bf82b414d88d07a6b0bb1a4cb79b9de251c794664fb4"
+      "sha256": "c4f351198392e17019255679d37cf5b5980570b1208c174056760da618f0b958"
     },
     {
       "path": "preprocess/feature/artifacts/feature_recipe.json",
