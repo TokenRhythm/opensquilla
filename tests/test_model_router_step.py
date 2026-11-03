@@ -91,6 +91,32 @@ async def test_model_policy_bypasses_legacy_complaint_confidence_and_context_rul
     )
 
 
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("previous,event", [(None, None), (None, "redo"), ("c2", "new_task")])
+async def test_known_new_task_routes_with_healthy_tier_when_intent_head_is_broken(
+    monkeypatch, previous, event
+):
+    class TierOnlyClassifier(Classifier):
+        def predict(self, value):
+            raise RuntimeError("BERT intent head unavailable")
+
+        def predict_tier(self, value):
+            self.inputs.append(deepcopy(value))
+            return {"tier_probabilities": {"c0": 1.0, "c1": 0.0, "c2": 0.0, "c3": 0.0}}
+
+    model = TierOnlyClassifier()
+    install(monkeypatch, model)
+    ctx = context(state=ModelPolicyState(previous) if previous else None)
+    ctx.metadata["router_model_control_event"] = event
+    result = await squilla_router.apply_squilla_router(ctx)
+    decision = result.metadata["router_model_decision"]["decision"]
+    assert result.metadata["routed_tier"] == "c0"
+    assert decision["intent"] == "new_task"
+    assert decision["intent_audit"]["run_status"] == "not_run"
+    assert decision["tier_audit"]["source"] == "classifier"
+    assert len(model.inputs) == 1
+
 @pytest.mark.asyncio
 async def test_replay_keeps_same_decision_without_predicting_or_redo_twice(monkeypatch):
     model = Classifier("redo")

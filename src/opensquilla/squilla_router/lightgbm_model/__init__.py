@@ -1,4 +1,4 @@
-"""The hash-pinned LightGBM intent/tier pair used by the model tier policy."""
+"""The hash-pinned BERT intent and LightGBM tier models used by the model policy."""
 
 from .model import (
     MANIFEST_HASH,

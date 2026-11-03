@@ -47,6 +47,14 @@ is required. Dream's preview and memory-writing behavior are unchanged.
 
 ## Upgrading to the Model Policy
 
+The BERT intent upgrade replaces the former LightGBM intent bundle. If you set
+`squilla_router.lightgbm_model_dir` to a copy of the old bundle, remove that setting
+to use the packaged models, or replace the entire external directory with the
+current verified BERT intent + LightGBM tier bundle (including its shared BGE
+resources). Mixing old manifests with new weights is not supported. A recognized
+old bundle produces this migration guidance at startup; it is never loaded
+silently or substituted without changing your explicit setting.
+
 Saved `strategy = "v4_phase3"` configurations now load as `lightgbm_model`.
 An omitted strategy also selects the new default. An explicitly disabled router
 stays disabled. Check custom ladders and budget expectations before enabling the

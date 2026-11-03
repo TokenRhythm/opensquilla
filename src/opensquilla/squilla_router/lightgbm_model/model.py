@@ -17,6 +17,7 @@ from typing import Any
 
 MODEL_SET_ID = "router-bert60-int8-intent-lightgbm-tier-v1"
 MANIFEST_HASH = "sha256:fd12bd784933733f6cc8bf82b414d88d07a6b0bb1a4cb79b9de251c794664fb4"
+_LEGACY_MANIFEST_HASH = "sha256:29fb79337458c4f35d3e0d1148fbdb1175c20069a5fa8ee6441633b0e2eee357"
 FEATURE_SCHEMA_VERSION = "lightgbm_380.v1"
 INTENT_LABELS = ("new_task", "continue", "redo")
 TIER_LABELS = ("C0", "C1", "C2", "C3")
@@ -57,7 +58,15 @@ def _verified_artifacts(model_root: str | Path | None) -> tuple[dict[str, Any], 
     )
     try:
         manifest_bytes = (root / "model_manifest.json").read_bytes()
-        if _hash(manifest_bytes) != MANIFEST_HASH:
+        manifest_hash = _hash(manifest_bytes)
+        if manifest_hash != MANIFEST_HASH:
+            if root != default_model_root() and manifest_hash == _LEGACY_MANIFEST_HASH:
+                raise LightGBMModelError(
+                    "squilla_router.lightgbm_model_dir contains the retired LightGBM intent "
+                    "bundle. Remove squilla_router.lightgbm_model_dir to use the packaged "
+                    "BERT intent model, or replace the entire directory with the current "
+                    "verified BERT intent + LightGBM tier bundle."
+                )
             raise LightGBMModelError("bundled LightGBM model manifest hash mismatch")
         manifest = json.loads(manifest_bytes)
         if (
@@ -277,12 +286,9 @@ class LightGBMRouterModel:
                 "cannot load bundled LightGBM runtime; install recommended dependencies"
             ) from exc
 
-    def _build_features(self, router_input: Mapping[str, Any]) -> Any:
-        from .input_contract import RouterInput
-
+    def _build_features(self, canonical: Mapping[str, Any]) -> Any:
         if self._closed:
             raise LightGBMInferenceError("LightGBM router model is closed")
-        canonical = RouterInput.model_validate(router_input).model_dump(mode="json")
         features = self._featurizer.transform_row({"input": canonical})
         if features.shape != (380,) or not self._np.isfinite(features).all():
             raise LightGBMInferenceError("LightGBM feature contract was violated")
@@ -290,17 +296,21 @@ class LightGBMRouterModel:
 
     def build_features(self, router_input: Mapping[str, Any]) -> Any:
         """Return the exact float32[380] feature vector for parity inspection."""
+        from .input_contract import RouterInput
+
         with self._lock:
             try:
-                return self._build_features(router_input).copy()
+                canonical = RouterInput.model_validate(router_input).model_dump(mode="json")
+                return self._build_features(canonical).copy()
             except (LightGBMModelError, LightGBMInferenceError):
                 raise
             except Exception as exc:
                 raise LightGBMInferenceError("LightGBM feature extraction failed") from exc
 
-    def _intent_features(self, canonical: Mapping[str, Any]) -> dict[str, Any]:
-        """Reproduce bert_text88_runtime.v1 using the shared frozen tokenizer."""
-        from ._vendor.features.numeric import extract_numeric88
+    def _intent_features(
+        self, canonical: Mapping[str, Any], tier_features: Any,
+    ) -> dict[str, Any]:
+        """Reuse tier numeric88 and reproduce the frozen BERT text contract."""
         from ._vendor.features.runtime import _tokenizer_content_ids
         from ._vendor.features.text import (
             SEGMENT_KINDS,
@@ -324,10 +334,12 @@ class LightGBMRouterModel:
             sequence = [encoder.cls_token_id, *content, encoder.sep_token_id]
             ids[0, index, :len(sequence)] = sequence
             mask[0, index, :len(sequence)] = 1
-        numeric = np.asarray(
-            self._intent_scaler.transform(extract_numeric88(canonical).reshape(1, -1)),
-            dtype=np.float32,
-        )
+        # The frozen 380-vector embeds rules48, route-history16, then
+        # previous-signals19 + context5 in the original numeric88 order.
+        numeric = np.concatenate((
+            tier_features[164:212], tier_features[276:292], tier_features[356:380],
+        )).reshape(1, 88)
+        numeric = np.asarray(self._intent_scaler.transform(numeric), dtype=np.float32)
         numeric = np.clip(numeric, -5.0, 5.0).astype(np.float32, copy=False)
         if numeric.shape != (1, 88) or not np.isfinite(numeric).all():
             raise LightGBMInferenceError("BERT numeric feature contract was violated")
@@ -355,6 +367,28 @@ class LightGBMRouterModel:
             )[0]
             return dict(zip(TIER_LABELS, map(float, calibrated), strict=True))
 
+    def predict_tier(self, router_input: Mapping[str, Any]) -> dict[str, Any]:
+        """Classify a known new task without executing the intent model."""
+        from .input_contract import RouterInput
+
+        with self._lock:
+            try:
+                canonical = RouterInput.model_validate(router_input).model_dump(mode="json")
+                features = self._build_features(canonical)
+                tier = self.predict_tier_features(features)
+                return {
+                    "tier_probabilities": tier,
+                    "tier_decision": max(TIER_LABELS, key=tier.__getitem__),
+                    "feature_vector_hash": _hash(
+                        features.astype("<f4", copy=False).tobytes(order="C"),
+                    ),
+                    "identity": dict(self.identity),
+                }
+            except (LightGBMModelError, LightGBMInferenceError):
+                raise
+            except Exception as exc:
+                raise LightGBMInferenceError("Model-policy tier inference failed") from exc
+
     def predict(self, router_input: Mapping[str, Any]) -> LightGBMPrediction:
         from .calibration import apply_temperature
         from .input_contract import RouterInput
@@ -365,7 +399,9 @@ class LightGBMRouterModel:
                 features = self._build_features(canonical)
                 assert self._intent_session is not None
                 logits = self._np.asarray(
-                    self._intent_session.run(["logits"], self._intent_features(canonical))[0],
+                    self._intent_session.run(
+                        ["logits"], self._intent_features(canonical, features),
+                    )[0],
                     dtype=self._np.float64,
                 )
                 if logits.shape != (1, 3) or not self._np.isfinite(logits).all():
