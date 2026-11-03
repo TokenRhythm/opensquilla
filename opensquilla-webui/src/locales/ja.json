@@ -1497,6 +1497,9 @@
       "recommendations": {
         "router": "推奨ルーティング",
         "ensemble": "推奨アンサンブル",
+        "updateAvailable": "新しい推奨プラン",
+        "previewRouter": "モデル階層をプレビューし、確認後に置き換えます。現在のモードは維持します。",
+        "previewEnsemble": "候補モデルと集約モデルをプレビューし、確認後に置き換えます。現在のモードは維持します。",
         "available": "{provider} の新しい{kind}があります。",
         "unchanged": "置き換えを確認するまで、現在の設定は変わりません。",
         "title": "{provider} の{kind}を使用しますか？",

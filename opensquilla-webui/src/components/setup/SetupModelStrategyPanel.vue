@@ -1,11 +1,12 @@
 <script setup lang="ts">
 import ControlSelect from '@/components/ControlSelect.vue'
-import { computed, nextTick, onBeforeUnmount, ref, useId, watch } from 'vue'
+import { computed, nextTick, onBeforeUnmount, ref, watch } from 'vue'
 import { useI18n } from 'vue-i18n'
 import Icon from '@/components/Icon.vue'
 import SetupModelCapacity from '@/components/setup/SetupModelCapacity.vue'
 import SetupModelIdentity from '@/components/setup/SetupModelIdentity.vue'
 import SetupModelCombobox from '@/components/setup/SetupModelCombobox.vue'
+import SetupModelRecommendation from '@/components/setup/SetupModelRecommendation.vue'
 import SetupTierTable from '@/components/setup/SetupTierTable.vue'
 import type { ModelRecommendation } from '@/modules/providerConfiguration'
 import { useDocumentEvent } from '@/composables/useDocumentEvent'
@@ -147,7 +148,6 @@ const emit = defineEmits<{
   resetRecommendedEnsemble: []
 }>()
 
-const resetHelpId = `router-reset-help-${useId()}`
 const bindingLabel = computed(() => t(
   props.panel.routingSummary?.binding === 'follow_primary' ? 'setup.modelStrategy.bindingFollowPrimary'
     : props.panel.routingSummary?.binding === 'custom' ? 'setup.modelStrategy.bindingCustom'
@@ -851,26 +851,21 @@ function credentialLabel(candidate: EnsembleCandidateView): string {
             {{ t('setup.modelStrategy.retainedDrafts') }}
           </p>
         </div>
-        <div v-if="panel.routingSummary.recommendedProviderId" class="setup-model-strategy__reset">
-          <button
-            type="button"
-            class="btn btn--ghost"
-            data-testid="router-reset-recommended"
-            :disabled="Boolean(panel.routingSummary.resetDisabledReason) || panel.routingSummary.resetPending || routingModeBusy"
-            :aria-busy="panel.routingSummary.resetPending ? 'true' : undefined"
-            :aria-describedby="resetHelpId"
-            @click="requestRecommendedReset"
-          >
-            <Icon name="refresh" :size="15" aria-hidden="true" />
-            {{ t(panel.routingSummary.resetPending ? 'setup.modelStrategy.resettingRecommended' : 'setup.modelStrategy.resetRecommended', { provider: panel.routingSummary.recommendedProviderLabel }) }}
-          </button>
-          <p :id="resetHelpId">{{ panel.routingSummary.resetDisabledReason || t(panel.routingSummary.enabled ? 'setup.modelStrategy.resetKeepsMode' : 'setup.modelStrategy.resetKeepsOff') }}</p>
-        </div>
       </section>
-      <div v-if="showRouterDetails && routerRecommendation?.hasUpdate" class="setup-model-strategy__recommendation-notice" data-testid="router-recommendation-update" role="status">
-        <p>{{ t('setup.modelStrategy.recommendations.available', { provider: panel.routingSummary?.recommendedProviderLabel, kind: t('setup.modelStrategy.recommendations.router') }) }}</p>
-        <p>{{ t('setup.modelStrategy.recommendations.unchanged') }}</p>
-      </div>
+      <SetupModelRecommendation
+        v-if="showRouterDetails && panel.routingSummary?.recommendedProviderId"
+        kind="router"
+        :provider="panel.routingSummary.recommendedProviderLabel"
+        :has-update="routerRecommendation?.hasUpdate"
+        :disabled="routingModeBusy"
+        :busy="panel.routingSummary.resetPending"
+        :disabled-reason="panel.routingSummary.resetDisabledReason"
+        :help-text="t(routerRecommendation ? 'setup.modelStrategy.recommendations.previewRouter' : panel.routingSummary.enabled ? 'setup.modelStrategy.resetKeepsMode' : 'setup.modelStrategy.resetKeepsOff')"
+        :action-label="routerRecommendation ? undefined : t(panel.routingSummary.resetPending ? 'setup.modelStrategy.resettingRecommended' : 'setup.modelStrategy.resetRecommended', { provider: panel.routingSummary.recommendedProviderLabel })"
+        action-test-id="router-reset-recommended"
+        update-test-id="router-recommendation-update"
+        @review="requestRecommendedReset"
+      />
       <p v-if="showRouterDetails && panel.routingSummary?.crossProviderEnabled" class="setup-model-strategy__hint" data-testid="routing-cross-provider-enabled">
         {{ t('setup.modelStrategy.crossProviderNotice') }}
       </p>
@@ -983,11 +978,17 @@ function credentialLabel(candidate: EnsembleCandidateView): string {
         <p class="setup-model-strategy__hint" data-testid="ensemble-candidate-image-hint">
           {{ t('setup.modelStrategy.candidateModelHint') }}
         </p>
-        <div v-if="ensembleRecommendation" class="setup-model-strategy__recommendation-notice" data-testid="ensemble-recommendation">
-          <p v-if="ensembleRecommendation.hasUpdate" role="status">{{ t('setup.modelStrategy.recommendations.available', { provider: displayProvider(ensembleRecommendation.providerId), kind: t('setup.modelStrategy.recommendations.ensemble') }) }}</p>
-          <p>{{ t('setup.modelStrategy.recommendations.unchanged') }}</p>
-          <button type="button" class="btn btn--ghost" data-testid="ensemble-use-recommended" :disabled="routingModeBusy" @click="emit('resetRecommendedEnsemble')">{{ t('setup.modelStrategy.recommendations.useEnsemble', { provider: displayProvider(ensembleRecommendation.providerId) }) }}</button>
-        </div>
+        <SetupModelRecommendation
+          v-if="ensembleRecommendation"
+          kind="ensemble"
+          :provider="displayProvider(ensembleRecommendation.providerId)"
+          :has-update="ensembleRecommendation.hasUpdate"
+          :disabled="routingModeBusy"
+          :help-text="t('setup.modelStrategy.recommendations.previewEnsemble')"
+          action-test-id="ensemble-use-recommended"
+          data-testid="ensemble-recommendation"
+          @review="emit('resetRecommendedEnsemble')"
+        />
         <div
           v-if="panel.ensemble.schemeCardsAvailable && ensembleScheme !== 'legacy'"
           class="setup-model-strategy__schemes"
@@ -1825,16 +1826,6 @@ function credentialLabel(candidate: EnsembleCandidateView): string {
 </template>
 
 <style scoped>
-.setup-model-strategy__recommendation-notice {
-  margin: var(--sp-3) 0;
-  padding: var(--sp-3);
-  border-left: 3px solid var(--accent);
-  background: var(--bg-hover);
-  color: var(--text-muted);
-  font-size: var(--fs-sm);
-  line-height: 1.6;
-}
-.setup-model-strategy__recommendation-notice p { margin: 0 0 var(--sp-1); }
 .setup-model-strategy {
   container: model-strategy-panel / inline-size;
   gap: var(--sp-3);
@@ -1859,8 +1850,7 @@ function credentialLabel(candidate: EnsembleCandidateView): string {
   margin: 0;
 }
 .setup-model-strategy__saved-facts dl > div { min-width: 0; }
-.setup-model-strategy__saved-facts dt,
-.setup-model-strategy__reset p {
+.setup-model-strategy__saved-facts dt {
   color: var(--text-muted);
   font-size: var(--fs-xs);
   line-height: 1.5;
@@ -1875,12 +1865,9 @@ function credentialLabel(candidate: EnsembleCandidateView): string {
 .setup-model-strategy__draft { font-size: var(--fs-xs); margin: var(--sp-2) 0 0; overflow-wrap: anywhere; }
 .setup-model-strategy__binding { color: var(--text-muted); }
 .setup-model-strategy__draft { color: var(--accent); }
-.setup-model-strategy__reset { flex: 0 1 300px; min-width: 0; }
-.setup-model-strategy__reset .btn { height: auto; text-align: start; white-space: normal; overflow-wrap: anywhere; }
-.setup-model-strategy__reset p { margin: var(--sp-1) 0 0; }
 @container model-strategy-panel (max-width: 640px) {
   .setup-model-strategy__saved-summary { align-items: stretch; flex-direction: column; }
-  .setup-model-strategy__saved-facts, .setup-model-strategy__reset { flex-basis: auto; }
+  .setup-model-strategy__saved-facts { flex-basis: auto; }
 }
 
 .setup-model-strategy__page-head {
