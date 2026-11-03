@@ -320,6 +320,9 @@ async def test_task_runtime_settles_only_after_working_version_result(
     from opensquilla.session.models import AgentTaskStatus
 
     env = workspace_turn
+    # Real SQLite commits can take seconds on shared Windows runners.
+    # Events below prove ordering; this budget only bounds a hung test.
+    io_timeout = 30.0
     after_done, release_finalizer = asyncio.Event(), asyncio.Event()
     done_observed = asyncio.Event()
     emitted = []
@@ -373,17 +376,17 @@ async def test_task_runtime_settles_only_after_working_version_result(
     assert "generated_artifact_adopter" not in envelope.runtime_services
     handle = await runtime.enqueue(envelope, "Update the heading color")
     try:
-        await asyncio.wait_for(after_done.wait(), timeout=2)
-        await asyncio.wait_for(done_observed.wait(), timeout=2)
+        await asyncio.wait_for(after_done.wait(), timeout=io_timeout)
+        await asyncio.wait_for(done_observed.wait(), timeout=io_timeout)
         assert observations == [("session.event.done", 1)]
         running = await env.storage.get_agent_task(handle.task_id)
         assert running.status == AgentTaskStatus.RUNNING
         assert TURN_COMMITTED_EVENT not in [name for name, _ in emitted]
         release_finalizer.set()
-        record = await runtime.wait(handle.task_id, timeout=2)
+        record = await runtime.wait(handle.task_id, timeout=io_timeout)
     finally:
         release_finalizer.set()
-        await runtime.shutdown(cancel=False, timeout=2)
+        await runtime.shutdown(cancel=False, timeout=io_timeout)
 
     names = [name for name, _ in emitted]
     durable = await env.storage.get_agent_task(handle.task_id)
