@@ -1598,6 +1598,9 @@
       "recommendations": {
         "router": "recommended routing",
         "ensemble": "recommended ensemble",
+        "updateAvailable": "New recommendation",
+        "previewRouter": "Preview the model tiers, then confirm to replace them; keep the current mode.",
+        "previewEnsemble": "Preview the proposer and aggregator models, then confirm to replace them; keep the current mode.",
         "available": "New {kind} available for {provider}.",
         "unchanged": "Your current configuration stays unchanged until you confirm a replacement.",
         "title": "Use {provider} {kind}?",

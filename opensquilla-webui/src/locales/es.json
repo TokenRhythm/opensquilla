@@ -1497,6 +1497,9 @@
       "recommendations": {
         "router": "configuración de rutas recomendada",
         "ensemble": "configuración de fusión recomendada",
+        "updateAvailable": "Nueva recomendación",
+        "previewRouter": "Revisa los niveles de modelos y confirma su reemplazo; se conserva el modo actual.",
+        "previewEnsemble": "Revisa los modelos proponentes y agregador y confirma su reemplazo; se conserva el modo actual.",
         "available": "Nueva {kind} disponible para {provider}.",
         "unchanged": "La configuración actual no cambia hasta que confirmes el reemplazo.",
         "title": "¿Usar la {kind} de {provider}?",

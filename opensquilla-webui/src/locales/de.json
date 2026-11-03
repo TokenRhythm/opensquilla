@@ -1497,6 +1497,9 @@
       "recommendations": {
         "router": "Routing-Empfehlung",
         "ensemble": "Ensemble-Empfehlung",
+        "updateAvailable": "Neue Empfehlung",
+        "previewRouter": "Modellstufen prüfen und den Ersatz bestätigen; der aktuelle Modus bleibt erhalten.",
+        "previewEnsemble": "Vorschlags- und Aggregatormodelle prüfen und den Ersatz bestätigen; der aktuelle Modus bleibt erhalten.",
         "available": "Neue {kind} für {provider} verfügbar.",
         "unchanged": "Die aktuelle Konfiguration bleibt bis zur Bestätigung unverändert.",
         "title": "{kind} von {provider} verwenden?",

@@ -1969,7 +1969,9 @@ describe('saved routing summary and recommended recovery', () => {
       routingSummary: { ...summary, providerId, providerLabel, recommendedProviderId: providerId, recommendedProviderLabel: providerLabel },
     })
     expect(el.querySelector('[data-testid="routing-saved-summary"]')?.textContent).toContain(providerLabel)
-    expect(el.querySelector('[data-testid="router-reset-recommended"]')?.textContent).toContain(providerLabel)
+    const action = el.querySelector('[data-testid="router-reset-recommended"]')!
+    expect(action.textContent).toContain(`Use ${providerLabel} recommended tiers`)
+    expect(action.closest('.model-recommendation')?.textContent).toContain(providerLabel)
     app.unmount()
   })
 
@@ -2028,5 +2030,52 @@ describe('saved routing summary and recommended recovery', () => {
     const { app, el } = await mountPanel({ routingSummary: summary }, { routingModeBusy: true })
     expect(el.querySelector<HTMLButtonElement>('[data-testid="router-reset-recommended"]')?.disabled).toBe(true)
     app.unmount()
+  })
+
+  it.each(['router', 'ensemble'] as const)('reviews the %s recommendation through the same entry without changing mode', async kind => {
+    const onResetRecommendedRouter = vi.fn()
+    const onResetRecommendedEnsemble = vi.fn()
+    const onUpdateStrategy = vi.fn()
+    const recommendation = {
+      providerId: 'tokenrhythm', kind, revision: 'synthetic-revision',
+      source: 'bundled', rows: [], currentRows: [], hasUpdate: true, notified: false,
+    }
+    const { app, el } = await mountPanel({ activeStrategy: kind, routingSummary: summary }, {
+      routerRecommendation: kind === 'router' ? recommendation : undefined,
+      ensembleRecommendation: kind === 'ensemble' ? recommendation : undefined,
+      onResetRecommendedRouter, onResetRecommendedEnsemble, onUpdateStrategy,
+    })
+    try {
+      const card = el.querySelector('.model-recommendation')!
+      expect(el.querySelectorAll('.model-recommendation')).toHaveLength(1)
+      expect(card.textContent).toContain('TokenRhythm')
+      expect(card.querySelector('[role="status"]')?.textContent).toContain('New recommendation')
+      const action = card.querySelector<HTMLButtonElement>('button')!
+      expect(action.textContent).toContain(`Use TokenRhythm recommended ${kind === 'router' ? 'tiers' : 'ensemble'}…`)
+      expect(document.getElementById(action.getAttribute('aria-describedby')!)?.textContent).toBeTruthy()
+      action.click()
+      expect(kind === 'router' ? onResetRecommendedRouter : onResetRecommendedEnsemble).toHaveBeenCalledOnce()
+      expect(kind === 'router' ? onResetRecommendedEnsemble : onResetRecommendedRouter).not.toHaveBeenCalled()
+      expect(onUpdateStrategy).not.toHaveBeenCalled()
+    } finally { app.unmount() }
+  })
+
+  it('keeps the ensemble entry available without an update and locks it while routing is busy', async () => {
+    const onResetRecommendedEnsemble = vi.fn()
+    const { app, el } = await mountPanel({ activeStrategy: 'ensemble' }, {
+      ensembleRecommendation: {
+        providerId: 'tokenrhythm', kind: 'ensemble', revision: 'synthetic-revision',
+        source: 'bundled', rows: [], currentRows: [], hasUpdate: false, notified: true,
+      },
+      routingModeBusy: true, onResetRecommendedEnsemble,
+    })
+    try {
+      const card = el.querySelector('[data-testid="ensemble-recommendation"]')!
+      expect(card.querySelector('[role="status"]')).toBeNull()
+      const action = card.querySelector<HTMLButtonElement>('button')!
+      expect(action.disabled).toBe(true)
+      action.click()
+      expect(onResetRecommendedEnsemble).not.toHaveBeenCalled()
+    } finally { app.unmount() }
   })
 })
