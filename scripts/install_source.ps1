@@ -136,7 +136,8 @@ function Test-SquillaRouterAssets {
     $modelRoot = Join-Path $sourceRoot 'src/opensquilla/squilla_router/models'
     $required = @(
         "$sourceRoot/src/opensquilla/squilla_router/lightgbm_model/assets/artifact_manifest.json",
-        "$sourceRoot/src/opensquilla/squilla_router/lightgbm_model/assets/intent/model.txt.gz",
+        "$sourceRoot/src/opensquilla/squilla_router/lightgbm_model/assets/intent/model.int8.onnx",
+        "$sourceRoot/src/opensquilla/squilla_router/lightgbm_model/assets/intent/standard_scaler88.joblib",
         "$sourceRoot/src/opensquilla/squilla_router/lightgbm_model/assets/tier/model.txt.gz",
         "$modelRoot/v4.2_phase3_inference/lgbm_main.bin",
         "$modelRoot/v4.2_phase3_inference/router.runtime.yaml",

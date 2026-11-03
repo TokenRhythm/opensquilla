@@ -1,4 +1,41 @@
-This package contains the exact LightGBM pair selected by the 2026-10-20 model-policy experiment:
+The single-model policy now uses the selected BERT-60M Encoder + Embedding
+INT8 intent classifier, with the original LightGBM tier classifier unchanged.
+The `lightgbm_model` configuration name is retained for compatibility; legacy,
+direct and Ensemble routing do not use this model pair.
+
+The intent weight is exactly 59,844,613 bytes, SHA-256
+`4bb16d564a672f892502a909522bb0ad5ad1ecee87bba72094a9f0203258fd35`, from
+`20261103-bert60-intent-compression-v2/model.encoder-int8.embedding-int8.onnx`.
+It uses the original BERT numeric88 StandardScaler and temperature
+`1.349285881307928`, and reuses the byte-identical existing BGE tokenizer.
+Text budgets are 128/80/48 including CLS/SEP, padded to 128 per segment;
+empty history/answer use `[EMPTY]`. Numeric features are scaled then clipped to
+[-5, 5]. No transformers dependency or extra tokenizer is required.
+The ONNX file and 2,695-byte scaler are ordinary binary Git resources.
+
+`assets/intent/golden_vectors.json` records synthetic source-runtime input
+hashes and exact quantized-candidate outputs. These are not FP32 equivalence
+claims: the experiment's original FP32 logit tolerance was not met.
+The six candidate cases also include separately measured AVX2, Apple M5 and
+Apple M1 (Virtual) ARM64 probability vectors under ORT 1.24.4, CPU-only, one
+intra/inter-op thread and `session.x64quantprecision=1`. M5 and AVX2 repeated
+runs reproduced their vectors exactly. The complete M1 matrix was captured on
+macOS 26.6.2 with numpy 2.5.3 in
+[CI job 125986706486](https://github.com/TokenRhythm/opensquilla/actions/runs/41655999956/job/125986706486).
+It differs from both M5 and the original source, despite identical input hashes.
+Tests require the entire six-case matrix to match one measured kernel profile
+within 1e-6; they do not equate ARM64 with a single CPU implementation or select
+a different profile per case. Prepared-input hashes, intent labels and final
+policy decisions remain strict. Maximum native-reference differences were
+0.0061261 on AVX2, 0.080843 on M5 and 0.045091 on M1. These finite fixtures do
+not guarantee identical probabilities or accuracy on arbitrary inputs or
+unmeasured CPU implementations.
+`assets/source_parity_cases.json` and `runtime_compatibility.json` retain the
+historical LightGBM pair measurements below; their intent distributions are
+historical only. The tier fixtures, weights, feature pipeline and calibration
+are unchanged. The local manifest now identifies and verifies the mixed pair.
+
+The original LightGBM pair selected by the 2026-10-20 experiment was:
 
 - Model set: `router-lightgbm-99d6ff75-d444135-a1`.
 - Original manifest SHA-256: `29fb79337458c4f35d3e0d1148fbdb1175c20069a5fa8ee6441633b0e2eee357`.
@@ -30,16 +67,14 @@ The frozen snapshot contains no separate license file. These source files retain
 their upstream licensing and are not relicensed by the surrounding project.
 
 The local adapter removes the registry/database dependency. It verifies the
-original manifest and the selected inference closure before native model loading
-or pickle deserialization. The two model text files are distributed as gzip;
+local manifest and the selected inference closure before native model loading
+or pickle deserialization. The retained tier model text is distributed as gzip;
 verification hashes the decompressed original bytes. The encoder, tokenizer,
-three joblib transformers, calibration files, bundles, and feature metadata are
-unchanged. The packaged model reuses the byte-identical ONNX model and tokenizer
-in `../models/v4.2_phase3_inference/bge_onnx/`; the original manifest still
-verifies both before loading. External `lightgbm_model_dir` bundles remain
+three tier transformers, tier calibration and feature metadata are unchanged. The packaged model reuses the byte-identical ONNX model and tokenizer
+in `../models/v4.2_phase3_inference/bge_onnx/`; the manifest still verifies both before loading. External `lightgbm_model_dir` bundles remain
 self-contained, with `preprocess/feature/artifacts/bge/model.onnx` and
 `preprocess/feature/artifacts/bge/tokenizer.json`. Both layouts avoid the long
-content-addressed Windows paths; the source manifests and hashes are unchanged.
+content-addressed Windows paths; the tier source manifests and hashes are unchanged.
 Training run manifests and training metrics remain referenced in the original
 manifest but are omitted from the inference distribution.
 
@@ -48,7 +83,7 @@ character TF-IDF/SVD100, rules48, history BGE/PCA64, route-history16,
 previous-answer BGE/PCA64, previous-signals19, and context5. BGE uses CLS pooling,
 float32 L2 normalization, a fixed 512-token input, and frozen segment truncation.
 An empty history or previous answer produces a zero semantic block. There is no
-extra scaling step. Both heads use the original temperature calibration.
+extra scaling step for the tier head. Each head uses its original calibration.
 
 The runtime is CPU-only and uses local files exclusively. Installation needs
 numpy, LightGBM, ONNX Runtime, tokenizers, scikit-learn, joblib and pydantic.

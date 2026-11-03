@@ -151,7 +151,8 @@ check_squilla_router_assets() {
     local pointer_line="version https://git-lfs.github.com/spec/v1"
     local required=(
         "${source_root}/src/opensquilla/squilla_router/lightgbm_model/assets/artifact_manifest.json"
-        "${source_root}/src/opensquilla/squilla_router/lightgbm_model/assets/intent/model.txt.gz"
+        "${source_root}/src/opensquilla/squilla_router/lightgbm_model/assets/intent/model.int8.onnx"
+        "${source_root}/src/opensquilla/squilla_router/lightgbm_model/assets/intent/standard_scaler88.joblib"
         "${source_root}/src/opensquilla/squilla_router/lightgbm_model/assets/tier/model.txt.gz"
         "${model_root}/v4.2_phase3_inference/lgbm_main.bin"
         "${model_root}/v4.2_phase3_inference/router.runtime.yaml"

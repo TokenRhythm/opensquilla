@@ -1,7 +1,7 @@
-"""Offline loading of the original classifiers and frozen 380-feature runtime.
+"""Offline BERT intent and LightGBM tier inference with frozen preprocessing.
 
-Only the artifact registry adapter is replaced. Feature extraction and trained
-transformers retain the frozen training implementation and original bytes.
+The tier feature pipeline and trained transformers retain their frozen bytes
+and arithmetic. Intent uses the selected quantized BERT training contract.
 """
 
 from __future__ import annotations
@@ -15,8 +15,9 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-MODEL_SET_ID = "router-lightgbm-99d6ff75-d444135-a1"
-MANIFEST_HASH = "sha256:29fb79337458c4f35d3e0d1148fbdb1175c20069a5fa8ee6441633b0e2eee357"
+MODEL_SET_ID = "router-bert60-int8-intent-lightgbm-tier-v1"
+MANIFEST_HASH = "sha256:c4f351198392e17019255679d37cf5b5980570b1208c174056760da618f0b958"
+_LEGACY_MANIFEST_HASH = "sha256:29fb79337458c4f35d3e0d1148fbdb1175c20069a5fa8ee6441633b0e2eee357"
 FEATURE_SCHEMA_VERSION = "lightgbm_380.v1"
 INTENT_LABELS = ("new_task", "continue", "redo")
 TIER_LABELS = ("C0", "C1", "C2", "C3")
@@ -57,7 +58,15 @@ def _verified_artifacts(model_root: str | Path | None) -> tuple[dict[str, Any], 
     )
     try:
         manifest_bytes = (root / "model_manifest.json").read_bytes()
-        if _hash(manifest_bytes) != MANIFEST_HASH:
+        manifest_hash = _hash(manifest_bytes)
+        if manifest_hash != MANIFEST_HASH:
+            if root != default_model_root() and manifest_hash == _LEGACY_MANIFEST_HASH:
+                raise LightGBMModelError(
+                    "squilla_router.lightgbm_model_dir contains the retired LightGBM intent "
+                    "bundle. Remove squilla_router.lightgbm_model_dir to use the packaged "
+                    "BERT intent model, or replace the entire directory with the current "
+                    "verified BERT intent + LightGBM tier bundle."
+                )
             raise LightGBMModelError("bundled LightGBM model manifest hash mismatch")
         manifest = json.loads(manifest_bytes)
         if (
@@ -174,7 +183,7 @@ class LightGBMPrediction:
 
 
 class LightGBMRouterModel:
-    """One local feature runtime shared by the intent and tier classifiers."""
+    """Single-model policy: BERT intent plus the unchanged LightGBM tier head."""
 
     source = "lightgbm_model"
     _available = True
@@ -188,6 +197,7 @@ class LightGBMRouterModel:
         self._lock = threading.RLock()
         self._closed = False
         self._encoder = None
+        self._intent_session = None
         try:
             import joblib
             import lightgbm as lgb
@@ -233,11 +243,19 @@ class LightGBMRouterModel:
             self._encoder = encoder
             self._models = {}
             self._temperatures = {}
+            with gzip.open(one("lightgbm_model", "tier"), "rt", encoding="utf-8") as handle:
+                self._models["tier"] = lgb.Booster(model_str=handle.read())
+            self._intent_scaler = _load_transformer(one("numeric_scaler", "intent"))
+            options = onnxruntime.SessionOptions()
+            options.intra_op_num_threads = 1
+            options.inter_op_num_threads = 1
+            options.execution_mode = onnxruntime.ExecutionMode.ORT_SEQUENTIAL
+            options.add_session_config_entry("session.x64quantprecision", "1")
+            self._intent_session = onnxruntime.InferenceSession(
+                str(one("onnx_model", "intent")), sess_options=options,
+                providers=["CPUExecutionProvider"],
+            )
             for target in ("intent", "tier"):
-                model_file = one("lightgbm_model", target)
-                with gzip.open(model_file, "rt", encoding="utf-8") as handle:
-                    text = handle.read()
-                self._models[target] = lgb.Booster(model_str=text)
                 calibration = json.loads(
                     one("temperature_calibration", target).read_text(encoding="utf-8")
                 )
@@ -248,7 +266,7 @@ class LightGBMRouterModel:
                 "input_schema_version": FEATURE_SCHEMA_VERSION,
                 "feature_vector_dim": 380,
                 "execution_mode": "native_embedded",
-                "model_type": "lightgbm",
+                "model_type": "bert_intent_lightgbm_tier",
                 "runtime_versions": {
                     name: _runtime_version(name, module)
                     for name, module in {
@@ -268,12 +286,9 @@ class LightGBMRouterModel:
                 "cannot load bundled LightGBM runtime; install recommended dependencies"
             ) from exc
 
-    def _build_features(self, router_input: Mapping[str, Any]) -> Any:
-        from .input_contract import RouterInput
-
+    def _build_features(self, canonical: Mapping[str, Any]) -> Any:
         if self._closed:
             raise LightGBMInferenceError("LightGBM router model is closed")
-        canonical = RouterInput.model_validate(router_input).model_dump(mode="json")
         features = self._featurizer.transform_row({"input": canonical})
         if features.shape != (380,) or not self._np.isfinite(features).all():
             raise LightGBMInferenceError("LightGBM feature contract was violated")
@@ -281,16 +296,57 @@ class LightGBMRouterModel:
 
     def build_features(self, router_input: Mapping[str, Any]) -> Any:
         """Return the exact float32[380] feature vector for parity inspection."""
+        from .input_contract import RouterInput
+
         with self._lock:
             try:
-                return self._build_features(router_input).copy()
+                canonical = RouterInput.model_validate(router_input).model_dump(mode="json")
+                return self._build_features(canonical).copy()
             except (LightGBMModelError, LightGBMInferenceError):
                 raise
             except Exception as exc:
                 raise LightGBMInferenceError("LightGBM feature extraction failed") from exc
 
-    def predict_features(self, features: Any) -> LightGBMPrediction:
-        """Run both calibrated heads on a precomputed vector (golden tests)."""
+    def _intent_features(
+        self, canonical: Mapping[str, Any], tier_features: Any,
+    ) -> dict[str, Any]:
+        """Reuse tier numeric88 and reproduce the frozen BERT text contract."""
+        from ._vendor.features.runtime import _tokenizer_content_ids
+        from ._vendor.features.text import (
+            SEGMENT_KINDS,
+            extract_text_segments,
+            truncate_content_tokens,
+        )
+
+        np = self._np
+        encoder = self._encoder
+        assert encoder is not None
+        texts = extract_text_segments(canonical).as_tuple()
+        ids = np.full((1, 3, 128), encoder.pad_token_id, dtype=np.int64)
+        mask = np.zeros_like(ids)
+        for index, (kind, text, length) in enumerate(
+            zip(SEGMENT_KINDS, texts, (128, 80, 48), strict=True)
+        ):
+            content = truncate_content_tokens(
+                kind, _tokenizer_content_ids(encoder.tokenizer, text or "[EMPTY]"),
+                max_content_tokens=length - 2,
+            )
+            sequence = [encoder.cls_token_id, *content, encoder.sep_token_id]
+            ids[0, index, :len(sequence)] = sequence
+            mask[0, index, :len(sequence)] = 1
+        # The frozen 380-vector embeds rules48, route-history16, then
+        # previous-signals19 + context5 in the original numeric88 order.
+        numeric = np.concatenate((
+            tier_features[164:212], tier_features[276:292], tier_features[356:380],
+        )).reshape(1, 88)
+        numeric = np.asarray(self._intent_scaler.transform(numeric), dtype=np.float32)
+        numeric = np.clip(numeric, -5.0, 5.0).astype(np.float32, copy=False)
+        if numeric.shape != (1, 88) or not np.isfinite(numeric).all():
+            raise LightGBMInferenceError("BERT numeric feature contract was violated")
+        return {"input_ids": ids, "attention_mask": mask, "numeric88": numeric}
+
+    def predict_tier_features(self, features: Any) -> dict[str, float]:
+        """Run the unchanged calibrated tier head on a frozen 380-vector."""
         from .calibration import apply_temperature, probabilities_to_logits
 
         with self._lock:
@@ -299,48 +355,81 @@ class LightGBMRouterModel:
             matrix = self._np.asarray(features, dtype=self._np.float32).reshape(1, -1)
             if matrix.shape != (1, 380) or not self._np.isfinite(matrix).all():
                 raise LightGBMInferenceError("LightGBM requires a finite float32[380] vector")
-            outputs = {}
-            for target, labels in (("intent", INTENT_LABELS), ("tier", TIER_LABELS)):
-                values = self._np.asarray(
-                    self._models[target].predict(matrix, num_threads=1), dtype=self._np.float64
-                )
-                if (
-                    values.shape != (1, len(labels))
-                    or not self._np.isfinite(values).all()
-                    or (values < 0).any()
-                ):
-                    raise LightGBMInferenceError("LightGBM returned an invalid probability vector")
-                mass = values.sum(axis=1, keepdims=True)
-                if (mass <= 0).any():
-                    raise LightGBMInferenceError("LightGBM returned no probability mass")
-                calibrated = apply_temperature(
-                    probabilities_to_logits(values / mass),
-                    self._temperatures[target],
-                )[0]
-                outputs[target] = dict(zip(labels, map(float, calibrated), strict=True))
-            return LightGBMPrediction(
-                intent_probabilities=outputs["intent"],
-                tier_probabilities=outputs["tier"],
-                intent_decision=max(
-                    ("continue", "redo", "new_task"), key=outputs["intent"].__getitem__
-                ),
-                tier_decision=max(TIER_LABELS, key=outputs["tier"].__getitem__),
-                feature_vector_hash=_hash(matrix.astype("<f4", copy=False).tobytes(order="C")),
-                identity=dict(self.identity),
+            values = self._np.asarray(
+                self._models["tier"].predict(matrix, num_threads=1), dtype=self._np.float64,
             )
+            if (values.shape != (1, 4) or not self._np.isfinite(values).all()
+                    or (values < 0).any() or values.sum() <= 0):
+                raise LightGBMInferenceError("LightGBM returned an invalid probability vector")
+            calibrated = apply_temperature(
+                probabilities_to_logits(values / values.sum(axis=1, keepdims=True)),
+                self._temperatures["tier"],
+            )[0]
+            return dict(zip(TIER_LABELS, map(float, calibrated), strict=True))
 
-    def predict(self, router_input: Mapping[str, Any]) -> LightGBMPrediction:
+    def predict_tier(self, router_input: Mapping[str, Any]) -> dict[str, Any]:
+        """Classify a known new task without executing the intent model."""
+        from .input_contract import RouterInput
+
         with self._lock:
             try:
-                return self.predict_features(self._build_features(router_input))
+                canonical = RouterInput.model_validate(router_input).model_dump(mode="json")
+                features = self._build_features(canonical)
+                tier = self.predict_tier_features(features)
+                return {
+                    "tier_probabilities": tier,
+                    "tier_decision": max(TIER_LABELS, key=tier.__getitem__),
+                    "feature_vector_hash": _hash(
+                        features.astype("<f4", copy=False).tobytes(order="C"),
+                    ),
+                    "identity": dict(self.identity),
+                }
             except (LightGBMModelError, LightGBMInferenceError):
                 raise
             except Exception as exc:
-                raise LightGBMInferenceError("LightGBM routing inference failed") from exc
+                raise LightGBMInferenceError("Model-policy tier inference failed") from exc
+
+    def predict(self, router_input: Mapping[str, Any]) -> LightGBMPrediction:
+        from .calibration import apply_temperature
+        from .input_contract import RouterInput
+
+        with self._lock:
+            try:
+                canonical = RouterInput.model_validate(router_input).model_dump(mode="json")
+                features = self._build_features(canonical)
+                assert self._intent_session is not None
+                logits = self._np.asarray(
+                    self._intent_session.run(
+                        ["logits"], self._intent_features(canonical, features),
+                    )[0],
+                    dtype=self._np.float64,
+                )
+                if logits.shape != (1, 3) or not self._np.isfinite(logits).all():
+                    raise LightGBMInferenceError("BERT returned invalid intent logits")
+                intent = dict(zip(
+                    INTENT_LABELS,
+                    map(float, apply_temperature(logits, self._temperatures["intent"])[0]),
+                    strict=True,
+                ))
+                tier = self.predict_tier_features(features)
+                return LightGBMPrediction(
+                    intent_probabilities=intent, tier_probabilities=tier,
+                    intent_decision=max(("continue", "redo", "new_task"), key=intent.__getitem__),
+                    tier_decision=max(TIER_LABELS, key=tier.__getitem__),
+                    feature_vector_hash=_hash(
+                        features.astype("<f4", copy=False).tobytes(order="C"),
+                    ),
+                    identity=dict(self.identity),
+                )
+            except (LightGBMModelError, LightGBMInferenceError):
+                raise
+            except Exception as exc:
+                raise LightGBMInferenceError("Model-policy routing inference failed") from exc
 
     def close(self) -> None:
         with self._lock:
             if not self._closed:
                 assert self._encoder is not None
                 self._encoder.close()
+                self._intent_session = None
                 self._closed = True

@@ -447,7 +447,11 @@ def decide_model_tier(
         if not inference_ran:
             inference_ran = True
             try:
-                result = classifier.predict(copy.deepcopy(canonical))
+                tier_only = getattr(classifier, "predict_tier", None) if head == "tier" else None
+                # A rule already fixed the intent: a failing intent head must
+                # not prevent the independent tier classifier from running.
+                predictor = tier_only if callable(tier_only) else classifier.predict
+                result = predictor(copy.deepcopy(canonical))
             except Exception as exc:
                 if getattr(exc, "fail_closed", False) is True:
                     raise

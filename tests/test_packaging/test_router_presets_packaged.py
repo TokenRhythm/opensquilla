@@ -62,6 +62,13 @@ def test_wheel_contains_complete_verified_lightgbm_bundle(isolated_core_wheel: P
     import gzip
     import hashlib
     import json
+    import runpy
+
+    release = runpy.run_path(str(REPO_ROOT / "scripts/build_wheelhouse_zip.py"))
+    assert release["check_router_assets"](
+        REPO_ROOT / "src/opensquilla/squilla_router/models"
+    ).ok
+    assert release["missing_router_assets_in_wheel"](isolated_core_wheel) == []
 
     prefix = "opensquilla/squilla_router/lightgbm_model"
     with zipfile.ZipFile(isolated_core_wheel) as wheel:
@@ -99,9 +106,9 @@ def test_wheel_contains_complete_verified_lightgbm_bundle(isolated_core_wheel: P
             assert len(payload) == record["size_bytes"], path
             assert hashlib.sha256(payload).hexdigest() == record["sha256"], path
         original = wheel.read(f"{asset_prefix}/model_manifest.json")
-        assert hashlib.sha256(original).hexdigest() == (
-            "29fb79337458c4f35d3e0d1148fbdb1175c20069a5fa8ee6441633b0e2eee357"
-        )
+        from opensquilla.squilla_router.lightgbm_model import MANIFEST_HASH
+
+        assert "sha256:" + hashlib.sha256(original).hexdigest() == MANIFEST_HASH
         source = json.loads(original)
         shared = "opensquilla/squilla_router/models/v4.2_phase3_inference/bge_onnx"
         for role, filename in (("onnx_model", "model.onnx"), ("tokenizer", "tokenizer.json")):
@@ -112,12 +119,15 @@ def test_wheel_contains_complete_verified_lightgbm_bundle(isolated_core_wheel: P
             assert len(str(shared_installed / filename)) < 260
             assert len(payload) == reference["size"], path
             assert "sha256:" + hashlib.sha256(payload).hexdigest() == reference["sha256"], path
-        for target in ("intent", "tier"):
-            reference = next(
-                ref
-                for ref in source["models"]
-                if (ref["artifact_type"] == "lightgbm_model" and f"/{target}/" in ref["path"])
-            )
-            decoded = gzip.decompress(wheel.read(f"{asset_prefix}/{target}/model.txt.gz"))
-            assert len(decoded) == reference["size"]
-            assert "sha256:" + hashlib.sha256(decoded).hexdigest() == reference["sha256"]
+        assert f"{asset_prefix}/intent/model.txt.gz" not in names
+        assert {
+            f"{asset_prefix}/intent/model.int8.onnx",
+            f"{asset_prefix}/intent/standard_scaler88.joblib",
+        } <= names
+        reference = next(
+            ref for ref in source["models"]
+            if ref["artifact_type"] == "lightgbm_model" and "/tier/" in ref["path"]
+        )
+        decoded = gzip.decompress(wheel.read(f"{asset_prefix}/tier/model.txt.gz"))
+        assert len(decoded) == reference["size"]
+        assert "sha256:" + hashlib.sha256(decoded).hexdigest() == reference["sha256"]

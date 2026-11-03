@@ -3,8 +3,8 @@
   "files": [
     {
       "path": "bundles/intent.json",
-      "size_bytes": 5331,
-      "sha256": "12f9706ba34fb681008d19a9fd0a9cdb871af47215a4cf7f3aa085557cc5bb2f"
+      "size_bytes": 1407,
+      "sha256": "e2673a3aaeacb4bc04bb8e4e40aa1fb745445a4277ffdfc422c31d481745781b"
     },
     {
       "path": "bundles/tier.json",
@@ -13,23 +13,28 @@
     },
     {
       "path": "intent/calibration.json",
-      "size_bytes": 116,
-      "sha256": "fd4e2361aa56276eb2d0ca5b3990e510dc77e255310fbb38a4f3f691140bd781"
+      "size_bytes": 115,
+      "sha256": "2cadf73c25698d3fa8fd19b99116e03628d2399e2e54d99d3ec62e9d39a8913d"
     },
     {
       "path": "intent/golden_vectors.json",
-      "size_bytes": 44966,
-      "sha256": "958a84d20e6107e465df5427cc199d774ec95e44eb4bd6d4db13857b74645eca"
+      "size_bytes": 6266,
+      "sha256": "1d662d4fe07b912dbea4cc0a5c6f874ca1303736cf21222d226f74aac1e7c738"
     },
     {
-      "path": "intent/model.txt.gz",
-      "size_bytes": 7290131,
-      "sha256": "f82821f91e20a8536a1b7cb88c494b4659e26bcc9e1ef47b354a7728830bf482"
+      "path": "intent/model.int8.onnx",
+      "size_bytes": 59844613,
+      "sha256": "4bb16d564a672f892502a909522bb0ad5ad1ecee87bba72094a9f0203258fd35"
+    },
+    {
+      "path": "intent/standard_scaler88.joblib",
+      "size_bytes": 2695,
+      "sha256": "a21f68eafb1540d7c97792ca23b1b079e5de427cc2bcf0300e6b5370d90f4ff5"
     },
     {
       "path": "model_manifest.json",
-      "size_bytes": 7010,
-      "sha256": "29fb79337458c4f35d3e0d1148fbdb1175c20069a5fa8ee6441633b0e2eee357"
+      "size_bytes": 6947,
+      "sha256": "c4f351198392e17019255679d37cf5b5980570b1208c174056760da618f0b958"
     },
     {
       "path": "preprocess/feature/artifacts/feature_recipe.json",
@@ -73,8 +78,8 @@
     },
     {
       "path": "provenance.json",
-      "size_bytes": 3108,
-      "sha256": "5af7f31c2b226a005320f497ed452e581aa1485672a10cc04ca7e9f16ec64b17"
+      "size_bytes": 3810,
+      "sha256": "d3c2cf8e6dbc4e85f53161ea5a010c3554a8f503cb9eb9c8d867517afa3aae4d"
     },
     {
       "path": "runtime_compatibility.json",

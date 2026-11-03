@@ -179,6 +179,42 @@ def test_frozen_cross_project_parity(row, expected):
     assert len(classifier.inputs) <= 1
 
 
+
+@pytest.mark.parametrize("intent,tier", [("continue", "c1"), ("redo", "c2"), ("new_task", "c0")])
+def test_unknown_intent_reuses_full_prediction_without_a_second_tier_call(intent, tier):
+    state, router_input, result = fixture({"previous": "c1", "intent": intent})
+
+    class SplitClassifier(Classifier):
+        def predict_tier(self, value):
+            pytest.fail("An existing full prediction must supply the tier result")
+
+    classifier = SplitClassifier(result)
+    decision = decide_model_tier(router_input, state, classifier)
+    assert decision.intent == intent
+    assert decision.tier == tier
+    assert len(classifier.inputs) == 1
+
+
+@pytest.mark.parametrize("error", [RuntimeError("tier unavailable"), None])
+def test_tier_only_failure_preserves_default_and_audit(error):
+    class BrokenTier:
+        def predict(self, value):
+            pytest.fail("A tier failure must not rerun the unrelated intent head")
+
+        def predict_tier(self, value):
+            if error is not None:
+                raise error
+            return {"tier_probabilities": {"c0": 1.0}}
+
+    decision = decide_model_tier({"current_request": "hello"}, None, BrokenTier())
+    assert decision.tier == "c1"
+    assert decision.intent_audit.run_status == "not_run"
+    assert decision.tier_audit.source == "fallback"
+    assert decision.tier_audit.run_status == "error"
+    assert decision.tier_audit.reason == (
+        "classifier_error:RuntimeError" if error else "invalid_classifier_result"
+    )
+
 def test_raw_input_no_mutation_or_legacy_text_truncation():
     state, router_input, result = fixture({"previous": "c1", "intent": "new_task"})
     router_input["current_request"] = "x" * 30_000
@@ -195,7 +231,8 @@ def test_raw_input_no_mutation_or_legacy_text_truncation():
     assert decision.next_state.generation_start_input_message_id == "generation-start"
 
 
-def test_integrity_failure_is_not_swallowed_as_classifier_fallback():
+@pytest.mark.parametrize("tier_only", [False, True])
+def test_integrity_failure_is_not_swallowed_as_classifier_fallback(tier_only):
     class IntegrityError(RuntimeError):
         fail_closed = True
 
@@ -203,8 +240,11 @@ def test_integrity_failure_is_not_swallowed_as_classifier_fallback():
         def predict(self, value):
             raise IntegrityError("manifest changed")
 
+    classifier = Broken()
+    if tier_only:
+        classifier.predict_tier = classifier.predict
     with pytest.raises(IntegrityError):
-        decide_model_tier({"current_request": "hello"}, None, Broken())
+        decide_model_tier({"current_request": "hello"}, None, classifier)
 
 
 @pytest.mark.parametrize("reason", ["validation_failure", "no_progress"])

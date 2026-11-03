@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import math
 import platform
@@ -52,7 +53,7 @@ def test_manifest_and_boot_probe_do_not_import_ml():
     identity = validate_artifacts()
     assert identity["model_set_id"] == MODEL_SET_ID
     assert identity["model_manifest_hash"] == MANIFEST_HASH
-    assert identity["artifact_count"] == 18
+    assert identity["artifact_count"] == 19
     code = (
         "import sys; from opensquilla.squilla_router.lightgbm_model import validate_artifacts; "
         "validate_artifacts(); "
@@ -62,29 +63,37 @@ def test_manifest_and_boot_probe_do_not_import_ml():
     subprocess.run([sys.executable, "-c", code], check=True)
 
 
-def test_original_classifier_golden_vectors(model):
+def test_original_tier_classifier_golden_vectors(model):
     import numpy as np
 
-    for target in ("intent", "tier"):
-        golden = json.loads(
-            (default_model_root() / target / "golden_vectors.json").read_text(encoding="utf-8")
+    golden = json.loads(
+        (default_model_root() / "tier/golden_vectors.json").read_text(encoding="utf-8")
+    )
+    for case in golden["cases"]:
+        values = model.predict_tier_features(case["features"])
+        np.testing.assert_allclose(
+            [values[label] for label in golden["classes"]],
+            case["expected"]["calibrated_probabilities"], rtol=1e-10, atol=1e-12,
         )
-        for case in golden["cases"]:
-            prediction = model.predict_features(case["features"])
-            values = getattr(prediction, target + "_probabilities")
-            np.testing.assert_allclose(
-                [values[label] for label in golden["classes"]],
-                case["expected"]["calibrated_probabilities"],
-                rtol=1e-10,
-                atol=1e-12,
-            )
-            expected = dict(
-                zip(golden["classes"], case["expected"]["calibrated_probabilities"], strict=True)
-            )
-            labels = ("continue", "redo", "new_task") if target == "intent" else tuple(values)
-            assert getattr(prediction, target + "_decision") == max(
-                labels, key=expected.__getitem__
-            )
+
+
+def test_bert_intent_preprocessing_matches_source(model):
+    from opensquilla.squilla_router.lightgbm_model.input_contract import RouterInput
+
+    inputs = json.loads(
+        (default_model_root() / "source_parity_cases.json").read_text(encoding="utf-8")
+    )["cases"]
+    expected = json.loads(
+        (default_model_root() / "intent/golden_vectors.json").read_text(encoding="utf-8")
+    )["cases"]
+    for source, golden in zip(inputs, expected, strict=True):
+        assert source["name"] == golden["name"]
+        canonical = RouterInput.model_validate(source["input"]).model_dump(mode="json")
+        prepared = model._intent_features(canonical, model.build_features(canonical))
+        assert {key: hashlib.sha256(value.tobytes()).hexdigest()
+                for key, value in prepared.items()} == golden["prepared_sha256"]
+    assert set(model._models) == {"tier"}, "The replaced LightGBM intent head must not load"
+    assert model._intent_session.get_providers() == ["CPUExecutionProvider"]
 
 
 def test_runtime_identity_does_not_require_distribution_metadata(model):
@@ -157,7 +166,45 @@ def test_full_features_and_outputs_match_frozen_source(model):
     reference = json.loads(
         (default_model_root() / "source_parity_cases.json").read_text(encoding="utf-8")
     )
+    intents = {case["name"]: case for case in json.loads(
+        (default_model_root() / "intent/golden_vectors.json").read_text(encoding="utf-8")
+    )["cases"]}
+    predictions = {case["name"]: model.predict(case["input"]) for case in reference["cases"]}
+    profile_names = ("arm64", "arm64_m1") if arm64 else ("native", "x86_avx2")
+
+    def profile_probabilities(profile, name):
+        golden = intents[name]
+        return (golden["probabilities"] if profile == "native"
+                else golden["runtime_probabilities"][profile])
+
+    # One measured kernel profile must explain the whole six-case matrix.
+    # Architecture alone does not identify the ARM implementation (M1 vs M5).
+    profile_errors = {
+        profile: max(
+            abs(prediction.intent_probabilities[label]
+                - profile_probabilities(profile, name)[label])
+            for name, prediction in predictions.items()
+            for label in prediction.intent_probabilities
+        )
+        for profile in profile_names
+    }
+    selected_profile = min(profile_errors, key=profile_errors.__getitem__)
+    processor = platform.processor()
+    if platform.system() == "Darwin":
+        processor = subprocess.run(
+            ["sysctl", "-n", "machdep.cpu.brand_string"], capture_output=True, text=True,
+        ).stdout.strip() or processor
+    # Capture every vector before assertions so an unfamiliar CPU kernel leaves
+    # complete evidence in a failed CI report, rather than only its first case.
+    print("BERT intent runtime evidence: " + json.dumps({
+        "machine": platform.machine(), "platform": platform.platform(), "processor": processor,
+        "runtime_versions": model.identity["runtime_versions"],
+        "selected_profile": selected_profile, "profile_max_errors": profile_errors,
+        "cases": {name: prediction.intent_probabilities
+                  for name, prediction in predictions.items()},
+    }, sort_keys=True))
     for case in reference["cases"]:
+        intent_expected = intents[case["name"]]["probabilities"]
         features = model.build_features(case["input"])
         assert features.dtype == np.float32
         assert features.shape == (380,)
@@ -179,17 +226,22 @@ def test_full_features_and_outputs_match_frozen_source(model):
             atol=2e-6,
             err_msg=case["name"],
         )
-        prediction = model.predict(case["input"])
+        prediction = predictions[case["name"]]
         for target in ("intent", "tier"):
             values = getattr(prediction, target + "_probabilities")
-            expected = case[target + "_probabilities"]
-            np.testing.assert_allclose(
-                list(values.values()),
-                [expected[label] for label in values],
-                rtol=0 if bounds else 1e-10,
-                atol=bounds[target] if bounds else 1e-12,
-                err_msg=case["name"],
-            )
+            expected = intent_expected if target == "intent" else case["tier_probabilities"]
+            if target == "intent":
+                measured = profile_probabilities(selected_profile, case["name"])
+                np.testing.assert_allclose(
+                    list(values.values()), [measured[label] for label in values],
+                    rtol=0, atol=1e-6, err_msg=f'{case["name"]} ({selected_profile})',
+                )
+            else:
+                np.testing.assert_allclose(
+                    list(values.values()), [expected[label] for label in values],
+                    rtol=0 if bounds else 1e-10,
+                    atol=bounds[target] if bounds else 1e-12, err_msg=case["name"],
+                )
             labels = ("continue", "redo", "new_task") if target == "intent" else tuple(values)
             assert getattr(prediction, target + "_decision") == max(
                 labels, key=expected.__getitem__
@@ -199,7 +251,7 @@ def test_full_features_and_outputs_match_frozen_source(model):
         prior = case["input"].get("active_route_tier")
         state = ModelPolicyState(prior.lower(), task_id="reference-task") if prior else None
         reference_prediction = SimpleNamespace(
-            intent_probabilities=case["intent_probabilities"],
+            intent_probabilities=intent_expected,
             tier_probabilities=case["tier_probabilities"],
         )
         decisions = [
@@ -251,7 +303,8 @@ def test_tampered_manifest_fails_closed(tmp_path: Path):
     [
         ("intent/calibration.json", b"{}", "artifact hash mismatch: intent/calibration.json"),
         ("preprocess/feature/artifacts/pca64.joblib", None, "assets are missing or invalid"),
-        ("intent/model.txt.gz", b"\x1f\x8b\x08", "assets are missing or invalid"),
+        ("intent/model.int8.onnx", b"invalid", "artifact hash mismatch: intent/model.int8.onnx"),
+        ("intent/standard_scaler88.joblib", None, "assets are missing or invalid"),
         ("preprocess/feature/artifacts/bge/tokenizer.json", None, "assets are missing or invalid"),
     ],
 )
@@ -369,3 +422,71 @@ def test_encoder_cache_is_bounded_lru_and_releases_owned_rows(monkeypatch):
     assert not encoder._memory_cache
     with pytest.raises(RuntimeError, match="closed"):
         encode("1")
+
+
+def test_predict_reuses_numeric88_for_long_json(model, monkeypatch):
+    from opensquilla.squilla_router.lightgbm_model._vendor.features import lightgbm380, numeric
+
+    original = lightgbm380.extract_numeric88
+    calls = []
+
+    def extract_once(value):
+        calls.append(value)
+        assert len(calls) == 1, "A second full-text scan can exceed the routing deadline"
+        return original(value)
+
+    monkeypatch.setattr(lightgbm380, "extract_numeric88", extract_once)
+    monkeypatch.setattr(numeric, "extract_numeric88", extract_once)
+    # Empty objects expose the full-text regex scan that previously ran twice.
+    router_input = {"current_request": "Inspect this JSON: " + json.dumps([{}] * 9600)}
+    prediction = model.predict(router_input)
+    assert len(router_input["current_request"]) == 38_419
+    assert len(calls) == 1
+    assert prediction.intent_decision == "new_task"
+    assert prediction.tier_decision == "C0"
+
+
+def test_tier_only_prediction_survives_broken_intent(model, monkeypatch):
+    class BrokenIntent:
+        def run(self, *_args, **_kwargs):
+            raise AssertionError("Known new tasks must not run BERT")
+
+    router_input = {"current_request": "Explain binary search."}
+    expected = model.predict(router_input)
+    monkeypatch.setattr(model, "_intent_session", BrokenIntent())
+    actual = model.predict_tier(router_input)
+    assert actual["tier_probabilities"] == expected.tier_probabilities
+    assert actual["feature_vector_hash"] == expected.feature_vector_hash
+    assert "intent_probabilities" not in actual
+    with pytest.raises(LightGBMInferenceError):
+        model.predict(router_input)
+
+
+@pytest.mark.parametrize("through_gateway", [False, True])
+def test_known_legacy_external_bundle_has_actionable_upgrade_error(
+    tmp_path, monkeypatch, through_gateway,
+):
+    from opensquilla.squilla_router.lightgbm_model import model as module
+
+    # Substitute the recognized digest, without keeping a duplicate legacy manifest.
+    payload = b'{"model_set_id":"retired-lightgbm-intent-bundle"}'
+    (tmp_path / "model_manifest.json").write_bytes(payload)
+    monkeypatch.setattr(module, "_LEGACY_MANIFEST_HASH", module._hash(payload))
+    def validate():
+        if through_gateway:
+            from opensquilla.gateway.boot import validate_squilla_router_runtime
+            from opensquilla.gateway.config import GatewayConfig
+
+            config = GatewayConfig()
+            config.squilla_router.lightgbm_model_dir = str(tmp_path)
+            validate_squilla_router_runtime(config)
+        else:
+            validate_artifacts(tmp_path)
+
+    with pytest.raises(LightGBMModelError, match="Remove squilla_router.lightgbm_model_dir") as exc:
+        validate()
+    assert "replace the entire directory" in str(exc.value)
+    assert exc.value.fail_closed
+    (tmp_path / "model_manifest.json").write_bytes(payload + b" ")
+    with pytest.raises(LightGBMModelError, match="manifest hash mismatch"):
+        validate()
