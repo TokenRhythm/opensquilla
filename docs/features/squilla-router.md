@@ -154,6 +154,19 @@ The reset button replaces the current ladder with that provider's recommendation
 including saved or unsaved custom tiers. Other primary providers do not show this
 shortcut. Restoring tiers keeps the current usage mode.
 
+OpenRouter and TokenRhythm recommendations are checked in the background at each
+Gateway startup, including Desktop restarts, and every 24 hours while it stays
+running. A cached recommendation remains available during the check or if the
+request fails. Disabling background network checks in privacy settings also
+disables these checks.
+
+The settings page announces a new recommendation only when its model selections
+change: the provider, model, or assigned tier/role. Thinking-level changes alone
+do not trigger an update notice. You can still preview and explicitly adopt the
+complete recommendation, including its thinking settings. Downloading a
+recommendation never replaces saved models automatically; confirmed changes apply
+to newly accepted tasks.
+
 Saving explicit provider and model selections for executable text tiers enables
 cross-provider routing automatically. Each selected provider uses its own configured
 profile; no additional settings switch is needed. This also applies when saving an

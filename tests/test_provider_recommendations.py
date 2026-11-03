@@ -146,7 +146,7 @@ def test_only_allowed_fields_enter_cache_and_revisions_ignore_metadata(
     assert "public-dummy" not in (Path(config.state_dir) / rec.STATE_FILENAME).read_text()
 
 
-def test_attempt_ttl_survives_restart_and_expires_after_24h(config, monkeypatch, allow_refresh):
+def test_explicit_refresh_obeys_persisted_attempt_ttl(config, monkeypatch, allow_refresh):
     now = [10_000.0]
     monkeypatch.setattr(rec.time, "time", lambda: now[0])
     calls = _mock_fetch(monkeypatch, _documents())
@@ -158,6 +158,58 @@ def test_attempt_ttl_survives_restart_and_expires_after_24h(config, monkeypatch,
     now[0] += 1
     assert not rec.refresh_recommendations(config=config)
     assert len(calls) == 4
+
+
+@pytest.mark.parametrize("fetch_fails", [False, True])
+def test_warm_cache_startup_checks_immediately_then_waits_24h(
+    config, monkeypatch, allow_refresh, fetch_fails,
+):
+    now = [10_000.0]
+    monkeypatch.setattr(rec.time, "time", lambda: now[0])
+    _mock_fetch(monkeypatch, _documents())
+    rec.refresh_recommendations(config=config)
+    rec._INSTANCES.clear()
+    now[0] += 60
+    documents = (
+        {kind: httpx.ReadTimeout("unavailable") for kind in rec.RECOMMENDATION_URLS}
+        if fetch_fails else _documents("b")
+    )
+    calls = _mock_fetch(monkeypatch, documents)
+    fetch = rec._fetch_document
+    attempt_times = []
+
+    def timed_fetch(url):
+        attempt_times.append(now[0])
+        return fetch(url)
+
+    monkeypatch.setattr(rec, "_fetch_document", timed_fetch)
+    delays = []
+
+    class SimulatedClockEvent:
+        def is_set(self):
+            return len(calls) >= 4
+
+        def wait(self, seconds):
+            delays.append(seconds)
+            now[0] += seconds
+            return False
+
+        def set(self):
+            pass
+
+    instance = rec._instance(config)
+    instance.config = config
+    instance.stop = SimulatedClockEvent()
+    before = copy.deepcopy(vars(config))
+    rec._background_worker(instance)
+
+    assert attempt_times == [10_060.0] * 2 + [10_060.0 + rec.TTL_SECONDS] * 2
+    assert delays == [0.0, 1.0, rec.TTL_SECONDS - 1.0, 1.0]
+    assert instance.checked_in_process
+    assert rec.get_recommendation(config, "tokenrhythm", "router")["rows"][0]["model"] == (
+        "route-c0-a" if fetch_fails else "route-c0-b"
+    )
+    assert vars(config) == before
 
 
 def test_background_worker_waits_for_ttl_and_refreshes_again(config, monkeypatch, allow_refresh):
@@ -345,6 +397,35 @@ def test_instance_isolation_return_copy_and_notification_persistence(
     assert not Path(other.state_dir).exists()
 
 
+@pytest.mark.parametrize("kind", ["router", "ensemble"])
+def test_thinking_only_revisions_preserve_notification_acknowledgement(
+    config, monkeypatch, allow_refresh, kind,
+):
+    documents = _documents()
+    _mock_fetch(monkeypatch, documents)
+    rec.refresh_recommendations(config=config)
+    original = rec.get_recommendation(config, "tokenrhythm", kind)
+    rec.mark_recommendation_notified(config, "tokenrhythm", kind, original["revision"])
+    rec._INSTANCES.clear()
+
+    row = (
+        documents[kind]["tokenrhythm"]["c0"] if kind == "router"
+        else documents[kind]["tokenrhythm"]["proposers"][0]
+    )
+    row["thinking_level"] = "medium"
+    assert rec.refresh_recommendations(config=config, force=True)
+    updated = rec.get_recommendation(config, "tokenrhythm", kind)
+    assert updated["revision"] != original["revision"]
+    assert updated["rows"][0]["thinkingLevel"] == "medium"
+    rec._INSTANCES.clear()
+    assert rec.recommendation_notified(config, "tokenrhythm", kind, updated["revision"])
+    # A genuinely different model gets a fresh notice, even if thinking stays the same.
+    row["model"] = "replacement-model"
+    assert rec.refresh_recommendations(config=config, force=True)
+    changed = rec.get_recommendation(config, "tokenrhythm", kind)
+    assert not rec.recommendation_notified(config, "tokenrhythm", kind, changed["revision"])
+
+
 def test_corrupt_cached_unit_does_not_poison_other_units(config, monkeypatch, allow_refresh):
     _mock_fetch(monkeypatch, _documents())
     rec.refresh_recommendations(config=config)
@@ -386,7 +467,14 @@ def test_privacy_opt_out_keeps_cached_recommendation_readable(config, monkeypatc
     assert len(calls) == 2
 
 
-def test_background_singleflight_does_not_block_reads(config, monkeypatch, allow_refresh):
+@pytest.mark.parametrize("warm_cache", [False, True])
+def test_background_singleflight_does_not_block_reads(
+    config, monkeypatch, allow_refresh, warm_cache,
+):
+    if warm_cache:
+        _mock_fetch(monkeypatch, _documents("cached"))
+        rec.refresh_recommendations(config=config)
+        rec._INSTANCES.clear()
     entered, release, completed = threading.Event(), threading.Event(), threading.Event()
     calls = []
     documents = _documents()
@@ -406,7 +494,10 @@ def test_background_singleflight_does_not_block_reads(config, monkeypatch, allow
     try:
         assert thread is not None and entered.wait(2)
         assert rec.start_background_recommendation_refresh(config=config) is thread
-        assert rec.get_recommendation(config, "openrouter", "router")["source"] == "bundled"
+        cached = rec.get_recommendation(config, "openrouter", "router")
+        assert cached["source"] == ("remote" if warm_cache else "bundled")
+        if warm_cache:
+            assert cached["rows"][0]["model"] == "route-c0-cached"
         assert not rec.refresh_recommendations(config=config, force=True)
         release.set()
         assert completed.wait(2)
