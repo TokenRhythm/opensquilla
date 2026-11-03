@@ -87,6 +87,10 @@
         <Icon :name="sidebarNavIcons[item.icon] ?? item.icon" :size="17" />
         <span class="sidebar-fn-label">{{ item.title }}</span>
       </router-link>
+      <button v-if="account && !account.loggedIn" type="button" class="sidebar-fn-item" data-icon="settings" @click="openSettings">
+        <Icon name="settings-2" :size="17" />
+        <span class="sidebar-fn-label">{{ t('chrome.settings') }}</span>
+      </button>
     </div>
 
 
@@ -460,6 +464,7 @@ import { SettingsBackgroundRoute, useSettingsRouteOverlay } from './router/setti
 import SidebarAccountMenu from './components/SidebarAccountMenu.vue'
 import { useI18n } from 'vue-i18n'
 import { routeTitle } from './router'
+import { useAccountStore } from './stores/account'
 import { getPlatform } from '@/platform'
 import { copyTextWithFallback } from '@/utils/browser'
 import { currentSessionLink } from '@/utils/chat/sessionLinks'
@@ -563,6 +568,7 @@ import {
 const appStore = useAppStore()
 const workbenchStore = useWorkbenchStore()
 const platform = getPlatform()
+const account = platform.account ? useAccountStore() : null
 const injectedGatewayAccess = inject(GATEWAY_ACCESS_KEY)
 if (!injectedGatewayAccess) throw new Error('GatewayAccess was not provided')
 const gatewayAccess = injectedGatewayAccess

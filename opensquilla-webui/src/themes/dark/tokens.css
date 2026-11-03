@@ -19,6 +19,8 @@
   --bg-surface-2: #28282B;
   --bg-elevated: #2D2D30;
   --bg-hover: #353539;
+  --account-wallet-bg: var(--bg-surface-2);
+  --account-menu-divider: color-mix(in srgb, var(--text) 10%, transparent);
   --text: #F5F5F7;
   --text-muted: #B0B0B6;
   --text-dim: #87878E;

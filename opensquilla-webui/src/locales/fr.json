@@ -5131,14 +5131,15 @@
   },
   "account": {
     "menu": {
+      "loginRegister": "Connexion / Inscription",
       "recharge": "Recharger",
       "balance": "Solde TokenRhythm",
       "todayUsage": "Utilisation du jour",
       "todayUsageHint": "Tokens d’entrée et de sortie enregistrés aujourd’hui par ce Gateway, tous fournisseurs confondus. Utilise votre fuseau horaire local et les mêmes données que la page d’utilisation, pas la facture du compte TokenRhythm.",
-      "viewUsage": "Voir l’utilisation",
+      "viewUsage": "Utilisation et limites",
       "balanceUnavailable": "Solde indisponible",
-      "balanceStale": "Le solde peut être obsolète",
-      "usageUnavailable": "Utilisation locale indisponible",
+      "balanceStale": "Dernier solde",
+      "usageUnavailable": "Indisponible",
       "usageApproximate": "Utilisation approximative"
     },
     "recoveryLogin": "Réinitialiser la connexion et autoriser à nouveau",

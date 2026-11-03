@@ -5131,14 +5131,15 @@
   },
   "account": {
     "menu": {
+      "loginRegister": "ログイン / 新規登録",
       "recharge": "チャージ",
       "balance": "TokenRhythm 残高",
       "todayUsage": "本日の使用量",
       "todayUsageHint": "現在のゲートウェイが本日記録した全プロバイダーの入力・出力 Token です。ローカルタイムゾーンで集計し、使用量ページと同じデータを使用します。TokenRhythm アカウントの請求額ではありません。",
-      "viewUsage": "使用量を見る",
-      "balanceUnavailable": "残高を取得できません",
-      "balanceStale": "残高が古い可能性があります",
-      "usageUnavailable": "ローカル使用量を取得できません",
+      "viewUsage": "使用量と上限",
+      "balanceUnavailable": "残高取得不可",
+      "balanceStale": "前回の残高",
+      "usageUnavailable": "取得不可",
       "usageApproximate": "概算使用量"
     },
     "recoveryLogin": "ログインをリセットして再認証",

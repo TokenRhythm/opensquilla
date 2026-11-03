@@ -5234,14 +5234,15 @@
   },
   "account": {
     "menu": {
+      "loginRegister": "Sign in / Register",
       "recharge": "Add funds",
       "balance": "TokenRhythm balance",
       "todayUsage": "Today’s usage",
       "todayUsageHint": "Input and output tokens recorded by this Gateway today, across all providers. Uses your local time zone and the same data as the Usage page; this is not the TokenRhythm account bill.",
-      "viewUsage": "View usage",
-      "balanceUnavailable": "Balance unavailable",
-      "balanceStale": "Balance may be out of date",
-      "usageUnavailable": "Local usage unavailable",
+      "viewUsage": "Usage and limits",
+      "balanceUnavailable": "No balance data",
+      "balanceStale": "Last balance",
+      "usageUnavailable": "Unavailable",
       "usageApproximate": "Approximate usage"
     },
     "recoveryLogin": "Reset sign-in and authorize again",

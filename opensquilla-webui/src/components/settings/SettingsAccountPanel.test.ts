@@ -162,7 +162,7 @@ describe('logout confirmation', () => {
   return { el, trigger, dialog: document.querySelector<HTMLElement>('[role="dialog"]')! }
  }
 
- it.each(['signed_out', 'signed_in', 'unverified'] as const)('hands settings focus back to the menu trigger while %s', async (status) => {
+ it.each(['signed_in', 'unverified'] as const)('hands settings focus back to the menu trigger while %s', async (status) => {
   let focusAtSettings: Element | null = null
   const onSettings = vi.fn(() => { focusAtSettings = document.activeElement })
   const el = await mount(SidebarAccountMenu, state({ status, profile }), { onSettings })
