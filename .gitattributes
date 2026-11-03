@@ -31,3 +31,7 @@ src/opensquilla/squilla_router/lightgbm_model/** text eol=lf
 src/opensquilla/squilla_router/lightgbm_model/assets/**/*.joblib filter=lfs diff=lfs merge=lfs -text
 src/opensquilla/squilla_router/lightgbm_model/assets/**/*.pkl filter=lfs diff=lfs merge=lfs -text
 src/opensquilla/squilla_router/lightgbm_model/assets/**/*.gz filter=lfs diff=lfs merge=lfs -text
+
+# The quantized intent head and scaler are ordinary Git binary assets.
+src/opensquilla/squilla_router/lightgbm_model/assets/intent/*.onnx -text
+src/opensquilla/squilla_router/lightgbm_model/assets/intent/standard_scaler88.joblib -filter -diff -merge -text

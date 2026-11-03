@@ -21,7 +21,7 @@ It is not required. OpenSquilla can also run in direct single-model mode.
 
 ## Base Model and Memory
 
-Routing defaults to the packaged intent and tier LightGBM classifiers with
+Routing defaults to the packaged BERT-60M INT8 intent and LightGBM tier classifiers with
 `strategy = "lightgbm_model"` and `tier_policy = "model"`. An explicit
 `squilla_router.lightgbm_model_dir` must contain the same verified model bundle.
 `squilla_router.v4_bundle_dir` applies only to the explicit `legacy_v4_phase3`
@@ -54,7 +54,8 @@ new path; the following behavior changes apply even to an existing V4 configurat
 
 - A new task uses the tier classifier. Continue keeps the last admitted tier;
   Redo advances it by one, capped at C3. Explicit New Task starts a new context
-  generation. The two classifiers and their preprocessing run locally.
+  generation. BERT-60M INT8 classifies intent; the unchanged LightGBM model
+  classifies tiers. Both run locally under the existing `lightgbm_model` strategy.
   When that generation exceeds the request window, the existing summarizer first
   condenses its own history under the configured budget. The summary is request-local:
   it neither reads an older task's checkpoint nor rewrites the full transcript.

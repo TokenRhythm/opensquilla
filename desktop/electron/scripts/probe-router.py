@@ -37,7 +37,7 @@ def _probe() -> dict[str, object]:
             "input_schema_version": "lightgbm_380.v1",
             "feature_vector_dim": 380,
             "execution_mode": "native_embedded",
-            "model_type": "lightgbm",
+            "model_type": "bert_intent_lightgbm_tier",
         }
         if any(identity.get(key) != value for key, value in expected.items()):
             raise RuntimeError("packaged router runtime identity is inconsistent")

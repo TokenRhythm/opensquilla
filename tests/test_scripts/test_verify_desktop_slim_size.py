@@ -54,7 +54,7 @@ def test_release_budgets_include_fixed_font_and_router_asset_allowances() -> Non
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
     resource_bytes = sum(item["size_bytes"] for item in manifest["files"])
     allowance = resource_bytes + manifest_path.stat().st_size
-    assert allowance == MODULE.LIGHTGBM_ASSET_ALLOWANCE == 24_212_758
+    assert allowance == MODULE.LIGHTGBM_ASSET_ALLOWANCE == 76_727_112
     assert [item.maximum_bytes for item in MODULE.ASSET_BUDGETS["macos"]] == [
         400_886_040 + allowance,
         405_301_192 + allowance,

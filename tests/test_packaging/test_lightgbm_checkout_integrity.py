@@ -10,7 +10,7 @@ from pathlib import Path
 import pytest
 
 
-def test_autocrlf_checkout_preserves_frozen_router_text(tmp_path: Path) -> None:
+def test_autocrlf_checkout_preserves_frozen_router_assets(tmp_path: Path) -> None:
     if shutil.which("git") is None:
         pytest.skip("Git is required to exercise checkout conversion")
     root = Path(__file__).resolve().parents[2]
@@ -39,6 +39,15 @@ def test_autocrlf_checkout_preserves_frozen_router_text(tmp_path: Path) -> None:
         destination = repository / relative
         destination.parent.mkdir(parents=True, exist_ok=True)
         payload = path.read_bytes()
+        destination.write_bytes(payload)
+        expected[relative] = payload
+    # Small binary fixtures exercise the production paths without copying
+    # the 60 MB ONNX into this checkout-conversion test.
+    for filename in ("model.int8.onnx", "standard_scaler88.joblib"):
+        relative = package.relative_to(root) / "assets/intent" / filename
+        destination = repository / relative
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        payload = b"\x00binary\r\nmodel\n\xff"
         destination.write_bytes(payload)
         expected[relative] = payload
     git("add", ".")

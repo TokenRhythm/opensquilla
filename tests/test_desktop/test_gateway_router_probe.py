@@ -33,7 +33,7 @@ def router_probe(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
         "input_schema_version": "lightgbm_380.v1",
         "feature_vector_dim": 380,
         "execution_mode": "native_embedded",
-        "model_type": "lightgbm",
+        "model_type": "bert_intent_lightgbm_tier",
         "runtime_versions": dict.fromkeys(
             ("numpy", "lightgbm", "onnxruntime", "tokenizers", "scikit-learn", "joblib"), "1.2.3",
         ),
@@ -59,7 +59,8 @@ def test_router_probe_checks_runtime_and_closes_model(router_probe) -> None:
 
     assert result == {
         "probe": "opensquilla-desktop-router", "frozen": False,
-        "modelType": "lightgbm", "executionMode": "native_embedded", "featureVectorDim": 380,
+        "modelType": "bert_intent_lightgbm_tier",
+        "executionMode": "native_embedded", "featureVectorDim": 380,
         "runtimeVersions": [
             "joblib", "lightgbm", "numpy", "onnxruntime", "scikit-learn", "tokenizers",
         ],

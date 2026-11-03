@@ -6,6 +6,11 @@ import { dirname, join } from 'node:path'
 import { test } from 'node:test'
 import { assertGatewayResources, fileHash, gatewayInputs, verifyGatewayIntegrity, writeGatewayBuildRecord } from './gateway-integrity.mjs'
 
+const routerAssets = [
+  'intent/model.int8.onnx', 'intent/standard_scaler88.joblib',
+  'tier/model.txt.gz', 'preprocess/model.onnx',
+]
+
 function fixture(t) {
   const repo = mkdtempSync(join(tmpdir(), 'gateway-integrity-'))
   t.after(() => rmSync(repo, { recursive: true, force: true }))
@@ -21,12 +26,12 @@ function fixture(t) {
     files: [{ path: 'model.onnx', size_bytes: 5, sha256: fileHash(join(repo, router, 'model.onnx')) }],
   }))
   const lightgbm = 'src/opensquilla/squilla_router/lightgbm_model/assets'
-  for (const path of ['intent/model.txt.gz', 'tier/model.txt.gz', 'preprocess/model.onnx']) {
+  for (const path of routerAssets) {
     write(`${lightgbm}/${path}`, 'model')
   }
   write(`${lightgbm}/artifact_manifest.json`, JSON.stringify({
     schema_version: 1,
-    files: ['intent/model.txt.gz', 'tier/model.txt.gz', 'preprocess/model.onnx'].map(path => ({
+    files: routerAssets.map(path => ({
       path, size_bytes: 5, sha256: fileHash(join(repo, lightgbm, path)),
     })),
   }))
@@ -193,8 +198,8 @@ test('old provenance cannot be reused for a modified executable', (t) => {
   assert.throws(() => verifyGatewayIntegrity(repo, runtime, { prepared: true }), /prepared Gateway outputs/)
 })
 
-for (const asset of ['intent/model.txt.gz', 'tier/model.txt.gz', 'preprocess/model.onnx']) {
-  test(`LightGBM ${asset} missing or corrupt is rejected`, (t) => {
+for (const asset of routerAssets) {
+  test(`Router ${asset} missing or corrupt is rejected`, (t) => {
     const { repo, runtime, packageDir } = fixture(t)
     const path = join(packageDir, 'squilla_router/lightgbm_model/assets', asset)
     writeFileSync(path, 'other')

@@ -304,7 +304,7 @@ async function verifyGatewayRouter(gatewayBinary, env) {
     '--internal-child', 'python-code', code,
   ], { label: 'router' }), {
     probe: 'opensquilla-desktop-router', frozen: true,
-    modelType: 'lightgbm', executionMode: 'native_embedded', featureVectorDim: 380,
+    modelType: 'bert_intent_lightgbm_tier', executionMode: 'native_embedded', featureVectorDim: 380,
     runtimeVersions: ['joblib', 'lightgbm', 'numpy', 'onnxruntime', 'scikit-learn', 'tokenizers'],
     lightgbmVersionResource: true,
     intentLabels: ['continue', 'new_task', 'redo'], tierLabels: ['C0', 'C1', 'C2', 'C3'],

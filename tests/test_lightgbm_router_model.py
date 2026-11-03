@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import math
 import platform
@@ -52,7 +53,7 @@ def test_manifest_and_boot_probe_do_not_import_ml():
     identity = validate_artifacts()
     assert identity["model_set_id"] == MODEL_SET_ID
     assert identity["model_manifest_hash"] == MANIFEST_HASH
-    assert identity["artifact_count"] == 18
+    assert identity["artifact_count"] == 19
     code = (
         "import sys; from opensquilla.squilla_router.lightgbm_model import validate_artifacts; "
         "validate_artifacts(); "
@@ -62,29 +63,37 @@ def test_manifest_and_boot_probe_do_not_import_ml():
     subprocess.run([sys.executable, "-c", code], check=True)
 
 
-def test_original_classifier_golden_vectors(model):
+def test_original_tier_classifier_golden_vectors(model):
     import numpy as np
 
-    for target in ("intent", "tier"):
-        golden = json.loads(
-            (default_model_root() / target / "golden_vectors.json").read_text(encoding="utf-8")
+    golden = json.loads(
+        (default_model_root() / "tier/golden_vectors.json").read_text(encoding="utf-8")
+    )
+    for case in golden["cases"]:
+        values = model.predict_tier_features(case["features"])
+        np.testing.assert_allclose(
+            [values[label] for label in golden["classes"]],
+            case["expected"]["calibrated_probabilities"], rtol=1e-10, atol=1e-12,
         )
-        for case in golden["cases"]:
-            prediction = model.predict_features(case["features"])
-            values = getattr(prediction, target + "_probabilities")
-            np.testing.assert_allclose(
-                [values[label] for label in golden["classes"]],
-                case["expected"]["calibrated_probabilities"],
-                rtol=1e-10,
-                atol=1e-12,
-            )
-            expected = dict(
-                zip(golden["classes"], case["expected"]["calibrated_probabilities"], strict=True)
-            )
-            labels = ("continue", "redo", "new_task") if target == "intent" else tuple(values)
-            assert getattr(prediction, target + "_decision") == max(
-                labels, key=expected.__getitem__
-            )
+
+
+def test_bert_intent_preprocessing_matches_source(model):
+    from opensquilla.squilla_router.lightgbm_model.input_contract import RouterInput
+
+    inputs = json.loads(
+        (default_model_root() / "source_parity_cases.json").read_text(encoding="utf-8")
+    )["cases"]
+    expected = json.loads(
+        (default_model_root() / "intent/golden_vectors.json").read_text(encoding="utf-8")
+    )["cases"]
+    for source, golden in zip(inputs, expected, strict=True):
+        assert source["name"] == golden["name"]
+        canonical = RouterInput.model_validate(source["input"]).model_dump(mode="json")
+        prepared = model._intent_features(canonical)
+        assert {key: hashlib.sha256(value.tobytes()).hexdigest()
+                for key, value in prepared.items()} == golden["prepared_sha256"]
+    assert set(model._models) == {"tier"}, "The replaced LightGBM intent head must not load"
+    assert model._intent_session.get_providers() == ["CPUExecutionProvider"]
 
 
 def test_runtime_identity_does_not_require_distribution_metadata(model):
@@ -157,7 +166,11 @@ def test_full_features_and_outputs_match_frozen_source(model):
     reference = json.loads(
         (default_model_root() / "source_parity_cases.json").read_text(encoding="utf-8")
     )
+    intents = {case["name"]: case for case in json.loads(
+        (default_model_root() / "intent/golden_vectors.json").read_text(encoding="utf-8")
+    )["cases"]}
     for case in reference["cases"]:
+        intent_expected = intents[case["name"]]["probabilities"]
         features = model.build_features(case["input"])
         assert features.dtype == np.float32
         assert features.shape == (380,)
@@ -182,14 +195,27 @@ def test_full_features_and_outputs_match_frozen_source(model):
         prediction = model.predict(case["input"])
         for target in ("intent", "tier"):
             values = getattr(prediction, target + "_probabilities")
-            expected = case[target + "_probabilities"]
-            np.testing.assert_allclose(
-                list(values.values()),
-                [expected[label] for label in values],
-                rtol=0 if bounds else 1e-10,
-                atol=bounds[target] if bounds else 1e-12,
-                err_msg=case["name"],
-            )
+            expected = intent_expected if target == "intent" else case["tier_probabilities"]
+            if target == "intent":
+                # Match a measured candidate vector, not a wide cross-CPU range.
+                profiles = intents[case["name"]]["runtime_probabilities"]
+                candidates = ([profiles["arm64"]] if arm64
+                              else [intent_expected, profiles["x86_avx2"]])
+                closest = min(
+                    candidates, key=lambda candidate: max(
+                        abs(values[label] - candidate[label]) for label in values
+                    ),
+                )
+                np.testing.assert_allclose(
+                    list(values.values()), [closest[label] for label in values],
+                    rtol=0, atol=1e-6, err_msg=case["name"],
+                )
+            else:
+                np.testing.assert_allclose(
+                    list(values.values()), [expected[label] for label in values],
+                    rtol=0 if bounds else 1e-10,
+                    atol=bounds[target] if bounds else 1e-12, err_msg=case["name"],
+                )
             labels = ("continue", "redo", "new_task") if target == "intent" else tuple(values)
             assert getattr(prediction, target + "_decision") == max(
                 labels, key=expected.__getitem__
@@ -199,7 +225,7 @@ def test_full_features_and_outputs_match_frozen_source(model):
         prior = case["input"].get("active_route_tier")
         state = ModelPolicyState(prior.lower(), task_id="reference-task") if prior else None
         reference_prediction = SimpleNamespace(
-            intent_probabilities=case["intent_probabilities"],
+            intent_probabilities=intent_expected,
             tier_probabilities=case["tier_probabilities"],
         )
         decisions = [
@@ -251,7 +277,8 @@ def test_tampered_manifest_fails_closed(tmp_path: Path):
     [
         ("intent/calibration.json", b"{}", "artifact hash mismatch: intent/calibration.json"),
         ("preprocess/feature/artifacts/pca64.joblib", None, "assets are missing or invalid"),
-        ("intent/model.txt.gz", b"\x1f\x8b\x08", "assets are missing or invalid"),
+        ("intent/model.int8.onnx", b"invalid", "artifact hash mismatch: intent/model.int8.onnx"),
+        ("intent/standard_scaler88.joblib", None, "assets are missing or invalid"),
         ("preprocess/feature/artifacts/bge/tokenizer.json", None, "assets are missing or invalid"),
     ],
 )
