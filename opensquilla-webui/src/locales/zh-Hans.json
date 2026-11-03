@@ -5233,14 +5233,15 @@
   },
   "account": {
     "menu": {
+      "loginRegister": "登录/注册",
       "recharge": "去充值",
       "balance": "TokenRhythm 余额",
       "todayUsage": "今日用量",
       "todayUsageHint": "按本地时区统计当前网关今天记录的所有服务商的输入与输出 Token，与用量页口径一致，不代表 TokenRhythm 账号账单。",
-      "viewUsage": "查看用量",
-      "balanceUnavailable": "暂时无法获取余额",
-      "balanceStale": "余额可能不是最新的",
-      "usageUnavailable": "暂时无法获取本地用量",
+      "viewUsage": "用量与额度",
+      "balanceUnavailable": "余额不可用",
+      "balanceStale": "上次余额",
+      "usageUnavailable": "暂不可用",
       "usageApproximate": "近似用量"
     },
     "recoveryLogin": "重置本机登录并重新授权",

@@ -20,12 +20,23 @@ const open = ref(false)
 const logoutOpen = ref(false)
 const menuId = useId()
 const summaryId = useId()
+const usageHintId = useId()
+const usageHintHovered = ref(false)
+const usageHintFocused = ref(false)
+const usageHintPinned = ref(false)
+const usageHintDismissed = ref(false)
+const usageHintVisible = computed(() => usageHintPinned.value
+  || (!usageHintDismissed.value && (usageHintHovered.value || usageHintFocused.value)))
 const usageOpen = computed(() => open.value && account.loggedIn && !props.collapsed)
 const { tokens, loading, error: usageError, approximate } = useTodayUsage(usageOpen)
 const wallet = computed(() => account.state?.wallet)
 const walletLoading = computed(() => account.refreshing || account.state?.walletStatus === 'loading')
 const walletUnavailable = computed(() => ['error', 'stale'].includes(account.state?.walletStatus || ''))
 const balance = computed(() => formatAccountMoney(wallet.value?.balances.available, wallet.value?.currency))
+const walletStatus = computed(() => walletLoading.value ? t('shared.loading')
+  : failure.value || (walletUnavailable.value ? t(wallet.value ? 'account.menu.balanceStale' : 'account.menu.balanceUnavailable') : ''))
+const usageStatus = computed(() => loading.value ? t('shared.loading')
+  : usageError.value ? t('account.menu.usageUnavailable') : '')
 const tokenCount = computed(() => tokens.value === null ? '—' : tokens.value.toLocaleString(locale.value, { notation: 'compact', maximumFractionDigits: 2 }))
 const failure = computed(() => account.error
   ? te(`account.errors.${account.error}`) ? t(`account.errors.${account.error}`) : t('account.errors.generic')
@@ -33,7 +44,35 @@ const failure = computed(() => account.error
 
 function close(focus = false) {
   open.value = false
+  resetUsageHint()
   if (focus) trigger.value?.focus()
+}
+function resetUsageHint() {
+  usageHintHovered.value = false
+  usageHintFocused.value = false
+  usageHintPinned.value = false
+  usageHintDismissed.value = false
+}
+function dismissUsageHint() {
+  usageHintPinned.value = false
+  usageHintDismissed.value = true
+}
+function toggleUsageHint() {
+  if (usageHintPinned.value) dismissUsageHint()
+  else { usageHintPinned.value = true; usageHintDismissed.value = false }
+}
+function hoverUsageHint(event: PointerEvent) {
+  if (event.pointerType === 'touch') return
+  usageHintHovered.value = true
+  usageHintDismissed.value = false
+}
+function focusUsageHint() {
+  usageHintFocused.value = true
+  usageHintDismissed.value = false
+}
+function blurUsageHint() {
+  usageHintFocused.value = false
+  usageHintPinned.value = false
 }
 function items() {
   return [...(root.value?.querySelectorAll<HTMLButtonElement>('[role="menuitem"]:not(:disabled)') || [])]
@@ -45,9 +84,18 @@ async function openMenu(last = false) {
   enabled[last ? enabled.length - 1 : 0]?.focus()
 }
 function toggle() { if (open.value) close(true); else void openMenu() }
-function outside(event: PointerEvent) { if (!root.value?.contains(event.target as Node)) close() }
+function outside(event: PointerEvent) {
+  const target = event.target as HTMLElement
+  if (!root.value?.contains(target)) close()
+  else if (!target.closest('.sidebar-account__usage-help')) dismissUsageHint()
+}
 function keydown(event: KeyboardEvent) {
-  if (event.key === 'Escape') { event.preventDefault(); close(true) }
+  if (event.key === 'Escape') {
+    event.preventDefault()
+    if (usageHintVisible.value) dismissUsageHint()
+    else close(true)
+    return
+  }
   if (event.key === 'Tab') { close(true); return }
   if (!['ArrowDown', 'ArrowUp', 'Home', 'End'].includes(event.key)) return
   event.preventDefault()
@@ -73,59 +121,63 @@ onUnmounted(() => document.removeEventListener('pointerdown', outside))
 <template>
   <div v-if="!collapsed" ref="root" class="sidebar-account">
     <button
+      v-if="account.loggedIn"
       ref="trigger" class="sidebar-fn-item" data-testid="sidebar-account-trigger" type="button"
-      :aria-label="account.loggedIn ? account.name : t('account.loginSettings')"
-      :title="account.loggedIn ? account.name : t('account.loginSettings')"
+      :aria-label="account.name"
+      :title="account.name"
       aria-haspopup="menu" :aria-expanded="open" :aria-controls="open ? menuId : undefined"
       @click="toggle" @keydown.down.prevent="openMenu()" @keydown.up.prevent="openMenu(true)"
     >
-      <span class="sidebar-account__avatar" aria-hidden="true"><img v-if="account.loggedIn" :src="accountAvatarUrl" alt="" width="28" height="28" draggable="false" /><Icon v-else name="user" :size="17" /></span>
-      <span class="sidebar-account__name">{{ account.loggedIn ? account.name : t('account.loginSettings') }}</span>
-      <Icon name="chevronDown" :size="14" aria-hidden="true" />
+      <span class="sidebar-account__avatar" aria-hidden="true"><img :src="accountAvatarUrl" alt="" width="28" height="28" draggable="false" /></span>
+      <span class="sidebar-account__name">{{ account.name }}</span>
+      <Icon name="chevronDown" :size="14" class="sidebar-account__chevron" :class="{ 'is-open': open }" data-testid="sidebar-account-chevron" aria-hidden="true" />
     </button>
+    <button
+      v-else type="button" class="sidebar-account__login" data-testid="sidebar-account-login"
+      :disabled="account.busy" @click="login"
+    >{{ t('account.menu.loginRegister') }}</button>
     <div
-      v-if="open" :id="menuId" class="sidebar-account__menu" role="menu"
-      :aria-label="t('account.title')" :aria-describedby="account.loggedIn ? summaryId : undefined"
+      v-if="open && account.loggedIn" :id="menuId" class="sidebar-account__menu" role="menu"
+      :aria-label="t('account.title')" :aria-describedby="summaryId"
       @keydown="keydown"
     >
-      <template v-if="account.loggedIn">
-        <div class="sidebar-account__identity" role="presentation">
-          <span class="sidebar-account__avatar" aria-hidden="true"><img :src="accountAvatarUrl" alt="" width="36" height="36" draggable="false" /></span>
-          <strong class="sidebar-account__name" :title="account.name">{{ account.name }}</strong>
-        </div>
-        <div :id="summaryId" role="presentation" class="sidebar-account__summary">
-          <span class="sidebar-account__sr-only">{{ t('account.menu.todayUsageHint') }}</span>
-          <div class="sidebar-account__wallet">
-            <div class="sidebar-account__wallet-row">
-              <div class="sidebar-account__wallet-balance">
-                <span class="sidebar-account__caption">{{ t('account.menu.balance') }}</span>
-                <strong data-testid="sidebar-account-balance" :aria-busy="walletLoading">{{ balance }}</strong>
+      <div class="sidebar-account__identity" role="presentation">
+        <span class="sidebar-account__avatar" aria-hidden="true"><img :src="accountAvatarUrl" alt="" width="36" height="36" draggable="false" /></span>
+        <strong class="sidebar-account__name" :title="account.name">{{ account.name }}</strong>
+      </div>
+      <div :id="summaryId" role="presentation" class="sidebar-account__summary">
+        <div class="sidebar-account__wallet">
+          <div class="sidebar-account__wallet-row">
+            <div class="sidebar-account__wallet-balance">
+              <div class="sidebar-account__balance-label">
+                <span v-show="!walletStatus" class="sidebar-account__caption">{{ t('account.available') }}</span>
+                <span class="sidebar-account__hint" :class="{ 'sidebar-account__hint--warning': (walletUnavailable || failure) && !walletLoading }" data-testid="sidebar-account-wallet-status" :role="failure && !walletLoading ? 'alert' : 'status'" :title="walletStatus || undefined">{{ walletStatus }}</span>
               </div>
-              <button type="button" role="menuitem" tabindex="-1" class="sidebar-account__recharge" data-testid="sidebar-account-recharge" @click="account.openLink('recharge')">
-                {{ t('account.menu.recharge') }}<Icon name="arrowUpRight" :size="14" aria-hidden="true" />
-              </button>
+              <strong data-testid="sidebar-account-balance" :aria-busy="walletLoading" :title="balance">{{ balance }}</strong>
             </div>
-            <span v-if="walletLoading" class="sidebar-account__hint" role="status">{{ t('shared.loading') }}</span>
-            <span v-else-if="walletUnavailable" class="sidebar-account__hint sidebar-account__hint--warning" role="status">{{ t(wallet ? 'account.menu.balanceStale' : 'account.menu.balanceUnavailable') }}</span>
-          </div>
-          <div class="sidebar-account__usage" data-testid="sidebar-account-today-usage" :aria-busy="loading">
-            <span class="sidebar-account__caption sidebar-account__usage-label">
-              {{ t('account.menu.todayUsage') }}<Icon name="info" :size="13" aria-hidden="true" />
-            </span>
-            <span class="sidebar-account__usage-value" :title="usageError ? t('account.menu.usageUnavailable') : tokens === null ? undefined : tokens.toLocaleString(locale)">
-              <span class="sidebar-account__tokens">{{ approximate && tokens !== null ? '≈ ' : '' }}{{ tokenCount }}<small v-if="tokens !== null"> Tokens</small></span>
-              <span v-if="loading" class="sidebar-account__usage-status" role="status">{{ t('shared.loading') }}</span>
-              <span v-else-if="usageError" class="sidebar-account__usage-status" role="status">{{ t('account.menu.usageUnavailable') }}</span>
-            </span>
+            <button type="button" role="menuitem" tabindex="-1" class="sidebar-account__recharge" data-testid="sidebar-account-recharge" @click="account.openLink('recharge')">
+              {{ t('account.menu.recharge') }}<span class="sidebar-account__recharge-arrow" aria-hidden="true" />
+            </button>
           </div>
         </div>
-        <div class="sidebar-account__divider" role="separator" />
-        <button type="button" role="menuitem" tabindex="-1" class="sidebar-account__item" data-testid="sidebar-account-usage" @click="openUsage"><Icon name="chart-no-axes-column" :size="17" aria-hidden="true" />{{ t('account.menu.viewUsage') }}</button>
-      </template>
-      <button v-else type="button" role="menuitem" tabindex="-1" class="sidebar-account__item" :disabled="account.busy" @click="login"><Icon name="user" :size="17" aria-hidden="true" />{{ t('account.login') }}</button>
-      <button type="button" role="menuitem" tabindex="-1" class="sidebar-account__item" data-testid="sidebar-account-settings" @click="openSettings"><Icon name="settings-2" :size="17" aria-hidden="true" />{{ t('chrome.settings') }}</button>
-      <button v-if="account.loggedIn" type="button" role="menuitem" tabindex="-1" class="sidebar-account__item" :disabled="account.busy" @click="requestLogout"><Icon name="log-out" :size="17" aria-hidden="true" />{{ t('account.logout') }}</button>
-      <p v-if="failure" class="sidebar-account__error" role="alert">{{ failure }}</p>
+        <div class="sidebar-account__usage" data-testid="sidebar-account-today-usage" :aria-busy="loading">
+          <span class="sidebar-account__caption sidebar-account__usage-label">
+            <span class="sidebar-account__usage-title" :title="t('account.menu.todayUsage')">{{ t('account.menu.todayUsage') }}</span>
+            <span class="sidebar-account__usage-help" @pointerenter="hoverUsageHint" @pointerleave="usageHintHovered = false">
+              <button type="button" role="menuitem" tabindex="-1" class="sidebar-account__info" data-testid="sidebar-account-usage-info" :aria-label="t('account.menu.todayUsage')" :aria-describedby="usageHintId" @focus="focusUsageHint" @blur="blurUsageHint" @click.stop="toggleUsageHint"><Icon name="info" :size="13" aria-hidden="true" /></button>
+              <span :id="usageHintId" class="sidebar-account__tooltip" :class="{ 'is-visible': usageHintVisible }" role="tooltip" :aria-hidden="!usageHintVisible">{{ t('account.menu.todayUsageHint') }}</span>
+            </span>
+          </span>
+          <span class="sidebar-account__usage-value">
+            <span v-if="!usageStatus" class="sidebar-account__tokens" :title="tokens?.toLocaleString(locale)">{{ approximate && tokens !== null ? '≈ ' : '' }}{{ tokenCount }}<small v-if="tokens !== null"> Tokens</small></span>
+            <span class="sidebar-account__usage-status" role="status" :title="usageStatus || undefined">{{ usageStatus }}</span>
+          </span>
+        </div>
+      </div>
+      <div class="sidebar-account__divider" role="separator" />
+      <button type="button" role="menuitem" tabindex="-1" class="sidebar-account__item" data-testid="sidebar-account-usage" @click="openUsage"><Icon name="chart-no-axes-column" :size="14" aria-hidden="true" />{{ t('account.menu.viewUsage') }}</button>
+      <button type="button" role="menuitem" tabindex="-1" class="sidebar-account__item" data-testid="sidebar-account-settings" @click="openSettings"><Icon name="settings-2" :size="14" aria-hidden="true" />{{ t('chrome.settings') }}</button>
+      <button type="button" role="menuitem" tabindex="-1" class="sidebar-account__item" :disabled="account.busy" @click="requestLogout"><Icon name="log-out" :size="14" aria-hidden="true" />{{ t('account.logout') }}</button>
     </div>
   </div>
   <AccountLogoutDialog :open="logoutOpen" @close="logoutOpen = false" />
@@ -133,42 +185,58 @@ onUnmounted(() => document.removeEventListener('pointerdown', outside))
 
 <style scoped>
 .sidebar-account { position: relative; }
-.sidebar-account__sr-only { position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px; overflow: hidden; clip-path: inset(50%); white-space: nowrap; border: 0; }
 .sidebar-fn-item { display: flex; align-items: center; gap: 10px; width: 100%; padding: 10px 12px; border: 0; background: transparent; color: var(--text); cursor: pointer; font: inherit; border-radius: var(--radius-md); }
 .sidebar-fn-item:hover, .sidebar-fn-item[aria-expanded="true"] { background: var(--bg-hover); }
+.sidebar-account__chevron { flex-shrink: 0; transition: transform var(--dur-fast) var(--ease-standard); }
+.sidebar-account__chevron.is-open { transform: rotate(180deg); }
+.sidebar-account__login { display: block; box-sizing: border-box; width: 100%; min-height: 36px; margin: 6px 0; padding: 6px 12px; border: 1px solid var(--border); border-radius: var(--radius-full); background: transparent; color: var(--text); cursor: pointer; font: inherit; font-size: var(--fs-xs); }
+.sidebar-account__login:disabled { opacity: .5; cursor: default; }
+.sidebar-account__login:not(:disabled):hover { background: var(--bg-hover); }
+.sidebar-account__login:not(:disabled):active { background: var(--bg-active, var(--bg-hover)); }
 .sidebar-account__avatar { flex: 0 0 28px; height: 28px; display: grid; place-items: center; border-radius: var(--radius-full); background: var(--bg-hover); font-size: var(--fs-sm); font-weight: 600; }
 .sidebar-account__avatar img { display: block; width: 100%; height: 100%; object-fit: contain; border-radius: inherit; }
 .sidebar-account__name { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; text-align: left; }
-.sidebar-account__menu { position: absolute; bottom: calc(100% + 8px); left: 0; box-sizing: border-box; width: 100%; max-height: calc(100dvh - 80px); overflow-y: auto; padding: 6px; background: var(--bg); border: 1px solid var(--border); border-radius: var(--radius-lg); box-shadow: var(--shadow-lg); z-index: 50; }
-.sidebar-account__identity { display: flex; align-items: center; gap: 10px; padding: 8px 10px 12px; font-size: var(--fs-md); }
+.sidebar-account__menu { position: absolute; bottom: calc(100% + 8px); left: 0; box-sizing: border-box; width: 100%; max-height: calc(100dvh - 80px); overflow-y: auto; padding: 8px 0; background: var(--bg); border: 0; border-radius: var(--radius-lg); box-shadow: var(--shadow-lg); z-index: 50; }
+.sidebar-account__identity { display: flex; align-items: center; gap: 10px; padding: 8px 16px 12px; font-size: var(--fs-md); }
 .sidebar-account__identity .sidebar-account__avatar { flex-basis: 36px; height: 36px; }
 .sidebar-account__identity strong { font-weight: 600; }
-.sidebar-account__wallet { margin: 0 4px; padding: 10px; background: var(--bg-hover); border-radius: var(--radius-md); }
+.sidebar-account__wallet { margin: 0 12px; padding: 8px 12px; background: var(--account-wallet-bg, var(--bg-surface-2)); border-radius: var(--radius-md); }
 .sidebar-account__caption { color: var(--text-muted); font-size: var(--fs-xs); line-height: 1.5; }
 .sidebar-account__wallet-row { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
-.sidebar-account__wallet-balance { display: flex; flex-direction: column; gap: 4px; min-width: 0; overflow-wrap: anywhere; }
-.sidebar-account__wallet-balance strong { font-size: var(--fs-md); font-weight: 600; font-variant-numeric: tabular-nums; }
+.sidebar-account__wallet-balance { display: flex; flex-direction: column; gap: 4px; min-width: 0; }
+.sidebar-account__balance-label { height: 18px; line-height: 18px; }
+.sidebar-account__wallet-balance strong { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: var(--fs-md); line-height: 24px; font-weight: 600; font-variant-numeric: tabular-nums; }
 .sidebar-account__menu button { display: flex; align-items: center; border: 0; background: transparent; color: var(--text); border-radius: var(--radius-sm); cursor: pointer; font: inherit; text-align: left; }
 .sidebar-account__menu button:disabled { opacity: .5; cursor: default; }
 .sidebar-account__menu button:not(:disabled):hover { background: var(--bg-hover); }
-.sidebar-account__menu button:focus-visible, .sidebar-fn-item:focus-visible { outline: 2px solid var(--accent); outline-offset: -2px; }
-.sidebar-account__menu .sidebar-account__recharge { flex-shrink: 0; gap: 2px; max-width: 50%; min-height: 32px; padding: 4px 8px; border: 1px solid var(--border); font-size: var(--fs-xs); }
-.sidebar-account__recharge :deep(svg) { flex-shrink: 0; }
-/* Reserve both rows so async usage updates never move this bottom-anchored
-   menu, and long translated labels cannot crowd out the token count. */
-.sidebar-account__usage { display: flex; flex-direction: column; align-items: stretch; gap: 4px; padding: 12px 14px; }
-.sidebar-account__usage-label { display: inline-flex; align-items: center; flex-shrink: 0; gap: 4px; white-space: nowrap; }
-.sidebar-account__usage-value { display: flex; align-items: center; justify-content: flex-end; gap: 6px; min-width: 0; min-height: 24px; overflow: hidden; white-space: nowrap; }
-.sidebar-account__usage-status { min-width: 0; overflow: hidden; text-overflow: ellipsis; font-size: var(--fs-xs); line-height: 1.5; color: var(--text-muted); }
-.sidebar-account__tokens { flex-shrink: 0; font-size: var(--fs-sm); line-height: 1.5; font-weight: 600; font-variant-numeric: tabular-nums; }
+.sidebar-account__menu button:focus-visible, .sidebar-fn-item:focus-visible, .sidebar-account__login:focus-visible { outline: 2px solid var(--accent); outline-offset: -2px; }
+.sidebar-account__menu .sidebar-account__recharge { flex-shrink: 0; gap: 4px; max-width: 50%; height: 28px; padding: 0 8px; border: 1px solid var(--border); font-size: var(--fs-xs); line-height: 18px; white-space: nowrap; transition: background-color var(--dur-fast) var(--ease-standard), border-color var(--dur-fast) var(--ease-standard); }
+.sidebar-account__menu .sidebar-account__recharge:not(:disabled):hover { background: var(--bg-hover); border-color: var(--text-faint, var(--text-muted)); }
+.sidebar-account__menu .sidebar-account__recharge:not(:disabled):active { background: color-mix(in srgb, var(--text) 12%, var(--account-wallet-bg, var(--bg-surface-2))); border-color: var(--text-muted); }
+.sidebar-account__recharge-arrow { flex: 0 0 12px; height: 12px; background: currentColor; mask: url('@/assets/account/recharge-arrow.png') center / contain no-repeat; }
+/* Refresh messages share the caption and value lines to keep the menu still. */
+.sidebar-account__usage { position: relative; display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, auto); align-items: center; column-gap: 8px; margin: 0 12px; padding: 11px 10px; }
+.sidebar-account__usage-label { display: inline-flex; align-items: center; min-width: 0; gap: 4px; white-space: nowrap; }
+.sidebar-account__usage-title { min-width: 0; overflow: hidden; text-overflow: ellipsis; }
+.sidebar-account__usage-help { display: inline-flex; flex-shrink: 0; }
+.sidebar-account__menu .sidebar-account__info { justify-content: center; width: 20px; height: 24px; padding: 0; color: var(--text-muted); }
+/* The identity and wallet above the help button leave 126px before the menu edge. */
+.sidebar-account__tooltip { position: absolute; top: 10px; transform: translateY(max(-100%, -126px)); left: 0; right: 0; z-index: 1; padding: 10px 12px; border-radius: var(--radius-md); background: var(--text); color: var(--bg); box-shadow: var(--shadow-md); font-size: var(--fs-xs); font-weight: 400; line-height: 1.5; white-space: normal; overflow-wrap: anywhere; visibility: hidden; opacity: 0; pointer-events: none; }
+.sidebar-account__tooltip.is-visible { visibility: visible; opacity: 1; pointer-events: auto; }
+.sidebar-account__usage-value { display: flex; align-items: center; justify-content: flex-end; min-width: 0; min-height: 24px; white-space: nowrap; }
+.sidebar-account__usage-status { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; text-align: right; font-size: var(--fs-xs); line-height: 20px; color: var(--text-muted); }
+.sidebar-account__tokens { overflow: hidden; text-overflow: ellipsis; font-size: var(--fs-sm); line-height: 1.5; font-weight: 600; font-variant-numeric: tabular-nums; }
 .sidebar-account__tokens small { font-size: var(--fs-xs); font-weight: 400; color: var(--text-muted); }
-.sidebar-account__hint { display: block; flex-basis: 100%; margin-top: 2px; font-size: var(--fs-xs); line-height: 1.5; color: var(--text-muted); }
+.sidebar-account__hint { display: block;  overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: var(--fs-xs); line-height: 18px; color: var(--text-muted); }
 .sidebar-account__hint--warning { color: var(--warn); }
-.sidebar-account__divider { height: 1px; margin: 0 4px 4px; background: var(--border); }
-.sidebar-account__menu .sidebar-account__item { gap: 10px; width: 100%; min-height: 38px; padding: 8px 10px; font-size: var(--fs-sm); }
+.sidebar-account__divider { height: .5px; margin: 0 0 4px; background: var(--account-menu-divider); }
+.sidebar-account__menu .sidebar-account__item { box-sizing: border-box; gap: 10px; width: calc(100% - 24px); min-height: 38px; margin: 0 12px; padding: 8px 10px; font-size: var(--fs-xs); }
 .sidebar-account__item :deep(svg) { flex-shrink: 0; color: var(--text-muted); }
-.sidebar-account__error { padding: 4px 10px; margin: 0; color: var(--danger); font-size: var(--fs-xs); overflow-wrap: anywhere; }
 @media (pointer: coarse) {
   .sidebar-account__menu .sidebar-account__item, .sidebar-account__menu .sidebar-account__recharge { min-height: 44px; }
+  .sidebar-account__login, .sidebar-account__menu .sidebar-account__info { min-width: 44px; min-height: 44px; }
+}
+@media (prefers-reduced-motion: reduce) {
+  .sidebar-account__chevron, .sidebar-account__menu .sidebar-account__recharge { transition: none; }
 }
 </style>

@@ -103,14 +103,14 @@ describe('sidebar account summary', () => {
     expect(usage.textContent).toContain('84')
     expect(mock.account.state.source).toBe('manual')
 
-    mock.account.state.wallet.balances.available = '19.10'
+    mock.account.state.wallet.balances.available = '1234567890123456789.10001'
     await nextTick()
-    expect(balance.textContent).toContain('19.10')
+    expect(balance.textContent).toContain('¥1,234,567,890,123,456,789.11')
     expect(usage.textContent).toContain('84')
     mock.usage!.tokens.value = 125
     await nextTick()
     expect(usage.textContent).toContain('125')
-    expect(balance.textContent).toContain('19.10')
+    expect(balance.textContent).toContain('¥1,234,567,890,123,456,789.11')
   })
 
   it('opens remote recharge but routes usage to the local today view', async () => {
@@ -136,7 +136,7 @@ describe('sidebar account summary', () => {
     const usage = host.querySelector('[data-testid="sidebar-account-today-usage"]')!
     expect(balance.textContent).toContain('—')
     expect(balance.textContent).not.toContain('0.00')
-    expect(usage.textContent).toContain('—')
+    expect(usage.textContent).toContain('暂不可用')
     expect(usage.textContent).not.toMatch(/\b0\b/)
     expect(button(host, 'sidebar-account-settings').disabled).toBe(false)
   })
@@ -151,13 +151,41 @@ describe('sidebar account summary', () => {
     expect(host.querySelector('[data-testid="sidebar-account-balance"]')?.textContent).toContain('23.45')
   })
 
+  it('keeps one wallet status region through refresh, failure and recovery', async () => {
+    const { host } = await mount()
+    await open(host)
+    const status = host.querySelector('[data-testid="sidebar-account-wallet-status"]')!
+    const balance = host.querySelector('[data-testid="sidebar-account-balance"]')!
+    expect(status).not.toBeNull()
+    expect(status.textContent?.trim()).toBe('')
+
+    mock.account.refreshing = true
+    await nextTick()
+    expect(host.querySelector('[data-testid="sidebar-account-wallet-status"]')).toBe(status)
+    expect(status.textContent).toContain('加载中')
+    expect(balance.textContent).toContain('23.45')
+    expect(balance.getAttribute('aria-busy')).toBe('true')
+
+    mock.account.refreshing = false
+    mock.account.state.walletStatus = 'stale'
+    await nextTick()
+    expect(host.querySelector('[data-testid="sidebar-account-wallet-status"]')).toBe(status)
+    expect(status.textContent).toContain('上次余额')
+    expect(balance.textContent).toContain('23.45')
+
+    mock.account.state.walletStatus = 'ready'
+    await nextTick()
+    expect(host.querySelector('[data-testid="sidebar-account-wallet-status"]')).toBe(status)
+    expect(status.textContent?.trim()).toBe('')
+    expect(balance.getAttribute('aria-busy')).toBe('false')
+  })
+
   it('shows a confirmed zero only after local usage has finished loading', async () => {
     const { host } = await mount()
     mock.usage!.tokens.value = null
     mock.usage!.loading.value = true
     await open(host)
     const usage = host.querySelector('[data-testid="sidebar-account-today-usage"]')!
-    expect(usage.textContent).toContain('—')
     expect(usage.textContent).not.toMatch(/\b0\b/)
     expect(usage.textContent).toContain('加载中')
     mock.usage!.tokens.value = 0
@@ -184,17 +212,61 @@ describe('sidebar account summary', () => {
     expect(usage.textContent).not.toContain('近似用量')
   })
 
-  it('keeps settings reachable without logging in', async () => {
-    const { host, props } = await mount(state({ status: 'signed_out', profile: null, wallet: null, walletStatus: 'idle', keyStatus: 'missing' }))
+  it('exposes the usage explanation to keyboard navigation and assistive technology', async () => {
+    const { host } = await mount()
     await open(host)
-    expect(host.querySelector('[data-testid="sidebar-account-balance"]')).toBeNull()
-    const settings = button(host, 'sidebar-account-settings')
-    expect(settings.disabled).toBe(false)
-    settings.click()
+    const info = button(host, 'sidebar-account-usage-info')
+    const recharge = button(host, 'sidebar-account-recharge')
+    expect(document.activeElement).toBe(recharge)
+    recharge.dispatchEvent(new KeyboardEvent('keydown', { key: 'ArrowDown', bubbles: true }))
     await nextTick()
-    expect(props.onSettings).toHaveBeenCalledOnce()
-    expect(mock.account.action).not.toHaveBeenCalled()
+    expect(document.activeElement).toBe(info)
+
+    const descriptionId = info.getAttribute('aria-describedby')
+    expect(descriptionId).toBeTruthy()
+    const tooltip = document.getElementById(descriptionId!)
+    expect(tooltip?.getAttribute('role')).toBe('tooltip')
+    expect(tooltip?.getAttribute('aria-hidden')).toBe('false')
+    expect(tooltip?.textContent).toContain('按本地时区')
+    expect(tooltip?.textContent).toContain('不代表 TokenRhythm 账号账单')
+
+    info.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true }))
+    await nextTick()
+    expect(tooltip?.getAttribute('aria-hidden')).toBe('true')
+    expect(host.querySelector('[role="menu"]')).not.toBeNull()
+    info.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true }))
+    await nextTick()
     expect(host.querySelector('[role="menu"]')).toBeNull()
+    expect(document.activeElement).toBe(button(host, 'sidebar-account-trigger'))
+  })
+
+  it('lets touch and pointer users toggle the usage explanation without closing the menu', async () => {
+    const { host } = await mount()
+    await open(host)
+    const info = button(host, 'sidebar-account-usage-info')
+    const tooltip = document.getElementById(info.getAttribute('aria-describedby')!)!
+    expect(tooltip.getAttribute('aria-hidden')).toBe('true')
+
+    info.click()
+    await nextTick()
+    expect(tooltip.getAttribute('aria-hidden')).toBe('false')
+    expect(host.querySelector('[role="menu"]')).not.toBeNull()
+
+    info.click()
+    await nextTick()
+    expect(tooltip.getAttribute('aria-hidden')).toBe('true')
+    expect(host.querySelector('[role="menu"]')).not.toBeNull()
+  })
+
+  it('offers direct sign-in from the signed-out capsule', async () => {
+    const { host, router } = await mount(state({ status: 'signed_out', profile: null, wallet: null, walletStatus: 'idle', keyStatus: 'missing' }))
+    const login = button(host, 'sidebar-account-login')
+    expect(login.textContent).toContain('登录/注册')
+    expect(host.querySelectorAll('button')).toHaveLength(1)
+    expect(host.querySelector('[role="menu"]')).toBeNull()
+    login.click()
+    await vi.waitFor(() => expect(router.currentRoute.value.path).toBe('/settings/account'))
+    expect(mock.account.action).toHaveBeenCalledExactlyOnceWith('login')
   })
 
   it('navigates menu actions by keyboard and restores trigger focus with Escape', async () => {
@@ -208,6 +280,9 @@ describe('sidebar account summary', () => {
     expect(document.activeElement).toBe(items[0])
     document.activeElement!.dispatchEvent(new KeyboardEvent('keydown', { key: 'ArrowDown', bubbles: true }))
     expect(document.activeElement).toBe(items[1])
+    document.activeElement!.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true }))
+    await nextTick()
+    expect(host.querySelector('[role="menu"]')).not.toBeNull()
     document.activeElement!.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true }))
     await nextTick()
     expect(host.querySelector('[role="menu"]')).toBeNull()

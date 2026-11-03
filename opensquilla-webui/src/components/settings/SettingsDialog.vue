@@ -821,7 +821,7 @@ function restoreSettingsFocus() {
   const targets = [
     usableInvoker(),
     ...document.querySelectorAll<HTMLElement>('[data-testid="sidebar-account-trigger"]'),
-    document.querySelector<HTMLElement>('.sidebar-foot button[data-icon="settings"]'),
+    document.querySelector<HTMLElement>('.sidebar-core button[data-icon="settings"], .sidebar-foot button[data-icon="settings"]'),
     document.querySelector<HTMLElement>('[data-testid="sidebar-toggle-collapsed"]'),
   ]
   targets.find(canRestoreFocus)?.focus({ preventScroll: true })

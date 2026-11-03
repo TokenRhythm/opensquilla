@@ -5131,14 +5131,15 @@
   },
   "account": {
     "menu": {
+      "loginRegister": "Anmelden / Registrieren",
       "recharge": "Aufladen",
       "balance": "TokenRhythm-Guthaben",
       "todayUsage": "Heutige Nutzung",
       "todayUsageHint": "Heute von diesem Gateway erfasste Eingabe- und Ausgabe-Tokens aller Anbieter. Verwendet Ihre lokale Zeitzone und dieselben Daten wie die Nutzungsseite, nicht die TokenRhythm-Kontoabrechnung.",
-      "viewUsage": "Nutzung anzeigen",
-      "balanceUnavailable": "Guthaben nicht verfügbar",
-      "balanceStale": "Guthaben möglicherweise veraltet",
-      "usageUnavailable": "Lokale Nutzung nicht verfügbar",
+      "viewUsage": "Nutzung und Limits",
+      "balanceUnavailable": "Kein Saldo",
+      "balanceStale": "Letzter Saldo",
+      "usageUnavailable": "Nicht verfügbar",
       "usageApproximate": "Ungefähre Nutzung"
     },
     "recoveryLogin": "Anmeldung zurücksetzen und erneut autorisieren",
