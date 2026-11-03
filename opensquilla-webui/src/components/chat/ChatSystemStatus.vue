@@ -40,7 +40,7 @@ watch([connectionVisible, approvalCount], () => {
     const stable = Array.from(topbar?.querySelectorAll<HTMLButtonElement>(
       '[data-testid="chat-session-actions-trigger"], [data-testid="sidebar-toggle-collapsed"]',
     ) ?? []).find(button => !button.closest('[inert], [hidden], [style*="display: none"]'))
-    const settings = document.querySelector<HTMLButtonElement>('.sidebar-core button[data-icon="settings"], .sidebar-foot button[data-icon="settings"]')
+    const settings = document.querySelector<HTMLButtonElement>('.sidebar-foot button[data-icon="settings"]')
     const sidebarFallback = settings?.closest('[inert], [hidden], [style*="display: none"]') ? null : settings
     ;(sibling || stable || sidebarFallback)?.focus()
   })

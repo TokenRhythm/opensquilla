@@ -162,22 +162,23 @@ describe('logout confirmation', () => {
   return { el, trigger, dialog: document.querySelector<HTMLElement>('[role="dialog"]')! }
  }
 
- it.each(['signed_in', 'unverified'] as const)('hands settings focus back to the menu trigger while %s', async (status) => {
-  let focusAtSettings: Element | null = null
-  const onSettings = vi.fn(() => { focusAtSettings = document.activeElement })
+ it.each(['signed_in', 'unverified'] as const)('opens settings from its own footer button while %s', async (status) => {
+  const onSettings = vi.fn()
   const el = await mount(SidebarAccountMenu, state({ status, profile }), { onSettings })
   mock.store.busy = true
   const trigger = el.querySelector<HTMLButtonElement>('[aria-haspopup="menu"]')!
   trigger.click()
   await nextTick()
-  const settings = [...el.querySelectorAll<HTMLButtonElement>('[role="menuitem"]')].find(button => button.textContent === '设置')!
+  const settings = el.querySelector<HTMLButtonElement>('[data-testid="sidebar-footer-settings"]')!
+  expect(trigger.nextElementSibling).toBe(settings)
+  expect(settings.getAttribute('aria-label')).toBe('设置')
+  expect(el.querySelector('[role="menu"]')?.textContent).not.toContain('设置')
   expect(settings.disabled).toBe(false)
   settings.focus()
   settings.click()
   await nextTick()
   expect(onSettings).toHaveBeenCalledOnce()
-  expect(focusAtSettings).toBe(trigger)
-  expect(document.activeElement).toBe(trigger)
+  expect(document.activeElement).toBe(settings)
   expect(el.querySelector('[role="menu"]')).toBeNull()
   expect(mock.store.action).not.toHaveBeenCalled()
  })

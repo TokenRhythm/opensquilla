@@ -104,7 +104,7 @@ function keydown(event: KeyboardEvent) {
   const next = event.key === 'Home' ? 0 : event.key === 'End' ? enabled.length - 1 : (index + (event.key === 'ArrowDown' ? 1 : -1) + enabled.length) % enabled.length
   enabled[next]?.focus()
 }
-function openSettings() { close(true); emit('settings') }
+function openSettings() { close(); emit('settings') }
 function openUsage() { close(true); void router.push('/usage?range=today') }
 async function login() {
   close(true)
@@ -129,13 +129,21 @@ onUnmounted(() => document.removeEventListener('pointerdown', outside))
       @click="toggle" @keydown.down.prevent="openMenu()" @keydown.up.prevent="openMenu(true)"
     >
       <span class="sidebar-account__avatar" aria-hidden="true"><img :src="accountAvatarUrl" alt="" width="28" height="28" draggable="false" /></span>
-      <span class="sidebar-account__name">{{ account.name }}</span>
-      <Icon name="chevronDown" :size="14" class="sidebar-account__chevron" :class="{ 'is-open': open }" data-testid="sidebar-account-chevron" aria-hidden="true" />
+      <span class="sidebar-account__trigger-label">
+        <span class="sidebar-account__name">{{ account.name }}</span>
+        <Icon name="chevronDown" :size="14" class="sidebar-account__chevron" :class="{ 'is-open': open }" data-testid="sidebar-account-chevron" aria-hidden="true" />
+      </span>
     </button>
     <button
       v-else type="button" class="sidebar-account__login" data-testid="sidebar-account-login"
       :disabled="account.busy" @click="login"
     >{{ t('account.menu.loginRegister') }}</button>
+    <button
+      type="button" class="sidebar-account__settings" data-icon="settings" data-testid="sidebar-footer-settings"
+      :aria-label="t('chrome.settings')" :title="t('chrome.settings')" @click="openSettings"
+    >
+      <Icon name="settings-2" :size="17" aria-hidden="true" />
+    </button>
     <div
       v-if="open && account.loggedIn" :id="menuId" class="sidebar-account__menu" role="menu"
       :aria-label="t('account.title')" :aria-describedby="summaryId"
@@ -176,7 +184,6 @@ onUnmounted(() => document.removeEventListener('pointerdown', outside))
       </div>
       <div class="sidebar-account__divider" role="separator" />
       <button type="button" role="menuitem" tabindex="-1" class="sidebar-account__item" data-testid="sidebar-account-usage" @click="openUsage"><Icon name="chart-no-axes-column" :size="14" aria-hidden="true" />{{ t('account.menu.viewUsage') }}</button>
-      <button type="button" role="menuitem" tabindex="-1" class="sidebar-account__item" data-testid="sidebar-account-settings" @click="openSettings"><Icon name="settings-2" :size="14" aria-hidden="true" />{{ t('chrome.settings') }}</button>
       <button type="button" role="menuitem" tabindex="-1" class="sidebar-account__item" :disabled="account.busy" @click="requestLogout"><Icon name="log-out" :size="14" aria-hidden="true" />{{ t('account.logout') }}</button>
     </div>
   </div>
@@ -184,9 +191,12 @@ onUnmounted(() => document.removeEventListener('pointerdown', outside))
 </template>
 
 <style scoped>
-.sidebar-account { position: relative; }
+.sidebar-account { position: relative; display: grid; grid-template-columns: minmax(0, 1fr) auto; align-items: center; gap: var(--sp-1); }
+.sidebar-account__settings { display: grid; place-items: center; width: 36px; height: 36px; padding: 0; border: 0; border-radius: var(--radius-md); background: transparent; color: var(--text); cursor: pointer; }
+.sidebar-account__settings:hover { background: var(--bg-hover); }
 .sidebar-fn-item { display: flex; align-items: center; gap: 10px; width: 100%; padding: 10px 12px; border: 0; background: transparent; color: var(--text); cursor: pointer; font: inherit; border-radius: var(--radius-md); }
 .sidebar-fn-item:hover, .sidebar-fn-item[aria-expanded="true"] { background: var(--bg-hover); }
+.sidebar-account__trigger-label { display: flex; align-items: center; min-width: 0; gap: var(--sp-1); }
 .sidebar-account__chevron { flex-shrink: 0; transition: transform var(--dur-fast) var(--ease-standard); }
 .sidebar-account__chevron.is-open { transform: rotate(180deg); }
 .sidebar-account__login { display: block; box-sizing: border-box; width: 100%; min-height: 36px; margin: 6px 0; padding: 6px 12px; border: 1px solid var(--border); border-radius: var(--radius-full); background: transparent; color: var(--text); cursor: pointer; font: inherit; font-size: var(--fs-xs); }
@@ -209,7 +219,7 @@ onUnmounted(() => document.removeEventListener('pointerdown', outside))
 .sidebar-account__menu button { display: flex; align-items: center; border: 0; background: transparent; color: var(--text); border-radius: var(--radius-sm); cursor: pointer; font: inherit; text-align: left; }
 .sidebar-account__menu button:disabled { opacity: .5; cursor: default; }
 .sidebar-account__menu button:not(:disabled):hover { background: var(--bg-hover); }
-.sidebar-account__menu button:focus-visible, .sidebar-fn-item:focus-visible, .sidebar-account__login:focus-visible { outline: 2px solid var(--accent); outline-offset: -2px; }
+.sidebar-account__menu button:focus-visible, .sidebar-fn-item:focus-visible, .sidebar-account__login:focus-visible, .sidebar-account__settings:focus-visible { outline: 2px solid var(--accent); outline-offset: -2px; }
 .sidebar-account__menu .sidebar-account__recharge { flex-shrink: 0; gap: 4px; max-width: 50%; height: 28px; padding: 0 8px; border: 1px solid var(--border); font-size: var(--fs-xs); line-height: 18px; white-space: nowrap; transition: background-color var(--dur-fast) var(--ease-standard), border-color var(--dur-fast) var(--ease-standard); }
 .sidebar-account__menu .sidebar-account__recharge:not(:disabled):hover { background: var(--bg-hover); border-color: var(--text-faint, var(--text-muted)); }
 .sidebar-account__menu .sidebar-account__recharge:not(:disabled):active { background: color-mix(in srgb, var(--text) 12%, var(--account-wallet-bg, var(--bg-surface-2))); border-color: var(--text-muted); }
@@ -234,7 +244,7 @@ onUnmounted(() => document.removeEventListener('pointerdown', outside))
 .sidebar-account__item :deep(svg) { flex-shrink: 0; color: var(--text-muted); }
 @media (pointer: coarse) {
   .sidebar-account__menu .sidebar-account__item, .sidebar-account__menu .sidebar-account__recharge { min-height: 44px; }
-  .sidebar-account__login, .sidebar-account__menu .sidebar-account__info { min-width: 44px; min-height: 44px; }
+  .sidebar-account__login, .sidebar-account__settings, .sidebar-account__menu .sidebar-account__info { min-width: 44px; min-height: 44px; }
 }
 @media (prefers-reduced-motion: reduce) {
   .sidebar-account__chevron, .sidebar-account__menu .sidebar-account__recharge { transition: none; }

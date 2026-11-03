@@ -6,7 +6,7 @@ test('Web Settings opens the Sandbox overview and file-safety details', async ({
   await page.goto('/control/')
   await page.waitForSelector('.topbar[data-connection-state]', { timeout: 10_000 })
 
-  await page.locator('.sidebar-fn-item[data-icon="settings"]').click()
+  await page.getByTestId('sidebar-footer-settings').click()
   const settings = page.getByRole('dialog', { name: 'Settings' })
   await expect(settings).toBeVisible()
 
