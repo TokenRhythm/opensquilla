@@ -42,7 +42,8 @@ declare global {
   interface OpenSquillaDesktopApi {
     getAccountState?: () => Promise<import('../../contracts/desktop/tokenrhythm-account').TokenRhythmAccountState>
     accountAction?: (action: import('../../contracts/desktop/tokenrhythm-account').AccountAction) => Promise<import('../../contracts/desktop/tokenrhythm-account').TokenRhythmAccountState>
-    selectAccountSource?: (source: import('../../contracts/desktop/tokenrhythm-account').ModelCredentialSource) => Promise<import('../../contracts/desktop/tokenrhythm-account').TokenRhythmAccountState>
+    selectAccountSource?: (source: import('../../contracts/desktop/tokenrhythm-account').ModelCredentialSource, expected?: import('../../contracts/desktop/tokenrhythm-account').AccountPrimaryActivation) => Promise<import('../../contracts/desktop/tokenrhythm-account').TokenRhythmAccountState>
+    cancelAccountPrimaryActivation?: (id?: string) => Promise<import('../../contracts/desktop/tokenrhythm-account').TokenRhythmAccountState>
     selectAccountMediaSource?: (kind: 'image' | 'video', source: import('../../contracts/desktop/tokenrhythm-account').AccountMediaSource) => Promise<import('../../contracts/desktop/tokenrhythm-account').TokenRhythmAccountState>
     openAccountLink?: (link: import('../../contracts/desktop/tokenrhythm-account').AccountLink) => Promise<void>
     onAccountState?: (callback: (state: import('../../contracts/desktop/tokenrhythm-account').TokenRhythmAccountState) => void) => () => void

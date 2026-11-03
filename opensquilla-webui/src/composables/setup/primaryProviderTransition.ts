@@ -38,17 +38,25 @@ export async function submitPrimaryProviderTransition<T extends object, R>(
   command: T,
   submit: (snapshot: T) => Promise<R>,
   providerLabel: (id: string) => string = id => id,
+  assertCurrent: () => void = () => {},
 ): Promise<{ result: R; routerAction?: RouterResolutionAction } | null> {
   // Clone plain wire data: callers may keep editing drafts while a dialog is open.
   const snapshot: T = JSON.parse(JSON.stringify(command))
+  assertCurrent()
   try {
-    return { result: await submit(snapshot) }
+    const result = await submit(snapshot)
+    assertCurrent()
+    return { result }
   } catch (error) {
     if (!(error instanceof SetupWorkflowError) || !error.details
       || error.reason !== 'router-provider-conflict') throw error
+    assertCurrent()
     const routerAction = await chooseRouterConflictAction(error, providerLabel)
+    assertCurrent()
     if (!routerAction) return null
     // A second error is surfaced; no automatic retry after uncertain network results.
-    return { result: await submit({ ...snapshot, routerAction }), routerAction }
+    const result = await submit({ ...snapshot, routerAction })
+    assertCurrent()
+    return { result, routerAction }
   }
 }

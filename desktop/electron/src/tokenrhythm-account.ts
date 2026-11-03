@@ -5,7 +5,7 @@ import { join } from 'node:path'
 import type { AddressInfo } from 'node:net'
 import { TokenRhythmLoginResult } from './tokenrhythm-login-result.js'
 import { LocalAccountStorageError, canRecoverAccountStorage } from './local-account-secrets.js'
-import type { AccountLink, AccountMediaSource, AccountProfile, AccountWallet, ModelCredentialSource, TokenRhythmAccountState } from '../../../contracts/desktop/tokenrhythm-account.js'
+import type { AccountLink, AccountMediaSource, AccountPrimaryActivation, AccountProfile, AccountWallet, ModelCredentialSource, TokenRhythmAccountState } from '../../../contracts/desktop/tokenrhythm-account.js'
 
 const SCOPES = 'profile.read wallet.read managed_key.read managed_key.obtain session.revoke offline_access'
 const CLIENT = 'opensquilla-desktop'
@@ -32,7 +32,7 @@ interface SavedAccount {
 function emptySavedAccount(): SavedAccount {
   return { version: 1, tokens: null, key: null, source: 'account', selectedAccountId: null, mediaSources: { image: 'inherit', video: 'inherit' }, mediaAccountIds: { image: null, video: null }, videoJobs: {}, pending: [] }
 }
-interface LoginAttempt { state: string; verifier: string; redirect: string; url: string; server: Server; timer: NodeJS.Timeout; epoch: number }
+interface LoginAttempt { state: string; verifier: string; redirect: string; url: string; server: Server; timer: NodeJS.Timeout; epoch: number; primaryActivationId: string; primaryActivationVersion: number }
 interface AccountDeviceInfo { name: string; os: string }
 export function describeAccountDevice(platform: string, systemVersion: string): AccountDeviceInfo | undefined {
   if (!/^[A-Za-z0-9][A-Za-z0-9 ._+()-]{0,47}$/.test(systemVersion)) return undefined
@@ -106,12 +106,20 @@ export function equalToken(actual: string, expected: string): boolean {
   return a.length === b.length && a.length > 0 && timingSafeEqual(a, b)
 }
 
-export function hasSavedModelConnection(config: Record<string, unknown>): boolean {
-  const llm = config.llm && typeof config.llm === 'object' ? config.llm as Record<string, unknown> : {}
-  // A fresh desktop writes an explicit empty primary to suppress env defaults.
-  // Preferences such as timeout alone are not a saved model connection.
-  return ['provider', 'model', 'api_key', 'api_key_env', 'base_url'].some(key => Boolean(llm[key]))
-    || Boolean(config.llm_profiles && Object.keys(config.llm_profiles as object).length)
+function activationId(value: unknown): string {
+  if (typeof value !== 'string' || !/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(value)) throw new AccountError('INVALID_ACCOUNT_ACTIVATION')
+  return value
+}
+
+/** Validate the renderer's complete expected identity before considering a bind. */
+export function accountPrimaryActivation(value: unknown): AccountPrimaryActivation {
+  if (!value || typeof value !== 'object' || Array.isArray(value)
+    || Object.keys(value).sort().join(',') !== 'accountId,id,sessionId') throw new AccountError('INVALID_ACCOUNT_ACTIVATION')
+  const request = value as Record<string, unknown>
+  for (const key of ['accountId', 'sessionId']) {
+    if (typeof request[key] !== 'string' || !/^[^\u0000-\u0020\u007f]{1,256}$/.test(request[key])) throw new AccountError('INVALID_ACCOUNT_ACTIVATION')
+  }
+  return { id: activationId(request.id), accountId: request.accountId as string, sessionId: request.sessionId as string }
 }
 
 /** The sole owner of account tokens and the shared model key. */
@@ -145,6 +153,10 @@ export class TokenRhythmAccount {
   private lease = ''
   private poll: NodeJS.Timeout | null = null
   private loginResult: TokenRhythmLoginResult | null = null
+  private primaryActivation: AccountPrimaryActivation | null = null
+  private primaryActivationLogin: { request: AccountPrimaryActivation; epoch: number; version: number } | null = null
+  private primaryActivationVersion = 0
+  private sourceSelectionVersion = 0
   constructor(private readonly deps: AccountDependencies) {
     this.origin = accountOrigin(deps.origin)
     this.request = deps.fetch ?? fetch
@@ -156,8 +168,32 @@ export class TokenRhythmAccount {
     if (this.admissionClosed) throw new AccountError('ACCOUNT_CLOSING')
   }
   private publish(patch: Partial<TokenRhythmAccountState> = {}): void {
-    this.state = { ...this.state, ...patch, revision: this.state.revision + 1, source: this.saved.source, selectedAccountId: this.saved.selectedAccountId, mediaSources: { ...this.saved.mediaSources }, pendingRevocation: this.saved.pending.length > 0 }
+    this.state = { ...this.state, ...patch, revision: this.state.revision + 1, source: this.saved.source, selectedAccountId: this.saved.selectedAccountId, mediaSources: { ...this.saved.mediaSources }, pendingRevocation: this.saved.pending.length > 0, primaryActivation: this.primaryActivation ? { ...this.primaryActivation } : null }
     this.deps.onState?.(this.snapshot())
+  }
+  private suppressPrimaryActivation(): void {
+    this.primaryActivationVersion++
+    this.primaryActivation = null
+    this.primaryActivationLogin = null
+  }
+  private offerPrimaryActivation(): void {
+    const login = this.primaryActivationLogin
+    if (!login) return
+    this.primaryActivationLogin = null
+    if (login.epoch === this.epoch && login.version === this.primaryActivationVersion
+      && login.request.accountId === this.saved.tokens?.accountId
+      && login.request.sessionId === this.saved.tokens?.sessionId) this.primaryActivation = login.request
+  }
+  async cancelPrimaryActivation(id?: string): Promise<TokenRhythmAccountState> {
+    this.assertOpen()
+    if (id !== undefined) {
+      activationId(id)
+      if (this.primaryActivation?.id !== id && this.primaryActivationLogin?.request.id !== id) return this.snapshot()
+    }
+    // Also suppress a login whose exchange/verification has not produced an offer yet.
+    this.suppressPrimaryActivation()
+    this.publish()
+    return this.snapshot()
   }
   private invalidate(): void {
     this.verifiedAt = 0
@@ -285,6 +321,8 @@ export class TokenRhythmAccount {
     } catch { throw new AccountError('ACCOUNT_RECOVERY_FAILED') }
     this.saved = next
     this.epoch++
+    this.sourceSelectionVersion++
+    this.suppressPrimaryActivation()
     this.invalidate()
     this.links = {}
     this.logoutPersistencePending = false
@@ -294,6 +332,9 @@ export class TokenRhythmAccount {
     return this.login()
   }
   private async startLogin(): Promise<TokenRhythmAccountState> {
+    // A manual choice made while OAuth is opening suppresses this default,
+    // without cancelling the user's authentication.
+    const primaryActivationVersion = this.primaryActivationVersion
     await this.initialize()
     this.assertOpen()
     if (this.state.status === 'storage_unavailable') throw new AccountError('ACCOUNT_STORAGE_UNAVAILABLE')
@@ -308,6 +349,9 @@ export class TokenRhythmAccount {
     this.assertOpen()
     if (this.state.status === 'verifying') throw new AccountError('ACCOUNT_LOGIN_IN_PROGRESS')
     if (this.saved.tokens) throw new AccountError('ACCOUNT_LOGOUT_REQUIRED')
+    this.primaryActivation = null
+    this.primaryActivationLogin = null
+    this.sourceSelectionVersion++
     this.loginResult?.close()
     this.loginResult = null
     const installation = await this.installation()
@@ -360,7 +404,7 @@ export class TokenRhythmAccount {
     const timeout = this.deps.loginTimeoutMs ?? 300_000
     const timer = setTimeout(() => { this.cancel(); this.publish({ errorCode: 'ACCOUNT_LOGIN_TIMEOUT' }) }, timeout)
     timer.unref()
-    this.attempt = { state, verifier, redirect, url: url.toString(), server, timer, epoch }
+    this.attempt = { state, verifier, redirect, url: url.toString(), server, timer, epoch, primaryActivationId: randomUUID(), primaryActivationVersion }
     this.publish({ status: 'authorizing', errorCode: null, loginExpiresAt: this.now() + timeout })
     try { await this.deps.openExternal(url.toString()) } catch { this.publish({ errorCode: 'ACCOUNT_BROWSER_UNAVAILABLE' }) }
     return this.snapshot()
@@ -373,7 +417,12 @@ export class TokenRhythmAccount {
   }
   cancel(): TokenRhythmAccountState {
     this.assertOpen()
-    if (!['authorizing', 'verifying'].includes(this.state.status)) return this.snapshot()
+    const hadActivation = Boolean(this.primaryActivation || this.primaryActivationLogin)
+    this.suppressPrimaryActivation()
+    if (!['authorizing', 'verifying'].includes(this.state.status)) {
+      if (hadActivation) this.publish()
+      return this.snapshot()
+    }
     this.loginResult?.finish('cancelled')
     if (this.saved.tokens) {
       void this.logout().catch(() => this.publish({ errorCode: 'ACCOUNT_STORAGE_UNAVAILABLE' }))
@@ -429,6 +478,12 @@ export class TokenRhythmAccount {
       throw new AccountError('ACCOUNT_STORAGE_UNAVAILABLE')
     }
     if (attempt.epoch !== this.epoch) return
+    if (attempt.primaryActivationVersion === this.primaryActivationVersion) {
+      this.primaryActivationLogin = {
+        request: { id: attempt.primaryActivationId, accountId: tokens.accountId, sessionId: tokens.sessionId },
+        epoch: attempt.epoch, version: attempt.primaryActivationVersion,
+      }
+    }
     if (!this.admissionClosed) {
       await this.verify(true)
       if (!this.admissionClosed && this.state.status === 'signed_in' && this.state.keyStatus === 'ready') await this.deps.onSignedIn?.().catch(() => {})
@@ -492,6 +547,9 @@ export class TokenRhythmAccount {
           try { const url = new URL(href, this.origin); if (url.origin === this.origin && !url.username && !url.password) this.links[name] = url.toString() } catch { /* unavailable link */ }
         }
         this.verifiedAt = this.now()
+        // Only an explicit exchange can leave this offer. A restored session,
+        // polling, or key repair cannot create an activation request.
+        this.offerPrimaryActivation()
         this.publish({ status: 'signed_in', profile, errorCode: null })
         await Promise.all([this.refreshWallet(epoch), this.ensureKey(epoch)])
         if (epoch === this.epoch && !this.admissionClosed && this.saved.recoveryPending && this.state.keyStatus === 'ready') {
@@ -513,6 +571,7 @@ export class TokenRhythmAccount {
         if (ENDED.has(code(error)) || !this.saved.tokens) {
           await this.logoutTombstone().catch(() => {})
           this.saved.tokens = null; this.saved.key = null
+          this.suppressPrimaryActivation()
           await this.persist().catch(() => {})
           this.publish({ status: 'reauth_required', profile: null, wallet: null, walletStatus: 'idle', keyStatus: 'missing', errorCode: code(error) })
         } else this.publish({ status: 'unverified', errorCode: code(error) })
@@ -595,20 +654,51 @@ export class TokenRhythmAccount {
     }
     return this.snapshot()
   }
-  async selectSource(source: ModelCredentialSource): Promise<TokenRhythmAccountState> {
-    await this.initialize()
+  async selectSource(source: ModelCredentialSource, expected?: AccountPrimaryActivation): Promise<TokenRhythmAccountState> {
     this.assertOpen()
     if (source !== 'manual' && source !== 'account') throw new AccountError('INVALID_ACCOUNT_SOURCE')
+    const request = expected === undefined ? undefined : accountPrimaryActivation(expected)
+    if (request && source !== 'account') throw new AccountError('INVALID_ACCOUNT_ACTIVATION')
+    const selectionVersion = ++this.sourceSelectionVersion
+    if (!request) {
+      this.suppressPrimaryActivation()
+      this.publish()
+    }
+    await this.initialize()
+    this.assertOpen()
+    const assertCurrent = () => {
+      if (selectionVersion !== this.sourceSelectionVersion || request && (
+        this.primaryActivation?.id !== request.id
+        || this.primaryActivation.accountId !== request.accountId
+        || this.primaryActivation.sessionId !== request.sessionId
+        || this.saved.tokens?.accountId !== request.accountId
+        || this.saved.tokens?.sessionId !== request.sessionId
+      )) throw new AccountError(request ? 'ACCOUNT_PRIMARY_ACTIVATION_STALE' : 'ACCOUNT_SOURCE_CHANGED')
+    }
+    assertCurrent()
     if (source === 'manual' && this.saved.source === 'manual') return this.snapshot()
     if (source === 'account') {
       await this.verify()
       this.assertOpen()
+      // No await may separate this comparison from the source/binding mutation.
+      assertCurrent()
       if (this.state.status !== 'signed_in' || this.state.keyStatus !== 'ready' || !this.saved.tokens) throw new AccountError('ACCOUNT_MODEL_UNAVAILABLE')
     }
+    const selectionEpoch = this.epoch
     const previous = { source: this.saved.source, selectedAccountId: this.saved.selectedAccountId }
     this.saved.source = source
     if (source === 'account') this.saved.selectedAccountId = this.saved.tokens!.accountId
-    try { await this.persist() } catch (error) { Object.assign(this.saved, previous); throw error }
+    try { await this.persist() } catch (error) {
+      // A later choice/logout owns the current state, including when its disk
+      // transaction is queued behind this failed write.
+      if (selectionVersion === this.sourceSelectionVersion && selectionEpoch === this.epoch) {
+        Object.assign(this.saved, previous)
+        this.publish()
+      }
+      throw error
+    }
+    assertCurrent()
+    if (request && this.primaryActivation?.id === request.id) this.primaryActivation = null
     this.publish()
     return this.snapshot()
   }
@@ -689,6 +779,8 @@ export class TokenRhythmAccount {
   }
   private async performLogout(): Promise<TokenRhythmAccountState> {
     this.assertOpen()
+    this.sourceSelectionVersion++
+    this.suppressPrimaryActivation()
     this.loginResult?.finish('cancelled')
     this.epoch++; this.closeAttempt(); this.invalidate()
     const tombstone = this.logoutTombstone()

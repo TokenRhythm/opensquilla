@@ -245,10 +245,12 @@ async function desktopAccountScenario(options: {
   status?: TokenRhythmAccountState['status']
   fail?: 'cancel' | 'error'
   recommendations?: boolean
+  initialConfigRead?: Promise<void>
 } = {}) {
   const events: string[] = []
   const account = reactive({
     supported: true,
+    primaryMutationBusy: false,
     state: {
       revision: 1, status: options.status ?? 'signed_in', profile: { accountId: options.accountId ?? 'a', sessionId: 's', displayName: 'A', maskedPhone: '' },
       wallet: null, walletStatus: 'ready', keyStatus: 'ready', errorCode: null, walletErrorCode: null,
@@ -257,6 +259,7 @@ async function desktopAccountScenario(options: {
     get loggedIn() { return ['signed_in', 'unverified'].includes(this.state.status) },
     get ready() { return this.state.status === 'signed_in' && this.state.keyStatus === 'ready' },
     init: vi.fn(async () => {}),
+    cancelPrimaryActivation: vi.fn(async () => account.state),
     selectSource: vi.fn(async (source: ModelCredentialSource) => {
       events.push(`source:${source}`)
       account.state = { ...account.state, source, selectedAccountId: source === 'account' ? account.state.profile?.accountId ?? null : account.state.selectedAccountId, revision: account.state.revision + 1 }
@@ -269,12 +272,17 @@ async function desktopAccountScenario(options: {
     llm_profiles: (options.stored === false ? {} : { tokenrhythm: { model: 'gpt-4.1-mini', credential_source: options.accountOnly ? 'account' : 'manual' } }) as Record<string, { model: string; credential_source: string }>,
     squilla_router: { enabled: false }, llm_ensemble: { enabled: false },
   }
+  let configReads = 0
   rpcCall.mockImplementation(async (method: string, params?: Record<string, unknown>) => {
     if (method === 'onboarding.catalog') return { providers: ['openai', 'tokenrhythm'].map(providerId => ({
       providerId, label: providerId, runtimeSupported: true, requiresApiKey: true, envKey: `${providerId.toUpperCase()}_API_KEY`, defaultDirectModel: 'gpt-4.1-mini',
       fields: [{ name: 'model', label: 'Model', default: 'gpt-4.1-mini' }, { name: 'api_key', label: 'API key', secret: true }],
     })) }
-    if (method === 'config.get') return structuredClone(saved)
+    if (method === 'config.get') {
+      const snapshot = structuredClone(saved)
+      if (++configReads === 1) await options.initialConfigRead
+      return snapshot
+    }
     if (method === 'config.effective') return { fields: { 'llm.provider': { source: 'config', value: saved.llm.provider } } }
     if (method === 'onboarding.status') {
       const primaryReady = saved.llm.provider !== 'tokenrhythm' || account.state.source === 'manual'
@@ -309,6 +317,96 @@ async function desktopAccountScenario(options: {
 }
 
 describe('desktop account and manual provider boundaries', () => {
+  it('refreshes after an external activation that finishes before the initial snapshot arrives', async () => {
+    let finishInitialRead!: () => void
+    const initialConfigRead = new Promise<void>(resolve => { finishInitialRead = resolve })
+    const { api, app, account, saved } = await desktopAccountScenario({ initialConfigRead })
+    try {
+      expect(api.loaded.value).toBe(false)
+      account.primaryMutationBusy = true
+      saved.llm = { provider: 'tokenrhythm', model: 'new-primary-model', credential_source: 'account' }
+      account.primaryMutationBusy = false
+      finishInitialRead()
+      await vi.waitFor(() => expect(api.config.value.llm?.provider).toBe('tokenrhythm'))
+      expect(api.loaded.value).toBe(true)
+      expect(api.providerPanel.value.accountPrimary).toBe(true)
+    } finally { finishInitialRead(); app.unmount() }
+  })
+
+  it('refreshes the saved primary after an external activation with an unchanged account binding', async () => {
+    const { api, app, account, saved } = await desktopAccountScenario()
+    try {
+      api.updateProviderField('api_key', 'synthetic-unsaved-provider-key')
+      api.updateCapabilityField('image', 'size', '512x512')
+      const before = JSON.parse(JSON.stringify(account.state))
+      rpcCall.mockClear()
+      account.primaryMutationBusy = true
+      // The app-level actor commits a provider switch without changing the
+      // already selected account/source/session, so identity watchers do not fire.
+      saved.llm_profiles.openai = saved.llm
+      delete saved.llm_profiles.tokenrhythm
+      saved.llm = { provider: 'tokenrhythm', model: 'new-primary-model', credential_source: 'account' }
+      account.primaryMutationBusy = false
+      await vi.waitFor(() => expect(api.config.value.llm?.provider).toBe('tokenrhythm'))
+      expect(account.state).toEqual(before)
+      expect(rpcCall).toHaveBeenCalledWith('onboarding.status')
+      expect(api.providerPanel.value.accountPrimary).toBe(true)
+      expect(api.providerPanel.value.credentialPanel?.apiKeyValue).toBe('synthetic-unsaved-provider-key')
+      expect(api.capabilitiesPanel.value.form.imageSize).toBe('512x512')
+    } finally { app.unmount() }
+  })
+
+  it.each(['account', 'manual', 'save-and-activate', 'routing', 'remove-active'] as const)('supersedes pending login activation before a manual %s primary mutation', async entry => {
+    const { api, app, account, events } = await desktopAccountScenario({ source: entry === 'routing' ? 'manual' : 'account' })
+    account.cancelPrimaryActivation.mockImplementation(async () => {
+      events.push('cancel-auto')
+      expect(account.primaryMutationBusy).toBe(true)
+      return account.state
+    })
+    try {
+      if (entry === 'account') await api.activateAccountProvider()
+      if (entry === 'manual') await api.activateProvider('tokenrhythm')
+      if (entry === 'save-and-activate') {
+        await api.requestSelectConfiguredProvider('tokenrhythm')
+        api.updateProviderField('api_key', 'synthetic-manual-key')
+        await api.saveProviderAndActivate()
+      }
+      if (entry === 'routing') {
+        api.setFixedProvider('tokenrhythm')
+        await api.saveModelStrategy()
+      }
+      if (entry === 'remove-active') await api.removeProviderProfile('openai')
+      expect(account.cancelPrimaryActivation).toHaveBeenCalled()
+      expect(events[0]).toBe('cancel-auto')
+      expect(events.some(event => event.startsWith('onboarding.'))).toBe(true)
+      expect(account.primaryMutationBusy).toBe(false)
+    } finally { app.unmount() }
+  })
+
+  it.each(['account', 'manual'] as const)('releases the shared mutation lock if cancellation fails for the %s primary action', async entry => {
+    const { api, app, account, events } = await desktopAccountScenario()
+    account.cancelPrimaryActivation.mockRejectedValueOnce(new Error('Cancellation IPC failed'))
+    try {
+      if (entry === 'account') await api.activateAccountProvider()
+      else await api.activateProvider('tokenrhythm')
+      expect(events).toEqual([])
+      expect(account.primaryMutationBusy).toBe(false)
+      expect(api.primaryMutationPending.value).toBe(false)
+      expect(pushToast).toHaveBeenCalled()
+    } finally { app.unmount() }
+  })
+
+  it('blocks a manual primary mutation while the shared automatic actor owns the lock', async () => {
+    const { api, app, account, events } = await desktopAccountScenario()
+    try {
+      account.primaryMutationBusy = true
+      await api.activateProvider('tokenrhythm')
+      expect(account.cancelPrimaryActivation).not.toHaveBeenCalled()
+      expect(events).toEqual([])
+      expect(account.primaryMutationBusy).toBe(true)
+    } finally { account.primaryMutationBusy = false; app.unmount() }
+  })
+
   it.each(['account', 'manual'] as const)('preserves %s credentials and provider drafts when applying remote routing recommendations', async source => {
     const { api, app, saved, account } = await desktopAccountScenario({ primary: 'tokenrhythm', source, recommendations: true })
     try {

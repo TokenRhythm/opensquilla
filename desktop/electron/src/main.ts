@@ -1,7 +1,7 @@
 import { app, BrowserWindow, clipboard, dialog, Menu, ipcMain, nativeTheme, net as electronNet, powerMonitor, protocol, safeStorage, screen, shell, Tray } from 'electron'
 import electronUpdater from 'electron-updater'
 import { parse as parseToml } from 'smol-toml'
-import { TokenRhythmAccount, AccountError, hasSavedModelConnection, pauseAccountsForMaintenance, type AccountMaintenancePause } from './tokenrhythm-account.js'
+import { TokenRhythmAccount, AccountError, accountPrimaryActivation, pauseAccountsForMaintenance, type AccountMaintenancePause } from './tokenrhythm-account.js'
 import { TokenRhythmModelProxy } from './tokenrhythm-model-proxy.js'
 import { resolveAccountOrigin } from './tokenrhythm-environment.js'
 import { LocalAccountSecrets, LOCAL_ACCOUNT_FILE } from './local-account-secrets.js'
@@ -3549,15 +3549,6 @@ function desktopAccount() {
       }
     },
     onInvalidate: () => proxy?.invalidate(),
-    onSignedIn: async () => {
-      const raw = await readOptionalDesktopText(join(profile.home, 'config.toml'))
-      const config = raw ? parseToml(raw) : {}
-      const envConfig = await readOptionalDesktopText(join(profile.home, '.env'))
-      const hasModels = hasSavedModelConnection(config)
-        || Boolean(await readOptionalDesktopText(profile.credentialPath))
-        || Boolean(envConfig && /^\s*(?:export\s+)?[A-Z_]*(?:API_KEY|API_KEY_ENV)\s*=\s*[^\s#]/m.test(envConfig))
-      if (!hasModels && !account.snapshot().selectedAccountId) await account.selectSource('account')
-    },
   })
   proxy = new TokenRhythmModelProxy(account)
   const entry = { account, proxy }
@@ -3605,9 +3596,14 @@ ipcMain.handle('desktop:account:action', async (event, action: AccountAction) =>
     default: throw new AccountError('INVALID_ACCOUNT_ACTION')
   }
 })
-ipcMain.handle('desktop:account:source', async (event, source: ModelCredentialSource) => {
+ipcMain.handle('desktop:account:source', async (event, source: ModelCredentialSource, expected?: unknown) => {
   requireAccountSender(event)
-  return desktopAccount().account.selectSource(source)
+  return desktopAccount().account.selectSource(source, expected === undefined ? undefined : accountPrimaryActivation(expected))
+})
+ipcMain.handle('desktop:account:cancel-primary', async (event, id?: unknown) => {
+  requireAccountSender(event)
+  if (id !== undefined && typeof id !== 'string') throw new AccountError('INVALID_ACCOUNT_ACTIVATION')
+  return desktopAccount().account.cancelPrimaryActivation(id)
 })
 ipcMain.handle('desktop:account:media-source', async (event, kind: 'image' | 'video', source: AccountMediaSource) => {
   requireAccountSender(event)

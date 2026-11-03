@@ -3,7 +3,8 @@ import { contextBridge, ipcRenderer, webUtils } from 'electron'
 if (process.isMainFrame) contextBridge.exposeInMainWorld('opensquillaDesktop', {
   getAccountState: () => ipcRenderer.invoke('desktop:account:get'),
   accountAction: (action: unknown) => ipcRenderer.invoke('desktop:account:action', action),
-  selectAccountSource: (source: unknown) => ipcRenderer.invoke('desktop:account:source', source),
+  selectAccountSource: (source: unknown, expected?: unknown) => ipcRenderer.invoke('desktop:account:source', source, expected),
+  cancelAccountPrimaryActivation: (id?: unknown) => ipcRenderer.invoke('desktop:account:cancel-primary', id),
   selectAccountMediaSource: (kind: unknown, source: unknown) => ipcRenderer.invoke('desktop:account:media-source', kind, source),
   openAccountLink: (link: unknown) => ipcRenderer.invoke('desktop:account:link', link),
   onAccountState: (callback: (payload: unknown) => void) => {

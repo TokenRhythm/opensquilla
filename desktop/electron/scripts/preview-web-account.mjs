@@ -3,12 +3,10 @@
 // bridge capability, never a website token or managed model key.
 import { createHash } from 'node:crypto'
 import { createServer } from 'node:http'
-import { readFile } from 'node:fs/promises'
 import { join, resolve } from 'node:path'
 import { spawn } from 'node:child_process'
 import { AsyncLocalStorage } from 'node:async_hooks'
-import { parse as parseToml } from 'smol-toml'
-import { TokenRhythmAccount, hasSavedModelConnection } from '../dist/tokenrhythm-account.js'
+import { TokenRhythmAccount } from '../dist/tokenrhythm-account.js'
 import { LocalAccountSecrets, LOCAL_ACCOUNT_FILE } from '../dist/local-account-secrets.js'
 import { TokenRhythmModelProxy } from '../dist/tokenrhythm-model-proxy.js'
 
@@ -38,11 +36,6 @@ const account = new TokenRhythmAccount({
   openExternal: async url => { const request = navigation.getStore(); if (request) request.url = url },
   returnToWebUI: `${uiOrigin}/control/settings/account`,
   onOpenDesktop: async () => {},
-  onSignedIn: async () => {
-    const raw = await readFile(join(profile, 'config.toml'), 'utf8').catch(() => '')
-    const config = raw ? parseToml(raw) : {}
-    if (!hasSavedModelConnection(config) && !account.snapshot().selectedAccountId) await account.selectSource('account')
-  },
 })
 const proxy = new TokenRhythmModelProxy(account)
 
@@ -91,7 +84,9 @@ const server = createServer((req, res) => { void (async () => {
         case 'test': state = await account.testModel(); break
       }
     } else if (path === '/api/local-account/source' && ['manual', 'account'].includes(value.source)) {
-      state = await account.selectSource(value.source)
+      state = await account.selectSource(value.source, value.expected)
+    } else if (path === '/api/local-account/cancel-primary') {
+      state = await account.cancelPrimaryActivation(value.id)
     } else if (path === '/api/local-account/media-source' && ['image', 'video'].includes(value.kind) && ['inherit', 'manual', 'account'].includes(value.source)) {
       state = await account.selectMediaSource(value.kind, value.source)
     } else if (path === '/api/local-account/link' && links.has(value.link)) {
