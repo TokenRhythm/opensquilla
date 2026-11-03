@@ -575,7 +575,16 @@ export function createDesktopPlatform(): Platform {
     account: window.opensquillaDesktop?.getAccountState ? {
       getState: () => requireDesktopApi().getAccountState!(),
       action: action => requireDesktopApi().accountAction!(action),
-      selectSource: source => requireDesktopApi().selectAccountSource!(source),
+      selectSource: async (source, expected) => {
+        const api = requireDesktopApi()
+        // Older shells cannot guard an automatic bind and never offer one.
+        if (expected && !api.cancelAccountPrimaryActivation) throw new Error('ACCOUNT_PRIMARY_ACTIVATION_STALE')
+        return expected ? api.selectAccountSource!(source, expected) : api.selectAccountSource!(source)
+      },
+      cancelPrimaryActivation: id => {
+        const api = requireDesktopApi()
+        return api.cancelAccountPrimaryActivation ? api.cancelAccountPrimaryActivation(id) : api.getAccountState!()
+      },
       selectMediaSource: (kind, source) => requireDesktopApi().selectAccountMediaSource!(kind, source),
       openLink: link => requireDesktopApi().openAccountLink!(link),
       onState: callback => requireDesktopApi().onAccountState!(callback),

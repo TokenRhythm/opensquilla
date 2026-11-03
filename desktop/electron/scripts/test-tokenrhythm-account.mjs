@@ -4,10 +4,12 @@ import { chmod, mkdir, mkdtemp, readFile, readdir, rm, writeFile } from 'node:fs
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { createHash } from 'node:crypto'
+import { EventEmitter } from 'node:events'
 import { TokenRhythmAccount, describeAccountDevice, pauseAccountsForMaintenance } from '../dist/tokenrhythm-account.js'
 import { TokenRhythmModelProxy, allowedModelRoute } from '../dist/tokenrhythm-model-proxy.js'
 import { LocalAccountSecrets, LOCAL_ACCOUNT_FILE } from '../dist/local-account-secrets.js'
 import { requestAccountLogin } from '../dist/account-login-recovery.js'
+import { bindAccountPrimaryActivationLifecycle } from '../dist/account-primary-activation-lifecycle.js'
 const scope = 'profile.read wallet.read managed_key.read managed_key.obtain session.revoke offline_access'
 const until = async fn => { for(let i=0;i<200;i++){if(fn())return;await new Promise(r=>setTimeout(r,5))}throw Error('condition timeout') }
 test('account device labels use the OS product version and distinguish Windows 11', () => {
@@ -257,11 +259,241 @@ test('logout immediately interrupts an open model stream',async t=>{
  const response=await fetch(env.OPENSQUILLA_DESKTOP_ACCOUNT_URL+'/v1/chat/completions',{method:'POST',headers:{Authorization:'Bearer '+lease},body:'{}'}),reader=response.body.getReader();await reader.read();await f.account.logout();await assert.rejects(()=>reader.read())
 })
 
-test('first login treats saved unavailable connections as existing configuration', async () => {
- const {hasSavedModelConnection}=await import('../dist/tokenrhythm-account.js')
- assert.equal(hasSavedModelConnection({}),false)
- assert.equal(hasSavedModelConnection({llm:{provider:'',model:'',api_key:'',api_key_env:'',base_url:'',timeout:120}}),false)
- for(const config of [{llm:{provider:'openai',api_key:''}},{llm:{api_key_env:'MISSING_KEY'}},{llm_profiles:{tokenrhythm:{api_key:''}}}])assert.equal(hasSavedModelConnection(config),true)
+test('explicit verified login offers one identity-bound default without selecting a source', async t => {
+ const f=await fixture(t);await f.login()
+ const request=f.account.snapshot().primaryActivation
+ assert.match(request.id,/^[0-9a-f-]{36}$/)
+ assert.deepEqual({accountId:request.accountId,sessionId:request.sessionId},{accountId:'a',sessionId:'session-a'})
+ assert.equal(f.account.snapshot().source,'manual')
+ await f.account.verify(true);await f.account.retryKey();await f.account.modelKeyRejected()
+ assert.deepEqual(f.account.snapshot().primaryActivation,request)
+ const saved=JSON.parse(f.deps.decrypt(await readFile(join(f.directory,'account.enc'),'utf8')))
+ assert.equal('primaryActivation' in saved,false)
+ await f.account.selectSource('account',request)
+ assert.equal(f.account.snapshot().selectedAccountId,'a')
+ assert.equal(f.account.snapshot().primaryActivation,null)
+ await assert.rejects(()=>f.account.selectSource('account',request),/ACCOUNT_PRIMARY_ACTIVATION_STALE/)
+})
+
+test('an explicit login with an initially unavailable key keeps the same default through retry', async t => {
+ const f=await fixture(t,{keyFailure:true});await f.login()
+ const request=f.account.snapshot().primaryActivation
+ assert.equal(f.account.snapshot().status,'signed_in')
+ assert.equal(f.account.snapshot().keyStatus,'disabled')
+ assert.ok(request)
+ await assert.rejects(()=>f.account.selectSource('account',request),/ACCOUNT_MODEL_UNAVAILABLE/)
+ f.env.keyFailure=false;await f.account.retryKey()
+ assert.deepEqual(f.account.snapshot().primaryActivation,request)
+ await f.account.selectSource('account',request)
+ assert.equal(f.account.snapshot().primaryActivation,null)
+})
+
+test('cancelling the default during OAuth preserves login and suppresses its later offer', async t => {
+ let release,entered
+ const gate=new Promise(resolve=>{release=resolve})
+ const f=await fixture(t,{beforeFetch:async(url,init)=>{
+  if(new URL(url).pathname==='/api/oauth/token' && new URLSearchParams(init.body).get('grant_type')==='authorization_code'){entered=true;await gate}
+ }})
+ await browserCallback(f);await until(()=>entered)
+ await f.account.cancelPrimaryActivation()
+ release();await f.account.loginCompletionPromise
+ assert.equal(f.account.snapshot().status,'signed_in')
+ assert.equal(f.account.snapshot().primaryActivation,null)
+ await f.account.retryKey();assert.equal(f.account.snapshot().primaryActivation,null)
+})
+
+test('manual source intent suppresses an OAuth default without cancelling authentication', async t => {
+ const f=await fixture(t);await f.account.login()
+ await f.account.selectSource('manual')
+ await browserCallback(f);await f.account.loginCompletionPromise
+ assert.equal(f.account.snapshot().status,'signed_in')
+ assert.equal(f.account.snapshot().source,'manual')
+ assert.equal(f.account.snapshot().primaryActivation,null)
+})
+
+test('restoration, refresh and maintenance never recreate a cancelled login default', async t => {
+ const f=await fixture(t);await f.login()
+ const request=f.account.snapshot().primaryActivation
+ await f.account.cancelPrimaryActivation(request.id)
+ await f.account.verify(true);await f.account.retryKey();await f.account.modelKeyRejected()
+ const pause=f.account.pauseForMaintenance();await pause.drained;pause.resume()
+ await until(()=>!f.account.admissionClosed);await f.account.verify(true)
+ assert.equal(f.account.snapshot().primaryActivation,null)
+ await f.account.close()
+ const restored=new TokenRhythmAccount(f.deps);t.after(()=>restored.close())
+ await restored.initialize();await restored.verify(true);await restored.retryKey()
+ assert.equal(restored.snapshot().primaryActivation,null)
+})
+
+test('an old login default cannot bind a new account or cancel its newer offer', async t => {
+ const f=await fixture(t);await f.login()
+ const old=f.account.snapshot().primaryActivation
+ const verify=f.account.verify.bind(f.account)
+ let release,entered=false
+ const gate=new Promise(resolve=>{release=resolve})
+ f.account.verify=async()=>{entered=true;await gate;return verify()}
+ const selecting=f.account.selectSource('account',old)
+ await until(()=>entered)
+ f.account.verify=verify
+ await f.account.logout();f.setIdentity('b');await f.login()
+ const current=f.account.snapshot().primaryActivation
+ assert.notEqual(current.id,old.id)
+ await f.account.cancelPrimaryActivation(old.id)
+ assert.deepEqual(f.account.snapshot().primaryActivation,current)
+ release();await assert.rejects(()=>selecting,/ACCOUNT_PRIMARY_ACTIVATION_STALE/)
+ assert.equal(f.account.snapshot().selectedAccountId,null)
+ assert.deepEqual(f.account.snapshot().primaryActivation,current)
+ await f.account.selectSource('account',current)
+ assert.equal(f.account.snapshot().selectedAccountId,'b')
+})
+
+test('failed guarded persistence restores its previous choice and retains the matching offer', async t => {
+ const f=await fixture(t);await f.login()
+ const request=f.account.snapshot().primaryActivation
+ f.env.storageFailure=true
+ await assert.rejects(()=>f.account.selectSource('account',request),/failed/)
+ assert.equal(f.account.snapshot().source,'manual')
+ assert.equal(f.account.snapshot().selectedAccountId,null)
+ assert.deepEqual(f.account.snapshot().primaryActivation,request)
+ f.env.storageFailure=false
+ await f.account.selectSource('account',request)
+ assert.equal(f.account.snapshot().primaryActivation,null)
+})
+
+test('an older failed bind cannot roll back a newer manual choice', async t => {
+ const f=await fixture(t);await f.login()
+ const request=f.account.snapshot().primaryActivation
+ const persist=f.account.persist.bind(f.account)
+ let release,entered=false
+ const gate=new Promise(resolve=>{release=resolve})
+ f.account.persist=async()=>{entered=true;await gate;throw new Error('older write failed')}
+ const selecting=f.account.selectSource('account',request)
+ await until(()=>entered)
+ f.account.persist=persist
+ await f.account.selectSource('manual')
+ release();await assert.rejects(()=>selecting,/older write failed/)
+ assert.equal(f.account.snapshot().source,'manual')
+ assert.equal(f.account.snapshot().primaryActivation,null)
+ const saved=JSON.parse(f.deps.decrypt(await readFile(join(f.directory,'account.enc'),'utf8')))
+ assert.equal(saved.source,'manual')
+})
+
+test('expected activation payload rejects extra fields and mismatched identities', async t => {
+ const f=await fixture(t);await f.login()
+ const request=f.account.snapshot().primaryActivation
+ for(const value of [null,[],{}, {...request,extra:true},{...request,id:'bad'},{...request,accountId:'a\n'}]){
+  await assert.rejects(()=>f.account.selectSource('account',value),/INVALID_ACCOUNT_ACTIVATION/)
+ }
+ for(const value of [{...request,accountId:'b'},{...request,sessionId:'session-b'}]){
+  await assert.rejects(()=>f.account.selectSource('account',value),/ACCOUNT_PRIMARY_ACTIVATION_STALE/)
+ }
+ await assert.rejects(()=>f.account.cancelPrimaryActivation({id:request.id}),/INVALID_ACCOUNT_ACTIVATION/)
+ assert.deepEqual(f.account.snapshot().primaryActivation,request)
+ assert.equal(f.account.snapshot().source,'manual')
+})
+
+test('cancel after verified login publishes the cleared default without signing out', async t => {
+ const f=await fixture(t);await f.login()
+ const states=[];f.deps.onState=state=>states.push(state)
+ const state=f.account.cancel()
+ assert.equal(state.status,'signed_in')
+ assert.equal(state.primaryActivation,null)
+ assert.equal(states.at(-1).primaryActivation,null)
+ await f.account.retryKey()
+ assert.equal(f.account.snapshot().primaryActivation,null)
+})
+
+test('closed admission rejects source choices without clearing the pending default', async t => {
+ const f=await fixture(t);await f.login()
+ const request=f.account.snapshot().primaryActivation
+ const pause=f.account.pauseForMaintenance();await pause.drained
+ const before=f.account.snapshot()
+ await assert.rejects(()=>f.account.selectSource('manual'),/ACCOUNT_CLOSING/)
+ assert.deepEqual(f.account.snapshot(),before)
+ assert.deepEqual(f.account.snapshot().primaryActivation,request)
+ pause.resume();await until(()=>!f.account.admissionClosed)
+ await f.account.close()
+ const closed=f.account.snapshot()
+ await assert.rejects(()=>f.account.selectSource('manual'),/ACCOUNT_CLOSING/)
+ assert.deepEqual(f.account.snapshot(),closed)
+})
+
+test('only committed main-document navigation retires a login default and preserves account choices', async t => {
+ const f=await fixture(t);await f.login();await f.account.selectSource('account')
+ await f.account.logout();f.setIdentity('b');await f.login()
+ const request=f.account.snapshot().primaryActivation
+ const saved=await readFile(join(f.directory,'account.enc'),'utf8')
+ const contents=new EventEmitter()
+ bindAccountPrimaryActivationLifecycle(contents,()=>f.account.invalidatePrimaryActivation())
+ contents.emit('did-navigate-in-page',{},'opensquilla://desktop/control/settings',true)
+ contents.emit('did-frame-navigate',{},'about:blank',200,'OK',false,1,2)
+ contents.emit('did-start-navigation',{},'opensquilla://desktop/control',false,true)
+ const cancelled={defaultPrevented:false,preventDefault(){this.defaultPrevented=true}}
+ cancelled.preventDefault();contents.emit('will-navigate',cancelled,'opensquilla://desktop/control')
+ assert.deepEqual(f.account.snapshot().primaryActivation,request)
+ contents.emit('did-navigate',{},'opensquilla://desktop/control',200,'OK')
+ // A newly mounted renderer reads this host snapshot with no replayable offer.
+ const remounted=f.account.snapshot()
+ assert.equal(remounted.primaryActivation,null)
+ assert.equal(remounted.status,'signed_in')
+ assert.equal(remounted.profile.accountId,'b')
+ assert.equal(remounted.source,'account')
+ assert.equal(remounted.selectedAccountId,'a')
+ assert.equal(await readFile(join(f.directory,'account.enc'),'utf8'),saved)
+ await assert.rejects(()=>f.account.selectSource('account',request),/ACCOUNT_PRIMARY_ACTIVATION_STALE/)
+ await f.account.verify(true);assert.equal(f.account.snapshot().primaryActivation,null)
+})
+
+for(const lifecycle of ['render-process-gone','destroyed']){
+ test(`${lifecycle} retires defaults during maintenance even when renderer delivery throws`,async t=>{
+  const f=await fixture(t);await f.login()
+  const request=f.account.snapshot().primaryActivation
+  const contents=new EventEmitter()
+  bindAccountPrimaryActivationLifecycle(contents,()=>f.account.invalidatePrimaryActivation())
+  const pause=f.account.pauseForMaintenance();await pause.drained
+  const onState=f.deps.onState
+  f.deps.onState=()=>{throw new Error('renderer frame is gone')}
+  assert.doesNotThrow(()=>contents.emit(lifecycle,{}, {reason:'crashed'}))
+  assert.equal(f.account.snapshot().primaryActivation,null)
+  assert.equal(f.account.snapshot().status,'signed_in')
+  f.deps.onState=onState
+  pause.resume();await until(()=>!f.account.admissionClosed);await f.account.verify(true)
+  assert.equal(f.account.snapshot().primaryActivation,null)
+  await assert.rejects(()=>f.account.selectSource('account',request),/ACCOUNT_PRIMARY_ACTIVATION_STALE/)
+ })
+}
+
+test('renderer lifecycle suppresses a pending OAuth default without cancelling its login',async t=>{
+ let release,entered=false
+ const gate=new Promise(resolve=>{release=resolve})
+ const f=await fixture(t,{beforeFetch:async(url,init)=>{
+  if(new URL(url).pathname==='/api/oauth/token' && new URLSearchParams(init.body).get('grant_type')==='authorization_code'){entered=true;await gate}
+ }})
+ const contents=new EventEmitter()
+ bindAccountPrimaryActivationLifecycle(contents,()=>f.account.invalidatePrimaryActivation())
+ await browserCallback(f);await until(()=>entered)
+ contents.emit('did-navigate',{},'opensquilla://desktop/control',200,'OK')
+ release();await f.account.loginCompletionPromise
+ assert.equal(f.account.snapshot().status,'signed_in')
+ assert.equal(f.account.snapshot().primaryActivation,null)
+ assert.equal(f.account.snapshot().source,'manual')
+})
+
+test('renderer destruction invalidates every account while normal admission is closing',async t=>{
+ const first=await fixture(t),second=await fixture(t)
+ await first.login();await second.login()
+ const contents=new EventEmitter()
+ bindAccountPrimaryActivationLifecycle(contents,()=>{
+  for(const account of [first.account,second.account]) account.invalidatePrimaryActivation()
+ })
+ first.deps.onState=()=>{throw new Error('destroyed frame')}
+ const closing=first.account.close()
+ assert.doesNotThrow(()=>contents.emit('destroyed'))
+ assert.equal(first.account.snapshot().primaryActivation,null)
+ assert.equal(second.account.snapshot().primaryActivation,null)
+ assert.equal(second.account.snapshot().status,'signed_in')
+ first.deps.onState=undefined
+ await closing
 })
 test('restart restores encrypted login and validates before exposing a lease',async t=>{
  const f=await fixture(t);await f.login();await f.account.selectSource('account');const old=(await f.account.runtimeState()).credential;f.account.close()

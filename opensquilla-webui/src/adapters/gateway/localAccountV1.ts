@@ -9,7 +9,7 @@ export interface LocalAccountReply {
 let http: ReturnType<typeof createPrivateHttpTransport> | null = null
 
 /** Account presentation boundary. The transport never carries website tokens. */
-export async function localAccountRequest(path: 'state' | 'action' | 'source' | 'media-source' | 'link', data?: Record<string, string>): Promise<LocalAccountReply> {
+export async function localAccountRequest(path: 'state' | 'action' | 'source' | 'cancel-primary' | 'media-source' | 'link', data?: Record<string, unknown>): Promise<LocalAccountReply> {
   try {
     http ??= createPrivateHttpTransport({ authToken: () => '' })
     return await http.requestJson<LocalAccountReply>(`/api/local-account/${path}`, data

@@ -14,6 +14,11 @@ export interface AccountWallet {
   balances: { available: string; recharge: string; bonus: string; debt: string; frozen: string }
   asOf: string
 }
+export interface AccountPrimaryActivation {
+  id: string
+  accountId: string
+  sessionId: string
+}
 export interface TokenRhythmAccountState {
   revision: number
   status: AccountStatus
@@ -28,13 +33,16 @@ export interface TokenRhythmAccountState {
   mediaSources: { image: AccountMediaSource; video: AccountMediaSource }
   pendingRevocation: boolean
   loginExpiresAt: number | null
+  /** One explicit login's pending default; never persisted or restored. */
+  primaryActivation?: AccountPrimaryActivation | null
 }
 export type AccountAction = 'login' | 'cancel' | 'reopen' | 'refresh' | 'retry-key' | 'logout' | 'test'
 export type AccountLink = 'account' | 'usage' | 'recharge'
 export interface TokenRhythmAccountApi {
   getState(): Promise<TokenRhythmAccountState>
   action(action: AccountAction): Promise<TokenRhythmAccountState>
-  selectSource(source: ModelCredentialSource): Promise<TokenRhythmAccountState>
+  selectSource(source: ModelCredentialSource, expected?: AccountPrimaryActivation): Promise<TokenRhythmAccountState>
+  cancelPrimaryActivation(id?: string): Promise<TokenRhythmAccountState>
   selectMediaSource(kind: 'image' | 'video', source: AccountMediaSource): Promise<TokenRhythmAccountState>
   openLink(link: AccountLink): Promise<void>
   onState(callback: (state: TokenRhythmAccountState) => void): () => void

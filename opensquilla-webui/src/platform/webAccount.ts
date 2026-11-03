@@ -1,6 +1,6 @@
 import type { TokenRhythmAccountApi, TokenRhythmAccountState, AccountAction, AccountLink, ModelCredentialSource, AccountMediaSource } from '../../../contracts/desktop/tokenrhythm-account'
 
-export type WebAccountRequest = (path: 'state' | 'action' | 'source' | 'media-source' | 'link', data?: Record<string, string>) => Promise<{ state: TokenRhythmAccountState; url?: string | null }>
+export type WebAccountRequest = (path: 'state' | 'action' | 'source' | 'cancel-primary' | 'media-source' | 'link', data?: Record<string, unknown>) => Promise<{ state: TokenRhythmAccountState; url?: string | null }>
 
 function openResult(url: string | null | undefined, popup: Window | null): void {
   if (!url) { popup?.close(); return }
@@ -25,7 +25,8 @@ export function createWebAccount(localAccountRequest: WebAccountRequest): TokenR
         return result.state
       } catch (error) { popup?.close(); throw error }
     },
-    async selectSource(source: ModelCredentialSource) { return (await localAccountRequest('source', { source })).state },
+    async selectSource(source: ModelCredentialSource, expected) { return (await localAccountRequest('source', { source, ...(expected ? { expected } : {}) })).state },
+    async cancelPrimaryActivation(id) { return (await localAccountRequest('cancel-primary', id === undefined ? {} : { id })).state },
     async selectMediaSource(kind: 'image' | 'video', source: AccountMediaSource) { return (await localAccountRequest('media-source', { kind, source })).state },
     async openLink(link: AccountLink) {
       const popup = window.open('', 'opensquilla-account-link')

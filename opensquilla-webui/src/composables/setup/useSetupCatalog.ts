@@ -6,7 +6,6 @@ import { useSetupCapabilitiesForm } from '@/composables/setup/useSetupCapabiliti
 import { useModelRecommendations } from '@/composables/setup/useModelRecommendations'
 import { useSetupBehaviorForm } from '@/composables/setup/useSetupBehaviorForm'
 import {
-  hasEffectiveProvider,
   catalogNeedsRefresh,
   updateDiscoveredCatalog,
   normalizeCatalogSyncStatus,
@@ -53,6 +52,12 @@ import { GATEWAY_ACCESS_KEY } from '@/modules/gatewayAccess'
 import { useToasts, type ToastTone } from '@/composables/useToasts'
 import { useConfirm } from '@/composables/useConfirm'
 import { chooseRouterConflictAction, submitPrimaryProviderTransition } from '@/composables/setup/primaryProviderTransition'
+import {
+  activateAccountPrimary,
+  AccountPrimaryActivationError,
+  primaryProviderIsConfigured,
+  representativeAccountProviderModel,
+} from './accountPrimaryActivation'
 import { savedRouterActivationSafe } from '@/composables/setup/savedRouterSafety'
 import {
   isSetupCapabilityUnsupported,
@@ -503,6 +508,17 @@ const capabilityResetPending = ref<CapabilityId | ''>('')
 const saveAllPending = ref(false)
 const providerSavePending = ref(false)
 const primaryMutationPending = ref(false)
+let ownsPrimaryMutationLock = false
+function setPrimaryMutationPending(pending: boolean) {
+  primaryMutationPending.value = pending
+  if (pending && !account.primaryMutationBusy) {
+    account.primaryMutationBusy = true
+    ownsPrimaryMutationLock = true
+  } else if (!pending && ownsPrimaryMutationLock) {
+    account.primaryMutationBusy = false
+    ownsPrimaryMutationLock = false
+  }
+}
 const modelStrategyRoutingBusy = ref(false)
 // Immediate mode writes reuse the forms, but their optimistic changes are not
 // manual drafts. Keep the existing draft indicators stable until they settle.
@@ -581,36 +597,6 @@ let imageModelDiscoveryEpoch = 0
 
 function normalizeProviderId(value: unknown): string {
   return String(value || '').trim().toLowerCase()
-}
-
-function primaryProviderIsConfigured(
-  llm: ConfigData['llm'],
-  onboardingStatus: OnboardingStatus,
-  effective: EffectiveConfigData,
-): boolean {
-  if (!normalizeProviderId(llm?.provider)) return false
-
-  // Config/effective may report a materialized provider default as coming from
-  // "config" even when provider resolution rejected it because multiple
-  // credential-shaped environment variables disagree. In that state the
-  // Gateway deliberately withholds every credential and cannot run a turn.
-  // Never turn that unresolved default into an Active/Configured provider card;
-  // doing so makes a successful read-only probe look like completed setup while
-  // the authoritative onboarding status remains blocking.
-  const resolution = onboardingStatus.sectionDetails?.llm?.providerResolution
-  if (String(resolution?.status || '').trim().toLowerCase() === 'conflict') {
-    return false
-  }
-
-  // A config file can exist because the user changed an unrelated setting;
-  // config.get still materializes llm defaults in that case. Prefer the
-  // effective field's provenance so only an operator choice (or a usable
-  // registry-default credential) hydrates the primary provider editor.
-  const source = String(effective.fields?.['llm.provider']?.source || '')
-  if (source) {
-    return source !== 'default' || onboardingStatus.llmConfigured === true
-  }
-  return hasEffectiveProvider(llm || {}, onboardingStatus)
 }
 
 function resetTierModelDiscovery() {
@@ -813,6 +799,27 @@ watch(section, value => {
 let catalogMounted = false
 let initialLoadPending = false
 let initialLoadRetryPending = false
+let refreshAfterExternalPrimaryMutation = false
+
+function reloadAfterExternalPrimaryMutation() {
+  if (!refreshAfterExternalPrimaryMutation || account.primaryMutationBusy
+    || !catalogMounted || !loaded.value || !gatewayAccess.isAvailable) return
+  refreshAfterExternalPrimaryMutation = false
+  void loadData({ preserveProviderDraft: true, preserveDirtySectionDrafts: true })
+}
+
+// The login coordinator can finish while this dialog is open, including when
+// the account binding itself stays unchanged. Refresh its provider snapshot
+// after that shared transaction, without duplicating our own save reloads.
+watch(() => account.primaryMutationBusy, busy => {
+  if (busy) {
+    refreshAfterExternalPrimaryMutation = !primaryMutationPending.value
+    return
+  }
+  reloadAfterExternalPrimaryMutation()
+}, { flush: 'sync', immediate: true })
+
+watch([loaded, () => gatewayAccess.isAvailable], reloadAfterExternalPrimaryMutation)
 
 async function loadInitialData() {
   if (!catalogMounted || loaded.value || !gatewayAccess.isAvailable) return
@@ -855,17 +862,8 @@ watch([
   () => account.state?.mediaSources.video,
 ], () => {
   if (loaded.value && catalogMounted && gatewayAccess.isAvailable && !primaryMutationPending.value) {
-    if (account.ready && account.state?.source === 'account' && !currentProvider.value && !storedProfileIds.value.size) void activateAccountProvider()
-    else void loadData({ preserveProviderDraft: true, preserveDirtySectionDrafts: true })
+    void loadData({ preserveProviderDraft: true, preserveDirtySectionDrafts: true })
   }
-})
-
-// Login can finish while the Gateway is still starting. Complete the empty
-// primary once its configuration has actually loaded, without touching drafts.
-watch([loaded, () => gatewayAccess.isAvailable], () => {
-  if (loaded.value && catalogMounted && gatewayAccess.isAvailable && !primaryMutationPending.value
-    && account.ready && account.state?.source === 'account'
-    && !currentProvider.value && !storedProfileIds.value.size) void activateAccountProvider()
 })
 
 watch(() => gatewayAccess.isAvailable, available => {
@@ -2669,7 +2667,8 @@ function providerProbeFieldLabel(field: FieldSpec): string {
 
 function providerInteractionLocked(): boolean {
   return (
-    providerSavePending.value
+    account.primaryMutationBusy
+    || providerSavePending.value
     || modelStrategyRoutingBusy.value
     || routerResetPending.value
     || primaryMutationPending.value
@@ -2881,6 +2880,7 @@ async function reportPrimaryMutationFailure(error: unknown, options: SaveOptions
 
 function representativeProviderModel(providerId: string): string {
   const provider = normalizeProviderId(providerId)
+  if (provider === 'tokenrhythm') return representativeAccountProviderModel(config.value, catalog.value)
   const savedModel = String(storedProfileConfig(provider).model || '').trim()
   if (savedModel) return savedModel
 
@@ -3042,30 +3042,25 @@ function cancelConfiguredProviderProbe(value: string) {
 
 async function activateAccountProvider() {
   if (providerInteractionLocked() || !account.ready) return
-  primaryMutationPending.value = true
-  let acknowledged = false
-  let activated = false
+  setPrimaryMutationPending(true)
   try {
-    if (currentProvider.value !== 'tokenrhythm') {
-      const command = { providerId: 'tokenrhythm', credentialSource: 'account' as const, imageGenerationIntent: 'preserve' as const }
-      const transition = storedProfileIds.value.has('tokenrhythm')
-        ? await submitPrimaryProviderTransition(command, snapshot => setupWorkflow.profile.activateProfile(snapshot), providerCatalogLabel)
-        : await submitPrimaryProviderTransition({ ...command, model: representativeProviderModel('tokenrhythm') }, snapshot => setupWorkflow.profile.upsertAndActivateProfile(snapshot), providerCatalogLabel)
-      if (!transition) return
-      acknowledged = true
-      acceptPrimaryRouterAction(transition.routerAction)
-    }
-    // Validation uses the current login only within the Gateway operation.
-    // Do not replace a prior account binding until that operation commits.
-    await selectProviderCredentialSource('account')
-    activated = true
-    await loadData({ preserveDirtySectionDrafts: true, throwOnError: true })
-    invalidateReadiness()
+    await account.cancelPrimaryActivation?.()
+    const result = await activateAccountPrimary({
+      setupWorkflow,
+      currentProvider: currentProvider.value,
+      hasStoredProfile: storedProfileIds.value.has('tokenrhythm'),
+      model: representativeProviderModel('tokenrhythm'),
+      providerLabel: providerCatalogLabel,
+      bind: () => selectProviderCredentialSource('account'),
+      refresh: () => loadData({ preserveDirtySectionDrafts: true, throwOnError: true }),
+      onRouterAction: acceptPrimaryRouterAction,
+    })
+    if (result.status === 'success') invalidateReadiness()
   } catch (error) {
-    if (acknowledged || activated) {
-      pushToast(t(activated ? 'setup.modelStrategy.savedRefreshFailed' : 'setup.provider.primarySavedAdditionalFailed'), { tone: 'warn' })
-    } else await reportPrimaryMutationFailure(error)
-  } finally { primaryMutationPending.value = false }
+    if (error instanceof AccountPrimaryActivationError && (error.providerCommitted || error.bindingCommitted)) {
+      pushToast(t(error.bindingCommitted ? 'setup.modelStrategy.savedRefreshFailed' : 'setup.provider.primarySavedAdditionalFailed'), { tone: 'warn' })
+    } else await reportPrimaryMutationFailure(error instanceof AccountPrimaryActivationError ? error.cause : error)
+  } finally { setPrimaryMutationPending(false) }
 }
 
 function separateAccountCatalog(providerId: string): boolean {
@@ -3102,14 +3097,14 @@ async function activateProvider(value: string) {
   const row = configuredProviders.value.find(item => normalizeProviderId(item.providerId) === providerId)
   if (!providerId || !row?.primaryEligible || row.active) return
   if (providerId === 'tokenrhythm' && currentProvider.value === 'tokenrhythm' && account.supported && account.state?.source === 'account') {
-    primaryMutationPending.value = true
-    try { await account.selectSource('manual'); await loadData({ preserveDirtySectionDrafts: true, throwOnError: true }); invalidateReadiness() }
+    setPrimaryMutationPending(true)
+    try { await account.cancelPrimaryActivation?.(); await account.selectSource('manual'); await loadData({ preserveDirtySectionDrafts: true, throwOnError: true }); invalidateReadiness() }
     catch (error) { await reportPrimaryMutationFailure(error) }
-    finally { primaryMutationPending.value = false }
+    finally { setPrimaryMutationPending(false) }
     return
   }
   providerActivationRequestPending = true
-  primaryMutationPending.value = true
+  setPrimaryMutationPending(true)
   let acknowledged = false
   const previousBinding = routerBinding.value
   const replacesRouter = primarySwitchReplacesRouter(providerId, currentProvider.value)
@@ -3122,6 +3117,7 @@ async function activateProvider(value: string) {
       error: '',
     }
     try {
+      await account.cancelPrimaryActivation?.()
       const transition = await submitPrimaryProviderTransition({
         providerId,
         ...manualCredentialCommand(providerId),
@@ -3147,7 +3143,7 @@ async function activateProvider(value: string) {
       providerId: '', phase: 'idle', models: [], suggestedModel: '', error: '',
     }
     providerActivationRequestPending = false
-    primaryMutationPending.value = false
+    setPrimaryMutationPending(false)
   }
 }
 
@@ -3413,7 +3409,7 @@ async function removeProviderProfile(providerId: string) {
     return
   }
   const imageUsedProfileCredential = imageGenerationUsesProfileCredential(provider)
-  primaryMutationPending.value = true
+  setPrimaryMutationPending(true)
   try {
   if (!(await confirmProviderDraftDiscard())) return
   const baseConfirmationBody = row.active
@@ -3432,6 +3428,7 @@ async function removeProviderProfile(providerId: string) {
   if (!ok) return
   let removalAcknowledged = false
   try {
+    if (row.active) await account.cancelPrimaryActivation?.()
     if (row.active && replacement) {
       // Removing the active profile keeps the existing removal contract. The
       // replacement is promoted atomically by the Gateway; router conflict
@@ -3483,7 +3480,7 @@ async function removeProviderProfile(providerId: string) {
     }
   }
   } finally {
-    primaryMutationPending.value = false
+    setPrimaryMutationPending(false)
   }
 }
 
@@ -4252,7 +4249,7 @@ async function saveAccountProvider(options: SaveOptions): Promise<boolean> {
   const contextPatch = model ? promotedForm.contextWindowPatch('tokenrhythm', model) : null
   const profileModelChanged = !primary && providerForm.isDirty.value
   providerSavePending.value = true
-  primaryMutationPending.value = true
+  setPrimaryMutationPending(true)
   let wrote = false
   let restartRequired = false
   try {
@@ -4302,7 +4299,7 @@ async function saveAccountProvider(options: SaveOptions): Promise<boolean> {
     return false
   } finally {
     providerSavePending.value = false
-    primaryMutationPending.value = false
+    setPrimaryMutationPending(false)
   }
 }
 
@@ -4327,7 +4324,7 @@ async function saveProvider(options: SaveOptions = {}): Promise<boolean> {
     && !options.activate
   if (settingsOnly) {
     providerSavePending.value = true
-    primaryMutationPending.value = true
+    setPrimaryMutationPending(true)
     let thinkingAcknowledged = false
     let writesCompleted = false
     let restartRequired = false
@@ -4368,7 +4365,7 @@ async function saveProvider(options: SaveOptions = {}): Promise<boolean> {
       return false
     } finally {
       providerSavePending.value = false
-      primaryMutationPending.value = false
+      setPrimaryMutationPending(false)
     }
   }
   // A saved identity with an unavailable primary is still a first usable
@@ -4438,7 +4435,7 @@ async function saveProvider(options: SaveOptions = {}): Promise<boolean> {
     providerFixedModelDraftSnapshot.value = null
   }
   providerSavePending.value = true
-  primaryMutationPending.value = true
+  setPrimaryMutationPending(true)
   // Snapshot all provider-owned patches before a conflict dialog can yield.
   const providerPatches: Record<string, unknown> = {
     ...promotedForm.providerPatches(),
@@ -4473,7 +4470,10 @@ async function saveProvider(options: SaveOptions = {}): Promise<boolean> {
           ...payload,
           ...manualCredentialCommand(selectedProviderId),
           ...imageGenerationIntentPayload(selectedProviderId),
-        }, command => setupWorkflow.profile.upsertAndActivateProfile(command), providerCatalogLabel)
+        }, async command => {
+          await account.cancelPrimaryActivation?.()
+          return setupWorkflow.profile.upsertAndActivateProfile(command)
+        }, providerCatalogLabel)
         if (!transition) return false
         primaryAcknowledged = true
         restartRequired ||= transition.result?.restartRequired === true
@@ -4518,7 +4518,10 @@ async function saveProvider(options: SaveOptions = {}): Promise<boolean> {
     // replace-primary flow: the legacy configure RPC atomically swaps the
     // provider, credential, endpoint, and default model after verification.
     const payload = providerConfigurePayload(options.includeProviderModelDraft === true)
-    const transition = await submitPrimaryProviderTransition(payload, command => setupWorkflow.provider.configurePrimary(command), providerCatalogLabel)
+    const transition = await submitPrimaryProviderTransition(payload, async command => {
+      await account.cancelPrimaryActivation?.()
+      return setupWorkflow.provider.configurePrimary(command)
+    }, providerCatalogLabel)
     if (!transition) return false
     restartRequired ||= transition.result?.restartRequired === true
     primaryAcknowledged = true
@@ -4596,7 +4599,7 @@ async function saveProvider(options: SaveOptions = {}): Promise<boolean> {
     return false
   } finally {
     providerSavePending.value = false
-    primaryMutationPending.value = false
+    setPrimaryMutationPending(false)
   }
 }
 
@@ -4673,7 +4676,7 @@ async function saveRouter() {
     return
   }
   if (providerInteractionLocked()) return
-  primaryMutationPending.value = true
+  setPrimaryMutationPending(true)
   let routingAcknowledged = false
   try {
     if (routerForm.routingDirty.value) {
@@ -4688,13 +4691,13 @@ async function saveRouter() {
       pushToast(primaryMutationResultUncertain(err) ? message : `${message} ${saveFailedMessage(err)}`, { tone: 'warn' })
     } else await reportSaveFailure(err, {})
   } finally {
-    primaryMutationPending.value = false
+    setPrimaryMutationPending(false)
   }
 }
 
 async function saveEnsemble() {
   if (providerInteractionLocked()) return
-  primaryMutationPending.value = true
+  setPrimaryMutationPending(true)
   try {
     // Partial payload: only the keys the user actually changed; the gateway
     // keeps current values for everything omitted. No restart — the turn
@@ -4707,7 +4710,7 @@ async function saveEnsemble() {
   } catch (err) {
     await reportSaveFailure(err, {})
   } finally {
-    primaryMutationPending.value = false
+    setPrimaryMutationPending(false)
   }
 }
 
@@ -4825,8 +4828,9 @@ async function saveModelStrategy(options: SaveOptions & {
     if (cancelled) options.onCancelled?.(savedSections)
     saveToast(options, message, { tone: cancelled ? 'info' : 'warn' }, restartRequired)
   }
-  primaryMutationPending.value = true
+  setPrimaryMutationPending(true)
   try {
+    if (fixedProviderChanged) await account.cancelPrimaryActivation?.()
     if (hasRouterWork) {
       if (routerRoutingPayload) {
         const result = await setupWorkflow.capability.configureRouter(routerRoutingPayload)
@@ -4912,7 +4916,7 @@ async function saveModelStrategy(options: SaveOptions & {
     }
     return false
   } finally {
-    primaryMutationPending.value = false
+    setPrimaryMutationPending(false)
   }
 }
 
