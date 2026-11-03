@@ -10,7 +10,7 @@ on:
       account_environment:
         description: Account/API environment embedded in the test installer
         type: choice
-        default: uat
+        default: production
         options:
           - uat
           - production
