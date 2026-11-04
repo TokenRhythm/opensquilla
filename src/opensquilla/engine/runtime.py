@@ -2897,17 +2897,10 @@ class _SelectorFallbackProvider:
             return cast(ChatConfig, self._config_for_active_leg(config))
 
         metadata = self._turn_metadata or {}
-        if (
+        model_policy = (
             metadata.get("router_tier_policy") == "model"
             and metadata.get("routing_applied") is True
-        ):
-            from opensquilla.engine.steps.model_router import ModelRouteError
-
-            # Tool output continues the admitted task; it must not classify an
-            # empty user message or substitute a different tier for image support.
-            raise ModelRouteError(
-                f"Selected tier {metadata.get('routed_tier')} has no proven image support"
-            )
+        )
         if not callable(self._image_catalog_lookup):
             return None
 
@@ -2931,15 +2924,27 @@ class _SelectorFallbackProvider:
         provider_id, model = self._active_deployment()
         metadata = self._turn_metadata or {}
         session_key = self._image_routing_session_key
+        continuation_metadata = dict(metadata) if model_policy else {}
+        if model_policy:
+            # These records already occur in the current message view. Retaining
+            # their pre-turn estimates would count them twice during admission.
+            for key in (
+                "attachment_material_estimated_tokens",
+                "attachment_generated_normalization_estimated_tokens",
+                "material_estimated_tokens", "input_normalization",
+                "routing_additional_request_context_tokens", "skills_context_prompt",
+            ):
+                continuation_metadata.pop(key, None)
         turn = TurnContext(
             message="",
             session_key=session_key,
             config=gateway_config,
             provider=self._provider,
             model=model,
-            tool_defs=[],
+            tool_defs=list(self._last_model_tools or []) if model_policy else [],
             system_prompt=config.system or "",
             metadata={
+                **continuation_metadata,
                 "image_context_has_images": True,
                 "had_attachments": True,
                 "executed_provider": provider_id,
@@ -2954,8 +2959,16 @@ class _SelectorFallbackProvider:
                 ),
             },
         )
-        turn = await apply_squilla_router(turn)
-        turn = await finalize_squilla_router_capacity(turn)
+        if model_policy:
+            from opensquilla.engine.steps.model_router import resolve_model_image_route
+
+            # A tool result continues the accepted semantic task. Reuse its
+            # current physical tier as the floor without invoking the classifier
+            # or committing a new model-policy decision.
+            turn = resolve_model_image_route(turn, tier=metadata.get("routed_tier"))
+        else:
+            turn = await apply_squilla_router(turn)
+            turn = await finalize_squilla_router_capacity(turn)
         if (
             turn.metadata.get("routing_applied") is not True
             or turn.metadata.get("image_input_projection_required") is True
@@ -2983,6 +2996,11 @@ class _SelectorFallbackProvider:
                 ),
             )
             deployment = candidate_selector.current_config
+            if model_policy and (
+                deployment.model != turn.model
+                or deployment.provider != turn.metadata.get("routed_provider")
+            ):
+                return None
             catalog = self._image_catalog_lookup(deployment, include_global_overrides=True)
         except Exception as exc:  # noqa: BLE001 - failed preparation keeps the active deployment
             log.warning(
@@ -3014,6 +3032,23 @@ class _SelectorFallbackProvider:
             "provider_context_window_tokens": physical_window,
             "provider_request_max_chars_explicit_cap": explicit_proof,
         })
+        if model_policy:
+            rebound_identity = rebind_execution_identity(
+                rebound, provider=str(deployment.provider), model=str(deployment.model),
+            )
+            if rebound_identity is None:
+                return None
+            rebound = rebound_identity
+            # Prove the complete continuation, including completed tool results,
+            # before changing the live selector. Refusal leaves the original
+            # deployment available for its existing image-marker projection.
+            if validate_provider_chat_admission(candidate_provider, messages, rebound) is not None:
+                return None
+            projection = project_provider_final_request(
+                candidate_provider, messages, self._last_model_tools, rebound,
+            )
+            if projection is None or not projection.fits:
+                return None
         self._selector = candidate_selector
         self._provider = candidate_provider
         self._fallback_deployment_limits[identity] = (physical_window, output_limit)
@@ -3025,6 +3060,16 @@ class _SelectorFallbackProvider:
         self._image_marker_reason = None
         self._image_probe_forbidden = False
         if self._turn_metadata is not None:
+            if model_policy:
+                for key in (
+                    "routed_tier", "routed_model", "routed_provider", "applied_model",
+                    "router_model_image_target_tier", "router_model_image_execution_tier",
+                    "image_input_mode", "image_input_reason", "image_input_projection_required",
+                    "routed_model_vision_support", "routing_extra", "savings_pct",
+                    "savings_max_price_per_m", "savings_routed_price_per_m",
+                ):
+                    if key in turn.metadata:
+                        self._turn_metadata[key] = turn.metadata[key]
             self._turn_metadata["image_continuation_provider"] = str(deployment.provider)
             self._turn_metadata["image_continuation_model"] = str(deployment.model)
         return rebound
@@ -10818,7 +10863,8 @@ class TurnRunner:
                 router_history_replay_request,
                 max_history_turns=0,
                 preserve_image_attachments=(
-                    turn.metadata.get("image_route_reason")
+                    turn.metadata.get("router_tier_policy") == "model"
+                    or turn.metadata.get("image_route_reason")
                     in {"current_turn", "history_context"}
                 ),
                 reachable_provider_kinds=self._route_capacity_provider_kinds(

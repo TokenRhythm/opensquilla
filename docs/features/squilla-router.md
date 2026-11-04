@@ -73,12 +73,16 @@ new path; the following behavior changes apply even to an existing V4 configurat
   heuristics do not rewrite the selected tier. In particular, the existing router
   budget configuration does not demote or cap the initial model-policy choice.
   A quality retry still checks the current budget before advancing.
-- Each tier executes one configured model. The model policy does not enter C3
-  Ensemble or silently select another tier/provider when credentials, image
-  support, or request capacity fail admission. The turn fails with that admission
-  error. Choose compatible models for every tier that can receive image requests.
-  Tool-produced image continuations also keep the admitted tier without rerouting;
-  a deployment without proven vision support is explicitly rejected.
+- Each tier executes one configured model; the model policy does not enter C3
+  Ensemble. For current, historical, or tool-produced images, execution checks
+  the selected tier and then later C0–C3 tiers in order for proven image support,
+  subject to capacity, budget, credentials, and provider continuity. This changes
+  neither the configured order nor the admitted semantic tier. If no visual
+  candidate is usable, the original target uses the existing text-marker
+  projection; unknown capability retains the bounded native-image probe.
+  Original image attachments remain intact, and marker projection adds no
+  frontend notification. Other capability and request-admission checks remain
+  authoritative. Quality retries record semantic and physical tiers separately.
 - Reasoning capability is required only when the effective request enables
   thinking. Explicit `llm.thinking = "off"` remains authoritative, including
   with `squilla_router.auto_thinking = false`.
@@ -253,7 +257,7 @@ Depending on configuration, SquillaRouter may influence:
 - direct model fallback in the legacy V4 strategy;
 - reasoning level;
 - response policy;
-- image-capability admission, or image-capable tier selection in legacy V4;
+- image-capable execution selection and text-marker projection;
 - cache-continuity safeguards for recent higher-tier turns in legacy V4.
 
 The exact decision is available through runtime metadata and diagnostics

@@ -2,24 +2,36 @@
 
 from __future__ import annotations
 
-import json
 from collections.abc import Callable
 from dataclasses import dataclass, replace
 from typing import Any
 
 from opensquilla.context_budget import ContextBudgetGovernor
+from opensquilla.engine.history import HistoryReplayProjection, project_history_replay_capacity
 from opensquilla.engine.routing.model_policy import (
     ModelPolicyDecision,
     quality_retry_controls,
     quality_retry_tier,
 )
 from opensquilla.engine.types import THINKING_BUDGETS, AgentConfig, ThinkingLevel
+from opensquilla.provider.image_projection import (
+    ImageProjectionMode,
+    count_image_blocks,
+    project_messages,
+)
 from opensquilla.provider.model_catalog import resolve_effective_context_window, shared_catalog
 from opensquilla.provider.protocol import (
     project_provider_final_request,
     validate_provider_chat_admission,
 )
 from opensquilla.provider.types import ChatConfig
+
+_IMAGE_ROUTE_FIELDS = (
+    "router_model_image_target_tier", "router_model_image_execution_tier",
+    "image_input_projection_required", "image_route_reason", "routed_model_vision_support",
+    "image_input_forced_rejection_reason", "image_input_mode", "image_input_reason",
+    "router_vision_followup_needs_image",
+)
 
 
 @dataclass(kw_only=True)
@@ -81,6 +93,18 @@ class ModelRouterQualityRetry:
         candidate_metadata = {
             key: value for key, value in metadata.items() if not key.startswith("routed_provider_")
         }
+        # The retry request can differ from the accepted turn after tools or
+        # compaction. Old attachment and projection flags must not decide which
+        # physical model can execute this current request.
+        for key in (
+            *_IMAGE_ROUTE_FIELDS, "material_estimated_tokens",
+            "attachment_material_estimated_tokens",
+            "attachment_generated_normalization_estimated_tokens", "input_normalization",
+        ):
+            candidate_metadata.pop(key, None)
+        request_capacity = project_history_replay_capacity(
+            HistoryReplayProjection(messages=tuple(messages)),
+        )
         candidate_metadata.update(
             routed_tier=target,
             routed_model=str(tier_cfg["model"]),
@@ -89,13 +113,23 @@ class ModelRouterQualityRetry:
             thinking_level=level,
             router_fallback_chain=[],
             router_fallback_strict=True,
+            image_context_has_images=count_image_blocks(messages) > 0,
+            routing_history_capacity_estimated_tokens=request_capacity.estimated_tokens,
+            routing_history_capacity_message_count=request_capacity.message_count,
+            routing_history_capacity_estimate_complete=request_capacity.estimate_complete,
+            routing_additional_request_context_tokens=0,
         )
         candidate_turn = replace(
-            self.turn, model=str(tier_cfg["model"]), metadata=candidate_metadata
+            self.turn, model=str(tier_cfg["model"]), metadata=candidate_metadata,
+            message="", raw_message="", attachments=[], tool_defs=list(tools or []),
+            system_prompt=chat_config.system or "",
         )
         from opensquilla.engine.routing.policy import budget_gate
         from opensquilla.engine.steps import squilla_router as common
-        from opensquilla.engine.steps.model_router import validate_model_route_capabilities
+        from opensquilla.engine.steps.model_router import (
+            resolve_model_image_route,
+            validate_model_route_capabilities,
+        )
 
         budget_cfg = router_cfg.budget
         if budget_cfg.limit_usd and budget_cfg.action != "off":
@@ -125,28 +159,22 @@ class ModelRouterQualityRetry:
             candidate_turn,
             router_cfg,
             routed_model=candidate_turn.model,
-            material_tokens=max(
-                1,
-                len(
-                    json.dumps(
-                        [message.model_dump(mode="json") for message in messages],
-                        ensure_ascii=False,
-                        default=str,
-                    )
-                )
-                // 3,
-            ),
+            material_tokens=common._complete_request_estimated_tokens(candidate_turn, ""),
         )
         if budget_gate(target, valid_tiers=list(router_cfg.tiers), budget=budget).tier != target:
             return None
         try:
-            # The original TurnContext predates request-window compaction. Only
-            # capability facts survive here; prove capacity from the final payload below.
-            validate_model_route_capabilities(
+            # Keep the semantic retry tier in durable policy state. Physical
+            # image execution may use a later configured tier, with capacity
+            # proven from the final payload below rather than stale history.
+            resolve_model_image_route(
                 candidate_turn, tier=target, thinking_mode=thinking_mode,
             )
+            validate_model_route_capabilities(candidate_turn, thinking_mode=thinking_mode)
         except (RuntimeError, ValueError):
             return None
+        execution_tier = str(candidate_metadata["routed_tier"])
+        tier_cfg = router_cfg.tiers[execution_tier]
         candidate_selector = self.selector.clone()
         from opensquilla.engine.selector_override import (
             apply_model_override,
@@ -154,7 +182,8 @@ class ModelRouterQualityRetry:
         )
 
         common._flag_tier_provider_mismatch(
-            candidate_turn, router_cfg.tiers, target, routing_applied=True, force_direct=True
+            candidate_turn, router_cfg.tiers, execution_tier,
+            routing_applied=True, force_direct=True,
         )
         candidate_provider = apply_model_override(
             candidate_selector,
@@ -251,6 +280,8 @@ class ModelRouterQualityRetry:
             messages, bound = prepare_request(
                 candidate_provider, candidate_selector, messages, tools, bound,
             )
+        elif vision_support == "unsupported":
+            messages = project_messages(messages, mode=ImageProjectionMode.MARKER).messages
         if validate_provider_chat_admission(candidate_provider, messages, bound) is not None:
             return None
         projection = project_provider_final_request(candidate_provider, messages, tools, bound)
@@ -264,6 +295,8 @@ class ModelRouterQualityRetry:
             "prompt_policy": prompt_policy,
             "thinking_level": level,
         }
+        if execution_tier != target:
+            update["execution_tier"] = execution_tier
         committed = await self.manager.advance_model_router_quality_retry(
             self.turn.session_key,
             self.input_message_id,
@@ -283,13 +316,13 @@ class ModelRouterQualityRetry:
         self.turn.model = model
         candidate_metadata["routing_extra"] = {
             **metadata.get("routing_extra", {}),
-            "final_tier": target,
-            "final_route_class": common.route_class_for_tier(target),
+            "final_tier": execution_tier,
+            "final_route_class": common.route_class_for_tier(execution_tier),
             "thinking_mode": thinking_mode,
             "prompt_policy": prompt_policy,
         }
         for key in tuple(metadata):
-            if key.startswith("routed_provider_"):
+            if key.startswith("routed_provider_") or key in _IMAGE_ROUTE_FIELDS:
                 del metadata[key]
         metadata.update(candidate_metadata)
         metadata.update(

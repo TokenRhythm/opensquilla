@@ -1302,8 +1302,12 @@ async def finalize_squilla_router_capacity(
 
     router_cfg = getattr(ctx.config, "squilla_router", None) if ctx.config else None
     if ctx.metadata.get("router_tier_policy") == "model":
-        from opensquilla.engine.steps.model_router import validate_model_route_capacity
+        from opensquilla.engine.steps.model_router import (
+            resolve_model_image_route,
+            validate_model_route_capacity,
+        )
 
+        resolve_model_image_route(ctx)
         return validate_model_route_capacity(
             ctx, allow_compaction_retry=allow_compaction_retry,
         )
