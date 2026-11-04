@@ -6,12 +6,12 @@ from types import SimpleNamespace
 
 import pytest
 
+import tests.test_engine.test_model_router_quality_images as quality_fixtures
 from opensquilla.engine import runtime as runtime_module
 from opensquilla.engine.turn_runner.agent_bootstrap_stage import _ResolvedCatalog
 from opensquilla.provider.model_catalog import ModelCatalog
 from opensquilla.provider.protocol import count_provider_image_blocks
 from opensquilla.provider.types import ErrorEvent, ModelCapabilities
-from tests.test_engine import test_model_router_quality_images as quality_fixtures
 from tests.test_engine.test_model_router_execution import _model_image_continuation_runtime
 
 quality_execution = quality_fixtures.quality_execution
