@@ -6,7 +6,7 @@ configured deployment without changing that semantic decision or its state.
 
 from __future__ import annotations
 
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from dataclasses import replace
 
 from opensquilla.engine.pipeline import TurnContext
@@ -270,6 +270,7 @@ def resolve_model_image_route(
     tier: str | None = None,
     thinking_mode: str | None = None,
     check_capacity: bool = True,
+    admit_candidate: Callable[[TurnContext], bool] | None = None,
 ) -> TurnContext:
     """Bind an image-capable forward tier, or retain the target's text projection.
 
@@ -300,7 +301,6 @@ def resolve_model_image_route(
         raise ModelRouteError("Selected model-policy deployment is missing")
     target = selected
     original_support = common._tier_deployment_vision_support(ctx, original)
-    material_tokens = common._complete_request_estimated_tokens(ctx, ctx.semantic_message)
     active_provider = str(
         ctx.metadata.get("executed_provider")
         or ctx.metadata.get("requested_provider")
@@ -321,12 +321,16 @@ def resolve_model_image_route(
         }
         candidate_metadata.update(
             routed_tier=candidate, routed_model=str(raw["model"]), routed_provider=provider,
+            image_input_mode="native", routed_model_vision_support="supported",
         )
+        candidate_metadata.pop("image_input_projection_required", None)
         candidate_turn = replace(ctx, model=str(raw["model"]), metadata=candidate_metadata)
         if candidate != selected:
             budget = common._budget_gate_input_for_turn(
                 candidate_turn, config, routed_model=candidate_turn.model,
-                material_tokens=material_tokens,
+                material_tokens=common._complete_request_estimated_tokens(
+                    candidate_turn, candidate_turn.semantic_message,
+                ),
             )
             allowed = budget_gate(candidate, valid_tiers=list(TEXT_TIERS), budget=budget)
             if allowed.tier != candidate:
@@ -349,6 +353,8 @@ def resolve_model_image_route(
             active_provider_id=active_provider, session_key=ctx.session_key,
         )
         if candidate_metadata.get("routed_provider_blocked"):
+            continue
+        if admit_candidate is not None and not admit_candidate(candidate_turn):
             continue
         target = candidate
         break
@@ -437,12 +443,13 @@ def validate_model_route_capacity(
     # Compaction may reduce known historical pressure, never current material,
     # and never changes the classified tier. Runtime must re-admit the actual
     # compacted request before provider execution.
+    history_tokens, _, history_complete = common._routing_history_capacity(ctx)
     if (
         allow_compaction_retry
         and assessment
         and assessment.status == "known_capacity_request_too_large"
-        and ctx.metadata.get("routing_history_capacity_estimate_complete") is True
-        and int(ctx.metadata.get("routing_history_capacity_estimated_tokens") or 0) > 0
+        and history_complete
+        and history_tokens > 0
     ):
         current_only = replace(
             ctx,
@@ -450,6 +457,8 @@ def validate_model_route_capacity(
                 **ctx.metadata,
                 "routing_history_capacity_estimated_tokens": 0,
                 "routing_history_capacity_message_count": 0,
+                "routing_history_marker_capacity_estimated_tokens": 0,
+                "routing_history_marker_capacity_message_count": 0,
             },
         )
         reduced = assess(current_only)

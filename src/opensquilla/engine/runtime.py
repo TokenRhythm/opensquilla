@@ -2383,6 +2383,7 @@ class _SelectorFallbackProvider:
             preview.__dict__ = self.__dict__.copy()
             preview._provider = provider
             preview._selector = selector
+            preview._image_continuation_rebound = False
             preview._turn_metadata = dict(self._turn_metadata or {})
             preview._fallback_limits = self._fallback_limits.copy()
             preview._fallback_deployment_limits = self._fallback_deployment_limits.copy()
@@ -2411,6 +2412,7 @@ class _SelectorFallbackProvider:
         """Install the exact retry leg that passed preflight before its durable CAS."""
         self._selector.override_provider_config(deployment, preserve_existing_tail=False)
         self._provider = provider
+        self._image_continuation_rebound = False
 
     async def _retry_provider_stream(
         self,
@@ -2926,10 +2928,20 @@ class _SelectorFallbackProvider:
         session_key = self._image_routing_session_key
         continuation_metadata = dict(metadata) if model_policy else {}
         if model_policy:
+            marker_capacity = project_history_replay_capacity(
+                HistoryReplayProjection(messages=tuple(messages)),
+                image_mode=ImageProjectionMode.MARKER,
+            )
+            continuation_metadata.update(
+                routing_history_marker_capacity_estimated_tokens=marker_capacity.estimated_tokens,
+                routing_history_marker_capacity_message_count=marker_capacity.message_count,
+                routing_history_marker_capacity_estimate_complete=marker_capacity.estimate_complete,
+            )
             # These records already occur in the current message view. Retaining
             # their pre-turn estimates would count them twice during admission.
             for key in (
                 "attachment_material_estimated_tokens",
+                "attachment_marker_material_estimated_tokens",
                 "attachment_generated_normalization_estimated_tokens",
                 "material_estimated_tokens", "input_normalization",
                 "routing_additional_request_context_tokens", "skills_context_prompt",
@@ -2959,96 +2971,115 @@ class _SelectorFallbackProvider:
                 ),
             },
         )
+        prepared: tuple[Any, Any, Any, ChatConfig, int, int] | None = None
+
+        def prepare_candidate(candidate_turn: TurnContext) -> bool:
+            nonlocal prepared
+            tier_provider_config = cross_provider_tier_config(
+                gateway_config, candidate_turn.metadata, candidate_turn.model,
+                active_provider_id=provider_id, session_key=session_key,
+            )
+            if candidate_turn.metadata.get("routed_provider_blocked"):
+                return False
+            try:
+                candidate_selector = self._selector.clone()
+                candidate_provider = apply_model_override(
+                    candidate_selector,
+                    candidate_turn.model,
+                    turn_metadata=candidate_turn.metadata,
+                    realign_routed_model=False,
+                    tier_provider_config=tier_provider_config,
+                    strict_router_fallback_chain=resolve_strict_router_fallback_chain(
+                        gateway_config, candidate_turn.metadata,
+                        active_provider_id=provider_id, session_key=session_key,
+                    ),
+                )
+                deployment = candidate_selector.current_config
+                if model_policy and (
+                    deployment.model != candidate_turn.model
+                    or deployment.provider != candidate_turn.metadata.get("routed_provider")
+                ):
+                    return False
+                catalog = self._image_catalog_lookup(deployment, include_global_overrides=True)
+                if catalog.vision_support == "unsupported":
+                    return False
+                window = max(1, int(catalog.context_window))
+                physical_window = window if getattr(catalog, "context_window_known", True) else 0
+                output_limit = min(max(1, int(config.max_tokens)), max(1, int(catalog.max_tokens)))
+                proof = ContextBudgetGovernor.from_values(
+                    context_window_tokens=window,
+                    max_output_tokens=output_limit,
+                    thinking_budget_tokens=(
+                        (config.thinking_budget_tokens or 0) if config.thinking else 0
+                    ),
+                    context_overflow_threshold=AgentConfig().context_overflow_threshold,
+                ).snapshot().provider_request_max_chars
+                explicit_proof = max(0, int(catalog.provider_request_proof_max_chars or 0))
+                if explicit_proof:
+                    proof = min(proof, explicit_proof)
+                rebound = config.model_copy(update={
+                    "max_tokens": output_limit,
+                    "model_capabilities": catalog.capabilities,
+                    "model_vision_support": catalog.vision_support,
+                    "provider_request_max_chars": proof,
+                    "provider_context_window_tokens": physical_window,
+                    "provider_request_max_chars_explicit_cap": explicit_proof,
+                })
+                if model_policy:
+                    rebound_identity = rebind_execution_identity(
+                        rebound, provider=str(deployment.provider), model=str(deployment.model),
+                    )
+                    if rebound_identity is None:
+                        return False
+                    rebound = rebound_identity
+                    if validate_provider_chat_admission(
+                        candidate_provider, messages, rebound,
+                    ) is not None:
+                        return False
+                    projection = project_provider_final_request(
+                        candidate_provider, messages, self._last_model_tools, rebound,
+                    )
+                    if projection is None or not projection.fits:
+                        return False
+            except Exception as exc:  # noqa: BLE001 - unavailable candidates leave execution intact
+                log.warning(
+                    "selector.image_continuation_unavailable",
+                    model=candidate_turn.model,
+                    error=type(exc).__name__,
+                )
+                return False
+            prepared = (
+                candidate_selector, candidate_provider, catalog, rebound,
+                physical_window, output_limit,
+            )
+            return True
+
         if model_policy:
             from opensquilla.engine.steps.model_router import resolve_model_image_route
 
-            # A tool result continues the accepted semantic task. Reuse its
-            # current physical tier as the floor without invoking the classifier
-            # or committing a new model-policy decision.
-            turn = resolve_model_image_route(turn, tier=metadata.get("routed_tier"))
+            # Tool output continues the accepted task. Each forward deployment
+            # must prove its complete request before the live selector changes.
+            turn = resolve_model_image_route(
+                turn, tier=metadata.get("routed_tier"), admit_candidate=prepare_candidate,
+            )
         else:
             turn = await apply_squilla_router(turn)
             turn = await finalize_squilla_router_capacity(turn)
-        if (
-            turn.metadata.get("routing_applied") is not True
-            or turn.metadata.get("image_input_projection_required") is True
-            or turn.metadata.get("large_context_capacity_blocked") is True
-            or not turn.model
-        ):
-            return None
-        tier_provider_config = cross_provider_tier_config(
-            gateway_config, turn.metadata, turn.model,
-            active_provider_id=provider_id, session_key=session_key,
-        )
-        if turn.metadata.get("routed_provider_blocked"):
-            return None
-        try:
-            candidate_selector = self._selector.clone()
-            candidate_provider = apply_model_override(
-                candidate_selector,
-                turn.model,
-                turn_metadata=turn.metadata,
-                realign_routed_model=False,
-                tier_provider_config=tier_provider_config,
-                strict_router_fallback_chain=resolve_strict_router_fallback_chain(
-                    gateway_config, turn.metadata,
-                    active_provider_id=provider_id, session_key=session_key,
-                ),
-            )
-            deployment = candidate_selector.current_config
-            if model_policy and (
-                deployment.model != turn.model
-                or deployment.provider != turn.metadata.get("routed_provider")
+            if (
+                turn.metadata.get("routing_applied") is not True
+                or turn.metadata.get("image_input_projection_required") is True
+                or turn.metadata.get("large_context_capacity_blocked") is True
+                or not turn.model
             ):
                 return None
-            catalog = self._image_catalog_lookup(deployment, include_global_overrides=True)
-        except Exception as exc:  # noqa: BLE001 - failed preparation keeps the active deployment
-            log.warning(
-                "selector.image_continuation_unavailable",
-                model=turn.model,
-                error=type(exc).__name__,
-            )
+            prepare_candidate(turn)
+        if prepared is None:
             return None
-        if turn.metadata.get("routed_provider_blocked") or catalog.vision_support == "unsupported":
-            return None
+        candidate_selector, candidate_provider, catalog, rebound, physical_window, output_limit = (
+            prepared
+        )
+        deployment = candidate_selector.current_config
         identity = _fallback_deployment_identity(deployment)
-        window = max(1, int(catalog.context_window))
-        physical_window = window if getattr(catalog, "context_window_known", True) else 0
-        output_limit = min(max(1, int(config.max_tokens)), max(1, int(catalog.max_tokens)))
-        proof = ContextBudgetGovernor.from_values(
-            context_window_tokens=window,
-            max_output_tokens=output_limit,
-            thinking_budget_tokens=(config.thinking_budget_tokens or 0) if config.thinking else 0,
-            context_overflow_threshold=AgentConfig().context_overflow_threshold,
-        ).snapshot().provider_request_max_chars
-        explicit_proof = max(0, int(catalog.provider_request_proof_max_chars or 0))
-        if explicit_proof:
-            proof = min(proof, explicit_proof)
-        rebound = config.model_copy(update={
-            "max_tokens": output_limit,
-            "model_capabilities": catalog.capabilities,
-            "model_vision_support": catalog.vision_support,
-            "provider_request_max_chars": proof,
-            "provider_context_window_tokens": physical_window,
-            "provider_request_max_chars_explicit_cap": explicit_proof,
-        })
-        if model_policy:
-            rebound_identity = rebind_execution_identity(
-                rebound, provider=str(deployment.provider), model=str(deployment.model),
-            )
-            if rebound_identity is None:
-                return None
-            rebound = rebound_identity
-            # Prove the complete continuation, including completed tool results,
-            # before changing the live selector. Refusal leaves the original
-            # deployment available for its existing image-marker projection.
-            if validate_provider_chat_admission(candidate_provider, messages, rebound) is not None:
-                return None
-            projection = project_provider_final_request(
-                candidate_provider, messages, self._last_model_tools, rebound,
-            )
-            if projection is None or not projection.fits:
-                return None
         self._selector = candidate_selector
         self._provider = candidate_provider
         self._fallback_deployment_limits[identity] = (physical_window, output_limit)
@@ -10597,6 +10628,10 @@ class TurnRunner:
             initial_metadata["attachment_material_estimated_tokens"] = int(
                 attachment_materialization.estimated_tokens
             )
+            if attachment_materialization.marker_estimated_tokens is not None:
+                initial_metadata["attachment_marker_material_estimated_tokens"] = int(
+                    attachment_materialization.marker_estimated_tokens
+                )
             initial_metadata["attachment_generated_normalization_estimated_tokens"] = int(
                 attachment_materialization.generated_normalization_estimated_tokens
             )
@@ -10883,6 +10918,12 @@ class TurnRunner:
             turn.metadata["routing_history_capacity_estimate_complete"] = (
                 history_capacity.get("history_capacity_estimate_complete") is True
             )
+            for suffix in ("estimated_tokens", "message_count", "estimate_complete"):
+                key = f"history_marker_capacity_{suffix}"
+                if key in history_capacity:
+                    turn.metadata[f"routing_{key}"] = history_capacity[key]
+                else:
+                    turn.metadata.pop(f"routing_{key}", None)
         # Capacity admission is safety-critical: it runs at the finalized
         # prompt/tool boundary outside the generic fail-open pipeline wrapper.
         # An unexpected estimator failure must stop the turn rather than leave
@@ -11824,6 +11865,12 @@ class TurnRunner:
                 history_capacity.get("history_capacity_estimate_complete") is True
             ),
         })
+        for suffix in ("estimated_tokens", "message_count", "estimate_complete"):
+            key = f"history_marker_capacity_{suffix}"
+            if key in history_capacity:
+                turn.metadata[f"routing_{key}"] = history_capacity[key]
+            else:
+                turn.metadata.pop(f"routing_{key}", None)
         await finalize_squilla_router_capacity(turn, retry_after_compaction=True)
         if not model_policy:
             require_current_selector_capacity(
@@ -11985,12 +12032,23 @@ class TurnRunner:
             replay,
             max_history_turns=max_history_turns,
         )
+        marker_capacity = project_history_replay_capacity(
+            replay,
+            max_history_turns=max_history_turns,
+            image_mode=ImageProjectionMode.MARKER,
+        )
         if exclude_compaction_context:
             return {
                 "history_capacity_estimated_tokens": capacity.estimated_tokens,
                 "history_capacity_message_count": capacity.message_count,
                 "history_capacity_estimate_complete": bool(
                     capacity.estimate_complete
+                    and (bound_user_message_id is None or bound_index is not None)
+                ),
+                "history_marker_capacity_estimated_tokens": marker_capacity.estimated_tokens,
+                "history_marker_capacity_message_count": marker_capacity.message_count,
+                "history_marker_capacity_estimate_complete": bool(
+                    marker_capacity.estimate_complete
                     and (bound_user_message_id is None or bound_index is not None)
                 ),
             }
@@ -12002,6 +12060,10 @@ class TurnRunner:
         get_context_states = getattr(self._session_manager, "get_context_states", None)
         capacity_estimate_complete = bool(
             capacity.estimate_complete
+            and (bound_user_message_id is None or bound_index is not None)
+        )
+        marker_estimate_complete = bool(
+            marker_capacity.estimate_complete
             and (bound_user_message_id is None or bound_index is not None)
         )
         try:
@@ -12041,6 +12103,7 @@ class TurnRunner:
             summaries = []
             context_states = []
             capacity_estimate_complete = False
+            marker_estimate_complete = False
 
         async def _summary_projection(
             skip_covered_through_ids: set[int] | None = None,
@@ -12068,6 +12131,9 @@ class TurnRunner:
         capacity_tokens = capacity.estimated_tokens + portable_summary_tokens
         capacity_message_count = capacity.message_count + portable_summary_messages
         capacity_envelope_score = capacity_tokens + (8 * capacity_message_count)
+        marker_tokens = marker_capacity.estimated_tokens + portable_summary_tokens
+        marker_message_count = marker_capacity.message_count + portable_summary_messages
+        marker_envelope_score = marker_tokens + (8 * marker_message_count)
         provider_kinds = {
             str(getattr(state, "provider", "") or "").strip()
             for state in context_states
@@ -12117,6 +12183,11 @@ class TurnRunner:
                 native_replay,
                 max_history_turns=max_history_turns,
             )
+            provider_marker_capacity = project_history_replay_capacity(
+                native_replay,
+                max_history_turns=max_history_turns,
+                image_mode=ImageProjectionMode.MARKER,
+            )
             residual_tokens, residual_messages = await _summary_projection(
                 native_context.covered_through_ids
             )
@@ -12130,11 +12201,24 @@ class TurnRunner:
             capacity_estimate_complete = bool(
                 capacity_estimate_complete and provider_capacity.estimate_complete
             )
+            provider_marker_tokens = provider_marker_capacity.estimated_tokens + residual_tokens
+            provider_marker_messages = provider_marker_capacity.message_count + residual_messages
+            provider_marker_score = provider_marker_tokens + (8 * provider_marker_messages)
+            if provider_marker_score > marker_envelope_score:
+                marker_tokens = provider_marker_tokens
+                marker_message_count = provider_marker_messages
+                marker_envelope_score = provider_marker_score
+            marker_estimate_complete = bool(
+                marker_estimate_complete and provider_marker_capacity.estimate_complete
+            )
 
         return {
             "history_capacity_estimated_tokens": max(0, capacity_tokens),
             "history_capacity_message_count": max(0, capacity_message_count),
             "history_capacity_estimate_complete": capacity_estimate_complete,
+            "history_marker_capacity_estimated_tokens": max(0, marker_tokens),
+            "history_marker_capacity_message_count": max(0, marker_message_count),
+            "history_marker_capacity_estimate_complete": marker_estimate_complete,
         }
 
     async def _router_previous_assistant_context(

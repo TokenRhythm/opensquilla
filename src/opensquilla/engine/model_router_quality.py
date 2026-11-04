@@ -3,11 +3,13 @@
 from __future__ import annotations
 
 from collections.abc import Callable
+from copy import deepcopy
 from dataclasses import dataclass, replace
 from typing import Any
 
 from opensquilla.context_budget import ContextBudgetGovernor
 from opensquilla.engine.history import HistoryReplayProjection, project_history_replay_capacity
+from opensquilla.engine.pipeline import TurnContext
 from opensquilla.engine.routing.model_policy import (
     ModelPolicyDecision,
     quality_retry_controls,
@@ -32,6 +34,15 @@ _IMAGE_ROUTE_FIELDS = (
     "image_input_forced_rejection_reason", "image_input_mode", "image_input_reason",
     "router_vision_followup_needs_image",
 )
+
+
+@dataclass(frozen=True)
+class _PreparedQualityRetry:
+    provider: Any
+    deployment: Any
+    config: ChatConfig
+    window: int
+    context_window_known: bool
 
 
 @dataclass(kw_only=True)
@@ -99,11 +110,17 @@ class ModelRouterQualityRetry:
         for key in (
             *_IMAGE_ROUTE_FIELDS, "material_estimated_tokens",
             "attachment_material_estimated_tokens",
-            "attachment_generated_normalization_estimated_tokens", "input_normalization",
+            "attachment_generated_normalization_estimated_tokens",
+            "attachment_marker_material_estimated_tokens", "input_normalization",
+            "skills_context_prompt",
         ):
             candidate_metadata.pop(key, None)
         request_capacity = project_history_replay_capacity(
             HistoryReplayProjection(messages=tuple(messages)),
+        )
+        marker_capacity = project_history_replay_capacity(
+            HistoryReplayProjection(messages=tuple(messages)),
+            image_mode=ImageProjectionMode.MARKER,
         )
         candidate_metadata.update(
             routed_tier=target,
@@ -117,6 +134,9 @@ class ModelRouterQualityRetry:
             routing_history_capacity_estimated_tokens=request_capacity.estimated_tokens,
             routing_history_capacity_message_count=request_capacity.message_count,
             routing_history_capacity_estimate_complete=request_capacity.estimate_complete,
+            routing_history_marker_capacity_estimated_tokens=marker_capacity.estimated_tokens,
+            routing_history_marker_capacity_message_count=marker_capacity.message_count,
+            routing_history_marker_capacity_estimate_complete=marker_capacity.estimate_complete,
             routing_additional_request_context_tokens=0,
         )
         candidate_turn = replace(
@@ -155,138 +175,184 @@ class ModelRouterQualityRetry:
                     getattr(budget_session, field) or 0.0
                 )
             candidate_metadata["session_cost_source"] = str(budget_session.cost_source or "")
+        budget_turn = candidate_turn
+        if candidate_metadata["image_context_has_images"] and (
+            common._tier_deployment_vision_support(candidate_turn, tier_cfg) == "unsupported"
+        ):
+            budget_turn = replace(
+                candidate_turn, metadata={**candidate_metadata, "image_input_mode": "marker"},
+            )
         budget = common._budget_gate_input_for_turn(
-            candidate_turn,
+            budget_turn,
             router_cfg,
             routed_model=candidate_turn.model,
-            material_tokens=common._complete_request_estimated_tokens(candidate_turn, ""),
+            material_tokens=common._complete_request_estimated_tokens(budget_turn, ""),
         )
         if budget_gate(target, valid_tiers=list(router_cfg.tiers), budget=budget).tier != target:
             return None
+
+        def prepare_candidate(proposed: TurnContext) -> _PreparedQualityRetry | None:
+            execution_tier = str(proposed.metadata["routed_tier"])
+            tier_cfg = router_cfg.tiers[execution_tier]
+            candidate_selector = self.selector.clone()
+            from opensquilla.engine.selector_override import (
+                apply_model_override,
+                cross_provider_tier_config,
+            )
+
+            common._flag_tier_provider_mismatch(
+                proposed, router_cfg.tiers, execution_tier,
+                routing_applied=True, force_direct=True,
+            )
+            candidate_provider = apply_model_override(
+                candidate_selector,
+                proposed.model,
+                turn_metadata=proposed.metadata,
+                realign_routed_model=False,
+                strict_router_fallback_chain=[],
+                tier_provider_config=cross_provider_tier_config(
+                    self.turn.config,
+                    proposed.metadata,
+                    proposed.model,
+                    active_provider_id=candidate_selector.active_provider_id,
+                    session_key=self.turn.session_key,
+                ),
+            )
+            deployment = candidate_selector.current_config
+            model = str(deployment.model)
+            provider_id = str(deployment.provider)
+            if model != tier_cfg["model"] or provider_id != (
+                tier_cfg.get("provider") or self.turn.config.llm.provider
+            ):
+                # A credential/continuity refusal may leave the selector on its
+                # original deployment. That is not admission of the requested tier.
+                return None
+            catalog = shared_catalog()
+            caps = catalog.resolve_deployment_capabilities(
+                model,
+                provider=provider_id,
+                api_key=deployment.api_key,
+                base_url=deployment.base_url,
+            )
+            llm = self.turn.config.llm
+            window, window_source = resolve_effective_context_window(
+                catalog,
+                model,
+                provider=provider_id,
+                global_override=llm.context_window_tokens,
+            )
+            maximum, _ = catalog.resolve_max_tokens_with_source(
+                model,
+                user_override=llm.max_tokens,
+                provider=provider_id,
+            )
+            if window_source not in {"catalog", "config", "override"}:
+                return None
+            # Retain the selected authority's limits without reusing the old
+            # transcript estimate that may have been compacted for this request.
+            deployment_limits = catalog.resolve_deployment_limits(
+                model, provider=provider_id, api_key=deployment.api_key,
+                base_url=deployment.base_url, proxy=deployment.proxy,
+                logical_max_tokens_override=llm.max_tokens,
+            )
+            window = min(window, deployment_limits.context_window)
+            if deployment_limits.max_output_tokens_known:
+                maximum = min(maximum, deployment_limits.max_output_tokens)
+            vision_support = catalog.resolve_deployment_vision_support(
+                model,
+                provider=provider_id,
+                api_key=deployment.api_key,
+                base_url=deployment.base_url,
+            )
+            proof_budget = ContextBudgetGovernor.from_values(
+                context_window_tokens=window,
+                max_output_tokens=maximum,
+                thinking_budget_tokens=thinking_budget,
+                context_overflow_threshold=(
+                    context_overflow_threshold if context_overflow_threshold is not None
+                    else AgentConfig().context_overflow_threshold
+                ),
+                provider_request_proof_max_chars=chat_config.provider_request_max_chars_explicit_cap,
+            ).snapshot().provider_request_max_chars
+            bound = chat_config.model_copy(
+                update={
+                    "max_tokens": maximum,
+                    "provider_context_window_tokens": window if window_source != "default" else 0,
+                    "provider_request_max_chars": proof_budget,
+                    "model_capabilities": caps,
+                    "model_vision_support": vision_support,
+                    "thinking": thinking_enabled,
+                    "thinking_level": thinking_level,
+                    "thinking_budget_tokens": thinking_budget,
+                    "thinking_budget_explicit": (
+                        automatic_thinking or chat_config.thinking_budget_explicit
+                    ),
+                    "physical_attempt_limit": 1,
+                }
+            )
+            from opensquilla.provider.execution_identity import rebind_execution_identity
+
+            rebound = rebind_execution_identity(bound, provider=provider_id, model=model)
+            assert rebound is not None
+            bound = rebound
+            request_messages = deepcopy(messages)
+            if prepare_request is not None:
+                request_messages, bound = prepare_request(
+                    candidate_provider, candidate_selector, request_messages, tools, bound,
+                )
+            elif vision_support == "unsupported":
+                request_messages = project_messages(
+                    request_messages, mode=ImageProjectionMode.MARKER,
+                ).messages
+            if validate_provider_chat_admission(
+                candidate_provider, request_messages, bound,
+            ) is not None:
+                return None
+            projection = project_provider_final_request(
+                candidate_provider, request_messages, tools, bound,
+            )
+            if projection is None or not projection.fits:
+                return None
+            return _PreparedQualityRetry(
+                provider=candidate_provider, deployment=deployment, config=bound, window=window,
+                context_window_known=window_source != "default",
+            )
+
+        prepared: _PreparedQualityRetry | None = None
+        attempted_tiers: set[str] = set()
+
+        def admit_candidate(proposed: TurnContext) -> bool:
+            nonlocal prepared
+            attempted_tiers.add(str(proposed.metadata["routed_tier"]))
+            try:
+                prepared = prepare_candidate(proposed)
+            except (RuntimeError, ValueError):
+                prepared = None
+            return prepared is not None
+
         try:
-            # Keep the semantic retry tier in durable policy state. Physical
-            # image execution may use a later configured tier, with capacity
-            # proven from the final payload below rather than stale history.
+            # Exact provider admission belongs to candidate selection: a refused
+            # visual deployment must leave later configured tiers available.
             resolve_model_image_route(
                 candidate_turn, tier=target, thinking_mode=thinking_mode,
+                admit_candidate=admit_candidate,
             )
             validate_model_route_capabilities(candidate_turn, thinking_mode=thinking_mode)
+            if prepared is None:
+                if str(candidate_metadata["routed_tier"]) in attempted_tiers:
+                    return None
+                prepared = prepare_candidate(candidate_turn)
         except (RuntimeError, ValueError):
             return None
+        if prepared is None:
+            return None
         execution_tier = str(candidate_metadata["routed_tier"])
-        tier_cfg = router_cfg.tiers[execution_tier]
-        candidate_selector = self.selector.clone()
-        from opensquilla.engine.selector_override import (
-            apply_model_override,
-            cross_provider_tier_config,
-        )
-
-        common._flag_tier_provider_mismatch(
-            candidate_turn, router_cfg.tiers, execution_tier,
-            routing_applied=True, force_direct=True,
-        )
-        candidate_provider = apply_model_override(
-            candidate_selector,
-            candidate_turn.model,
-            turn_metadata=candidate_metadata,
-            realign_routed_model=False,
-            strict_router_fallback_chain=[],
-            tier_provider_config=cross_provider_tier_config(
-                self.turn.config,
-                candidate_metadata,
-                candidate_turn.model,
-                active_provider_id=candidate_selector.active_provider_id,
-                session_key=self.turn.session_key,
-            ),
-        )
-        deployment = candidate_selector.current_config
+        candidate_provider = prepared.provider
+        deployment = prepared.deployment
+        bound = prepared.config
+        window = prepared.window
         model = str(deployment.model)
         provider_id = str(deployment.provider)
-        if model != tier_cfg["model"] or provider_id != (
-            tier_cfg.get("provider") or self.turn.config.llm.provider
-        ):
-            # A credential/continuity refusal may leave the selector on its
-            # original deployment. That is not admission of the requested tier.
-            return None
-        catalog = shared_catalog()
-        caps = catalog.resolve_deployment_capabilities(
-            model,
-            provider=provider_id,
-            api_key=deployment.api_key,
-            base_url=deployment.base_url,
-        )
-        llm = self.turn.config.llm
-        window, window_source = resolve_effective_context_window(
-            catalog,
-            model,
-            provider=provider_id,
-            global_override=llm.context_window_tokens,
-        )
-        maximum, _ = catalog.resolve_max_tokens_with_source(
-            model,
-            user_override=llm.max_tokens,
-            provider=provider_id,
-        )
-        if window_source not in {"catalog", "config", "override"}:
-            return None
-        # Retain the selected authority's limits without reusing the old
-        # transcript estimate that may have been compacted for this request.
-        deployment_limits = catalog.resolve_deployment_limits(
-            model, provider=provider_id, api_key=deployment.api_key,
-            base_url=deployment.base_url, proxy=deployment.proxy,
-            logical_max_tokens_override=llm.max_tokens,
-        )
-        window = min(window, deployment_limits.context_window)
-        if deployment_limits.max_output_tokens_known:
-            maximum = min(maximum, deployment_limits.max_output_tokens)
-        vision_support = catalog.resolve_deployment_vision_support(
-            model,
-            provider=provider_id,
-            api_key=deployment.api_key,
-            base_url=deployment.base_url,
-        )
-        proof_budget = ContextBudgetGovernor.from_values(
-            context_window_tokens=window,
-            max_output_tokens=maximum,
-            thinking_budget_tokens=thinking_budget,
-            context_overflow_threshold=(
-                context_overflow_threshold if context_overflow_threshold is not None
-                else AgentConfig().context_overflow_threshold
-            ),
-            provider_request_proof_max_chars=chat_config.provider_request_max_chars_explicit_cap,
-        ).snapshot().provider_request_max_chars
-        bound = chat_config.model_copy(
-            update={
-                "max_tokens": maximum,
-                "provider_context_window_tokens": window if window_source != "default" else 0,
-                "provider_request_max_chars": proof_budget,
-                "model_capabilities": caps,
-                "model_vision_support": vision_support,
-                "thinking": thinking_enabled,
-                "thinking_level": thinking_level,
-                "thinking_budget_tokens": thinking_budget,
-                "thinking_budget_explicit": (
-                    automatic_thinking or chat_config.thinking_budget_explicit
-                ),
-                "physical_attempt_limit": 1,
-            }
-        )
-        from opensquilla.provider.execution_identity import rebind_execution_identity
-
-        rebound = rebind_execution_identity(bound, provider=provider_id, model=model)
-        assert rebound is not None
-        bound = rebound
-        if prepare_request is not None:
-            messages, bound = prepare_request(
-                candidate_provider, candidate_selector, messages, tools, bound,
-            )
-        elif vision_support == "unsupported":
-            messages = project_messages(messages, mode=ImageProjectionMode.MARKER).messages
-        if validate_provider_chat_admission(candidate_provider, messages, bound) is not None:
-            return None
-        projection = project_provider_final_request(candidate_provider, messages, tools, bound)
-        if projection is None or not projection.fits:
-            return None
         update = {
             "tier": target,
             "model": model,
@@ -343,9 +409,9 @@ class ModelRouterQualityRetry:
             "provider_id": provider_id,
             "max_tokens": bound.max_tokens,
             "context_window_tokens": window,
-            "context_window_known": window_source != "default",
-            "model_capabilities": caps,
-            "model_vision_support": vision_support,
+            "context_window_known": prepared.context_window_known,
+            "model_capabilities": bound.model_capabilities,
+            "model_vision_support": bound.model_vision_support,
             "thinking": (thinking_level or True) if thinking_enabled else False,
             "thinking_budget_tokens": (
                 bound.thinking_budget_tokens if bound.thinking_budget_explicit else -1

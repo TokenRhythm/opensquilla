@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import base64
 from copy import deepcopy
+from dataclasses import replace
 from types import SimpleNamespace
+from unittest.mock import AsyncMock
 
 import pytest
 
@@ -14,6 +16,7 @@ from opensquilla.gateway.config import GatewayConfig, LlmProviderProfile
 from opensquilla.provider.image_projection import count_image_blocks
 from opensquilla.provider.selector import ModelSelector, ProviderConfig, SelectorConfig
 from opensquilla.provider.types import ChatConfig, ContentBlockImage, ContentBlockText, Message
+from opensquilla.provider.types import ErrorEvent as ProviderError
 from opensquilla.session.manager import SessionManager
 from opensquilla.session.storage import SessionStorage
 from tests.helpers.image_bytes import image_bytes
@@ -278,3 +281,154 @@ async def test_quality_image_retry_skips_unavailable_cross_provider_candidate(
     assert "routed_provider_blocked" not in e.turn.metadata
     assert e.config.squilla_router.tiers == config_before
     assert count_image_blocks(captured[0][0]) == int(later_vision)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("rejection", ["admission", "final_proof"])
+@pytest.mark.parametrize("outcome", ["later_vision", "marker", "refused"])
+async def test_quality_image_retry_checks_exact_request_for_each_visual_candidate(
+    quality_execution, monkeypatch, rejection, outcome,
+):
+    import opensquilla.engine.model_router_quality as quality
+
+    e = quality_execution
+    first_vision, later_vision = "qwen/qwen-vl-max", "gpt-4o"
+    text_model = e.config.squilla_router.tiers["c1"]["model"]
+    e.config.squilla_router.tiers["c2"]["model"] = first_vision
+    e.config.squilla_router.tiers["c3"]["model"] = later_vision
+    original_decision = deepcopy(e.turn.metadata["router_model_decision"])
+    original_config = deepcopy(e.config.squilla_router.tiers)
+    original_deployment = e.selector.current_config
+    messages = _image_messages()
+    original_messages = deepcopy(messages)
+    advance = AsyncMock(wraps=e.manager.advance_model_router_quality_retry)
+    monkeypatch.setattr(e.manager, "advance_model_router_quality_retry", advance)
+    admit = quality.validate_provider_chat_admission
+    project = quality.project_provider_final_request
+    attempts = []
+
+    def should_refuse(model):
+        return model == first_vision or (
+            model == later_vision and outcome != "later_vision"
+        ) or outcome == "refused"
+
+    def check_isolation():
+        assert e.turn.metadata["router_model_decision"] == original_decision
+        assert e.selector.current_config is original_deployment
+        assert advance.await_count == 0
+        assert messages == original_messages
+
+    def admission(provider, request, config):
+        check_isolation()
+        projection = project(provider, request, [], config)
+        assert projection is not None
+        model = projection.payload["model"]
+        attempts.append((model, count_image_blocks(request)))
+        if rejection == "admission" and should_refuse(model):
+            return ProviderError(message="Synthetic request refusal", code="request_refused")
+        return admit(provider, request, config)
+
+    def final_proof(provider, request, tools, config):
+        check_isolation()
+        projection = project(provider, request, tools, config)
+        assert projection is not None
+        if rejection == "final_proof" and should_refuse(projection.payload["model"]):
+            return replace(projection, fits=False)
+        return projection
+
+    monkeypatch.setattr(quality, "validate_provider_chat_admission", admission)
+    monkeypatch.setattr(quality, "project_provider_final_request", final_proof)
+
+    updates = await e.recovery.prepare(
+        e.wrapper, "validation_failure", messages,
+        chat_config=ChatConfig(max_tokens=1024, thinking=False), tools=[],
+    )
+
+    assert attempts[:2] == [(first_vision, 1), (later_vision, 1)]
+    assert messages == original_messages
+    assert e.config.squilla_router.tiers == original_config
+    if outcome == "refused":
+        assert updates is None
+        assert e.turn.metadata["router_model_decision"] == original_decision
+        assert e.selector.current_config is original_deployment
+        assert advance.await_count == e.recovery.used == 0
+        return
+    expected_tier = "c3" if outcome == "later_vision" else "c1"
+    assert updates is not None
+    assert updates["model_id"] == (later_vision if outcome == "later_vision" else text_model)
+    assert e.turn.metadata["routed_tier"] == expected_tier
+    assert e.turn.metadata["router_model_decision"]["state"]["tier"] == "c1"
+    assert e.turn.metadata["router_model_decision"]["decision"] == original_decision["decision"]
+    assert advance.await_count == e.recovery.used == 1
+    if outcome == "marker":
+        assert attempts[-1] == (text_model, 0)
+
+
+@pytest.mark.asyncio
+async def test_quality_image_retry_does_not_prepare_a_refused_visual_target_twice(
+    quality_execution, monkeypatch,
+):
+    import opensquilla.engine.model_router_quality as quality
+
+    e = quality_execution
+    for tier in ("c1", "c2", "c3"):
+        e.config.squilla_router.tiers[tier]["model"] = "qwen/qwen-vl-max"
+    decision_before = deepcopy(e.turn.metadata["router_model_decision"])
+    deployment_before = e.selector.current_config
+    project = quality.project_provider_final_request
+    attempts = []
+
+    def refuse(provider, request, tools, config):
+        projection = project(provider, request, tools, config)
+        assert projection is not None
+        attempts.append(projection.payload["model"])
+        return replace(projection, fits=False)
+
+    monkeypatch.setattr(quality, "project_provider_final_request", refuse)
+
+    updates = await e.recovery.prepare(
+        e.wrapper, "validation_failure", _image_messages(),
+        chat_config=ChatConfig(max_tokens=1024, thinking=False), tools=[],
+    )
+
+    assert updates is None
+    assert attempts == ["qwen/qwen-vl-max"] * 3
+    assert e.turn.metadata["router_model_decision"] == decision_before
+    assert e.selector.current_config is deployment_before
+    assert e.recovery.used == 0
+
+
+@pytest.mark.asyncio
+async def test_quality_marker_retry_prices_projected_input_instead_of_native_images(
+    quality_execution, monkeypatch,
+):
+    e = quality_execution
+    for tier in ("c1", "c2", "c3"):
+        e.config.squilla_router.tiers[tier]["model"] = "deepseek/deepseek-v4-flash"
+    budget = e.config.squilla_router.budget
+    budget.limit_usd = 0.001
+    budget.action = "cap"
+    budget.cap_tier = "c0"
+    budget.include_next_turn_estimate = True
+    zero_spend = SimpleNamespace(
+        session_id=e.node.session_id, epoch=0, billed_cost_usd=0.0,
+        total_cost_usd=0.0, estimated_cost_usd=0.0, cost_source="billed",
+    )
+    monkeypatch.setattr(
+        e.manager.storage, "reconcile_session_usage_totals_from_ledger",
+        AsyncMock(return_value=zero_spend),
+    )
+    # Synthetic $1/M input pricing makes the 1,024-token native-image reserve
+    # exceed this budget while the actual text-marker request still fits.
+    monkeypatch.setattr(
+        squilla_router, "_budget_next_turn_estimate", lambda _model, tokens: tokens / 1_000_000,
+    )
+
+    updates = await e.recovery.prepare(
+        e.wrapper, "validation_failure", _image_messages(),
+        chat_config=ChatConfig(max_tokens=1024, thinking=False), tools=[],
+    )
+
+    assert updates is not None
+    assert e.turn.metadata["routed_tier"] == "c1"
+    assert e.turn.metadata["image_input_mode"] == "marker"

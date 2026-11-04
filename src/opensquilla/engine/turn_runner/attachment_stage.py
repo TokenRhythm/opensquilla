@@ -87,6 +87,7 @@ class AttachmentMaterializationStats:
     parse_failure_count: int = 0
     provider_visible_text_chars: int = 0
     image_count: int = 0
+    marker_estimated_tokens: int | None = None
 
 
 def _materialization_stats(
@@ -158,6 +159,15 @@ def _materialization_stats(
             )
         ):
             block_index += 1
+    marker_estimated_tokens = estimated_tokens
+    if image_count:
+        from opensquilla.provider.image_projection import ImageProjectionMode, project_messages
+
+        marker_estimated_tokens = _materialization_stats(
+            project_messages(extra_messages, mode=ImageProjectionMode.MARKER).messages,
+            attachments=attachments,
+            generated_normalization_attachment_count=0,
+        ).estimated_tokens
     return AttachmentMaterializationStats(
         attachment_count=len(attachments),
         estimated_tokens=estimated_tokens,
@@ -167,6 +177,7 @@ def _materialization_stats(
         parse_failure_count=min(parse_failure_count, len(attachments)),
         provider_visible_text_chars=provider_visible_text_chars,
         image_count=image_count,
+        marker_estimated_tokens=marker_estimated_tokens,
     )
 
 

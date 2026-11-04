@@ -204,6 +204,7 @@ from opensquilla.provider.protocol import (
     count_provider_image_blocks,
     project_provider_final_request,
     project_provider_message_count,
+    provider_connection_config,
     provider_metadata,
     validate_provider_chat_admission,
 )
@@ -3378,6 +3379,29 @@ class Agent:
             model_capabilities=consumer_model_capabilities,
             provider_request_proof_max_chars=(consumer_provider_request_max_chars),
         )
+        support = "unknown"
+        try:
+            identity = provider_metadata(consumer_provider)
+            consumer_model = consumer_model_id or identity.model
+            if not identity.model or identity.model == consumer_model:
+                if consumer_provider is self.provider and consumer_model == self.config.model_id:
+                    support = self._active_model_vision_support_for_call(chat_config)
+                elif consumer_model:
+                    from opensquilla.provider.model_catalog import shared_catalog
+
+                    connection = provider_connection_config(consumer_provider)
+                    support = shared_catalog().resolve_deployment_vision_support(
+                        consumer_model,
+                        provider=identity.provider_id or identity.provider_name,
+                        api_key=connection.api_key,
+                        base_url=connection.base_url or identity.base_url,
+                    )
+        except Exception:  # noqa: BLE001 - unproven capability retains native pressure
+            pass
+        if support == "unsupported":
+            request_messages = project_messages(
+                request_messages, mode=ImageProjectionMode.MARKER,
+            ).messages
         active_user_index = _active_user_message_index_for_request(
             request_messages,
             current_user_text=active_user_message,

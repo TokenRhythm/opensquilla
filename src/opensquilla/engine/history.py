@@ -22,6 +22,7 @@ from opensquilla.provider import (
     ContentBlockToolUse,
     Message,
 )
+from opensquilla.provider.image_projection import ImageProjectionMode, project_messages
 from opensquilla.provider.replay_budget import project_message_replay_budget
 from opensquilla.provider.types import (
     ContentBlockDocument,
@@ -254,6 +255,7 @@ def project_history_replay_capacity(
     projection: HistoryReplayProjection,
     *,
     max_history_turns: int = 0,
+    image_mode: ImageProjectionMode = ImageProjectionMode.NATIVE,
 ) -> HistoryReplayCapacityProjection:
     """Estimate replay tokens after the route's real history-tail policy.
 
@@ -270,6 +272,8 @@ def project_history_replay_capacity(
     from opensquilla.session.tokenizer import estimate_tokens
 
     messages = list(projection.messages)
+    if image_mode is ImageProjectionMode.MARKER:
+        messages = project_messages(messages, mode=image_mode).messages
     provenance = list(projection.message_provenance)
     if messages and not provenance:
         # Compatibility for internal callers that construct a projection by
