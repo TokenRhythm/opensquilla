@@ -915,6 +915,10 @@ def _material_estimated_tokens(ctx: TurnContext, semantic_message: str) -> int:
     attachment_tokens = _token_estimate(
         metadata.get("attachment_material_estimated_tokens")
     ) or 0
+    if metadata.get("image_input_mode") == "marker":
+        marker_tokens = _token_estimate(metadata.get("attachment_marker_material_estimated_tokens"))
+        if marker_tokens is not None:
+            attachment_tokens = marker_tokens
     generated_normalization_tokens = _token_estimate(
         metadata.get("attachment_generated_normalization_estimated_tokens")
     ) or 0
@@ -975,6 +979,22 @@ def _request_jsonable(value: Any) -> Any:
     return value
 
 
+def _routing_history_capacity(ctx: TurnContext) -> tuple[int, int, bool]:
+    metadata = ctx.metadata
+    prefix = "routing_history_capacity"
+    if (
+        metadata.get("image_input_mode") == "marker"
+        and _token_estimate(metadata.get("routing_history_marker_capacity_estimated_tokens"))
+        is not None
+    ):
+        prefix = "routing_history_marker_capacity"
+    return (
+        _token_estimate(metadata.get(f"{prefix}_estimated_tokens")) or 0,
+        _token_estimate(metadata.get(f"{prefix}_message_count")) or 0,
+        metadata.get(f"{prefix}_estimate_complete") is True,
+    )
+
+
 def _complete_request_estimated_tokens(
     ctx: TurnContext,
     semantic_message: str,
@@ -990,12 +1010,7 @@ def _complete_request_estimated_tokens(
 
     metadata = getattr(ctx, "metadata", {}) or {}
     material_tokens = _final_material_estimated_tokens(ctx, semantic_message)
-    history_tokens = _token_estimate(
-        metadata.get("routing_history_capacity_estimated_tokens")
-    ) or 0
-    history_messages = _token_estimate(
-        metadata.get("routing_history_capacity_message_count")
-    ) or 0
+    history_tokens, history_messages, _ = _routing_history_capacity(ctx)
     additional_context_tokens = _token_estimate(
         metadata.get("routing_additional_request_context_tokens")
     ) or 0
@@ -1302,8 +1317,15 @@ async def finalize_squilla_router_capacity(
 
     router_cfg = getattr(ctx.config, "squilla_router", None) if ctx.config else None
     if ctx.metadata.get("router_tier_policy") == "model":
-        from opensquilla.engine.steps.model_router import validate_model_route_capacity
+        from opensquilla.engine.steps.model_router import (
+            resolve_model_image_route,
+            validate_model_route_capacity,
+        )
 
+        # Compaction re-admits the deployment already bound to the agent. A
+        # smaller history must not change only route metadata behind its back.
+        if not retry_after_compaction:
+            resolve_model_image_route(ctx)
         return validate_model_route_capacity(
             ctx, allow_compaction_retry=allow_compaction_retry,
         )

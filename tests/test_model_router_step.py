@@ -171,7 +171,7 @@ async def test_model_manual_hold_overrides_after_intent_prediction(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_image_turn_uses_model_then_validates_selected_deployment(monkeypatch):
+async def test_image_turn_keeps_semantic_target_and_restores_text_projection(monkeypatch):
     model = Classifier(tier="c2")
     install(monkeypatch, model)
     ctx = context()
@@ -180,9 +180,89 @@ async def test_image_turn_uses_model_then_validates_selected_deployment(monkeypa
     assert ctx.metadata["routed_tier"] == "c2"
     assert len(model.inputs) == 1
     monkeypatch.setattr(squilla_router, "_tier_deployment_vision_support", lambda *_: "unsupported")
-    with pytest.raises(ModelRouteError, match="image support"):
-        validate_model_route_capacity(ctx)
+    await squilla_router.finalize_squilla_router_capacity(ctx)
     assert ctx.metadata["routed_tier"] == "c2"
+    assert ctx.metadata["image_input_mode"] == "marker"
+    assert ctx.metadata["image_input_projection_required"] is True
+    assert ctx.metadata["router_model_decision"]["state"]["tier"] == "c2"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("history", [False, True])
+@pytest.mark.parametrize("intent", ["new_task", "continue", "redo"])
+async def test_image_execution_follows_forward_order_without_changing_semantic_state(
+    monkeypatch, history, intent,
+):
+    install(monkeypatch, Classifier(intent, "c1"))
+    state = None if intent == "new_task" else ModelPolicyState("c0" if intent == "redo" else "c1")
+    ctx = context(state=state)
+    if history:
+        ctx.metadata["image_context_has_images"] = True
+    else:
+        ctx.attachments = [{"mime_type": "image/png"}]
+    configured = deepcopy(ctx.config.squilla_router.tiers)
+    models = {raw["model"]: name for name, raw in configured.items()}
+    monkeypatch.setattr(
+        squilla_router, "_tier_deployment_vision_support",
+        lambda _, raw: "supported" if models[raw["model"]] in {"c0", "c2", "c3"}
+        else "unsupported",
+    )
+    await squilla_router.apply_squilla_router(ctx)
+    semantic = deepcopy(ctx.metadata["router_model_decision"])
+    await squilla_router.finalize_squilla_router_capacity(ctx)
+    assert ctx.metadata["routed_tier"] == "c2"
+    assert ctx.model == configured["c2"]["model"]
+    assert ctx.metadata["router_model_image_target_tier"] == "c1"
+    assert ctx.metadata["router_model_decision"] == semantic
+    assert semantic["state"]["tier"] == "c1"
+    assert ctx.metadata["image_input_mode"] == "native"
+    assert ctx.config.squilla_router.tiers == configured
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("target_support", ["unsupported", "unknown"])
+async def test_image_route_never_jumps_back_to_an_earlier_visual_tier(
+    monkeypatch, target_support,
+):
+    install(monkeypatch, Classifier(tier="c3"))
+    ctx = context()
+    ctx.metadata["image_context_has_images"] = True
+    original = ctx.config.squilla_router.tiers["c3"]["model"]
+    monkeypatch.setattr(
+        squilla_router, "_tier_deployment_vision_support",
+        lambda _, raw: target_support if raw["model"] == original else "supported",
+    )
+    await squilla_router.apply_squilla_router(ctx)
+    await squilla_router.finalize_squilla_router_capacity(ctx)
+    assert ctx.model == original
+    assert ctx.metadata["routed_tier"] == "c3"
+    assert ctx.metadata["image_input_mode"] == (
+        "marker" if target_support == "unsupported" else "native"
+    )
+    assert bool(ctx.metadata.get("image_input_projection_required")) is (
+        target_support == "unsupported"
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("constraint", ["budget", "provider"])
+async def test_visual_forward_selection_respects_execution_constraints(monkeypatch, constraint):
+    install(monkeypatch, Classifier(tier="c2"))
+    ctx = context(budget={"action": "cap", "cap_tier": "c2", "limit_usd": 0.01})
+    ctx.metadata["image_context_has_images"] = True
+    if constraint == "budget":
+        ctx.metadata.update(session_billed_cost_usd=1.0, session_cost_source="billed")
+    else:
+        ctx.config.squilla_router.tiers["c3"]["provider"] = "anthropic"
+    visual = ctx.config.squilla_router.tiers["c3"]["model"]
+    monkeypatch.setattr(
+        squilla_router, "_tier_deployment_vision_support",
+        lambda _, raw: "supported" if raw["model"] == visual else "unsupported",
+    )
+    await squilla_router.apply_squilla_router(ctx)
+    await squilla_router.finalize_squilla_router_capacity(ctx)
+    assert ctx.metadata["routed_tier"] == "c2"
+    assert ctx.metadata["image_input_mode"] == "marker"
 
 
 @pytest.mark.asyncio

@@ -216,7 +216,9 @@ async def test_observe_preserves_baseline_model_fallbacks_and_effort(execution):
 
 
 @pytest.mark.asyncio
-async def test_failed_selected_deployment_keeps_audit_but_not_active_state(execution, monkeypatch):
+async def test_capacity_rejected_deployment_keeps_audit_but_not_active_state(
+    execution, monkeypatch,
+):
     from opensquilla.engine.steps.model_router import ModelRouteError
     from opensquilla.session.model_router_state import build_model_router_context
 
@@ -225,7 +227,8 @@ async def test_failed_selected_deployment_keeps_audit_but_not_active_state(execu
     invalid = await e.manager.append_message(e.node.session_key, "user", "inspect this image")
 
     monkeypatch.setattr(squilla_router, "_get_strategy", lambda _: ScriptedClassifier("c2"))
-    with pytest.raises(ModelRouteError, match="image support"):
+    monkeypatch.setattr(squilla_router, "_capacity_tier_assessments", lambda *a, **k: [])
+    with pytest.raises(ModelRouteError, match="cannot fit"):
         await e.runner._run_pipeline(
             "inspect this image",
             e.node.session_key,
@@ -253,6 +256,49 @@ async def test_failed_selected_deployment_keeps_audit_but_not_active_state(execu
     )
     assert recovered["router_model_state"] == previous
     assert e.selector.current_config.model == "qwen/qwen3.7-flash"
+
+
+@pytest.mark.asyncio
+async def test_image_route_preserves_images_in_history_capacity_before_selecting_visual_tier(
+    execution, monkeypatch,
+):
+    from opensquilla.engine.runtime import RouterHistoryReplayRequest
+
+    e = execution
+    e.turn.config.llm.thinking = "off"
+    e.turn.config.squilla_router.tiers["c3"]["model"] = "qwen/qwen3.7-flash"
+    monkeypatch.setattr(squilla_router, "_get_strategy", lambda _: ScriptedClassifier("c2"))
+    entry = await e.manager.append_message(e.node.session_key, "user", "Compare the earlier image.")
+    history_projections = []
+
+    async def history_capacity(session_key, request, **kwargs):
+        assert session_key == e.node.session_key
+        history_projections.append(kwargs["preserve_image_attachments"])
+        return {
+            "history_capacity_estimated_tokens": 1536,
+            "history_capacity_message_count": 1,
+            "history_capacity_estimate_complete": True,
+        }
+
+    monkeypatch.setattr(e.runner, "_router_history_capacity_for_request", history_capacity)
+    turn, _ = await e.runner._run_pipeline(
+        "Compare the earlier image.", e.node.session_key, e.selector.resolve(), e.selector,
+        [], "system", [], history_has_recent_image=True,
+        bound_user_message_id=entry.message_id,
+        expected_session_id=e.node.session_id, expected_session_epoch=0,
+        model_router_context={
+            "router_model_state": e.turn.metadata["router_model_decision"]["state"],
+        },
+        router_history_replay_request=RouterHistoryReplayRequest(
+            exclude_last_user=True, bound_user_message_id=entry.message_id,
+            expected_session_id=e.node.session_id, expected_session_epoch=0,
+        ),
+    )
+
+    assert history_projections == [True]
+    assert turn.metadata["routed_tier"] == "c3"
+    assert turn.metadata["router_model_decision"]["state"]["tier"] == "c2"
+    assert turn.metadata["routing_history_capacity_estimated_tokens"] == 1536
 
 
 @pytest.mark.asyncio
@@ -541,17 +587,23 @@ async def test_model_execution_respects_actual_thinking_requirement(
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    ("vision_support", "default_tier"),
-    [("supported", "c0"), ("unsupported", "c0"), ("unsupported", "c1"), ("unknown", "c0")],
+    ("vision_support", "default_tier", "upgrade"),
+    [
+        ("supported", "c0", False),
+        ("unsupported", "c0", False),
+        ("unsupported", "c1", False),
+        ("unknown", "c0", False),
+        ("unsupported", "c0", True),
+    ],
 )
-async def test_model_policy_tool_image_continues_only_the_admitted_tier(
-    execution, monkeypatch, vision_support, default_tier,
+async def test_model_policy_tool_image_preserves_semantic_tier_and_projection(
+    execution, monkeypatch, vision_support, default_tier, upgrade,
 ):
     import json
     from base64 import b64encode
 
     from opensquilla.engine import Agent, ToolResult
-    from opensquilla.engine.steps.model_router import ModelRouteError
+    from opensquilla.engine.turn_runner.agent_bootstrap_stage import _ResolvedCatalog
     from opensquilla.provider import (
         DoneEvent,
         ModelCapabilities,
@@ -571,8 +623,11 @@ async def test_model_policy_tool_image_continues_only_the_admitted_tier(
     config = e.turn.config
     config.llm.thinking = "off"
     config.squilla_router.default_tier = default_tier
+    config.squilla_router.tiers["c3"]["model"] = config.squilla_router.tiers["c2"]["model"]
     if vision_support == "supported":
         config.squilla_router.tiers["c2"]["model"] = "qwen/qwen3.7-flash"
+    if upgrade:
+        config.squilla_router.tiers["c3"]["model"] = "qwen/qwen3.7-flash"
     monkeypatch.setattr(squilla_router, "_get_strategy", lambda _: ScriptedClassifier("c2"))
     entry = await e.manager.append_message(e.node.session_key, "user", "Inspect the tool image.")
     model_context = await e.runner._router_previous_assistant_context(
@@ -610,13 +665,37 @@ async def test_model_policy_tool_image_continues_only_the_admitted_tier(
         provider, e.selector, turn.metadata,
         image_routing_config=config, image_routing_session_key=e.node.session_key,
     )
-    wrapper.configure_image_continuation_catalog(
-        lambda *args, **kwargs: pytest.fail("Do not look for another image deployment")
-    )
+    continuations = []
+    if upgrade:
+        def build_continuation(deployment):
+            assert deployment.model == config.squilla_router.tiers["c3"]["model"]
+            continuation = _ProjectingScriptProvider(
+                provider_name="openrouter",
+                wire_provider=OpenAIProvider(
+                    api_key="synthetic-offline", model=deployment.model,
+                    base_url="https://openrouter.ai/api/v1", provider_kind="openrouter",
+                ),
+                streams=[[TextDeltaEvent(text="image answer"), DoneEvent()]],
+            )
+            continuations.append(continuation)
+            return continuation
+
+        monkeypatch.setattr("opensquilla.provider.selector._build_provider", build_continuation)
+        wrapper.configure_image_continuation_catalog(lambda *a, **k: _ResolvedCatalog(
+            max_tokens=1024, context_window=64_000,
+            capabilities=ModelCapabilities(supports_vision=True, supports_tools=True),
+            vision_support="supported",
+        ))
+    else:
+        wrapper.configure_image_continuation_catalog(
+            lambda *a, **k: pytest.fail("Do not bind a lower or unsupported image deployment")
+        )
     context = ToolContext(is_owner=True)
     image_data = b64encode(image_bytes()).decode("ascii")
+    tool_calls = []
 
     async def image_tool(call):
+        tool_calls.append(call.tool_use_id)
         context.tool_result_media[call.tool_use_id] = [{"mime": "image/png", "data": image_data}]
         return ToolResult(call.tool_use_id, call.tool_name, "Image loaded.")
 
@@ -637,21 +716,122 @@ async def test_model_policy_tool_image_continues_only_the_admitted_tier(
             )
         ],
     )
-    if vision_support == "supported":
-        events = [event async for event in agent.run_turn("Inspect the tool image.")]
-        assert not [event for event in events if event.kind == "error"], events
-        assert any(event.kind == "done" and event.text == "image answer" for event in events)
-        assert len(provider.calls) == 2
-        assert count_provider_image_blocks(provider.calls[-1]["messages"]) == 1
-        assert f"data:image/png;base64,{image_data}" in json.dumps(provider.calls[-1]["payload"])
+    events = [event async for event in agent.run_turn("Inspect the tool image.")]
+    assert not [event for event in events if event.kind == "error"], events
+    assert any(event.kind == "done" and event.text == "image answer" for event in events)
+    assert len(provider.calls) == (1 if upgrade else 2)
+    last_call = continuations[-1].calls[-1] if upgrade else provider.calls[-1]
+    if vision_support == "supported" or upgrade:
+        assert count_provider_image_blocks(last_call["messages"]) == 1
+        assert f"data:image/png;base64,{image_data}" in json.dumps(last_call["payload"])
     else:
-        with pytest.raises(ModelRouteError, match="Selected tier c2 has no proven image support"):
-            _ = [event async for event in agent.run_turn("Inspect the tool image.")]
-        assert len(provider.calls) == 1
+        assert count_provider_image_blocks(last_call["messages"]) == 0
+        assert "图片未分析" in json.dumps(last_call["payload"], ensure_ascii=False)
     assert count_provider_image_blocks(provider.calls[0]["messages"]) == 0
-    assert wrapper.active_deployment_config().model == turn.model
-    assert turn.metadata["routed_tier"] == "c2"
+    assert tool_calls == ["load-image"]
+    expected_tier = "c3" if upgrade else "c2"
+    assert wrapper.active_deployment_config().model == config.squilla_router.tiers[expected_tier][
+        "model"
+    ]
+    assert turn.metadata["routed_tier"] == expected_tier
     assert turn.metadata["router_model_decision"] == before
     rows = await e.manager.get_model_router_transcript(e.node.session_key)
     admitted = next(row for row in rows if row.message_id == entry.message_id)
     assert admitted.turn_context["router_model_decision"] == before
+
+
+def _model_image_continuation_runtime(monkeypatch):
+    from tests.test_engine.test_selector_fallback_routed_model import _image_continuation_runtime
+
+    runtime = _image_continuation_runtime(monkeypatch)
+    router = runtime.gateway.squilla_router
+    router.strategy = "lightgbm_model"
+    runtime.gateway.llm.thinking = "off"
+    text_tier = deepcopy(router.tiers["c0"])
+    image_tier = deepcopy(router.tiers["c1"])
+    router.tiers = {
+        "c0": deepcopy(image_tier),
+        "c1": deepcopy(image_tier),
+        "c2": text_tier,
+        "c3": image_tier,
+    }
+    runtime.metadata.update(
+        router_tier_policy="model",
+        routing_applied=True,
+        routed_tier="c2",
+        routed_model=text_tier["model"],
+        routed_provider=text_tier["provider"],
+        thinking_mode="T0",
+        prompt_policy="P0",
+        router_model_decision={"state": {"tier": "c2"}, "decision": {"tier": "c2"}},
+    )
+    return runtime
+
+
+@pytest.mark.asyncio
+async def test_model_tool_image_uses_forward_visual_deployment_without_reclassifying(monkeypatch):
+    from opensquilla.provider.protocol import count_provider_image_blocks
+
+    runtime = _model_image_continuation_runtime(monkeypatch)
+    original_tiers = deepcopy(runtime.gateway.squilla_router.tiers)
+    original_decision = deepcopy(runtime.metadata["router_model_decision"])
+    original_messages = [message.model_dump(mode="json") for message in runtime.messages]
+
+    rebound = await runtime.wrapper.prepare_image_continuation(runtime.messages, runtime.config)
+
+    assert rebound is not None
+    assert runtime.wrapper.active_deployment_config().model == runtime.image_model
+    assert runtime.metadata["routed_tier"] == "c3"
+    assert runtime.metadata["router_model_image_target_tier"] == "c2"
+    assert runtime.metadata["router_model_decision"] == original_decision
+    assert runtime.gateway.squilla_router.tiers == original_tiers
+    assert [message.model_dump(mode="json") for message in runtime.messages] == original_messages
+    events = [event async for event in runtime.wrapper.chat(runtime.messages, config=rebound)]
+    assert any(event.kind == "done" for event in events)
+    assert count_provider_image_blocks(runtime.built[-1].calls[0]["messages"]) == 1
+    assert not runtime.primary.calls
+
+
+@pytest.mark.asyncio
+async def test_model_tool_image_does_not_jump_backward_when_only_lower_tiers_support_images(
+    monkeypatch,
+):
+    import json
+
+    from opensquilla.provider.protocol import count_provider_image_blocks
+
+    runtime = _model_image_continuation_runtime(monkeypatch)
+    router = runtime.gateway.squilla_router
+    router.tiers["c3"] = deepcopy(router.tiers["c2"])
+    original_decision = deepcopy(runtime.metadata["router_model_decision"])
+
+    rebound = await runtime.wrapper.prepare_image_continuation(runtime.messages, runtime.config)
+    assert rebound is None
+    assert runtime.wrapper.active_deployment_config().model == router.tiers["c2"]["model"]
+    events = [
+        event async for event in runtime.wrapper.chat(runtime.messages, config=runtime.config)
+    ]
+    assert any(event.kind == "done" for event in events)
+    assert count_provider_image_blocks(runtime.primary.calls[0]["messages"]) == 0
+    assert "图片未分析" in json.dumps(runtime.primary.calls[0]["payload"], ensure_ascii=False)
+    assert runtime.metadata["router_model_decision"] == original_decision
+    assert not runtime.lookup_calls
+
+
+@pytest.mark.asyncio
+async def test_model_tool_image_keeps_current_deployment_if_complete_payload_cannot_be_proven(
+    monkeypatch,
+):
+    runtime = _model_image_continuation_runtime(monkeypatch)
+    original_metadata = deepcopy(runtime.metadata)
+    monkeypatch.setattr(
+        "opensquilla.engine.runtime.project_provider_final_request", lambda *a: None,
+    )
+
+    rebound = await runtime.wrapper.prepare_image_continuation(runtime.messages, runtime.config)
+    assert rebound is None
+
+    assert runtime.wrapper.active_deployment_config().model == "synthetic/text-small"
+    assert runtime.metadata == original_metadata
+    assert len(runtime.lookup_calls) == 1
+    assert all(not provider.calls for provider in runtime.built)

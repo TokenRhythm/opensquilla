@@ -96,6 +96,9 @@ class ModelPolicyRecovery:
     ) -> dict[str, Any] | None:
         callback = getattr(provider, "prepare_quality_retry", None)
         tier = self.metadata.get("routed_tier")
+        envelope = self.metadata.get("router_model_decision")
+        if isinstance(envelope, Mapping) and isinstance(envelope.get("state"), Mapping):
+            tier = envelope["state"].get("tier", tier)
         if (
             not self.enabled
             or self.quality_attempted

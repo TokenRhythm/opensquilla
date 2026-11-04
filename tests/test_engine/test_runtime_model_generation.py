@@ -250,15 +250,17 @@ def test_features_use_active_slice_until_compacted_task_anchor_requires_canonica
 
 @pytest.fixture
 async def image_generation(monkeypatch):
+    import base64
     import json
 
     from opensquilla.engine.steps import squilla_router
     from opensquilla.provider.selector import ModelSelector, ProviderConfig, SelectorConfig
+    from tests.helpers.image_bytes import image_bytes
 
     async with SessionStorage(":memory:") as storage:
         manager = SessionManager(storage, inject_time_prefix=False)
         node = await manager.create("agent:main:generation-image")
-        image = {"type": "image/png", "data": "aGVsbG8="}
+        image = {"type": "image/png", "data": base64.b64encode(image_bytes()).decode("ascii")}
         await manager.append_message(
             node.session_key, "user", json.dumps({"text": "OLD IMAGE TASK", "attachments": [image]})
         )
@@ -284,7 +286,8 @@ async def image_generation(monkeypatch):
         runner = TurnRunner(provider_selector=selector, session_manager=manager, config=config)
         owner = dict(expected_session_id=node.session_id, expected_session_epoch=0)
         env = SimpleNamespace(
-            manager=manager, storage=storage, node=node, runner=runner, config=config, owner=owner
+            manager=manager, storage=storage, node=node, runner=runner, config=config, owner=owner,
+            image=image,
         )
 
         async def route(text, tier, *, new_task=False, current_image=False):
@@ -366,12 +369,23 @@ async def test_explicit_new_task_drops_prior_generation_image_requirement(
 @pytest.mark.parametrize(
     "image_source", ["current", "generation_history", "archived_generation_history"]
 )
-async def test_model_generation_still_requires_vision_for_actual_images(
-    image_generation, image_source
+@pytest.mark.parametrize("visual_forward", [False, True])
+async def test_model_generation_image_execution_preserves_semantics_and_originals(
+    image_generation, image_source, visual_forward
 ):
-    from opensquilla.engine.steps.model_router import ModelRouteError
+    import json
+    from copy import deepcopy
+
+    from opensquilla.provider.types import ContentBlockImage
 
     e = image_generation
+    tiers = e.config.squilla_router.tiers
+    visual_model = tiers["c0"]["model"]
+    for tier in ("c1", "c2", "c3"):
+        tiers[tier]["model"] = "deepseek/deepseek-v4-flash"
+    if visual_forward:
+        tiers["c2"]["model"] = visual_model
+    configured = deepcopy(tiers)
     if image_source != "current":
         await e.route("Inspect this new image", "c0", new_task=True, current_image=True)
         await e.manager.append_message(e.node.session_key, "assistant", "NEW IMAGE ANSWER")
@@ -398,14 +412,42 @@ async def test_model_generation_still_requires_vision_for_actual_images(
             assert (
                 await e.storage.get_canonical_transcript_coverage(node.session_id)
             ).canonical_complete
-    with pytest.raises(ModelRouteError, match="no proven image support"):
-        await e.route(
-            "Explain this",
-            "c1",
-            new_task=image_source == "current",
-            current_image=image_source == "current",
-        )
+    turn, _ = await e.route(
+        "Explain this",
+        "c1",
+        new_task=image_source == "current",
+        current_image=image_source == "current",
+    )
     assert e.context.get("history_has_recent_image", False) == (image_source != "current")
+    assert turn.metadata["routed_tier"] == ("c2" if visual_forward else "c1")
+    assert turn.model == configured["c2" if visual_forward else "c1"]["model"]
+    assert turn.metadata["image_input_mode"] == ("native" if visual_forward else "marker")
+    assert bool(turn.metadata.get("image_input_projection_required")) is not visual_forward
+    assert turn.metadata["router_model_decision"]["state"]["tier"] == "c1"
+    assert tiers == configured
+    canonical = await e.storage.get_canonical_transcript(e.node.session_id)
+    admitted = next(row for row in canonical if row.message_id == e.entry.message_id)
+    decision = admitted.turn_context["router_model_decision"]
+    assert decision["status"] == "admitted" and decision["state_committed"] is True
+    assert decision["state"]["tier"] == "c1"
+    image_rows = [row for row in canonical if '"attachments"' in row.content]
+    assert image_rows
+    assert all(json.loads(row.content)["attachments"] == [e.image] for row in image_rows)
+    before_load = [row.model_dump() for row in canonical]
+    agent = Agent(provider=MagicMock(), config=AgentConfig(metadata=turn.metadata))
+    await e.runner._load_history(
+        agent, e.node.session_key, bound_user_message_id=e.entry.message_id, **e.owner
+    )
+    replayed = [*agent._history, *agent._request_image_context]
+    assert any(
+        isinstance(block, ContentBlockImage) and block.data == e.image["data"]
+        for message in replayed
+        if isinstance(message.content, list)
+        for block in message.content
+    )
+    assert before_load == [
+        row.model_dump() for row in await e.storage.get_canonical_transcript(e.node.session_id)
+    ]
 
 
 @pytest.mark.asyncio

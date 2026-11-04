@@ -1,12 +1,12 @@
 """Intent-led routing using the pinned pair from the model-policy experiment.
 
-The state machine selects a semantic tier. Physical admission validates that
-exact deployment; capability, budget and cache heuristics never replace it.
+The state machine selects a semantic tier. Image admission may bind a later
+configured deployment without changing that semantic decision or its state.
 """
 
 from __future__ import annotations
 
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from dataclasses import replace
 
 from opensquilla.engine.pipeline import TurnContext
@@ -97,7 +97,12 @@ async def apply_model_router(ctx: TurnContext) -> TurnContext:
             "prompt_policy"
         ) not in {"P0", "P1", "P2"}:
             raise ModelRouteError("Replayed execution control is invalid")
-        selected_tier = effective_state.tier
+        selected_tier = update.get("execution_tier", effective_state.tier)
+        if (
+            selected_tier not in TEXT_TIERS
+            or TEXT_TIERS.index(selected_tier) < TEXT_TIERS.index(effective_state.tier)
+        ):
+            raise ModelRouteError("Replayed image execution tier is invalid")
         thinking_mode = update["thinking_mode"]
         prompt_policy = update["prompt_policy"]
         prompt_hint = None
@@ -238,15 +243,10 @@ def validate_model_route_capabilities(
             f"Selected tier {selected} requires cross-provider routing for {provider}"
         )
     model = str(raw.get("model") or "")
-    has_images = (
-        common._attachments_include_image(ctx.attachments)
-        or ctx.metadata.get("image_context_has_images") is True
-        or ctx.metadata.get("router_vision_followup_needs_image") is True
-    )
     catalog = shared_catalog()
     capabilities = catalog.get_capabilities(model, provider_name=provider)
-    if has_images and capabilities.supports_vision is not True:
-        raise ModelRouteError(f"Selected tier {selected} has no proven image support")
+    # A text deployment can execute the existing marker projection. Image
+    # admission is resolved separately, before proving the final request.
     # Relay adapters can intentionally leave the control dialect unset while
     # the catalog still verifies that the underlying model reasons. Admission
     # checks that model fact; request controls remain provider-owned.
@@ -261,6 +261,142 @@ def validate_model_route_capabilities(
         raise ModelRouteError(f"Selected tier {selected} does not support reasoning")
     if ctx.tool_defs and not capabilities.supports_tools:
         raise ModelRouteError(f"Selected tier {selected} does not support tool calls")
+    return ctx
+
+
+def resolve_model_image_route(
+    ctx: TurnContext,
+    *,
+    tier: str | None = None,
+    thinking_mode: str | None = None,
+    check_capacity: bool = True,
+    admit_candidate: Callable[[TurnContext], bool] | None = None,
+) -> TurnContext:
+    """Bind an image-capable forward tier, or retain the target's text projection.
+
+    The durable model-policy envelope remains the semantic decision. Only
+    physical route metadata changes, and the configured ladder is never edited.
+    Unknown capability keeps the existing bounded provider probe rather than
+    being treated as evidence that the model cannot read images.
+    """
+    if ctx.metadata.get("routing_applied") is not True:
+        return ctx
+    from opensquilla.engine.routing.policy import budget_gate
+    from opensquilla.engine.selector_override import cross_provider_tier_config
+    from opensquilla.engine.steps import squilla_router as common
+
+    selected = tier or ctx.metadata.get("routed_tier")
+    if selected not in TEXT_TIERS:
+        raise ModelRouteError("Selected model-policy tier is missing")
+    has_current_image = common._attachments_include_image(ctx.attachments)
+    if not (
+        has_current_image
+        or ctx.metadata.get("image_context_has_images") is True
+        or ctx.metadata.get("router_vision_followup_needs_image") is True
+    ):
+        return ctx
+    config = ctx.config.squilla_router
+    original = config.tiers.get(selected)
+    if not isinstance(original, dict) or not original.get("model"):
+        raise ModelRouteError("Selected model-policy deployment is missing")
+    target = selected
+    original_support = common._tier_deployment_vision_support(ctx, original)
+    active_provider = str(
+        ctx.metadata.get("executed_provider")
+        or ctx.metadata.get("requested_provider")
+        or ctx.config.llm.provider
+    )
+    for candidate in TEXT_TIERS[TEXT_TIERS.index(selected):]:
+        raw = config.tiers.get(candidate)
+        if not isinstance(raw, dict) or not raw.get("model"):
+            continue
+        provider = str(raw.get("provider") or ctx.config.llm.provider)
+        if provider != str(ctx.config.llm.provider) and not config.cross_provider_tiers:
+            continue
+        if common._tier_deployment_vision_support(ctx, raw) != "supported":
+            continue
+        candidate_metadata = {
+            key: value for key, value in ctx.metadata.items()
+            if not key.startswith("routed_provider_")
+        }
+        candidate_metadata.update(
+            routed_tier=candidate, routed_model=str(raw["model"]), routed_provider=provider,
+            image_input_mode="native", routed_model_vision_support="supported",
+        )
+        candidate_metadata.pop("image_input_projection_required", None)
+        candidate_turn = replace(ctx, model=str(raw["model"]), metadata=candidate_metadata)
+        if candidate != selected:
+            budget = common._budget_gate_input_for_turn(
+                candidate_turn, config, routed_model=candidate_turn.model,
+                material_tokens=common._complete_request_estimated_tokens(
+                    candidate_turn, candidate_turn.semantic_message,
+                ),
+            )
+            allowed = budget_gate(candidate, valid_tiers=list(TEXT_TIERS), budget=budget)
+            if allowed.tier != candidate:
+                continue
+        try:
+            validate_model_route_capabilities(
+                candidate_turn, tier=candidate, thinking_mode=thinking_mode,
+            )
+            if check_capacity:
+                validate_model_route_capacity(
+                    candidate_turn, tier=candidate, thinking_mode=thinking_mode,
+                )
+        except ModelRouteError:
+            continue
+        # Catalog support is not permission to borrow the active provider's
+        # credentials. Reuse the execution boundary's local profile and state
+        # continuity checks, keeping rejected candidates out of live metadata.
+        cross_provider_tier_config(
+            ctx.config, candidate_metadata, candidate_turn.model,
+            active_provider_id=active_provider, session_key=ctx.session_key,
+        )
+        if candidate_metadata.get("routed_provider_blocked"):
+            continue
+        if admit_candidate is not None and not admit_candidate(candidate_turn):
+            continue
+        target = candidate
+        break
+    raw = config.tiers[target]
+    support = (
+        common._tier_deployment_vision_support(ctx, raw)
+        if target != selected else original_support
+    )
+    ctx.metadata.setdefault("router_model_image_target_tier", selected)
+    ctx.metadata.update(
+        image_context_has_images=True,
+        image_route_reason="current_turn" if has_current_image else "history_context",
+        image_input_mode="marker" if support == "unsupported" else "native",
+        image_input_reason=(
+            "model_vision_unsupported" if support == "unsupported"
+            else "capability_probe" if support == "unknown"
+            else "configured_image_capable_tier"
+        ),
+        routed_model_vision_support=support,
+    )
+    if support == "unsupported":
+        ctx.metadata["image_input_projection_required"] = True
+    else:
+        ctx.metadata.pop("image_input_projection_required", None)
+    if target != selected:
+        ctx.model = str(raw["model"])
+        ctx.metadata.update(
+            routed_tier=target,
+            routed_model=ctx.model,
+            routed_provider=str(raw.get("provider") or ctx.config.llm.provider),
+            applied_model=ctx.model,
+            router_model_image_execution_tier=target,
+        )
+        ctx.metadata["routing_extra"] = {
+            **ctx.metadata.get("routing_extra", {}),
+            "final_tier": target,
+            "final_route_class": common.route_class_for_tier(target),
+        }
+        common._flag_tier_provider_mismatch(
+            ctx, config.tiers, target, routing_applied=True, force_direct=True,
+        )
+        ctx.metadata.update(common._compute_savings(ctx.model, config.tiers))
     return ctx
 
 
@@ -307,12 +443,13 @@ def validate_model_route_capacity(
     # Compaction may reduce known historical pressure, never current material,
     # and never changes the classified tier. Runtime must re-admit the actual
     # compacted request before provider execution.
+    history_tokens, _, history_complete = common._routing_history_capacity(ctx)
     if (
         allow_compaction_retry
         and assessment
         and assessment.status == "known_capacity_request_too_large"
-        and ctx.metadata.get("routing_history_capacity_estimate_complete") is True
-        and int(ctx.metadata.get("routing_history_capacity_estimated_tokens") or 0) > 0
+        and history_complete
+        and history_tokens > 0
     ):
         current_only = replace(
             ctx,
@@ -320,6 +457,8 @@ def validate_model_route_capacity(
                 **ctx.metadata,
                 "routing_history_capacity_estimated_tokens": 0,
                 "routing_history_capacity_message_count": 0,
+                "routing_history_marker_capacity_estimated_tokens": 0,
+                "routing_history_marker_capacity_message_count": 0,
             },
         )
         reduced = assess(current_only)
