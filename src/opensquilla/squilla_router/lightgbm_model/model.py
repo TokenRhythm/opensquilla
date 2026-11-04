@@ -183,7 +183,7 @@ class LightGBMPrediction:
 
 
 class LightGBMRouterModel:
-    """Single-model policy: BERT intent plus the unchanged LightGBM tier head."""
+    """Context-aware BERT intent with current-request-only LightGBM tier inference."""
 
     source = "lightgbm_model"
     _available = True
@@ -295,7 +295,7 @@ class LightGBMRouterModel:
         return features
 
     def build_features(self, router_input: Mapping[str, Any]) -> Any:
-        """Return the exact float32[380] feature vector for parity inspection."""
+        """Extract full-input reference features; online tier inference uses current text only."""
         from .input_contract import RouterInput
 
         with self._lock:
@@ -310,7 +310,12 @@ class LightGBMRouterModel:
     def _intent_features(
         self, canonical: Mapping[str, Any], tier_features: Any,
     ) -> dict[str, Any]:
-        """Reuse tier numeric88 and reproduce the frozen BERT text contract."""
+        """Preserve BERT history while reusing tier current-request rules48."""
+        from ._vendor.features.numeric import (
+            extract_context5,
+            extract_previous_signals19,
+            extract_route_history16,
+        )
         from ._vendor.features.runtime import _tokenizer_content_ids
         from ._vendor.features.text import (
             SEGMENT_KINDS,
@@ -334,10 +339,18 @@ class LightGBMRouterModel:
             sequence = [encoder.cls_token_id, *content, encoder.sep_token_id]
             ids[0, index, :len(sequence)] = sequence
             mask[0, index, :len(sequence)] = 1
-        # The frozen 380-vector embeds rules48, route-history16, then
-        # previous-signals19 + context5 in the original numeric88 order.
+        # Tier features intentionally contain no history. Only rules48 depends
+        # solely on the current request; reuse its expensive scan while keeping
+        # the original contextual numeric88 contract for intent classification.
         numeric = np.concatenate((
-            tier_features[164:212], tier_features[276:292], tier_features[356:380],
+            tier_features[164:212],
+            extract_route_history16(canonical.get("route_history")),
+            extract_previous_signals19(
+                canonical["current_request"],
+                canonical.get("previous_answer"),
+                canonical.get("previous_usage"),
+            ),
+            extract_context5(canonical),
         )).reshape(1, 88)
         numeric = np.asarray(self._intent_scaler.transform(numeric), dtype=np.float32)
         numeric = np.clip(numeric, -5.0, 5.0).astype(np.float32, copy=False)
@@ -368,13 +381,13 @@ class LightGBMRouterModel:
             return dict(zip(TIER_LABELS, map(float, calibrated), strict=True))
 
     def predict_tier(self, router_input: Mapping[str, Any]) -> dict[str, Any]:
-        """Classify a known new task without executing the intent model."""
+        """Classify only the current request, without executing the intent model."""
         from .input_contract import RouterInput
 
         with self._lock:
             try:
                 canonical = RouterInput.model_validate(router_input).model_dump(mode="json")
-                features = self._build_features(canonical)
+                features = self._build_features({"current_request": canonical["current_request"]})
                 tier = self.predict_tier_features(features)
                 return {
                     "tier_probabilities": tier,
@@ -396,7 +409,7 @@ class LightGBMRouterModel:
         with self._lock:
             try:
                 canonical = RouterInput.model_validate(router_input).model_dump(mode="json")
-                features = self._build_features(canonical)
+                features = self._build_features({"current_request": canonical["current_request"]})
                 assert self._intent_session is not None
                 logits = self._np.asarray(
                     self._intent_session.run(

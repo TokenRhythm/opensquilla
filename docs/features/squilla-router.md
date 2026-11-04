@@ -44,6 +44,12 @@ final intent, not the model probabilities. Audits retain the raw argmax predicti
 and its confidence, and mark changed decisions with `intent_thresholds_v1`.
 The first turn remains New Task; only explicit New Task resets context.
 
+Tier classification uses only the current request text. Historical user messages,
+previous answers and usage, task anchors, route history, and historical context
+estimates do not enter its features. BERT intent classification retains that context.
+Continue and Redo keep their existing tier transition rules, and the actual provider
+request still uses the session's normal context.
+
 Chat thumbs up/down rate the answer independently of routing. Selections are kept
 only for the current page and reset on reload; they are not submitted or used for
 training. Clicking the selected thumb again clears it.

@@ -9,6 +9,7 @@ import platform
 import shutil
 import subprocess
 import sys
+from copy import deepcopy
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -89,7 +90,8 @@ def test_bert_intent_preprocessing_matches_source(model):
     for source, golden in zip(inputs, expected, strict=True):
         assert source["name"] == golden["name"]
         canonical = RouterInput.model_validate(source["input"]).model_dump(mode="json")
-        prepared = model._intent_features(canonical, model.build_features(canonical))
+        current_features = model.build_features({"current_request": canonical["current_request"]})
+        prepared = model._intent_features(canonical, current_features)
         assert {key: hashlib.sha256(value.tobytes()).hexdigest()
                 for key, value in prepared.items()} == golden["prepared_sha256"]
     assert set(model._models) == {"tier"}, "The replaced LightGBM intent head must not load"
@@ -227,8 +229,17 @@ def test_full_features_and_outputs_match_frozen_source(model):
             err_msg=case["name"],
         )
         prediction = predictions[case["name"]]
+        # Preserve the frozen full-history tier/CPU contract independently
+        # of the online current-request-only input policy.
+        raw_tier = model.predict_tier_features(features)
+        raw_prediction = SimpleNamespace(
+            intent_probabilities=prediction.intent_probabilities,
+            intent_decision=prediction.intent_decision,
+            tier_probabilities=raw_tier,
+            tier_decision=max(raw_tier, key=raw_tier.__getitem__),
+        )
         for target in ("intent", "tier"):
-            values = getattr(prediction, target + "_probabilities")
+            values = getattr(raw_prediction, target + "_probabilities")
             expected = intent_expected if target == "intent" else case["tier_probabilities"]
             if target == "intent":
                 measured = profile_probabilities(selected_profile, case["name"])
@@ -243,7 +254,7 @@ def test_full_features_and_outputs_match_frozen_source(model):
                     atol=bounds[target] if bounds else 1e-12, err_msg=case["name"],
                 )
             labels = ("continue", "redo", "new_task") if target == "intent" else tuple(values)
-            assert getattr(prediction, target + "_decision") == max(
+            assert getattr(raw_prediction, target + "_decision") == max(
                 labels, key=expected.__getitem__
             ), case["name"]
             assert math.isclose(sum(values.values()), 1.0, abs_tol=1e-12)
@@ -261,7 +272,7 @@ def test_full_features_and_outputs_match_frozen_source(model):
                 SimpleNamespace(predict=lambda _, result=result: result),
                 task_id_factory=lambda: "reference-new-task",
             )
-            for result in (prediction, reference_prediction)
+            for result in (raw_prediction, reference_prediction)
         ]
         for field in (
             "intent",
@@ -424,10 +435,10 @@ def test_encoder_cache_is_bounded_lru_and_releases_owned_rows(monkeypatch):
         encode("1")
 
 
-def test_predict_reuses_numeric88_for_long_json(model, monkeypatch):
-    from opensquilla.squilla_router.lightgbm_model._vendor.features import lightgbm380, numeric
+def test_predict_reuses_current_rules_for_long_json(model, monkeypatch):
+    from opensquilla.squilla_router.lightgbm_model._vendor.features import numeric
 
-    original = lightgbm380.extract_numeric88
+    original = numeric.extract_rules48
     calls = []
 
     def extract_once(value):
@@ -435,8 +446,7 @@ def test_predict_reuses_numeric88_for_long_json(model, monkeypatch):
         assert len(calls) == 1, "A second full-text scan can exceed the routing deadline"
         return original(value)
 
-    monkeypatch.setattr(lightgbm380, "extract_numeric88", extract_once)
-    monkeypatch.setattr(numeric, "extract_numeric88", extract_once)
+    monkeypatch.setattr(numeric, "extract_rules48", extract_once)
     # Empty objects expose the full-text regex scan that previously ran twice.
     router_input = {"current_request": "Inspect this JSON: " + json.dumps([{}] * 9600)}
     prediction = model.predict(router_input)
@@ -444,6 +454,61 @@ def test_predict_reuses_numeric88_for_long_json(model, monkeypatch):
     assert len(calls) == 1
     assert prediction.intent_decision == "new_task"
     assert prediction.tier_decision == "C0"
+
+
+_TANG_JIE_REQUEST = "帮我调研下智谱的唐杰，并生成一个html介绍"
+_HI_CONTEXT = {
+    "history_user": ["hi"],
+    "previous_answer": "你好！有什么我可以帮你的吗？😊",
+    "previous_usage": {
+        "input_tokens": 12971, "output_tokens": 112, "reasoning_tokens": 100,
+        "cached_tokens": 12800, "cache_write_tokens": 0,
+    },
+    "route_history": [{
+        "tier_id": "C0", "difficulty": 0.03155840496159989, "margin": 0.9575967052055792,
+    }],
+}
+
+
+@pytest.mark.parametrize(("field", "value"), [
+    *_HI_CONTEXT.items(),
+    ("context", {"turn_index": 5, "context_tokens_est": 20_000}),
+    ("task_anchor", "Debug a production outage"),
+    ("active_route_tier", "C3"),
+    ("previous_outcome", "failure"),
+    ("tool_state", {"available_tools": ["web_search", "write_file"]}),
+    ("attachments", [{"mime_type": "image/png", "name": "diagram.png"}]),
+])
+def test_tier_depends_only_on_current_request(model, field, value):
+    cold = {"current_request": _TANG_JIE_REQUEST}
+    contextual = {**cold, field: value}
+    original = deepcopy(contextual)
+    expected = model.predict_tier(cold)
+    actual = model.predict(contextual)
+    tier_only = model.predict_tier(contextual)
+    assert (actual.tier_probabilities == tier_only["tier_probabilities"]
+            == expected["tier_probabilities"])
+    assert actual.tier_decision == tier_only["tier_decision"] == expected["tier_decision"]
+    assert (actual.feature_vector_hash == tier_only["feature_vector_hash"]
+            == expected["feature_vector_hash"])
+    assert contextual == original
+
+
+def test_new_task_after_hi_matches_first_turn_tier(model):
+    from opensquilla.engine.routing.model_policy import ModelPolicyState, decide_model_tier
+
+    cold = {"current_request": _TANG_JIE_REQUEST}
+    contextual = {**cold, **deepcopy(_HI_CONTEXT), "active_route_tier": "C0"}
+    original = deepcopy(contextual)
+    first = decide_model_tier(cold, None, model)
+    after_hi = decide_model_tier(contextual, ModelPolicyState("c0", task_id="greeting"), model)
+    assert first.intent == after_hi.intent == "new_task"
+    assert first.tier == after_hi.tier
+    assert first.tier_audit.probabilities == after_hi.tier_audit.probabilities
+    assert first.intent_audit.run_status == "not_run"
+    assert after_hi.intent_audit.run_status == "ran"
+    assert after_hi.tier_audit.run_status == "ran"
+    assert contextual == original
 
 
 def test_tier_only_prediction_survives_broken_intent(model, monkeypatch):
