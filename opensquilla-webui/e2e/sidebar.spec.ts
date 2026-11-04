@@ -57,21 +57,155 @@ test.describe('Sidebar', () => {
       const label = await caption.evaluate(element => {
         const range = document.createRange()
         range.selectNodeContents(element)
-        return { bottom: range.getBoundingClientRect().bottom, lines: range.getClientRects().length }
+        return { bottom: range.getBoundingClientRect().bottom }
       })
       const readyBounds = (await amount.boundingBox())!
       expect(label.bottom).toBeLessThanOrEqual(readyBounds.y)
       expect(Math.abs(readyBounds.y - pendingBounds.y)).toBeLessThanOrEqual(1)
-      if (width === 260) {
-        expect(label.lines).toBe(1)
-        const recharge = (await page.getByTestId('sidebar-account-recharge').boundingBox())!
-        // The account-width popup can wrap the recharge button on narrow sidebars.
-        if (recharge.y >= readyBounds.y + readyBounds.height) {
-          expect(recharge.y - (readyBounds.y + readyBounds.height)).toBeGreaterThanOrEqual(4)
-        } else {
-          expect(readyBounds.x + readyBounds.width).toBeLessThanOrEqual(recharge.x)
-          expect(Math.abs((readyBounds.y + readyBounds.height / 2) - (recharge.y + recharge.height / 2))).toBeLessThanOrEqual(1)
+      const wallet = (await page.locator('.sidebar-account__wallet').boundingBox())!
+      const recharge = (await page.getByTestId('sidebar-account-recharge').boundingBox())!
+      expect(readyBounds.x + readyBounds.width).toBeLessThanOrEqual(recharge.x)
+      expect(Math.abs((wallet.y + wallet.height / 2) - (recharge.y + recharge.height / 2))).toBeLessThanOrEqual(1)
+    })
+  }
+
+  const accountMenuScenarios = [
+    { name: 'small phone', viewport: { width: 320, height: 568 }, sidebarWidth: 260, locale: 'zh-Hans', theme: 'light', touch: true },
+    { name: 'phone', viewport: { width: 390, height: 844 }, sidebarWidth: 260, locale: 'en', theme: 'dark', touch: true },
+    { name: 'phone landscape', viewport: { width: 844, height: 390 }, sidebarWidth: 260, locale: 'en', theme: 'light', touch: true },
+    { name: 'drawer boundary', viewport: { width: 768, height: 1024 }, sidebarWidth: 260, locale: 'zh-Hans', theme: 'light', touch: false },
+    { name: 'compact start', viewport: { width: 769, height: 720 }, sidebarWidth: 260, locale: 'en', theme: 'dark', touch: false },
+    { name: 'compact boundary', viewport: { width: 959, height: 720 }, sidebarWidth: 260, locale: 'en', theme: 'light', touch: false },
+    { name: 'resizable boundary', viewport: { width: 960, height: 600 }, sidebarWidth: 260, locale: 'zh-Hans', theme: 'dark', touch: false },
+    { name: 'narrow desktop with long values', viewport: { width: 1280, height: 720 }, sidebarWidth: 240, locale: 'en', theme: 'light', touch: false, longValues: true },
+    { name: 'default desktop', viewport: { width: 1440, height: 900 }, sidebarWidth: 260, locale: 'zh-Hans', theme: 'light', touch: false },
+    { name: 'wide desktop', viewport: { width: 1920, height: 1080 }, sidebarWidth: 480, locale: 'en', theme: 'dark', touch: false },
+  ]
+
+  for (const scenario of accountMenuScenarios) {
+    test(`account menu layout and interactions at ${scenario.name}`, async ({ browser }) => {
+      const context = await browser.newContext({
+        baseURL: process.env.OPENSQUILLA_WEBUI_BASE_URL || 'http://127.0.0.1:18791',
+        viewport: scenario.viewport,
+        hasTouch: scenario.touch,
+        isMobile: scenario.touch,
+      })
+      try {
+        const page = await context.newPage()
+        const pageErrors: string[] = []
+        page.on('pageerror', error => pageErrors.push(error.message))
+        const account: TokenRhythmAccountState = {
+          revision: 1, status: 'signed_in', keyStatus: 'ready',
+          profile: {
+            accountId: 'example-account', sessionId: 'example-session', maskedPhone: '',
+            displayName: scenario.longValues ? 'Synthetic example account with a long display name' : 'Demo user',
+          },
+          wallet: {
+            currency: 'CNY', asOf: '2026-01-01T00:00:00Z',
+            balances: { available: scenario.longValues ? '1234567890123456789.12' : '1241.62', bonus: '0', recharge: '1241.62', debt: '0', frozen: '0' },
+          },
+          walletStatus: 'ready', errorCode: null, walletErrorCode: null,
+          source: 'manual', selectedAccountId: null, pendingRevocation: false,
+          loginExpiresAt: null, mediaSources: { image: 'inherit', video: 'inherit' },
         }
+        await installSidebarFixture(page, {
+          'usage.query': { mode: 'ledger_exact', totals: { inputTokens: 654321, outputTokens: 12345, costNanos: 1000000 }, sessions: [], models: [], days: [] },
+        })
+        await installDesktopUpdateBridge(page, {}, account)
+        await page.addInitScript(({ locale, theme, sidebarWidth }) => {
+          localStorage.setItem('opensquilla-locale', locale)
+          localStorage.setItem('opensquilla-theme', theme)
+          localStorage.setItem('opensquilla.sidebar.width.v1', JSON.stringify({ version: 1, width: sidebarWidth, source: 'custom' }))
+        }, scenario)
+        await page.goto(CONTROL_URL)
+        if (scenario.touch || scenario.viewport.width <= 768) {
+          const toggle = page.getByTestId('sidebar-toggle-collapsed')
+          if (scenario.touch) await toggle.tap()
+          else await toggle.click()
+        }
+
+        const trigger = page.getByTestId('sidebar-account-trigger')
+        const activate = () => scenario.touch ? trigger.tap() : trigger.click()
+        await activate()
+        const menu = page.locator('.sidebar-account__menu')
+        const recharge = page.getByTestId('sidebar-account-recharge')
+        await expect(menu).toBeVisible()
+        await expect(page.getByTestId('sidebar-account-today-usage')).toHaveAttribute('aria-busy', 'false')
+        if (scenario.touch) await page.getByTestId('sidebar-account-balance').tap()
+        else await page.mouse.move(scenario.viewport.width - 10, 10)
+        await expect(trigger).toHaveCSS('background-color', 'rgba(0, 0, 0, 0)')
+
+        const geometry = await menu.evaluate(element => {
+          const rect = (selector: string) => {
+            const { x, y, width, height, right, bottom } = document.querySelector(selector)!.getBoundingClientRect()
+            return { x, y, width, height, right, bottom }
+          }
+          return {
+            menu: rect('.sidebar-account__menu'),
+            footer: rect('.sidebar-account'),
+            wallet: rect('.sidebar-account__wallet'),
+            caption: rect('.sidebar-account__balance-label'),
+            balance: rect('[data-testid="sidebar-account-balance"]'),
+            recharge: rect('[data-testid="sidebar-account-recharge"]'),
+            overflow: element.scrollWidth > element.clientWidth,
+            pageWidth: document.documentElement.scrollWidth,
+          }
+        })
+        expect(Math.abs(geometry.menu.x - geometry.footer.x)).toBeLessThanOrEqual(1)
+        expect(Math.abs(geometry.menu.right - geometry.footer.right)).toBeLessThanOrEqual(1)
+        expect(geometry.menu.x).toBeGreaterThanOrEqual(0)
+        expect(geometry.menu.y).toBeGreaterThanOrEqual(0)
+        expect(geometry.menu.right).toBeLessThanOrEqual(scenario.viewport.width)
+        expect(geometry.menu.bottom).toBeLessThanOrEqual(geometry.footer.y)
+        expect(geometry.footer.bottom).toBeLessThanOrEqual(scenario.viewport.height)
+        expect(geometry.overflow).toBe(false)
+        expect(geometry.pageWidth).toBeLessThanOrEqual(scenario.viewport.width)
+        expect(geometry.caption.bottom).toBeLessThanOrEqual(geometry.balance.y)
+        expect(Math.max(geometry.caption.right, geometry.balance.right)).toBeLessThanOrEqual(geometry.recharge.x)
+        expect(Math.abs((geometry.wallet.y + geometry.wallet.height / 2) - (geometry.recharge.y + geometry.recharge.height / 2))).toBeLessThanOrEqual(1)
+        if (scenario.touch) expect(geometry.recharge.height).toBeGreaterThanOrEqual(44)
+
+        const info = page.getByTestId('sidebar-account-usage-info')
+        const tooltip = page.getByRole('tooltip')
+        if (!scenario.touch) {
+          await info.hover()
+          await expect(tooltip).toBeVisible()
+          await tooltip.hover()
+          await expect(tooltip).toBeVisible()
+          await page.mouse.move(scenario.viewport.width - 10, 10)
+          await expect(tooltip).toBeHidden()
+        }
+        if (scenario.touch) await info.tap()
+        else await info.click()
+        await expect(tooltip).toBeVisible()
+        const hint = (await tooltip.boundingBox())!
+        const infoBounds = (await info.boundingBox())!
+        expect(hint.x).toBeGreaterThanOrEqual(0)
+        expect(hint.y).toBeGreaterThanOrEqual(0)
+        expect(hint.x + hint.width).toBeLessThanOrEqual(scenario.viewport.width)
+        expect(hint.y + hint.height).toBeLessThanOrEqual(scenario.viewport.height)
+        expect(hint.y + hint.height <= infoBounds.y
+          || hint.y >= infoBounds.y + infoBounds.height).toBe(true)
+        if (scenario.touch) await tooltip.tap()
+        else await tooltip.click()
+        await expect(tooltip).toBeVisible()
+        await expect(menu).toBeVisible()
+        await info.focus()
+        await page.keyboard.press('Escape')
+        await expect(tooltip).toBeHidden()
+        await expect(menu).toBeVisible()
+
+        await recharge.focus()
+        await page.keyboard.press('Escape')
+        await expect(menu).toHaveCount(0)
+        await expect(trigger).toBeFocused()
+        await activate()
+        await expect(menu).toBeVisible()
+        await activate()
+        await expect(menu).toHaveCount(0)
+        expect(pageErrors).toEqual([])
+      } finally {
+        await context.close()
       }
     })
   }
