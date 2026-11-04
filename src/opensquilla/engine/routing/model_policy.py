@@ -1,4 +1,4 @@
-"""Intent-led routing matching the frozen ``four-tier-intent-policy.v1``.
+"""Intent-led routing with probability thresholds and the frozen tier transitions.
 
 Classification owns the tier: continue retains the last committed tier, redo
 advances one tier, and new_task uses the tier head. Controller rules only
@@ -223,6 +223,14 @@ def _probability_winner(
     return winner, probabilities[winner]
 
 
+def _threshold_intent(probabilities: Mapping[str, float]) -> str:
+    """Apply the v1 intent thresholds without changing the classifier evidence."""
+    p_new, p_redo = probabilities["new_task"], probabilities["redo"]
+    if p_redo >= 0.25 and p_redo > p_new:
+        return "redo"
+    return "new_task" if p_new >= 0.01 else "continue"
+
+
 @dataclass(frozen=True)
 class ModelPolicyAudit:
     source: str
@@ -246,13 +254,18 @@ class ModelPolicyAudit:
             if self.source != "classifier" or not isinstance(self.probabilities, Mapping):
                 raise ValueError("classifier run is missing its probabilities")
             winner, confidence = _probability_winner(self.probabilities, labels)
+            final = winner
+            if self.reason == "intent_thresholds_v1":
+                if labels != INTENTS:
+                    raise ValueError("intent thresholds cannot select a tier")
+                final = _threshold_intent(self.probabilities)
             if (
                 self.prediction != winner
-                or self.final != winner
+                or self.final != final
                 or isinstance(self.confidence, bool)
                 or self.confidence != confidence
             ):
-                raise ValueError("classifier audit must preserve the fixed-order argmax")
+                raise ValueError("classifier audit conflicts with its prediction or decision rule")
         elif any(
             value is not None for value in (self.prediction, self.probabilities, self.confidence)
         ):
@@ -382,8 +395,10 @@ def _prediction_audit(result: Any, *, head: str, fallback: str) -> ModelPolicyAu
             raise ValueError("reported confidence differs from selected probability")
     except (TypeError, ValueError, OverflowError):
         return ModelPolicyAudit("fallback", "error", fallback, "invalid_classifier_result")
+    final = _threshold_intent(probabilities) if head == "intent" else winner
+    reason = "intent_thresholds_v1" if final != winner else "classifier_selected"
     return ModelPolicyAudit(
-        "classifier", "ran", winner, "classifier_selected", winner, probabilities, confidence
+        "classifier", "ran", final, reason, winner, probabilities, confidence
     )
 
 

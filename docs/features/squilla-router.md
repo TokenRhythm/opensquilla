@@ -37,6 +37,13 @@ personalized model. Routing diagnostics and manual model selection remain availa
 The model policy handles a classified correction or explicit Redo as a one-tier
 advance within the current task.
 
+For an active task without an explicit intent control, the policy selects Redo
+when `p_redo >= 0.25` and `p_redo > p_new`; otherwise it selects New Task when
+`p_new >= 0.01`, and Continue below that threshold. These thresholds change the
+final intent, not the model probabilities. Audits retain the raw argmax prediction
+and its confidence, and mark changed decisions with `intent_thresholds_v1`.
+The first turn remains New Task; only explicit New Task resets context.
+
 Chat thumbs up/down rate the answer independently of routing. Selections are kept
 only for the current page and reset on reload; they are not submitted or used for
 training. Clicking the selected thumb again clears it.

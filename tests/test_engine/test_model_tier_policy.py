@@ -10,12 +10,14 @@ from __future__ import annotations
 
 import copy
 import json
+from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
 import pytest
 
 from opensquilla.engine.routing.model_policy import (
+    ModelPolicyAudit,
     ModelPolicyDecision,
     ModelPolicyState,
     decide_model_tier,
@@ -173,11 +175,76 @@ def test_frozen_cross_project_parity(row, expected):
         control_context=row.get("context", {}),
         task_id_factory=lambda: "new-task",
     )
+    # Old argmax audit records remain readable. Only the two intent ties in
+    # the frozen oracle change routing under the new thresholds.
+    ModelPolicyAudit(**expected[6])
+    if row.get("intent_probs", {}).get("new_task") == 0.5:
+        new_task_index = cases().index({"previous": "c1", "intent": "new_task", "predicted": "c0"})
+        updated = copy.deepcopy(FROZEN_EXPECTED[new_task_index])
+        updated[6] = {**expected[6], "final": "new_task", "reason": "intent_thresholds_v1"}
+        expected = updated
     assert project(decision) == expected
     assert ModelPolicyDecision.from_dict(decision.to_dict()) == decision
     assert ModelPolicyState.from_dict(decision.next_state.to_dict()) == decision.next_state
     assert len(classifier.inputs) <= 1
 
+
+@pytest.mark.parametrize(
+    "p_new,p_redo,intent,tier",
+    [
+        (0.009999, 0.249999, "continue", "c1"),
+        (0.01, 0.0, "new_task", "c0"),
+        (0.009999, 0.25, "redo", "c2"),
+        (0.02, 0.249999, "new_task", "c0"),
+        (0.02, 0.25, "redo", "c2"),
+        (0.25, 0.25, "new_task", "c0"),
+        (0.26, 0.25, "new_task", "c0"),
+        (0.25, 0.26, "redo", "c2"),
+    ],
+)
+def test_intent_thresholds_preserve_raw_evidence_and_tier_transitions(p_new, p_redo, intent, tier):
+    probabilities = {"new_task": p_new, "continue": 1 - p_new - p_redo, "redo": p_redo}
+    state, router_input, result = fixture({"previous": "c1", "intent_probs": probabilities})
+    classifier = Classifier(result)
+    decision = decide_model_tier(router_input, state, classifier, input_message_id="now")
+    audit = decision.intent_audit
+    assert (decision.intent, decision.tier) == (intent, tier)
+    assert audit.source == "classifier"
+    assert audit.prediction == "continue"
+    assert audit.confidence == probabilities["continue"]
+    assert audit.probabilities == probabilities
+    assert audit.reason == (
+        "classifier_selected" if intent == "continue" else "intent_thresholds_v1"
+    )
+    assert not decision.context_reset
+    assert decision.next_state.generation_start_input_message_id == "generation-start"
+    assert decision.next_state.task_start_input_message_id == (
+        "now" if intent == "new_task" else "old-start"
+    )
+    assert len(classifier.inputs) == 1
+    assert ModelPolicyDecision.from_dict(decision.to_dict()) == decision
+    for changes in (
+        {"final": "continue" if intent != "continue" else "new_task"},
+        {"prediction": "new_task"},
+        {"confidence": p_new},
+    ):
+        with pytest.raises(ValueError):
+            replace(audit, **changes)
+
+
+def test_old_argmax_decision_replays_without_applying_new_thresholds():
+    state, router_input, result = fixture({"previous": "c1"})
+    old = decide_model_tier(router_input, state, Classifier(result))
+    old = replace(
+        old,
+        intent_audit=replace(
+            old.intent_audit,
+            probabilities={"new_task": 0.02, "continue": 0.98, "redo": 0.0},
+            confidence=0.98,
+        ),
+    )
+    assert ModelPolicyDecision.from_dict(old.to_dict()) == old
+    assert old.intent == "continue"
 
 
 @pytest.mark.parametrize("intent,tier", [("continue", "c1"), ("redo", "c2"), ("new_task", "c0")])
