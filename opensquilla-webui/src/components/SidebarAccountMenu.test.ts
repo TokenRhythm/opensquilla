@@ -259,6 +259,45 @@ describe('sidebar account summary', () => {
     expect(host.querySelector('[role="menu"]')).not.toBeNull()
   })
 
+  it('keeps the floating explanation open while crossing its hover gap and interacting with it', async () => {
+    const { host } = await mount()
+    await open(host)
+    const info = button(host, 'sidebar-account-usage-info')
+    const help = info.parentElement!
+    const tooltip = document.getElementById(info.getAttribute('aria-describedby')!)!
+    expect(host.contains(tooltip)).toBe(false)
+
+    vi.useFakeTimers()
+    try {
+      help.dispatchEvent(new PointerEvent('pointerenter', { pointerType: 'mouse' }))
+      await nextTick()
+      expect(tooltip.getAttribute('aria-hidden')).toBe('false')
+      help.dispatchEvent(new PointerEvent('pointerleave', { pointerType: 'mouse' }))
+      await vi.advanceTimersByTimeAsync(100)
+      tooltip.dispatchEvent(new PointerEvent('pointerenter', { pointerType: 'mouse' }))
+      await vi.advanceTimersByTimeAsync(200)
+      expect(tooltip.getAttribute('aria-hidden')).toBe('false')
+
+      tooltip.dispatchEvent(new PointerEvent('pointerdown', { bubbles: true, cancelable: true }))
+      tooltip.dispatchEvent(new Event('scroll'))
+      await nextTick()
+      expect(host.querySelector('[role="menu"]')).not.toBeNull()
+      expect(tooltip.getAttribute('aria-hidden')).toBe('false')
+
+      tooltip.dispatchEvent(new PointerEvent('pointerleave', { pointerType: 'mouse' }))
+      await vi.advanceTimersByTimeAsync(151)
+      expect(tooltip.getAttribute('aria-hidden')).toBe('true')
+      help.dispatchEvent(new PointerEvent('pointerenter', { pointerType: 'mouse' }))
+      await nextTick()
+      window.dispatchEvent(new Event('resize'))
+      await nextTick()
+      expect(tooltip.getAttribute('aria-hidden')).toBe('true')
+      expect(host.querySelector('[role="menu"]')).not.toBeNull()
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
   it('offers direct sign-in from the signed-out capsule', async () => {
     const { host, props, router } = await mount(state({ status: 'signed_out', profile: null, wallet: null, walletStatus: 'idle', keyStatus: 'missing' }))
     const login = button(host, 'sidebar-account-login')
