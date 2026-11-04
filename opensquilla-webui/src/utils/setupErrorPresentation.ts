@@ -8,6 +8,7 @@ const SETUP_REASON_KEYS = {
   'router-provider-conflict': 'setup.provider.routerConflictTitle',
   'already-active': 'setup.provider.alreadyActive',
   'router-invalid': 'errors.onboarding.router',
+  'ensemble-invalid': 'errors.onboarding.ensemble',
   'search-invalid': 'errors.onboarding.search',
   'image-generation-invalid': 'errors.onboarding.image',
 } as const
@@ -16,6 +17,7 @@ export function setupErrorMessage(error: unknown): string {
   const detail = error instanceof Error ? error.message : String(error ?? '')
   if (error instanceof SetupWorkflowError && error.reason) {
     const lead = i18n.global.t(SETUP_REASON_KEYS[error.reason])
+    if (error.reason === 'ensemble-invalid') return lead
     return detail ? `${lead} (${detail})` : lead
   }
   return detail

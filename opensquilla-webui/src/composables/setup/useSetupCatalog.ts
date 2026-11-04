@@ -31,9 +31,12 @@ import {
   type EnsembleCandidateRole,
   type EnsembleCandidateView,
   type EnsembleCredentialStatus,
+  type EnsembleLineupIssue,
   type SavedEnsembleRecommendation,
 } from '@/composables/setup/useSetupEnsembleForm'
 import {
+  CUSTOM_B5_MAX_PROPOSERS,
+  CUSTOM_B5_MIN_PROPOSERS,
   CUSTOM_B5_SELECTION_MODE,
   LEGACY_OPENROUTER_MODEL_OPTIONS,
   ROUTER_DYNAMIC_SELECTION_MODE,
@@ -3534,14 +3537,6 @@ function routingModeForStrategy(strategy: ModelStrategy): 'direct' | 'router' | 
   return 'direct'
 }
 
-function ensembleLineupIdentity(provider: unknown, model: unknown): string {
-  const normalizedProvider = normalizeProviderId(provider)
-  const normalizedModel = String(model || '').trim()
-  return normalizedProvider && normalizedModel
-    ? `${normalizedProvider}\n${normalizedModel}`
-    : ''
-}
-
 /**
  * A fresh Ensemble selection is a draft when its lineup is not runnable yet.
  * The mode card must still open the editor so the user can add the second
@@ -3550,36 +3545,17 @@ function ensembleLineupIdentity(provider: unknown, model: unknown): string {
  */
 function ensembleLineupReady(): boolean {
   const selectionMode = String(ensembleForm.selectionMode.value || '').trim()
-  // OpenRouter and TokenRhythm have a server-owned fixed B5 lineup. Their
-  // candidates are intentionally not copied into the custom editor, so the
-  // mode transition can be committed without a local candidate array.
-  if (selectionMode in STATIC_B5_PROFILES || staticB5ModeForProvider(currentProvider.value)) return true
-
-  const identities = new Set<string>()
-  for (const candidate of ensembleForm.candidates.value || []) {
-    if (candidate.enabled === false || String(candidate.role || '').trim().toLowerCase() === 'aggregator') continue
-    const identity = ensembleLineupIdentity(candidate.provider, candidate.model)
-    if (identity) identities.add(identity)
-  }
-  for (const model of ensembleForm.modelOptions.value || []) {
-    const identity = ensembleLineupIdentity(
-      String(model || '').includes('/') ? 'openrouter' : currentProvider.value,
-      model,
-    )
-    if (identity) identities.add(identity)
-  }
-  return identities.size >= 2
+  // Static/dynamic plans own their lineup; a custom draft is independent of
+  // the primary provider's preset support and of legacy model_options.
+  if (selectionMode in STATIC_B5_PROFILES || selectionMode === ROUTER_DYNAMIC_SELECTION_MODE) return true
+  return ensembleForm.draftLineupIssue() === null
 }
 
-function ensembleLineupHint(): string {
-  const proposerCount = (ensembleForm.candidates.value || []).filter(candidate => (
-    candidate.enabled !== false
-    && String(candidate.role || '').trim().toLowerCase() !== 'aggregator'
-    && ensembleLineupIdentity(candidate.provider, candidate.model)
-  )).length
-  return proposerCount > 0
-    ? t('setup.modelStrategy.ensembleMinimum')
-    : t('setup.modelStrategy.ensembleEmpty')
+function ensembleLineupHint(issue: EnsembleLineupIssue): string {
+  if (issue.kind === 'maximum') return t('setup.modelStrategy.ensembleMaximum', { max: CUSTOM_B5_MAX_PROPOSERS })
+  if (issue.kind === 'aggregators') return t('setup.modelStrategy.ensembleAggregatorMaximum', { max: 1 })
+  if (issue.kind === 'invalid') return t('errors.onboarding.ensemble')
+  return t('setup.modelStrategy.ensembleMinimumCount', { min: CUSTOM_B5_MIN_PROPOSERS, count: issue.proposerCount })
 }
 
 async function setModelStrategy(strategy: ModelStrategy) {
@@ -3617,6 +3593,12 @@ async function setModelStrategy(strategy: ModelStrategy) {
       || ensembleRoutingState.candidates.length > 0
       || ensembleRoutingState.modelOptions.length > 0
     )
+    const seededFirstStaticPlan = (
+      !hasExistingEnsembleDraft
+      && config.value.llm_ensemble?.selection_configured === false
+      && ensembleForm.selectionMode.value in STATIC_B5_PROFILES
+      && ensembleRoutingState.selectionMode === CUSTOM_B5_SELECTION_MODE
+    )
     if (hasExistingEnsembleDraft || (strategy === 'ensemble' && ensembleLineupReady())) {
       ensembleForm.restoreRoutingModeDetails(ensembleRoutingState)
     }
@@ -3626,7 +3608,9 @@ async function setModelStrategy(strategy: ModelStrategy) {
     // two distinct models for Ensemble. Keep the choice local and expose the
     // lineup editor; the eventual Save will validate the completed snapshot.
     // This avoids rejecting the user before they can add the second model.
-    if (strategy === 'ensemble' && !ensembleLineupReady()) return
+    // A fresh static plan is materialized by this RPC, not by copying a
+    // temporary preset into the draft. Its empty pre-activation state is valid.
+    if (strategy === 'ensemble' && !seededFirstStaticPlan && !ensembleLineupReady()) return
 
     let response
     let replacedRouter = false
@@ -4697,12 +4681,16 @@ async function saveRouter() {
 
 async function saveEnsemble() {
   if (providerInteractionLocked()) return
+  const { params, issue } = ensembleForm.prepareSave(config.value.llm_ensemble || {})
+  if (issue) {
+    pushToast(ensembleLineupHint(issue), { tone: 'danger' })
+    return
+  }
   setPrimaryMutationPending(true)
   try {
     // Partial payload: only the keys the user actually changed; the gateway
     // keeps current values for everything omitted. No restart — the turn
     // loop reads [llm_ensemble] live.
-    const params = ensembleForm.payload()
     if (Object.keys(params).length) {
       await setupWorkflow.capability.configureEnsemble(params)
     }
@@ -4725,7 +4713,8 @@ async function saveModelStrategy(options: SaveOptions & {
   const fixedProviderChanged = modelStrategyForm.fixedProviderDirty.value
   const fixedProviderId = normalizeProviderId(modelStrategyForm.fixedProvider.value)
   const fixedModel = modelStrategyForm.fixedModel.value.trim()
-  const ensemblePayload = JSON.parse(JSON.stringify(ensembleForm.payload()))
+  const { params: ensembleParams, issue: ensembleIssue } = ensembleForm.prepareSave(config.value.llm_ensemble || {})
+  const ensemblePayload = JSON.parse(JSON.stringify(ensembleParams))
   const hasRouterWork = Boolean(routerRoutingPayload) || Object.keys(routerVisualPatches).length > 0
   const hasFixedModelWork = fixedProviderChanged || Object.keys(fixedModelPatches).length > 0
   const hasEnsembleWork = Object.keys(ensemblePayload).length > 0
@@ -4747,11 +4736,11 @@ async function saveModelStrategy(options: SaveOptions & {
     saveToast(options, t('setup.toast.chooseProvider'), { tone: 'danger' })
     return false
   }
-  if (hasEnsembleWork && ensembleForm.enabled.value && !ensembleLineupReady()) {
+  if (ensembleIssue) {
     // Keep this client-side guard aligned with the Gateway's runtime
     // requirement. It prevents a predictable rejected write and leaves the
     // lineup draft intact for the user to complete.
-    saveToast(options, ensembleLineupHint(), { tone: 'danger' })
+    saveToast(options, ensembleLineupHint(ensembleIssue), { tone: 'danger' })
     return false
   }
 

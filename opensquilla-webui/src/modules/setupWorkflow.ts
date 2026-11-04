@@ -48,6 +48,7 @@ export type SetupWorkflowFailureReason =
   | 'router-provider-conflict'
   | 'already-active'
   | 'router-invalid'
+  | 'ensemble-invalid'
   | 'search-invalid'
   | 'image-generation-invalid'
 
