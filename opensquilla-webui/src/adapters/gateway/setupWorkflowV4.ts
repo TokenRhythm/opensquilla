@@ -84,6 +84,7 @@ export function mapSetupError(error: unknown): SetupWorkflowError {
   const reasons: Record<string, SetupWorkflowFailureReason> = {
     'onboarding.provider.invalid': 'provider-invalid',
     'onboarding.router.invalid': 'router-invalid',
+    'onboarding.ensemble.invalid': 'ensemble-invalid',
     'onboarding.search.invalid': 'search-invalid',
     'onboarding.imageGeneration.invalid': 'image-generation-invalid',
   }

@@ -1084,6 +1084,82 @@ afterEach(() => {
   document.body.innerHTML = ''
 })
 
+describe('custom Ensemble save guards', () => {
+  async function scenario(provider: string, enabled = false, proposerCount = 1) {
+    const saved = {
+      llm: { provider, model: 'synthetic/model-0' },
+      squilla_router: { enabled: true, tiers: { c0: { provider, model: 'synthetic/model-0' } } },
+      llm_ensemble: {
+        enabled, selection_mode: 'custom_b5', selection_configured: true,
+        model_options: ['legacy/a', 'legacy/b'],
+        candidates: [
+          ...Array.from({ length: proposerCount }, (_, index) => ({ provider, model: `synthetic/model-${index}`, role: 'proposer' })),
+          { provider, model: 'synthetic/disabled', role: 'proposer', enabled: false },
+          { provider, model: 'synthetic/model-0', role: 'aggregator' },
+        ],
+      },
+    }
+    rpcCall.mockImplementation(async (method: string) => {
+      if (method === 'config.get') return structuredClone(saved)
+      if (method === 'onboarding.status') return { hasConfig: true, llmConfigured: true, llmCredentialStatus: { provider, available: true, source: 'explicit' } }
+      if (method === 'onboarding.catalog') return { providers: [{
+        providerId: provider, label: provider, runtimeSupported: true, requiresApiKey: true,
+        fields: [{ name: 'model', label: 'Model', required: true, default: saved.llm.model }],
+      }] }
+      if (method === 'channels.status') return { channels: [] }
+      if (method === 'onboarding.ensemble.configure') return { changed: true }
+      return {}
+    })
+    return { ...await mountCatalog(), saved }
+  }
+
+  it.each(['openrouter', 'tokenrhythm', 'openai'].flatMap(provider => [false, true].flatMap(enabled => (
+    ['saveEnsemble', 'saveModelStrategy'].map(entry => ({ provider, enabled, entry }))
+  ))))('blocks $provider $entry with one proposer when enabled=$enabled before any write', async ({ provider, enabled, entry }) => {
+    const { api, app } = await scenario(provider, enabled)
+    api.setEnsembleProposerMaxRetries(1)
+    api.updateTierField('c0', 'model', 'synthetic/unsaved-router')
+    const draft = JSON.stringify(api.ensemblePanel.value.candidates)
+    rpcCall.mockClear()
+
+    if (entry === 'saveEnsemble') await api.saveEnsemble()
+    else expect(await api.saveModelStrategy({ reload: false })).toBe(false)
+
+    expect(rpcCall).not.toHaveBeenCalled()
+    expect(pushToast).toHaveBeenLastCalledWith(
+      expect.stringMatching(/2.*1.*aggregator/i), { tone: 'danger' },
+    )
+    expect(JSON.stringify(api.ensemblePanel.value.candidates)).toBe(draft)
+    expect(api.routerPanel.value.tierRows.find(row => row.name === 'c0')?.model).toBe('synthetic/unsaved-router')
+    expect(api.sectionDirty('modelStrategy')).toBe(true)
+    app.unmount()
+  })
+
+  it.each(['saveEnsemble', 'saveModelStrategy'] as const)('lets %s save a valid custom lineup without resending unchanged candidates', async entry => {
+    const { api, app } = await scenario('tokenrhythm', false, 2)
+    api.setEnsembleProposerMaxRetries(1)
+    rpcCall.mockClear()
+    if (entry === 'saveEnsemble') await api.saveEnsemble()
+    else expect(await api.saveModelStrategy({ reload: false })).toBe(true)
+    expect(rpcCall).toHaveBeenCalledWith('onboarding.ensemble.configure', { proposerMaxRetries: 1 })
+    app.unmount()
+  })
+
+  it.each(['tokenrhythm', 'openrouter'])('opens an incomplete %s custom lineup as an editable draft without an activation RPC', async provider => {
+    const { api, app } = await scenario(provider)
+    rpcCall.mockClear()
+    await api.setModelStrategy('ensemble')
+    expect(rpcCall).not.toHaveBeenCalled()
+    expect(api.modelStrategyPanel.value.activeStrategy).toBe('ensemble')
+    expect(api.ensemblePanel.value.selectionMode).toBe('custom_b5')
+    expect(api.ensemblePanel.value.custom.proposerCount).toBe(1)
+    api.addEnsembleCandidate(provider, 'synthetic/second')
+    expect(api.ensemblePanel.value.custom.proposerCount).toBe(2)
+    expect(api.sectionDirty('modelStrategy')).toBe(true)
+    app.unmount()
+  })
+})
+
 describe('explicit cross-provider Router saves', () => {
   async function scenario(permission?: boolean, existingForeign = false) {
     let rejectNextSave = false
@@ -2788,6 +2864,7 @@ describe('useSetupCatalog model strategy IA', () => {
     const { api, app } = await mountCatalog()
 
     api.addEnsembleCandidate('openrouter', 'user/pending-model', 'proposer')
+    api.addEnsembleCandidate('openrouter', 'user/second-model', 'proposer')
     const mutation = api.setModelStrategy('ensemble')
     await vi.waitFor(() => {
       expect(rpcCall).toHaveBeenCalledWith('models.routing.set', { mode: 'ensemble' })
@@ -2807,7 +2884,9 @@ describe('useSetupCatalog model strategy IA', () => {
     expect(api.modelStrategyPanel.value.activeStrategy).toBe('ensemble')
     expect(api.modelStrategyPanel.value.ensemble.candidates).toEqual(expect.arrayContaining([
       expect.objectContaining({ model: 'user/pending-model', role: 'proposer' }),
+      expect.objectContaining({ model: 'user/second-model', role: 'proposer' }),
     ]))
+    expect(api.modelStrategyPanel.value.ensemble.candidates.some(candidate => candidate.model === 'racing/edit')).toBe(false)
     expect(api.modelStrategyPanel.value.ensemble.candidates).not.toEqual(expect.arrayContaining([
       expect.objectContaining({ model: 'server/preview' }),
     ]))
@@ -2837,6 +2916,7 @@ describe('useSetupCatalog model strategy IA', () => {
     const { api, app } = await mountCatalog()
 
     api.addEnsembleCandidate('openrouter', 'user/pending-model', 'proposer')
+    api.addEnsembleCandidate('openrouter', 'user/second-model', 'proposer')
     const mutation = api.setModelStrategy('ensemble')
     await vi.waitFor(() => {
       expect(rpcCall).toHaveBeenCalledWith('models.routing.set', { mode: 'ensemble' })
@@ -2848,7 +2928,9 @@ describe('useSetupCatalog model strategy IA', () => {
     expect(api.modelStrategyPanel.value.activeStrategy).toBe('single')
     expect(api.modelStrategyPanel.value.ensemble.candidates).toEqual(expect.arrayContaining([
       expect.objectContaining({ model: 'user/pending-model', role: 'proposer' }),
+      expect.objectContaining({ model: 'user/second-model', role: 'proposer' }),
     ]))
+    expect(api.modelStrategyPanel.value.ensemble.candidates.some(candidate => candidate.model === 'racing/edit')).toBe(false)
     expect(api.sectionDirty('modelStrategy')).toBe(true)
     expect(pushToast).toHaveBeenCalledWith(
       expect.stringContaining('The save result could not be confirmed'),

@@ -11,6 +11,7 @@ import {
   staticB5ModeForProvider,
   useSetupEnsembleForm,
   type EnsembleConfigSlice,
+  type EnsembleCandidateConfig,
 } from './useSetupEnsembleForm'
 
 // onboarding.ensemble.configure has partial-payload semantics (omitted keys
@@ -43,6 +44,149 @@ function makePanel(
     ]),
   })
 }
+
+describe('useSetupEnsembleForm — custom save validation', () => {
+  const lineup = (count: number): EnsembleCandidateConfig[] => Array.from({ length: count }, (_, index) => ({
+    provider: 'openrouter', model: `synthetic/model-${index}`, enabled: true, role: 'proposer',
+  }))
+
+  it.each([0, 1, 2, 6, 7])('validates %i proposers even while Ensemble is disabled', count => {
+    const config = { enabled: false, selection_mode: CUSTOM_B5_SELECTION_MODE, candidates: lineup(count) }
+    const f = useSetupEnsembleForm()
+    f.initFromConfig(config)
+    f.setProposerMaxRetries(1)
+    const prepared = f.prepareSave(config)
+
+    expect(prepared.params).toEqual({ proposerMaxRetries: 1 })
+    expect(prepared.issue?.kind ?? null).toBe(count < 2 ? 'minimum' : count > 6 ? 'maximum' : null)
+    if (count < 2) expect(prepared.issue?.proposerCount).toBe(count)
+    expect(f.candidates.value).toHaveLength(count)
+    expect(f.isDirty.value).toBe(true)
+  })
+
+  it('does not count disabled rows, aggregators or legacy modelOptions as proposers', () => {
+    const candidates = [...lineup(1), { ...lineup(2)[1]!, enabled: false }, { ...lineup(1)[0]!, role: 'aggregator' }]
+    const config = { selection_mode: CUSTOM_B5_SELECTION_MODE, candidates, model_options: ['legacy/a', 'legacy/b'] }
+    const f = useSetupEnsembleForm()
+    f.initFromConfig(config)
+    f.setProposerMaxRetries(1)
+    expect(f.prepareSave(config)).toMatchObject({
+      params: { proposerMaxRetries: 1 }, issue: { kind: 'minimum', proposerCount: 1 },
+    })
+  })
+
+  it.each([0, 1, 2])('allows up to one enabled aggregator independently of %i aggregator rows', count => {
+    const config = {
+      selection_mode: CUSTOM_B5_SELECTION_MODE,
+      candidates: [...lineup(2), ...lineup(count).map(row => ({ ...row, role: 'aggregator' }))],
+    }
+    const f = useSetupEnsembleForm()
+    f.initFromConfig(config)
+    f.setProposerMaxRetries(1)
+    expect(f.prepareSave(config).issue?.kind ?? null).toBe(count > 1 ? 'aggregators' : null)
+  })
+
+  it('normalizes only submitted candidates and validates the same payload without changing the draft', () => {
+    const config = { selection_mode: CUSTOM_B5_SELECTION_MODE, candidates: lineup(2) }
+    const f = useSetupEnsembleForm()
+    f.initFromConfig(config)
+    f.candidates.value = [
+      { provider: ' OPENROUTER ', model: ' synthetic/a ', enabled: false },
+      { provider: 'openrouter', model: 'synthetic/a', source: 'legacy_model_options', enabled: true },
+      { provider: 'openrouter', model: 'synthetic/b', enabled: true },
+      { provider: 'openrouter', model: 'synthetic/a', role: 'aggregator' },
+    ]
+    const draft = JSON.stringify(f.candidates.value)
+    const prepared = f.prepareSave(config)
+    expect(prepared.issue).toBeNull()
+    expect(prepared.params.candidates).toEqual([
+      expect.objectContaining({ provider: 'openrouter', model: 'synthetic/a', enabled: true, role: 'proposer' }),
+      expect.objectContaining({ provider: 'openrouter', model: 'synthetic/b', enabled: true, role: 'proposer' }),
+      expect.objectContaining({ provider: 'openrouter', model: 'synthetic/a', role: 'aggregator' }),
+    ])
+    expect(JSON.stringify(f.candidates.value)).toBe(draft)
+
+    f.candidates.value = [lineup(1)[0]!, { ...lineup(1)[0]!, source: 'legacy_model_options' }]
+    const invalid = f.prepareSave(config)
+    expect(invalid.params.candidates).toHaveLength(1)
+    expect(invalid.issue).toEqual({ kind: 'minimum', proposerCount: 1 })
+  })
+
+  it('does not let retained duplicate rows satisfy the minimum or rewrite them on a partial save', () => {
+    const config = { selection_mode: CUSTOM_B5_SELECTION_MODE, candidates: [lineup(1)[0]!, lineup(1)[0]!] }
+    const f = useSetupEnsembleForm()
+    f.initFromConfig(config)
+    f.setProposerMaxRetries(1)
+    expect(f.prepareSave(config)).toEqual({
+      params: { proposerMaxRetries: 1 }, issue: { kind: 'minimum', proposerCount: 1 },
+    })
+    expect(config.candidates).toHaveLength(2)
+  })
+
+  it('does not rewrite valid retained duplicate rows and rejects ambiguous retained upper bounds', () => {
+    const config = { selection_mode: CUSTOM_B5_SELECTION_MODE, candidates: [...lineup(2), lineup(1)[0]!] }
+    const f = useSetupEnsembleForm()
+    f.initFromConfig(config)
+    f.setProposerMaxRetries(1)
+    expect(f.prepareSave(config)).toEqual({ params: { proposerMaxRetries: 1 }, issue: null })
+    config.candidates = [...lineup(6), lineup(1)[0]!]
+    expect(f.prepareSave(config)).toEqual({
+      params: { proposerMaxRetries: 1 }, issue: { kind: 'invalid', proposerCount: 6 },
+    })
+  })
+
+  it.each(['static_openrouter_b5', 'static_tokenrhythm_b5', 'router_dynamic'])(
+    'leaves %s lineups and partial payloads to their existing contracts', mode => {
+      const config = { selection_mode: mode, candidates: [] }
+      const f = useSetupEnsembleForm()
+      f.initFromConfig(config)
+      f.setProposerMaxRetries(1)
+      expect(f.prepareSave(config)).toEqual({ params: { proposerMaxRetries: 1 }, issue: null })
+    },
+  )
+
+  it('does not count stale modelOptions when directly switching a preset to custom', () => {
+    const config = { selection_mode: 'static_openrouter_b5', model_options: ['legacy/a', 'legacy/b'], candidates: lineup(1) }
+    const f = useSetupEnsembleForm()
+    f.initFromConfig(config)
+    f.setSelectionMode(CUSTOM_B5_SELECTION_MODE)
+    expect(f.prepareSave(config)).toEqual({
+      params: { selectionMode: CUSTOM_B5_SELECTION_MODE }, issue: { kind: 'minimum', proposerCount: 1 },
+    })
+    f.setScheme('preset', 'static_openrouter_b5')
+    expect(f.prepareSave(config)).toEqual({ params: {}, issue: null })
+  })
+
+  it('keeps first enabled-only activation server-owned but materializes an explicitly edited custom preview', () => {
+    const config: EnsembleConfigSlice = {
+      enabled: false, selection_mode: 'static_openrouter_b5', selection_configured: false,
+      activation_preview: { selection_mode: 'static_openrouter_b5', candidates: [] },
+    }
+    const f = useSetupEnsembleForm()
+    f.initFromConfig(config)
+    f.setEnabled(true)
+    expect(f.prepareSave(config)).toEqual({ params: { enabled: true }, issue: null })
+    f.addCandidate('openrouter', 'synthetic/first')
+    f.addCandidate('openrouter', 'synthetic/second')
+    const prepared = f.prepareSave(config)
+    expect(prepared.issue).toBeNull()
+    expect(prepared.params.selectionMode).toBe(CUSTOM_B5_SELECTION_MODE)
+    expect(prepared.params.candidates).toHaveLength(2)
+  })
+
+  it.each([0, 1, 2])('validates a first custom activation preview with %i proposers without rewriting it', count => {
+    const config: EnsembleConfigSlice = {
+      enabled: false, selection_mode: 'static_openrouter_b5', selection_configured: false,
+      activation_preview: { selection_mode: CUSTOM_B5_SELECTION_MODE, candidates: lineup(count) },
+    }
+    const f = useSetupEnsembleForm()
+    f.initFromConfig(config)
+    f.setEnabled(true)
+    const prepared = f.prepareSave(config)
+    expect(prepared.params).toEqual({ enabled: true })
+    expect(prepared.issue?.kind ?? null).toBe(count < 2 ? 'minimum' : null)
+  })
+})
 
 describe('useSetupEnsembleForm — init + dirty tracking', () => {
   it('is pristine before and after initFromConfig', () => {

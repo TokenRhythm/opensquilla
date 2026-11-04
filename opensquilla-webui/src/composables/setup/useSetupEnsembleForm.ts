@@ -173,6 +173,11 @@ export interface EnsembleConfigSlice {
   aggregator_timeout_seconds?: number
 }
 
+export interface EnsembleLineupIssue {
+  kind: 'minimum' | 'maximum' | 'aggregators' | 'invalid'
+  proposerCount: number
+}
+
 export interface SavedEnsembleRecommendation {
   revision: string
   proposers: Array<{ model: string; thinking_level: string | null }>
@@ -294,6 +299,23 @@ function normalizeCandidates(value: unknown): EnsembleCandidateConfig[] {
     }
   }
   return out
+}
+
+function customLineupIssue(rows: readonly EnsembleCandidateConfig[]): EnsembleLineupIssue | null {
+  const candidates = normalizeCandidates(rows).filter(candidate => candidate.enabled !== false)
+  const proposers = candidates.filter(candidate => candidate.role !== 'aggregator').length
+  const issue = (kind: EnsembleLineupIssue['kind']): EnsembleLineupIssue => ({ kind, proposerCount: proposers })
+  if (proposers < CUSTOM_B5_MIN_PROPOSERS) return issue('minimum')
+  if (proposers > CUSTOM_B5_MAX_PROPOSERS) return issue('maximum')
+  if (candidates.filter(candidate => candidate.role === 'aggregator').length > 1) return issue('aggregators')
+
+  // An omitted candidates payload preserves historical rows verbatim. The
+  // Gateway counts those rows, without deduplication, for its upper bounds.
+  // Do not silently rewrite them or let duplicates satisfy the minimum.
+  const enabledRows = rows.filter(candidate => candidate.enabled !== false)
+  const aggregatorCount = enabledRows.filter(candidate => normalizeCandidateRole(candidate.role) === 'aggregator').length
+  if (aggregatorCount > 1 || enabledRows.length - aggregatorCount > CUSTOM_B5_MAX_PROPOSERS) return issue('invalid')
+  return null
 }
 
 function legacyDefaultModelOptions(options: readonly string[]): boolean {
@@ -962,6 +984,48 @@ export function useSetupEnsembleForm() {
     return params
   }
 
+  function prepareSave(config: EnsembleConfigSlice): { params: ConfigureEnsemble; issue: EnsembleLineupIssue | null } {
+    const params = payload()
+    if (!Object.keys(params).length) return { params, issue: null }
+
+    if (params.candidates !== undefined) {
+      // Validate exactly the normalized rows being submitted. Do not mutate
+      // the draft, and preserve partial writes when candidates are omitted.
+      params.candidates = normalizeCandidates(params.candidates)
+      if (selectionMode.value === CUSTOM_B5_SELECTION_MODE && config.selection_mode !== CUSTOM_B5_SELECTION_MODE) {
+        params.selectionMode = CUSTOM_B5_SELECTION_MODE
+      }
+    }
+    if (
+      params.enabled === true && config.enabled !== true
+      && config.selection_configured === false
+      && params.selectionMode === undefined && params.candidates === undefined
+    ) {
+      // The first enabled-only save asks the Gateway to materialize its plan;
+      // validate its preview, not the dormant stored candidate array. An
+      // unknown/empty custom draft must remain editable without being sent.
+      const activationMode = config.activation_preview?.selection_mode ?? selectionMode.value
+      if (config.activation_preview?.blocked_reason) {
+        return { params, issue: { kind: 'invalid', proposerCount: 0 } }
+      }
+      return {
+        params,
+        issue: activationMode === CUSTOM_B5_SELECTION_MODE
+          ? customLineupIssue(config.activation_preview?.candidates ?? candidates.value)
+          : null,
+      }
+    }
+
+    const mode = params.selectionMode ?? config.selection_mode ?? selectionMode.value
+    if (mode !== CUSTOM_B5_SELECTION_MODE) return { params, issue: null }
+    const rows = (params.candidates ?? config.candidates ?? []) as EnsembleCandidateConfig[]
+    return { params, issue: customLineupIssue(rows) }
+  }
+
+  function draftLineupIssue(): EnsembleLineupIssue | null {
+    return customLineupIssue(candidates.value)
+  }
+
   function effectiveFacts(proposerCount: number, isPreset: boolean): EnsembleEffectiveFacts {
     // Mirrors the gateway builder: static presets and custom_b5 lineups get
     // the static defaults only while the stored value still equals the legacy
@@ -1181,6 +1245,8 @@ export function useSetupEnsembleForm() {
     setAllFailedPolicy,
     setProposerMaxRetries,
     payload,
+    prepareSave,
+    draftLineupIssue,
     createPanel,
   }
 }
