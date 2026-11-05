@@ -5379,9 +5379,15 @@ def _history_page_bytes(result: Mapping[str, Any]) -> int:
     return len(json.dumps(result, ensure_ascii=False, separators=(",", ":")).encode("utf-8"))
 
 
-def _cap_history_summary_markers(result: dict[str, Any], *, target_bytes: int) -> bool:
+def _cap_history_summary_markers(
+    result: dict[str, Any], *, target_bytes: int, base_bytes: int | None = None,
+) -> bool:
     summaries = result["compaction_summaries"]
     if len(summaries) < 2:
+        return False
+    if base_bytes is None:
+        base_bytes = _history_page_bytes({**result, "compaction_summaries": []})
+    if base_bytes >= target_bytes:
         return False
 
     def timestamp_ms(value: object) -> float:
@@ -5413,7 +5419,6 @@ def _cap_history_summary_markers(result: dict[str, Any], *, target_bytes: int) -
         value for summary in summaries
         if isinstance(value := summary.get("summary_markers_omitted"), int) and value > 0
     )
-    base_bytes = _history_page_bytes({**result, "compaction_summaries": []})
     nearest = [
         index for index in sorted(range(len(summaries)), key=priority)
         if base_bytes + _history_page_bytes({
@@ -5462,28 +5467,54 @@ def _reduce_history_page_metadata(result: dict[str, Any], *, target_bytes: int) 
     enter this fallback, including pages split between complete turn snapshots.
     """
 
-    if _history_page_bytes(result) <= target_bytes:
+    remaining_bytes = _history_page_bytes(result)
+    if remaining_bytes <= target_bytes:
         return True
     for summary in result["compaction_summaries"]:
         if summary.get("summary_text"):
             summary["summary_text"] = ""
             summary["summary_text_omitted"] = "history_page_budget"
-    if _history_page_bytes(result) <= target_bytes:
+    remaining_bytes = _history_page_bytes(result)
+    if remaining_bytes <= target_bytes:
         return True
-    if _cap_history_summary_markers(result, target_bytes=target_bytes):
+    summaries = result["compaction_summaries"]
+    summary_payload_bytes = (
+        sum(_history_page_bytes(summary) for summary in summaries)
+        + max(0, len(summaries) - 1)
+    )
+    base_bytes = remaining_bytes - summary_payload_bytes
+    if base_bytes < target_bytes and _cap_history_summary_markers(
+        result, target_bytes=target_bytes, base_bytes=base_bytes,
+    ):
         return True
 
-    snapshots = sorted(
-        (outcome for outcome in result["turn_outcomes"] if "activity_snapshot" in outcome),
-        key=lambda outcome: _history_page_bytes(outcome["activity_snapshot"]),
-        reverse=True,
-    )
-    for outcome in snapshots:
+    snapshots: list[tuple[int, int, dict[str, Any]]] = []
+    for outcome in result["turn_outcomes"]:
+        if "activity_snapshot" not in outcome:
+            continue
+        snapshot_bytes = _history_page_bytes(outcome["activity_snapshot"])
+        replacement = {key: value for key, value in outcome.items() if key != "activity_snapshot"}
+        original_bytes = (
+            _history_page_bytes(replacement) + len('"activity_snapshot":') + snapshot_bytes
+            + (1 if replacement else 0)
+        )
+        replacement["activity_snapshot_omitted"] = "history_page_budget"
+        delta = original_bytes - _history_page_bytes(replacement)
+        snapshots.append((snapshot_bytes, delta, outcome))
+    snapshots.sort(key=lambda value: value[0], reverse=True)
+    for _snapshot_bytes, delta, outcome in snapshots:
         outcome.pop("activity_snapshot")
         outcome["activity_snapshot_omitted"] = "history_page_budget"
-        if _history_page_bytes(result) <= target_bytes:
-            return True
-        if _cap_history_summary_markers(result, target_bytes=target_bytes):
+        # Re-encoding every remaining snapshot after each removal makes a
+        # hidden-row page quadratic. Removing a dictionary field changes only
+        # that outcome's exact encoded size; list framing stays unchanged.
+        remaining_bytes -= delta
+        base_bytes -= delta
+        if remaining_bytes <= target_bytes:
+            return _history_page_bytes(result) <= target_bytes
+        if base_bytes < target_bytes and _cap_history_summary_markers(
+            result, target_bytes=target_bytes, base_bytes=base_bytes,
+        ):
             return True
     return False
 

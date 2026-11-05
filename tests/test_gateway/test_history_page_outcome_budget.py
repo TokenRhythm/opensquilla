@@ -8,6 +8,7 @@ from types import SimpleNamespace
 
 import pytest
 
+from opensquilla.chat.history import transcript_entries_to_chat_messages
 from opensquilla.gateway import rpc_sessions
 from opensquilla.gateway.rpc.registry import RpcContext, RpcHandlerError
 from opensquilla.gateway.terminal_activity import terminal_activity_snapshot
@@ -208,6 +209,90 @@ async def test_oversized_core_outcome_fails_without_silent_loss(monkeypatch):
             "key": KEY, "direction": "before", "target_items": 50, "target_bytes": PAGE_BYTES,
         }, None)
     assert caught.value.code == "RESPONSE_TOO_LARGE"
+
+
+async def test_hidden_turn_snapshot_reduction_keeps_encoding_work_bounded(monkeypatch):
+    entries = [TranscriptEntry(
+        id=index, session_id="session-id", session_key=KEY,
+        message_id=f"hidden-{index}", role="assistant", content="NO_REPLY", created_at=index,
+        turn_context={"turn_id": f"hidden-turn-{index}", "run_kind": "heartbeat",
+                      "input_mode": "system_event"},
+    ) for index in range(1, 33)]
+    entries.append(TranscriptEntry(
+        id=33, session_id="session-id", session_key=KEY, message_id="visible-answer",
+        role="assistant", content="Visible answer", created_at=33,
+        turn_context={"turn_id": "visible-turn"},
+    ))
+    messages = transcript_entries_to_chat_messages(entries, content_mode="bounded")
+    assert [item["message_id"] for item in messages] == ["visible-answer"]
+    activity_entries = [{
+        "type": "segment", "id": f"step-{index:04d}-" + "a" * 220,
+        "order": index + 1, "segment_type": "tool",
+        "tool_use_id": f"call-{index:04d}-" + "b" * 180,
+        "name": "read_" + "x" * 120, "started_at": 1, "ended_at": 2, "is_error": False,
+    } for index in range(128)]
+    outcomes = []
+    for entry in entries[:-1]:
+        turn_id = entry.turn_context["turn_id"]
+        snapshot = terminal_activity_snapshot({
+            "version": 2, "task_id": turn_id, "turn_id": turn_id, "complete": True,
+            "reasoning_utf16_length": 0, "entries": activity_entries,
+        }, task_id=turn_id, turn_id=turn_id)
+        assert snapshot is not None
+        outcomes.append({
+            "turn_id": turn_id, "task_id": turn_id, "status": "succeeded",
+            "outcome": {"kind": "completed"}, "activity_snapshot": snapshot,
+        })
+    original = copy.deepcopy(outcomes)
+    input_bytes = encoded_bytes(outcomes)
+    assert input_bytes > PAGE_BYTES
+    install_history(monkeypatch, messages, outcomes)
+    encode_bytes = rpc_sessions._history_page_bytes
+    encoded_work = 0
+
+    def measured_bytes(value):
+        nonlocal encoded_work
+        size = encode_bytes(value)
+        encoded_work += size
+        return size
+
+    monkeypatch.setattr(rpc_sessions, "_history_page_bytes", measured_bytes)
+    page = await rpc_sessions._handle_sessions_history_page_v2({
+        "key": KEY, "direction": "before", "target_items": 50, "target_bytes": PAGE_BYTES,
+    }, None)
+    assert encoded_work <= input_bytes * 5
+    assert encoded_bytes(page) <= PAGE_BYTES
+    assert [item["message_id"] for item in page["items"]] == ["visible-answer"]
+    retained = [item for item in page["turn_outcomes"] if "activity_snapshot" in item]
+    omitted = [item for item in page["turn_outcomes"] if "activity_snapshot_omitted" in item]
+    assert retained and omitted
+    assert len(retained) + len(omitted) == len(outcomes)
+    restored = copy.deepcopy(page)
+    restore = next(
+        item for item in restored["turn_outcomes"] if "activity_snapshot_omitted" in item
+    )
+    restore.pop("activity_snapshot_omitted")
+    restore["activity_snapshot"] = next(
+        item["activity_snapshot"] for item in original if item["turn_id"] == restore["turn_id"]
+    )
+    assert encoded_bytes(restored) > PAGE_BYTES
+    assert outcomes == original
+
+
+@pytest.mark.parametrize("previous_marker", [None, "旧详情" * 100])
+def test_snapshot_reduction_accounts_for_existing_marker_bytes(previous_marker):
+    complete = outcome("turn", snapshot_bytes=PAGE_BYTES)
+    if previous_marker is not None:
+        complete["activity_snapshot_omitted"] = previous_marker
+    expected = {
+        key: value for key, value in complete.items() if key != "activity_snapshot"
+    }
+    expected["activity_snapshot_omitted"] = "history_page_budget"
+    page = {"items": [], "compaction_summaries": [], "turn_outcomes": [complete]}
+    budget = encoded_bytes({**page, "turn_outcomes": [expected]})
+    assert rpc_sessions._reduce_history_page_metadata(page, target_bytes=budget)
+    assert page["turn_outcomes"] == [expected]
+    assert encoded_bytes(page) == budget
 
 
 @pytest.fixture
