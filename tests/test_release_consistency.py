@@ -1053,6 +1053,9 @@ def test_release_workflow_prestages_draft_without_advancing_channels() -> None:
     script = Path(".github/scripts/prestage-release-to-oss.sh").read_text(encoding="utf-8")
     assert '--forbid-overwrite true' in script
     assert "verify_immutable_object" in script
+    assert "--parallel 64" in script
+    assert "--copy-source" in script
+    assert ".upload-staging/" in script
     assert 'ALIYUN_OSS_PREFIX_NORMALIZED}" != "releases"' in script
     assert "/channels/" not in script
     assert 'mirror_root}/latest' not in script

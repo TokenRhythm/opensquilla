@@ -126,15 +126,55 @@ verify_immutable_object() {
 put_immutable_object() {
   local source="$1"
   local name="$2"
-  local source_path
+  local source_path source_size staging_key staging_object
+  local -a options=(
+    api
+    put-object
+    --addressing-style "${OSS_ADDRESSING_STYLE_NORMALIZED}"
+    --bucket "${ALIYUN_OSS_BUCKET}"
+    --key "${ALIYUN_OSS_PREFIX_NORMALIZED}/${tag}/${name}"
+    --forbid-overwrite true
+  )
   source_path="$(realpath -- "${source}")"
-  "${ossutil_bin}" api put-object \
-    --addressing-style "${OSS_ADDRESSING_STYLE_NORMALIZED}" \
-    --bucket "${ALIYUN_OSS_BUCKET}" \
-    --key "${ALIYUN_OSS_PREFIX_NORMALIZED}/${tag}/${name}" \
-    --forbid-overwrite true \
-    --body "file://${source_path}" \
-    --cache-control "${versioned_cache_control}"
+  source_size="$(wc -c < "${source_path}")"
+  if (( source_size >= 8388608 )); then
+    staging_key="${ALIYUN_OSS_PREFIX_NORMALIZED}/.upload-staging/${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}/${name}"
+    staging_object="oss://${ALIYUN_OSS_BUCKET}/${staging_key}"
+    echo "Uploading multipart staging object: ${name} (${source_size} bytes)"
+    "${ossutil_bin}" cp \
+      --addressing-style "${OSS_ADDRESSING_STYLE_NORMALIZED}" \
+      --parallel 64 \
+      --part-size 262144 \
+      --bigfile-threshold 8388608 \
+      --read-timeout 30 \
+      --retry-times 3 \
+      --cache-control "${versioned_cache_control}" \
+      "${source_path}" "${staging_object}"
+    verify_immutable_object "${source}" "staging/${name}" "${staging_object}"
+    # Recheck after the potentially long transfer. The shared release lock
+    # serializes writers, while the immutable destination still wins races
+    # through the server-side forbid-overwrite condition below.
+    if object_exists "${dest_prefix}/${name}"; then
+      verify_immutable_object "${source}" "${name}" "${dest_prefix}/${name}"
+      return 0
+    fi
+    options=(
+      api
+      copy-object
+      --addressing-style "${OSS_ADDRESSING_STYLE_NORMALIZED}"
+      --bucket "${ALIYUN_OSS_BUCKET}"
+      --key "${ALIYUN_OSS_PREFIX_NORMALIZED}/${tag}/${name}"
+      --forbid-overwrite true
+      --copy-source "/${ALIYUN_OSS_BUCKET}/${staging_key}"
+      --metadata-directive COPY
+    )
+  else
+    options+=(
+      --body "file://${source_path}"
+      --cache-control "${versioned_cache_control}"
+    )
+  fi
+  "${ossutil_bin}" "${options[@]}"
 }
 
 upload_immutable_object() {

@@ -79,3 +79,17 @@ jobs:
           path: ${{ runner.temp }}/v058-reconcile/*.json
           if-no-files-found: ignore
           retention-days: 30
+
+      - name: Remove this attempt's temporary multipart staging
+        if: ${{ always() }}
+        timeout-minutes: 3
+        shell: bash
+        run: |
+          set -euo pipefail
+          staging_prefix="oss://${ALIYUN_OSS_BUCKET}/${ALIYUN_OSS_PREFIX}/.upload-staging/${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}/"
+          ossutil rm --addressing-style virtual \
+            --force --recursive --all-versions "${staging_prefix}" \
+            || echo "::warning::Temporary staging versions could not be removed: ${staging_prefix}"
+          ossutil rm --addressing-style virtual \
+            --force --recursive --multipart "${staging_prefix}" \
+            || echo "::warning::Temporary multipart uploads could not be removed: ${staging_prefix}"
