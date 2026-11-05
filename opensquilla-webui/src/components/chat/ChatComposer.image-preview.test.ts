@@ -3,6 +3,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { createApp, nextTick, type App } from 'vue'
 import i18n from '@/i18n'
 import type { Attachment } from '@/types/chat'
+import { recoverMessageAttachments } from '@/utils/chat/regenerateAttachments'
 import ChatComposer from './ChatComposer.vue'
 
 const apps: App[] = []
@@ -68,6 +69,35 @@ async function mountAttachment(attachment: Attachment) {
 }
 
 describe('ChatComposer uploaded image preview', () => {
+  it.each(['inline', 'staged'] as const)('renders the thumbnail for a recovered %s image and keeps preview separate from send', async kind => {
+    // Two individually small images exceed the aggregate inline budget, so the
+    // second one uses a staging token while still carrying its local preview.
+    const blob = new Blob([new Uint8Array(1_100_000)], { type: 'image/png' })
+    const content = {
+      fetchAttachment: vi.fn(async () => ({ ok: true as const, status: 200, source: 'staged' as const,
+        url: '/api/v1/attachments/original', blob, filename: 'sample.png' })),
+      uploadAttachment: vi.fn(async () => ({ fileUuid: 'fresh-upload' })),
+    }
+    const recovered = await recoverMessageAttachments(content, {
+      role: 'user', text: '', ts: null,
+      attachments: ['one.png', 'two.png'].map(name => ({
+        kind: 'staged' as const, displayId: name, renderKey: name, name, mime: 'image/png',
+        download_url: '/api/v1/attachments/original',
+      })),
+    }, 'source-session', new AbortController().signal)
+    const attachment = recovered[kind === 'inline' ? 0 : 1]!
+    expect(attachment.kind).toBe(kind)
+    const { host, previewImage, send, removeAttachment } = await mountAttachment(attachment)
+    const thumbnail = host.querySelector<HTMLImageElement>('.attachment-chip__thumb')
+    expect(thumbnail).not.toBeNull()
+    expect(thumbnail?.getAttribute('src')).toBe(attachment.dataUrl)
+    host.querySelector<HTMLButtonElement>('.attachment-chip__preview')?.click()
+    expect(previewImage).toHaveBeenCalledExactlyOnceWith(attachment)
+    expect(send).not.toHaveBeenCalled()
+    expect(removeAttachment).not.toHaveBeenCalled()
+    expect(content.uploadAttachment).toHaveBeenCalledOnce()
+  })
+
   it.each(['inline', 'data URL', 'staged'] as const)('opens an unsent %s image without sending or removing it', async (source) => {
     const attachment = imageAttachment(source === 'staged'
       ? { kind: 'staged', data: undefined, dataUrl: undefined, file_uuid: 'file-1', file: new File(['image'], 'sample.png', { type: 'image/png' }) }

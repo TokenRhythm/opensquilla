@@ -25,6 +25,92 @@ function setup(blob = new Blob(['original'], { type: 'image/png' })) {
 }
 
 describe('original message attachment recovery', () => {
+  it('restores an inline image thumbnail from the same bytes sent on the wire', async () => {
+    const { content, message, controller } = setup()
+    const recovered = await recoverMessageAttachments(content, message, 'source', controller.signal)
+    expect(recovered[0]?.dataUrl).toBe(`data:image/png;base64,${btoa('original')}`)
+    expect(serializeChatFiles(recovered.filter(isSendableAttachment)).attachments[0]).toMatchObject({
+      data: btoa('original'),
+    })
+    expect(serializeChatFiles(recovered.filter(isSendableAttachment)).attachments[0]).not.toHaveProperty('dataUrl')
+  })
+
+  it('keeps small staged image thumbnails without adding their preview bytes to the RPC payload', async () => {
+    const { content, message, controller } = setup(new Blob([new Uint8Array(1_100_000)], { type: 'image/png' }))
+    message.attachments = [display({ name: 'one.png' }), display({ name: 'two.png' })]
+    const recovered = await recoverMessageAttachments(content, message, 'source', controller.signal)
+    expect(recovered.map(attachment => attachment.kind)).toEqual(['inline', 'staged'])
+    expect(recovered.every(attachment => attachment.dataUrl?.startsWith('data:image/png;base64,'))).toBe(true)
+    expect(content.uploadAttachment).toHaveBeenCalledOnce()
+    const wire = serializeChatFiles(recovered.filter(isSendableAttachment))
+    expect(wire.attachments[1]).toMatchObject({ file_uuid: 'fresh-upload' })
+    expect(wire.attachments[1]).not.toHaveProperty('data')
+    expect(wire.attachments[1]).not.toHaveProperty('dataUrl')
+    expect(new TextEncoder().encode(JSON.stringify(wire)).length).toBeLessThan(2_000_000)
+  })
+
+  it.each(['image/png', 'image/bmp', 'image/tiff', 'application/pdf', 'image/svg+xml'])(
+    'does not base64-encode a large staged %s file just to add a thumbnail', async mime => {
+      const { content, message, controller } = setup(new Blob([new Uint8Array(2_000_001)], { type: mime }))
+      message.attachments = [display({ mime })]
+      const read = vi.spyOn(FileReader.prototype, 'readAsDataURL')
+      try {
+        const recovered = await recoverMessageAttachments(content, message, 'source', controller.signal)
+        expect(recovered[0]?.kind).toBe('staged')
+        expect(recovered[0]?.dataUrl).toBeUndefined()
+        expect(read).not.toHaveBeenCalled()
+        expect(content.uploadAttachment).toHaveBeenCalledOnce()
+      } finally { read.mockRestore() }
+    },
+  )
+
+  it('preserves an existing validated staged image thumbnail without encoding the large file again', async () => {
+    const { content, message, controller } = setup(new Blob([new Uint8Array(2_000_001)], { type: 'image/png' }))
+    const dataUrl = `data:image/png;base64,${btoa('thumbnail')}`
+    message.attachments = [display({ dataUrl })]
+    const read = vi.spyOn(FileReader.prototype, 'readAsDataURL')
+    try {
+      const recovered = await recoverMessageAttachments(content, message, 'source', controller.signal)
+      expect(recovered[0]).toMatchObject({ kind: 'staged', dataUrl, file_uuid: 'fresh-upload' })
+      expect(read).not.toHaveBeenCalled()
+    } finally { read.mockRestore() }
+  })
+
+  it.each([
+    ['image/png', 'data:image/svg+xml;base64,PHN2Zz4='],
+    ['image/svg+xml', 'data:image/svg+xml;base64,PHN2Zz4='],
+    ['application/pdf', 'data:application/pdf;base64,cGRm'],
+  ])('does not carry an unsafe or non-image staged preview for %s', async (mime, dataUrl) => {
+    const { content, message, controller } = setup(new Blob([new Uint8Array(2_000_001)], { type: mime }))
+    message.attachments = [display({ mime, dataUrl })]
+    const recovered = await recoverMessageAttachments(content, message, 'source', controller.signal)
+    expect(recovered[0]?.dataUrl).toBeUndefined()
+  })
+
+  it('does not expose an inline SVG or ordinary file as an image thumbnail', async () => {
+    const { content, message, controller } = setup()
+    message.attachments = [display({ mime: 'image/svg+xml' }), display({ mime: 'application/pdf' })]
+    const recovered = await recoverMessageAttachments(content, message, 'source', controller.signal)
+    expect(recovered.every(attachment => attachment.kind === 'inline' && !attachment.dataUrl)).toBe(true)
+  })
+
+  it('does not upload a small staged image after its thumbnail read is cancelled', async () => {
+    const { content, message, controller } = setup(new Blob([new Uint8Array(1_100_000)], { type: 'image/png' }))
+    message.attachments = [display({ name: 'one.png' }), display({ name: 'two.png' })]
+    const originalRead = FileReader.prototype.readAsDataURL
+    let reads = 0
+    const read = vi.spyOn(FileReader.prototype, 'readAsDataURL').mockImplementation(function (this: FileReader, file) {
+      if (++reads === 2) controller.abort()
+      else originalRead.call(this, file)
+    })
+    try {
+      const outcome = await recoverMessageAttachments(content, message, 'source', controller.signal)
+        .then(() => 'resolved', error => error.name)
+      expect(outcome).toBe('AbortError')
+      expect(content.uploadAttachment).not.toHaveBeenCalled()
+    } finally { read.mockRestore() }
+  })
+
   it.each([
     ['scan.tiff', 'image/tiff'],
     ['scan.bmp', 'image/bmp'],

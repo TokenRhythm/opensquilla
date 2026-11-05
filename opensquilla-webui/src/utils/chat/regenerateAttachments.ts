@@ -1,6 +1,12 @@
 import type { ArtifactContentAccess } from '@/modules/artifactWorkbench'
 import type { Attachment, ChatMessage } from '@/types/chat'
-import { isModelInputImageMime, normalizeAttachmentMimeValue, normalizeWorkspaceFileReferences } from './attachments'
+import {
+  isImageAttachmentMime,
+  isModelInputImageMime,
+  normalizeAttachmentMimeValue,
+  normalizeDisplayAttachment,
+  normalizeWorkspaceFileReferences,
+} from './attachments'
 
 // Match chat intake ceilings. Historical material must be read with a bound,
 // and large files go through the existing staging API rather than the RPC body.
@@ -94,13 +100,24 @@ export async function recoverMessageAttachments(
       const data = await readBase64(file, signal)
       assertActive(signal)
       inlineBytes += file.size
-      attachments.push({ ...base, kind: 'inline', data })
+      attachments.push({ ...base, kind: 'inline', data,
+        ...(isImageAttachmentMime(mime) ? { dataUrl: `data:${file.type};base64,${data}` } : {}) })
     } else {
+      // Keep small images visible when the aggregate inline budget stages them.
+      // Large staged files follow ordinary intake: reuse a safe retained preview
+      // if present, but do not encode the whole file just to add a thumbnail.
+      let dataUrl = normalizeDisplayAttachment({ ...original, mime }).dataUrl
+      if (!dataUrl && isImageAttachmentMime(mime) && file.size <= INLINE_BYTES) {
+        const data = await readBase64(file, signal)
+        assertActive(signal)
+        dataUrl = `data:${file.type};base64,${data}`
+      }
       const receipt = await content.uploadAttachment(file, mime)
       assertActive(signal)
       if (!receipt.fileUuid) throw new Error('Original attachment upload failed')
       attachments.push({ ...base, kind: 'staged', file_uuid: receipt.fileUuid,
-        expires_at: receipt.expiresAt, ttl_seconds: receipt.ttlSeconds })
+        expires_at: receipt.expiresAt, ttl_seconds: receipt.ttlSeconds,
+        ...(dataUrl ? { dataUrl } : {}) })
     }
   }
   return attachments
