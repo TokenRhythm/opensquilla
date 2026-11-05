@@ -6,11 +6,43 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ## [Unreleased]
 
+## [0.5.8] - 2026-11-05
+
+### Added
+
+- TokenRhythm account sign-in in Desktop, with account balance, recharge access,
+  and today's local token usage. Account credentials can serve text, image, and
+  video models; manual provider configuration remains available.
+- Local task-intent routing with BERT-60M INT8 and LightGBM: New Task chooses a
+  model tier from the current request, Continue retains the tier, and Redo
+  advances one tier up to C3.
+- Refreshable OpenRouter and TokenRhythm model recommendations, with a preview
+  and explicit confirmation before replacing saved model selections.
+
+### Changed
+
+- Saved `v4_phase3` router configurations migrate to the single-model
+  `lightgbm_model` policy. Initial routing is no longer demoted by budget caps;
+  explicit `legacy_v4_phase3` preserves the previous routing behavior.
+- Model recommendations refresh at Gateway startup and every 24 hours, retain
+  cached results while offline, and honor background-network privacy controls.
+- New chats reuse the last manually selected mode and model. Explicit tier
+  provider choices enable cross-provider routing when saved, and CLI tables
+  adapt to terminal width.
+- Desktop account controls bring sign-in, balance, usage, and Settings into
+  the sidebar.
+
 ### Fixed
 
 - Prevent malformed quotes and long file references in history from stalling
   compaction. Add local phase timings and Gateway process exit diagnostics.
 - Remove a vulnerable transitive dependency from Desktop's download proxy tooling.
+- Keep long-session history within response limits and preserve attachments
+  when editing or regenerating messages.
+- Preserve image continuity in routed conversations, validate custom Ensemble
+  lineups before saving, and recover provider stream tails and thinking options.
+- Improve Desktop shutdown, account-menu layout, activity scrolling, and
+  conversation recovery.
 
 ## [0.5.7] - 2026-10-23
 

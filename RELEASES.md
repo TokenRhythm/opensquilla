@@ -2,6 +2,7 @@
 
 | Version | Tag | Date | Notes |
 |---|---|---|---|
+| 0.5.8 | v0.5.8 | 2026-11-05 | Planned: Desktop account sign-in, task-aware routing, and reviewable model recommendations |
 | 0.5.7 | v0.5.7 | 2026-10-23 | Stable: document annotations, project Workbench, inline visualizations, and video generation |
 | 0.5.6 | v0.5.6 | 2026-09-30 | Stable: core reliability fixes, clearer local file references, and Browser Use (Beta) |
 | 0.5.5 | v0.5.5 | 2026-09-23 | Stable: C5 fusion, reliable task continuity, workspace previews, SkillHub, and signed Windows installers |
@@ -35,8 +36,8 @@ updater metadata, the versioned Python wheel, and `SHA256SUMS`:
 - `SHA256SUMS`
 
 0.5.x preview releases are GitHub pre-releases and must not be marked as Latest;
-stable releases such as 0.5.7 are normal releases and may be marked Latest
-once verified.
+stable releases such as 0.5.8 are normal releases and may be marked Latest
+once verified and explicitly confirmed by the maintainer.
 They do not publish Windows portable zips, Windows portable latest aliases,
 public wheelhouse zips, or separately branded macOS or Linux portable bundles.
 The listed macOS `.zip` is the Electron desktop and updater artifact, not a
@@ -132,9 +133,9 @@ their next automatic update.
 
 README install commands must use tag-pinned URLs such as:
 
-- `https://github.com/TokenRhythm/opensquilla/releases/download/v0.5.7/OpenSquilla-0.5.7-mac-arm64.dmg`
-- `https://github.com/TokenRhythm/opensquilla/releases/download/v0.5.7/OpenSquilla-0.5.7-win-x64.exe`
-- `https://github.com/TokenRhythm/opensquilla/releases/download/v0.5.7/opensquilla-0.5.7-py3-none-any.whl`
+- `https://github.com/TokenRhythm/opensquilla/releases/download/v0.5.8/OpenSquilla-0.5.8-mac-arm64.dmg`
+- `https://github.com/TokenRhythm/opensquilla/releases/download/v0.5.8/OpenSquilla-0.5.8-win-x64.exe`
+- `https://github.com/TokenRhythm/opensquilla/releases/download/v0.5.8/opensquilla-0.5.8-py3-none-any.whl`
 
 ## Release SOP
 
@@ -155,19 +156,21 @@ README install commands must use tag-pinned URLs such as:
    `desktop/electron/package-lock.json`, `install.sh`, and `install.ps1` to the
    release version.
 6. Run the focused release contract tests locally, then open and merge the
-   release PR only after review and CI pass.
+   release PR only after review and CI pass. Merge only when tagging and
+   publication will follow in the same working session: the merged download
+   pointers advertise the new version before its assets are public.
 7. Fetch `tokenrhythm main --tags`, verify the merged `tokenrhythm/main` SHA and
    CI one more time, then create the annotated tag on that exact SHA and push it
    to the canonical repository:
 
    ```sh
-   git tag -a v0.5.7 <verified-sha> -m "OpenSquilla 0.5.7"
-   git push tokenrhythm v0.5.7
+   git tag -a v0.5.8 <verified-sha> -m "OpenSquilla 0.5.8"
+   git push tokenrhythm v0.5.8
    ```
 
 8. Wait for both `.github/workflows/wheelhouse-release.yml` and
    `.github/workflows/docker-image.yml`. Review the draft GitHub Release. For
-   the `v0.5.7` stable, confirm it is not marked Pre-release, leave Latest
+   the `v0.5.8` stable, confirm it is not marked Pre-release, leave Latest
    unset until the maintainer explicitly confirms it at publish time, and
    confirm it contains only the Electron installers, updater metadata,
    versioned wheel, `SHA256SUMS`, plus GitHub's generated source archives. It
@@ -175,7 +178,7 @@ README install commands must use tag-pinned URLs such as:
    `OpenSquilla-windows-x64-portable.zip`.
 9. Verify GHCR before publishing broadly. For the first container release, make
    the newly created `ghcr.io/tokenrhythm/opensquilla` package public, then
-   confirm both `v0.5.7` and `latest` resolve to an amd64/arm64 manifest and
+   confirm both `v0.5.8` and `latest` resolve to an amd64/arm64 manifest and
    pass a gateway health smoke test.
 10. Publish the GitHub Release only after maintainer confirmation, then verify
    the OSS mirror workflow has consumed the canonical `TokenRhythm/opensquilla`
@@ -183,10 +186,10 @@ README install commands must use tag-pinned URLs such as:
    before running the post-publish tag URL checks:
 
    ```sh
-   curl --fail --head --location https://github.com/TokenRhythm/opensquilla/releases/download/v0.5.7/OpenSquilla-0.5.7-mac-arm64.dmg
-   curl --fail --head --location https://github.com/TokenRhythm/opensquilla/releases/download/v0.5.7/OpenSquilla-0.5.7-win-x64.exe
-   curl --fail --head --location https://github.com/TokenRhythm/opensquilla/releases/download/v0.5.7/opensquilla-0.5.7-py3-none-any.whl
-   curl --fail --head --location https://github.com/TokenRhythm/opensquilla/releases/download/v0.5.7/SHA256SUMS
+   curl --fail --head --location https://github.com/TokenRhythm/opensquilla/releases/download/v0.5.8/OpenSquilla-0.5.8-mac-arm64.dmg
+   curl --fail --head --location https://github.com/TokenRhythm/opensquilla/releases/download/v0.5.8/OpenSquilla-0.5.8-win-x64.exe
+   curl --fail --head --location https://github.com/TokenRhythm/opensquilla/releases/download/v0.5.8/opensquilla-0.5.8-py3-none-any.whl
+   curl --fail --head --location https://github.com/TokenRhythm/opensquilla/releases/download/v0.5.8/SHA256SUMS
    ```
 
 11. If a release tag is wrong before publication, stop and report its peeled
@@ -205,15 +208,15 @@ These checks cannot be fully proven by local artifact generation:
 
 - The tag exists on GitHub and matches `pyproject.toml`.
 - The release workflow can fetch hydrated Git LFS router assets.
-- The draft GitHub Release title is `OpenSquilla 0.5.7`.
-- Preview drafts are marked Pre-release and never Latest; the `v0.5.7`
+- The draft GitHub Release title is `OpenSquilla 0.5.8`.
+- Preview drafts are marked Pre-release and never Latest; the `v0.5.8`
   stable draft is not marked Pre-release, and Latest is applied only at
   publish after explicit maintainer confirmation.
 - Preview GitHub Releases contain the Electron installers, updater metadata,
   versioned wheel, and `SHA256SUMS` after `gh release upload --clobber`.
 - Preview GitHub Releases do not contain Windows portable zips or portable
   latest aliases.
-- The GHCR package is public, and `v0.5.7` plus `latest` expose both amd64
+- The GHCR package is public, and `v0.5.8` plus `latest` expose both amd64
   and arm64 images that pass the gateway health smoke test.
 - After a preview GitHub Release is published, the tag-pinned release asset URLs
   resolve.

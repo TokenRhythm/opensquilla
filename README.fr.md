@@ -51,9 +51,10 @@ enfichable dialogue avec TokenRhythm, OpenRouter, OpenAI, Anthropic, Ollama, Dee
 Qwen/DashScope et plus de 20 autres fournisseurs de LLM, sans aucun changement dans
 votre code ni dans votre schéma de configuration.
 
-OpenSquilla 0.5.7 est la version stable actuelle.
+OpenSquilla 0.5.8 est en préparation ; la version stable publique reste 0.5.7.
+Les liens 0.5.8 ci-dessous seront accessibles après publication.
 
-Téléchargements : [OpenSquilla 0.5.7](https://github.com/TokenRhythm/opensquilla/releases/tag/v0.5.7).
+Version stable publique : [OpenSquilla 0.5.7](https://github.com/TokenRhythm/opensquilla/releases/tag/v0.5.7).
 
 Pour une documentation produit orientée tâches, commencez par le
 [Guide produit OpenSquilla](README.product.md) ou par l'[index de la
@@ -78,9 +79,9 @@ GitHub publiées. Les installations de wheel Python utilisent des noms de fichie
 wheel versionnés, car les installateurs valident la version intégrée au nom de
 fichier du wheel.
 
-Pour un usage bureau en 0.5.7, préférez les installateurs de bureau empaquetés issus de la
-Release GitHub : `OpenSquilla-0.5.7-mac-arm64.dmg` sous macOS et
-`OpenSquilla-0.5.7-win-x64.exe` sous Windows.
+Pour un usage bureau en 0.5.8, préférez les installateurs de bureau empaquetés issus de la
+Release GitHub : `OpenSquilla-0.5.8-mac-arm64.dmg` sous macOS et
+`OpenSquilla-0.5.8-win-x64.exe` sous Windows.
 
 | Voie | Public | Quand l'utiliser |
 | --- | --- | --- |
@@ -129,11 +130,11 @@ Liens d'installation : [Git](https://git-scm.com/downloads) ·
 
 ### Installateurs de bureau
 
-Les installateurs de bureau 0.5.7 empaquettent la console de contrôle Vue et
+Les installateurs de bureau 0.5.8 empaquettent la console de contrôle Vue et
 l'environnement d'exécution de la passerelle dans une enveloppe Electron.
 
-- macOS Apple Silicon : <https://github.com/TokenRhythm/opensquilla/releases/download/v0.5.7/OpenSquilla-0.5.7-mac-arm64.dmg>
-- Windows x64 : <https://github.com/TokenRhythm/opensquilla/releases/download/v0.5.7/OpenSquilla-0.5.7-win-x64.exe>
+- macOS Apple Silicon : <https://github.com/TokenRhythm/opensquilla/releases/download/v0.5.8/OpenSquilla-0.5.8-mac-arm64.dmg>
+- Windows x64 : <https://github.com/TokenRhythm/opensquilla/releases/download/v0.5.8/OpenSquilla-0.5.8-win-x64.exe>
 
 Pour des téléchargements plus rapides depuis la Chine continentale, utilisez les alias de téléchargement direct OSS :
 - macOS Apple Silicon : <https://opensquilla-releases.oss-cn-beijing.aliyuncs.com/releases/latest/OpenSquilla-mac-arm64.dmg>
@@ -182,7 +183,7 @@ $env:Path = "$env:USERPROFILE\.local\bin;" + $env:Path
 **2. Installer OpenSquilla** — la même commande sur toutes les plateformes.
 
 ```sh
-uv tool install --python 3.12 "opensquilla[recommended] @ https://github.com/TokenRhythm/opensquilla/releases/download/v0.5.7/opensquilla-0.5.7-py3-none-any.whl"
+uv tool install --python 3.12 "opensquilla[recommended] @ https://github.com/TokenRhythm/opensquilla/releases/download/v0.5.8/opensquilla-0.5.8-py3-none-any.whl"
 ```
 
 Cela installe le wheel OpenSquilla depuis l'URL de release, puis laisse `uv`
@@ -207,7 +208,7 @@ opensquilla gateway run
 > nouveau terminal, ou réexécutez la ligne PATH de l'étape 1.
 
 Pour une installation entièrement épinglée, utilisez l'URL de wheel versionnée :
-`https://github.com/TokenRhythm/opensquilla/releases/download/v0.5.7/opensquilla-0.5.7-py3-none-any.whl`.
+`https://github.com/TokenRhythm/opensquilla/releases/download/v0.5.8/opensquilla-0.5.8-py3-none-any.whl`.
 
 <a id="install-from-source"></a>
 
