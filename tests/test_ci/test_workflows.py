@@ -2973,6 +2973,8 @@ def test_webui_chat_recovery_runs_the_verified_dist_through_gateway() -> None:
         "goal-mode.spec.ts",
         "history-content-reading.spec.ts",
         "history-hydration.spec.ts",
+        "history-pagination.real.spec.ts",
+        "history-size-limit.spec.ts",
         "http-delivery.spec.ts",
         "idle-chat-recovery.spec.ts",
         "modern-session-recovery.spec.ts",
