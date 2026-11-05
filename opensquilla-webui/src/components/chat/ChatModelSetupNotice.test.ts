@@ -1,13 +1,53 @@
 // @vitest-environment happy-dom
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
+import type { TokenRhythmAccountState } from '../../../../contracts/desktop/tokenrhythm-account'
 
 const routerPush = vi.fn(async () => {})
 const cleanups: Array<() => void> = []
 const settle = () => new Promise(resolve => setTimeout(resolve, 10))
 
-async function mountNotice(initial: Record<string, unknown> | Error, held = false) {
+function accountState(ready: boolean): TokenRhythmAccountState {
+  return {
+    revision: 1,
+    status: ready ? 'signed_in' : 'verifying',
+    keyStatus: ready ? 'ready' : 'loading',
+    source: 'account',
+    selectedAccountId: 'test-account',
+    profile: {
+      accountId: 'test-account', sessionId: 'test-session', displayName: 'Example', maskedPhone: '',
+    },
+    wallet: null,
+    walletStatus: 'idle',
+    errorCode: null,
+    walletErrorCode: null,
+    mediaSources: { image: 'inherit', video: 'inherit' },
+    pendingRevocation: false,
+    loginExpiresAt: null,
+    primaryActivation: null,
+  }
+}
+
+async function mountNotice(
+  initial: Record<string, unknown> | Error,
+  held = false,
+  initialAccount?: TokenRhythmAccountState,
+) {
   vi.resetModules()
   vi.doMock('vue-router', () => ({ useRouter: () => ({ push: routerPush }) }))
+  const accountListeners = new Set<(state: TokenRhythmAccountState) => void>()
+  let currentAccount = initialAccount
+  if (initialAccount) {
+    const api = {
+      getState: vi.fn(async () => currentAccount!),
+      onState(callback: (state: TokenRhythmAccountState) => void) {
+        accountListeners.add(callback)
+        return () => accountListeners.delete(callback)
+      },
+    }
+    vi.doMock('@/platform', () => ({ usePlatform: () => ({ account: api }) }))
+  } else {
+    vi.doUnmock('@/platform')
+  }
   const response = { value: initial }
   const status = vi.fn(async () => {
     if (response.value instanceof Error) throw response.value
@@ -26,9 +66,14 @@ async function mountNotice(initial: Record<string, unknown> | Error, held = fals
   const el = document.createElement('div')
   document.body.appendChild(el)
   const { useReadinessConnectionSync } = await import('@/composables/setup/useReadinessConnectionSync')
+  const useAccountStore = initialAccount ? (await import('@/stores/account')).useAccountStore : undefined
+  const pinia = initialAccount ? (await import('pinia')).createPinia() : undefined
+  let account: ReturnType<NonNullable<typeof useAccountStore>> | undefined
   const app = createApp({
     setup() {
-      useReadinessConnectionSync(gateway)
+      account = useAccountStore?.()
+      useReadinessConnectionSync(gateway, account)
+      void account?.init()
       return () => h(Component)
     },
   })
@@ -36,6 +81,7 @@ async function mountNotice(initial: Record<string, unknown> | Error, held = fals
     status,
   } as unknown as import('@/modules/setupWorkflow').SetupWorkflow)
   app.provide(GATEWAY_ACCESS_KEY, gateway as unknown as import('@/modules/gatewayAccess').GatewayAccess)
+  if (pinia) app.use(pinia)
   app.use(i18n)
   app.mount(el)
   let mounted = true
@@ -46,7 +92,11 @@ async function mountNotice(initial: Record<string, unknown> | Error, held = fals
   cleanups.push(unmount)
   await settle()
   await nextTick()
-  return { el, status, response, gateway, releaseAdmission, unmount }
+  function publishAccount(state: TokenRhythmAccountState) {
+    currentAccount = state
+    for (const listener of accountListeners) listener(state)
+  }
+  return { el, status, response, gateway, releaseAdmission, unmount, account, publishAccount }
 }
 
 beforeEach(() => {
@@ -55,6 +105,7 @@ beforeEach(() => {
 })
 afterEach(() => {
   for (const cleanup of cleanups.splice(0).reverse()) cleanup()
+  vi.doUnmock('@/platform')
 })
 
 describe('ChatModelSetupNotice', () => {
@@ -124,5 +175,43 @@ describe('ChatModelSetupNotice', () => {
     await settle()
     expect(status).toHaveBeenCalled()
     expect(el.querySelector('[role="status"]')).toBeNull()
+  })
+
+  it('clears the startup notice after a restored account becomes ready without restarting the Gateway', async () => {
+    const f = await mountNotice({ llmConfigured: false }, false, accountState(false))
+    expect(f.account?.ready).toBe(false)
+    expect(f.el.querySelector('[role="status"]')).not.toBeNull()
+    f.status.mockClear()
+    f.response.value = { llmConfigured: true }
+
+    f.publishAccount({ ...accountState(true), revision: 2 })
+    await settle()
+
+    expect(f.account?.ready).toBe(true)
+    expect(f.account?.primaryActivation).toBeNull()
+    expect(f.gateway).toEqual({ isAvailable: true, subscriptionEpoch: 1 })
+    expect(f.status).toHaveBeenCalledOnce()
+    expect(f.el.querySelector('[role="status"]')).toBeNull()
+  })
+
+  it('keeps the notice hidden when account logout leaves a configured manual provider available', async () => {
+    const initialAccount = { ...accountState(true), source: 'manual' as const }
+    const f = await mountNotice({ llmConfigured: true }, false, initialAccount)
+    expect(f.el.querySelector('[role="status"]')).toBeNull()
+    f.status.mockClear()
+
+    f.publishAccount({
+      ...initialAccount,
+      revision: 2,
+      status: 'signed_out',
+      keyStatus: 'missing',
+      profile: null,
+      selectedAccountId: null,
+    })
+    await settle()
+
+    expect(f.account?.ready).toBe(false)
+    expect(f.status).toHaveBeenCalledOnce()
+    expect(f.el.querySelector('[role="status"]')).toBeNull()
   })
 })

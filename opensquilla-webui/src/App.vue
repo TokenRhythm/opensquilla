@@ -465,6 +465,7 @@ import { getPlatform } from '@/platform'
 import { copyTextWithFallback } from '@/utils/browser'
 import { currentSessionLink } from '@/utils/chat/sessionLinks'
 import { useAppStore, type PendingApproval } from './stores/app'
+import { useAccountStore } from './stores/account'
 import { GATEWAY_ACCESS_KEY } from './modules/gatewayAccess'
 import { PRODUCT_ACTIVITY_KEY } from './modules/productActivity'
 import { useProductActivity } from './composables/useProductActivity'
@@ -568,7 +569,7 @@ const platform = getPlatform()
 const injectedGatewayAccess = inject(GATEWAY_ACCESS_KEY)
 if (!injectedGatewayAccess) throw new Error('GatewayAccess was not provided')
 const gatewayAccess = injectedGatewayAccess
-useReadinessConnectionSync(gatewayAccess)
+useReadinessConnectionSync(gatewayAccess, useAccountStore())
 useAccountPrimaryActivation(gatewayAccess)
 const productActivity = inject(PRODUCT_ACTIVITY_KEY)
 if (productActivity) useProductActivity(gatewayAccess, productActivity)
