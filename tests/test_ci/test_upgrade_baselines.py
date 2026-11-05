@@ -891,13 +891,17 @@ export async function preserveFailedDriverUntilExit({ originalError }) {
 import { EventEmitter } from 'node:events'
 import { mkdir, writeFile } from 'node:fs/promises'
 import { join } from 'node:path'
+export const DESKTOP_GATEWAY_STARTUP_TIMEOUT_MS = 120000
 export function requiredOption(name) {
   const index = process.argv.indexOf(name)
   if (index < 0 || !process.argv[index + 1]) throw new Error(`Missing ${name}`)
   return process.argv[index + 1]
 }
 export async function waitFor(check) {
-  if (!await check()) throw new Error('bridge unavailable')
+  for (let attempt = 0; attempt < 6; attempt += 1) {
+    if (await check()) return
+  }
+  throw new Error('bridge unavailable')
 }
 export async function launchPackagedCandidate({ env, userDataDir, model }) {
   console.log('SYNTHETIC_DESKTOP_LAUNCHED')
@@ -918,7 +922,54 @@ export async function launchPackagedCandidate({ env, userDataDir, model }) {
     throw new Error('signed handoff must use the production installation path')
   }
   let checks = 0
+  let startupPolls = 0
+  const updateListeners = new Set()
   const version = process.env.SYNTHETIC_BASELINE_VERSION
+  const desktop = {
+    getGatewayStatus: async () => {
+      startupPolls += 1
+      const ready = process.env.SYNTHETIC_STARTUP_STATE !== 'blocked' && startupPolls >= 2
+      return { status: ready ? 'ready' : 'starting', owned: ready }
+    },
+    onUpdateState: (listener) => {
+      updateListeners.add(listener)
+      return () => updateListeners.delete(listener)
+    },
+    checkForUpdates: async () => {
+      if (process.env.SYNTHETIC_STARTUP_STATE && startupPolls < 3) {
+        return { status: process.env.SYNTHETIC_STARTUP_STATE }
+      }
+      const root = env.OPENSQUILLA_DESKTOP_UPDATE_CHANNEL_ROOT
+      const response = await fetch(`${root}/channels/stable.json`)
+      if (checks++ === 0) {
+        if (response.status !== 503) throw new Error('missing pre-handoff failure')
+        console.log('SYNTHETIC_DISCOVERY_FAILURE')
+        return { status: 'error', errorCode: 'source_unreachable' }
+      }
+      const manifest = await response.json()
+      const available = {
+        status: 'available', latestVersion: manifest.version,
+        source: 'oss', installMode: signed ? 'manual' : 'native',
+        fallbackUsed: process.env.SYNTHETIC_FALLBACK_FAULT !== 'discovery',
+      }
+      if (process.env.SYNTHETIC_DOWNLOAD_STATE !== 'without-available') {
+        for (const listener of updateListeners) listener(available)
+      }
+      const downloadState = process.env.SYNTHETIC_DOWNLOAD_STATE
+      return downloadState
+        ? { ...available,
+            status: downloadState === 'without-available' ? 'downloading' : downloadState }
+        : available
+    },
+  }
+  if (version !== '0.5.3') {
+    desktop.getGatewayConnection = async () => {
+      const ready = startupPolls >= 3
+      if (ready) console.log('SYNTHETIC_STARTUP_READY')
+      return { status: ready ? 'ready' : 'starting' }
+    }
+  }
+  globalThis.window = { opensquillaDesktop: desktop }
   const app = new EventEmitter()
   return Object.assign(app, {
     firstWindow: async () => ({
@@ -937,19 +988,9 @@ export async function launchPackagedCandidate({ env, userDataDir, model }) {
       const body = callback.toString()
       if (body.includes('typeof window')) return true
       if (body.includes('getUpdateState')) return { currentVersion: version }
+      if (body.includes('getGatewayStatus')) return await callback()
       if (body.includes('checkForUpdates')) {
-        const root = env.OPENSQUILLA_DESKTOP_UPDATE_CHANNEL_ROOT
-        const response = await fetch(`${root}/channels/stable.json`)
-        if (checks++ === 0) {
-          if (response.status !== 503) throw new Error('missing pre-handoff failure')
-          return { status: 'error', errorCode: 'source_unreachable' }
-        }
-        const manifest = await response.json()
-        return {
-          status: 'available', latestVersion: manifest.version,
-          source: 'oss', installMode: signed ? 'manual' : 'native',
-          fallbackUsed: process.env.SYNTHETIC_FALLBACK_FAULT !== 'discovery',
-        }
+        return await callback()
       }
       if (body.includes('downloadUpdate')) {
         if (process.env.SYNTHETIC_COMPLETE_SIGNED !== '1') {
@@ -993,6 +1034,8 @@ def _run_rehearsal_driver(
     can_install: bool = True,
     download_source_mode: str | None = None,
     fallback_fault: str = '',
+    startup_state: str = '',
+    download_state: str = '',
 ) -> subprocess.CompletedProcess[str]:
     node, driver = rehearsal_driver
     manifest = driver.parent / "channel.json"
@@ -1046,6 +1089,8 @@ def _run_rehearsal_driver(
             "github" if download_source_mode == "github-to-oss" else "oss"
         ),
         "SYNTHETIC_FALLBACK_FAULT": fallback_fault,
+        "SYNTHETIC_STARTUP_STATE": startup_state,
+        "SYNTHETIC_DOWNLOAD_STATE": download_state,
     }
     # Keep the process deadline independent of Windows pipe-reader threads.
     # Files also retain partial diagnostics if the driver itself hangs.
@@ -1087,6 +1132,59 @@ def test_rehearsal_driver_accepts_selected_baseline(
     )
     assert result.returncode != 0  # The stub deliberately stops before downloading.
     assert f"DOWNLOAD_REACHED:{selected}" in result.stderr
+
+
+@pytest.mark.parametrize("startup_state", ["idle", "checking"])
+@pytest.mark.ci_serial
+def test_rehearsal_waits_for_baseline_startup_before_exercising_update_failure(
+    rehearsal_driver: tuple[str, Path], startup_state: str,
+) -> None:
+    result = _run_rehearsal_driver(
+        rehearsal_driver, baseline="0.5.7", installed="0.5.7", candidate="0.5.8",
+        startup_state=startup_state,
+    )
+    assert "DOWNLOAD_REACHED:0.5.7" in result.stderr
+    assert result.stdout.index("SYNTHETIC_STARTUP_READY") < result.stdout.index(
+        "SYNTHETIC_DISCOVERY_FAILURE"
+    )
+
+
+@pytest.mark.ci_serial
+def test_rehearsal_does_not_check_updates_before_failed_startup(
+    rehearsal_driver: tuple[str, Path],
+) -> None:
+    result = _run_rehearsal_driver(
+        rehearsal_driver, baseline="0.5.7", installed="0.5.7", candidate="0.5.8",
+        startup_state="blocked",
+    )
+    assert "bridge unavailable" in result.stderr
+    assert "SYNTHETIC_DISCOVERY_FAILURE" not in result.stdout
+    assert "DOWNLOAD_REACHED" not in result.stderr
+
+
+@pytest.mark.parametrize("download_state", ["downloading", "downloaded"])
+@pytest.mark.ci_serial
+def test_rehearsal_observes_available_before_automatic_download_advances(
+    rehearsal_driver: tuple[str, Path], download_state: str,
+) -> None:
+    result = _run_rehearsal_driver(
+        rehearsal_driver, baseline="0.5.7", installed="0.5.7", candidate="0.5.8",
+        download_state=download_state,
+    )
+    assert "DOWNLOAD_REACHED:0.5.7" in result.stderr
+
+
+@pytest.mark.parametrize("download_state", ["without-available", "error", "checking"])
+@pytest.mark.ci_serial
+def test_rehearsal_rejects_missing_discovery_or_failed_automatic_download(
+    rehearsal_driver: tuple[str, Path], download_state: str,
+) -> None:
+    result = _run_rehearsal_driver(
+        rehearsal_driver, baseline="0.5.7", installed="0.5.7", candidate="0.5.8",
+        download_state=download_state,
+    )
+    assert "AssertionError" in result.stderr
+    assert "DOWNLOAD_REACHED" not in result.stderr
 
 
 # Keep all consumers of the shared Node driver in the serial phase. Otherwise

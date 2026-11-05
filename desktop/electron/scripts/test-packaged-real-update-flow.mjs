@@ -9,6 +9,7 @@ import { spawn } from 'node:child_process'
 import { fileURLToPath } from 'node:url'
 
 import {
+  DESKTOP_GATEWAY_STARTUP_TIMEOUT_MS,
   launchPackagedCandidate,
   requiredOption,
   waitFor,
@@ -94,7 +95,7 @@ const {
   electron, environmentWithoutProviderSecrets, captureElectronProcessIdentity,
   closeElectronAndObserveExit, desktopShutdownEvidenceSince, gatewayProcessSnapshot,
   desktopProfileFingerprint, loadDesktopGatewayOwnershipRecord, verifyDesktopGatewayOwnership,
-  DESKTOP_GATEWAY_STARTUP_TIMEOUT_MS, assertCachedRestartEvidence, fileSha256,
+  assertCachedRestartEvidence, fileSha256,
   requestCachedQuitOnce, stageVerifiedCachedHandoff, waitForRestoredCache,
 } = cachedHandoff ? await import('./fixtures/packaged-cached-handoff/runtime.mjs') : {}
 const { captureSignedHandoffProcesses, observeSignedHandoff, preserveFailedDriverUntilExit, releaseExitedHandoffTransport, trackSignedChildClose } = signedHandoff
@@ -276,6 +277,22 @@ try {
     cacheEvidence.cycles = cacheCycles.map(({ ownership: _ownership, ...cycle }) => cycle)
     await captureCachedStage(page, 'restart-restored')
   } else {
+    // The bridge exists while startup still owns exclusive profile admission.
+    // Checks then legitimately return idle, or stop at checking if admission
+    // closes during discovery. Exercise updates only after the real baseline
+    // has completed that startup phase and its owned Gateway is ready.
+    await waitFor(
+      () => page.evaluate(async () => {
+        const desktop = window.opensquillaDesktop
+        const gateway = await desktop.getGatewayStatus()
+        if (gateway.owned !== true || gateway.status !== 'ready') return false
+        // v0.5.3 predates the connection descriptor API.
+        return typeof desktop.getGatewayConnection !== 'function'
+          || (await desktop.getGatewayConnection()).status === 'ready'
+      }),
+      `the official v${baselineVersion} Gateway after profile startup`,
+      DESKTOP_GATEWAY_STARTUP_TIMEOUT_MS + 45_000,
+    )
     // A failed discovery must leave the old, fully functional client running;
     // no installer handoff is allowed until an exact candidate has been found
     // and downloaded. The same process then retries against the valid fixture.
@@ -284,7 +301,26 @@ try {
     assert.equal(failed.errorCode, 'source_unreachable')
     assert.equal(app.process().killed, false)
     channelAvailable = true
-    const available = await page.evaluate(() => window.opensquillaDesktop.checkForUpdates())
+    const discovery = await page.evaluate(async () => {
+      const desktop = window.opensquillaDesktop
+      const states = []
+      const unsubscribe = desktop.onUpdateState(state => states.push(state))
+      try {
+        const result = await desktop.checkForUpdates()
+        // Current baselines start background preparation immediately after
+        // discovery, so the IPC result may already be downloading/downloaded.
+        // Still require an actual available state from this same check.
+        return { result, available: states.find(state => state.status === 'available') ?? result }
+      } finally {
+        unsubscribe()
+      }
+    })
+    assert.ok(
+      ['available', 'downloading', 'downloaded'].includes(discovery.result.status),
+      JSON.stringify(discovery.result),
+    )
+    assert.equal(discovery.result.latestVersion, expectedVersion)
+    const { available } = discovery
     assert.equal(available.status, 'available', JSON.stringify(available))
     assert.equal(available.latestVersion, expectedVersion)
     assert.equal(available.source, 'oss')
