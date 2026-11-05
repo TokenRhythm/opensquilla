@@ -1058,6 +1058,13 @@ def test_release_workflow_prestages_draft_without_advancing_channels() -> None:
     assert ".upload-staging/" in script
     assert "OPENSQUILLA_ALLOW_IMMUTABLE_REPAIR" in script
     assert "Immutable repair mode is restricted to v0.5.8" in script
+    assert (
+        'if [[ "${repair_mode}" != "1" ]] && object_exists "${dest_prefix}/${name}"; then'
+        in script
+    )
+    assert (
+        'if [[ "${repair_mode}" != "1" ]] && object_exists "${object}" \\' in script
+    )
     assert 'ALIYUN_OSS_PREFIX_NORMALIZED}" != "releases"' in script
     assert "/channels/" not in script
     assert 'mirror_root}/latest' not in script

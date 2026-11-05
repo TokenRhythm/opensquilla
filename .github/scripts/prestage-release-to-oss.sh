@@ -161,7 +161,13 @@ put_immutable_object() {
     # Recheck after the potentially long transfer. The shared release lock
     # serializes writers, while the immutable destination still wins races
     # through the server-side forbid-overwrite condition below.
-    if object_exists "${dest_prefix}/${name}"; then
+    # In repair mode the preceding delete marker leaves the historical
+    # versioned key visible to `ossutil ls`. Treating that listing as the
+    # current object would read the old bytes and abort before copy-object.
+    # The maintenance workflow already holds the shared writer lock and has
+    # checked the allow-listed delete marker, so commit the verified staging
+    # object directly. Normal release prestage keeps the idempotent race check.
+    if [[ "${repair_mode}" != "1" ]] && object_exists "${dest_prefix}/${name}"; then
       verify_immutable_object "${source}" "${name}" "${dest_prefix}/${name}"
       return 0
     fi
@@ -203,7 +209,7 @@ upload_immutable_object() {
     fi
   fi
   if ! put_immutable_object "${source}" "${name}"; then
-    if object_exists "${object}" \
+    if [[ "${repair_mode}" != "1" ]] && object_exists "${object}" \
       && verify_immutable_object "${source}" "${name}" "${object}"; then
       echo "Concurrent immutable OSS Draft asset already matches: ${object}"
       return 0
