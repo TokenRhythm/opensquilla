@@ -1661,8 +1661,10 @@ def configure_command(
                 return
             if normalized == "router" and router:
                 engine = SetupEngine(path=config_path)
-                engine.apply("router", {"mode": router, "defaultTier": default_tier})
+                mutation = engine.apply("router", {"mode": router, "defaultTier": default_tier})
                 result = engine.persist()
+                for warning in mutation.warnings:
+                    console.print(warning_panel(warning))
                 _print_saved_path(result.path)
                 _print_restart_guidance(result, config_path)
                 _print_env_reference_warnings(_load_config_for_cli(result.path))
