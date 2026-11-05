@@ -3886,6 +3886,14 @@
         }
       }
     },
+    "mention": {
+      "groups": {
+        "workspace": "Archivos del espacio de trabajo",
+        "sessions": "Chats recientes"
+      },
+      "unavailable": "Los archivos del espacio de trabajo no están disponibles ahora.",
+      "hint": "↑↓ para elegir · Intro para insertar · Esc para cerrar"
+    },
     "sessionCreated": {
       "title": "Chat creado",
       "open": "Abrir chat",

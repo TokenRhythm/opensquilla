@@ -629,6 +629,9 @@
       :skills-error="skillsError"
       :palette-open="slashOpen"
       :palette-active-index="slashIdx"
+      :mention-open="mentionOpen"
+      :mention-palette-id="mentionPaletteId"
+      :mention-active-index="mentionIdx"
       :has-context="Boolean(visualizeDraft.snapshot.value)"
       :can-close-project="isDraftRoute() && pendingWorkspaceId !== null"
       :can-choose-project="gatewayAccess.canChooseProject"
@@ -644,7 +647,7 @@
       :collapsed="composerCollapsed && composerFxEnabled && !isNewChatLanding"
       :floating="composerFxEnabled && !isNewChatLanding"
       @expand="expandComposer"
-      @composition-change="composing = $event; !$event && handleSlashInput()"
+      @composition-change="composing = $event; !$event && (handleSlashInput(), handleMentionInput())"
       @beforeinput="onTextareaBeforeInput"
       :choose-attachments="chooseAttachments"
       :choose-local-file-paths="localPathPicker.choose"
@@ -692,6 +695,12 @@
             :loading="skillsLoading" :error="skillsError" :selected-skills="selectedSkills"
             :composer-element="composerRef?.editorElement()?.closest<HTMLElement>('.chat-input-panel')"
             @close="closeSlashMenu(); composerRef?.focusTextarea()" @choose="completeSlashCmd" />
+        </div>
+        <div v-else-if="mentionOpen" ref="mentionMenuRef">
+          <ChatMentionPalette :palette-id="mentionPaletteId" :items="mentionItems" :active-index="mentionIdx"
+            :loading="mentionLoading" :error="mentionError"
+            :composer-element="composerRef?.editorElement()?.closest<HTMLElement>('.chat-input-panel')"
+            @close="closeMention(); composerRef?.focusTextarea()" @choose="chooseMention" />
         </div>
       </template>
       <template #context>
@@ -867,6 +876,7 @@ import { USAGE_REPORTING_KEY, type UsageReporting } from '@/modules/usageReporti
 import SkillLoadStatus from '@/components/chat/SkillLoadStatus.vue'
 import { mergeSkillLoad, type SkillLoadReceipt } from '@/types/skillLoads'
 import ChatSlashPalette from '@/components/chat/ChatSlashPalette.vue'
+import ChatMentionPalette from '@/components/chat/ChatMentionPalette.vue'
 import { SKILL_CATALOG_KEY } from '@/modules/skillCatalog'
 import type { SelectedSkillRef } from '@/types/selectedSkills'
 import { localPathPresentation } from '@/types/localPathReferences'
@@ -974,6 +984,8 @@ import {
 import {
   useChatSlashCommands,
 } from '@/composables/chat/useChatSlashCommands'
+import { useChatMentions } from '@/composables/chat/useChatMentions'
+import { WORKSPACE_FILES_KEY } from '@/modules/workspaceFiles'
 import { useChatStream } from '@/composables/chat/useChatStream'
 import { useChatToolDisclosureScope } from '@/composables/chat/useChatToolDisclosureScope'
 import { useComposerFloatingPreference } from '@/composables/useComposerFloatingPreference'
@@ -1425,6 +1437,7 @@ const conversationMinimapRef = ref<{ cancelNavigation: () => void } | null>(null
 const bottomSentinelRef = ref<HTMLElement | null>(null)
 const jumpToLatestButtonRef = ref<HTMLButtonElement | null>(null)
 const slashMenuRef = ref<HTMLElement | null>(null)
+const mentionMenuRef = ref<HTMLElement | null>(null)
 let bottomIntersectionObserver: IntersectionObserver | null = null
 const composerRef = ref<ChatComposerHandle | null>(null)
 /* Floating-composer retract: a pure controller accumulates slow user travel
@@ -1594,6 +1607,7 @@ const { inputText, composerText, localPaths, appendLocalPaths, removeLocalPath, 
 const selectedSkills = ref<SelectedSkillRef[]>([])
 const skillPositions = ref<Record<string, number>>({})
 const slashPaletteId = `chat-slash-options-${useId()}`
+const mentionPaletteId = `chat-mention-options-${useId()}`
 const composerRevision = ref(0)
 const aborted = ref(false)
 const autoScroll = ref(true)
@@ -3871,11 +3885,36 @@ const {
   isPlanModeCommand,
 } = chatSlashCommands
 
+const workspaceFiles = inject(WORKSPACE_FILES_KEY, null)
+const chatMentions = useChatMentions({
+  inputText: composerText,
+  sessionKey,
+  workspaceFiles,
+  sessionDirectory,
+  getCaret: () => composerRef.value?.getSelection().start ?? composerText.value.length,
+  setCaret: (position) => { void nextTick(() => {
+    composerRef.value?.focusTextarea()
+    composerRef.value?.setSelectionRange(position, position)
+  }) },
+  autoResizeTextarea,
+})
+const {
+  mentionOpen,
+  mentionIdx,
+  mentionItems,
+  mentionLoading,
+  mentionError,
+  handleMentionInput,
+  chooseMention,
+  closeMention,
+} = chatMentions
+
 const browserUseAvailable = computed(() => browserUseSupported.value
   && skillCandidates.value.some(candidate => candidate.name === 'browser-use' && candidate.ready))
 
 function prepareAddMenu() {
   closeSlashMenu()
+  closeMention()
   invalidateSkillCandidates()
   void loadSkillCandidates()
 }
@@ -3921,10 +3960,23 @@ watch([slashIdx, filteredSlashCmds], () => {
     ?.scrollIntoView?.({ block: 'nearest' })
 }, { flush: 'post' })
 
+watch([mentionIdx, mentionItems], () => {
+  mentionMenuRef.value
+    ?.querySelector<HTMLElement>('.chat-slash-item--active')
+    ?.scrollIntoView?.({ block: 'nearest' })
+}, { flush: 'post' })
+
 useDocumentEvent('pointerdown', event => {
+  const path = typeof event.composedPath === 'function' ? event.composedPath() : []
+  const pointerInside = (menu: HTMLElement | null) => {
+    if (!menu) return false
+    return path.includes(menu) || (event.target instanceof Node && menu.contains(event.target))
+  }
+  // The mention panel closes on the same outside click, before the slash menu
+  // path so one pointerdown can dismiss both panels.
+  if (mentionOpen.value && !pointerInside(mentionMenuRef.value)) closeMention()
   if (!slashOpen.value) return
   const menu = slashMenuRef.value
-  const path = typeof event.composedPath === 'function' ? event.composedPath() : []
   if (menu && (path.includes(menu) || (event.target instanceof Node && menu.contains(event.target)))) {
     return
   }
@@ -3950,6 +4002,12 @@ const chatComposerShortcuts = useChatComposerShortcuts({
   closeSlashMenu,
   completeSlashCmd,
   activateSlashCmd,
+  mentionOpen,
+  mentionIdx,
+  mentionItems,
+  chooseMention,
+  closeMention,
+  handleMentionInput,
   popPendingTail,
   enqueuePendingInput: async text => {
     const context = visualizeDraft.capture()
