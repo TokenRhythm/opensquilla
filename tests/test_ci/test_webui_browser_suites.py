@@ -21,6 +21,7 @@ assistant-activity.spec.ts auth-connection-recovery.spec.ts
 chat-send-lifecycle.spec.ts chat-send-lifecycle.real.spec.ts
 cross-window-sync.real.spec.ts composer-paste.spec.ts durable-delivery.spec.ts
 history-content-reading.spec.ts history-hydration.spec.ts http-delivery.spec.ts
+history-pagination.real.spec.ts history-size-limit.spec.ts
 idle-chat-recovery.spec.ts modern-session-recovery.spec.ts
 provider-error-experience.spec.ts retired-bgm-upgrade.spec.ts support-bundle.spec.ts
 console-clarity.spec.ts mobile-tabs.spec.ts header-responsive.spec.ts
@@ -49,7 +50,7 @@ def test_general_browser_shards_preserve_the_entire_existing_inventory_once() ->
     counts = Counter(spec for shard in shards for spec in shard)
     assert set(counts) == EXPECTED_GENERAL
     assert set(counts.values()) == {1}
-    assert [len(shard) for shard in shards] == [10, 9, 9, 9]
+    assert [len(shard) for shard in shards] == [10, 10, 10, 9]
     assert not set(counts).intersection(specs_for_suite("virtualization"))
     for spec in (*counts, *specs_for_suite("virtualization")):
         assert (Path("opensquilla-webui/e2e") / spec).is_file()

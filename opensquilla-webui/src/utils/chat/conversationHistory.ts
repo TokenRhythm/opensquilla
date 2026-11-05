@@ -211,6 +211,16 @@ export function compactionSummaryMessages(data: SessionReadHistoryPage): ChatMes
   })
 }
 
+export function historyPageHasLimitedMetadata(data: SessionReadHistoryPage): boolean {
+  return data.compactionSummaries.some(summary => (
+    summary.additional.summary_text_omitted === 'history_page_budget'
+    || (typeof summary.additional.summary_markers_omitted === 'number'
+      && summary.additional.summary_markers_omitted > 0)
+  )) || data.turnOutcomes.some(outcome => (
+    outcome.additional.activity_snapshot_omitted === 'history_page_budget'
+  ))
+}
+
 export function summaryCompactionIds(data: SessionReadHistoryPage): Set<string> {
   return new Set(
     compactionSummaryMessages(data).map(message => message.maintenance!.compactionId),

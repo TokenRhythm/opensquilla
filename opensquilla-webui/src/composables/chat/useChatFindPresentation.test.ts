@@ -19,6 +19,22 @@ const match: SessionMessageSearchMatch = { messageId: 'live', entryCursor: 'entr
 const page: SessionReadHistoryPage = { messages: [], hasMore: false, oldestCursor: null, newestCursor: null,
   scope: 'complete', loadedCount: 1, pageSize: 100, canonicalAvailable: true, canonicalComplete: true,
   compactionSummaries: [], turnOutcomes: [], additional: {} }
+type MetadataMarker = 'summary_text_omitted' | 'summary_markers_omitted' | 'activity_snapshot_omitted'
+function limitedPage(marker: MetadataMarker = 'activity_snapshot_omitted'): SessionReadHistoryPage {
+  if (marker === 'activity_snapshot_omitted') return { ...page, turnOutcomes: [{
+    turnId: 'turn-historical', taskId: null, status: 'succeeded', startedAt: null, finishedAt: null,
+    outcome: {}, errorClass: null, retryable: null, activitySnapshot: null, usage: null,
+    replayProof: { usageCallIndex: null, noPriorProviderDispatch: null, replaySafe: null,
+      retryAfterMs: null, userMessageId: null, terminalMessage: null },
+    additional: { [marker]: 'history_page_budget' },
+  }] }
+  return { ...page, compactionSummaries: [{
+    id: 'summary-historical', compactionId: null, compactionIndex: null, triggerReason: null,
+    summaryText: '', summaryFormat: '', coverageStatus: '', removedCount: null, keptCount: null,
+    coveredThroughId: null, createdAt: null,
+    additional: { [marker]: marker === 'summary_markers_omitted' ? 3 : 'history_page_budget' },
+  }] }
+}
 const viewport: ChatViewportSnapshot = { scrollTop: 412, width: 800, followLiveEdge: false,
   anchor: { key: 'message-live', intraOffset: 16 }, rows: [{ key: 'message-live', size: 100 }] }
 function context(controller = new AbortController()) {
@@ -188,18 +204,67 @@ describe('useChatFindPresentation', () => {
     expect(h.listMock.scrollToMessage).toHaveBeenCalledOnce()
   })
 
-  it.each(['abort', 'clear', 'session', 'dispose'] as const)('does not install a late context page after %s', async reason => {
+  it.each(['summary_text_omitted', 'summary_markers_omitted', 'activity_snapshot_omitted'] as const)(
+    'keeps the %s notice with its search window without changing live messages', async marker => {
+      const h = setup(), canonical = h.messages.value
+      h.contextRequest.mockResolvedValue(limitedPage(marker))
+      await h.api.select({ ...match, messageId: 'historical' }, 0, context())
+      expect(h.api.metadataLimited.value).toBe(true)
+      expect(h.contextMessages.value?.[0]?.messageId).toBe('historical')
+      expect(h.messages.value).toBe(canonical)
+
+      h.api.clear()
+      expect(h.api.metadataLimited.value).toBe(true)
+      await h.api.select({ ...match, messageId: 'historical' }, 0, context())
+      expect(h.contextRequest).toHaveBeenCalledOnce()
+      expect(h.api.metadataLimited.value).toBe(true)
+      await h.api.select(match, 0, context())
+      expect(h.api.metadataLimited.value).toBe(false)
+      expect(h.contextMessages.value).toBeNull()
+    },
+  )
+
+  it('replaces the metadata notice only when the next context window is installed', async () => {
+    const h = setup(), pending = deferred<SessionReadHistoryPage>()
+    h.contextRequest.mockResolvedValueOnce(limitedPage()).mockReturnValueOnce(pending.promise)
+    h.project.mockReturnValueOnce([message('historical')]).mockReturnValueOnce([message('other')])
+    await h.api.select({ ...match, messageId: 'historical' }, 0, context())
+    const selecting = h.api.select({ ...match, messageId: 'other' }, 0, context())
+    expect(h.api.metadataLimited.value).toBe(true)
+    expect(h.contextMessages.value?.[0]?.messageId).toBe('historical')
+    pending.resolve(page)
+    await selecting
+    expect(h.api.metadataLimited.value).toBe(false)
+    expect(h.contextMessages.value?.[0]?.messageId).toBe('other')
+  })
+
+  it.each(['reset', 'session', 'dispose'] as const)('clears an installed metadata notice on %s', async reason => {
+    const h = setup()
+    h.contextRequest.mockResolvedValue(limitedPage())
+    await h.api.select({ ...match, messageId: 'historical' }, 0, context())
+    expect(h.api.metadataLimited.value).toBe(true)
+    if (reason === 'reset') await h.api.reset(false)
+    else if (reason === 'session') h.sessionKey.value = 'session-B'
+    else h.scope.stop()
+    expect(h.api.metadataLimited.value).toBe(false)
+  })
+
+  it.each(['abort', 'clear', 'session', 'session-round-trip', 'dispose'] as const)('does not install a late context page after %s', async reason => {
     const h = setup(), pending = deferred<SessionReadHistoryPage>(), controller = new AbortController()
     h.contextRequest.mockReturnValue(pending.promise)
     const opening = h.api.select({ ...match, messageId: 'historical' }, 0, context(controller))
     if (reason === 'abort') controller.abort()
     else if (reason === 'clear') h.api.clear()
-    else if (reason === 'session') h.sessionKey.value = 'session-B'
+    else if (reason === 'session' || reason === 'session-round-trip') {
+      h.sessionKey.value = 'session-B'
+      if (reason === 'session-round-trip') h.sessionKey.value = 'session-A'
+    }
     else h.scope.stop()
-    pending.resolve(page)
+    pending.resolve(limitedPage())
     await opening
     expect(h.project).not.toHaveBeenCalled()
     expect(h.contextMessages.value).toBeNull()
+    expect(h.api.metadataLimited.value).toBe(false)
     expect(h.listMock.ensureMessageVisible).not.toHaveBeenCalled()
     expect(h.listMock.scrollToMessage).not.toHaveBeenCalled()
   })
@@ -209,11 +274,26 @@ describe('useChatFindPresentation', () => {
     h.contextRequest.mockReturnValueOnce(pending.promise)
     const old = h.api.select({ ...match, messageId: 'historical' }, 0, context())
     await h.api.select(match, 0, context())
-    pending.resolve(page)
+    pending.resolve(limitedPage())
     await old
     expect(h.project).not.toHaveBeenCalled()
     expect(h.contextMessages.value).toBeNull()
+    expect(h.api.metadataLimited.value).toBe(false)
     expect(h.listMock.scrollToMessage).toHaveBeenCalledOnce()
+  })
+
+  it('keeps a newer context notice when a previous complete page arrives late', async () => {
+    const h = setup(), pending = deferred<SessionReadHistoryPage>()
+    h.contextRequest.mockReturnValueOnce(pending.promise).mockResolvedValueOnce(limitedPage())
+    h.project.mockReturnValueOnce([message('other')])
+    const old = h.api.select({ ...match, messageId: 'historical' }, 0, context())
+    await h.api.select({ ...match, messageId: 'other' }, 0, context())
+    expect(h.api.metadataLimited.value).toBe(true)
+    pending.resolve(page)
+    await old
+    expect(h.contextMessages.value?.[0]?.messageId).toBe('other')
+    expect(h.api.metadataLimited.value).toBe(true)
+    expect(h.project).toHaveBeenCalledOnce()
   })
 
   it('does not scroll or highlight a late DOM mount after clear', async () => {

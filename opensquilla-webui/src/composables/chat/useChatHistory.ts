@@ -1,4 +1,4 @@
-import { projectConversationHistoryMessage, compactionSummaryMessages, summaryCompactionIds, isHistoryMaintenance, mergeHistoryMaintenance, turnOutcomeRecord, attachHistoryTurnOutcomes, preserveAcceptedEnsembleRouterRows } from '@/utils/chat/conversationHistory'
+import { projectConversationHistoryMessage, compactionSummaryMessages, summaryCompactionIds, isHistoryMaintenance, mergeHistoryMaintenance, turnOutcomeRecord, attachHistoryTurnOutcomes, preserveAcceptedEnsembleRouterRows, historyPageHasLimitedMetadata } from '@/utils/chat/conversationHistory'
 import { nextTick, ref, watch, type Ref } from 'vue'
 import type {
   ChatMaintenanceEvent,
@@ -308,21 +308,11 @@ export function useChatHistory(options: UseChatHistoryOptions) {
     return data.canonicalAvailable
   }
 
-  function responseMetadataLimited(data: SessionReadHistoryPage): boolean {
-    return data.compactionSummaries.some(summary => (
-      summary.additional.summary_text_omitted === 'history_page_budget'
-      || (typeof summary.additional.summary_markers_omitted === 'number'
-        && summary.additional.summary_markers_omitted > 0)
-    )) || data.turnOutcomes.some(outcome => (
-      outcome.additional.activity_snapshot_omitted === 'history_page_budget'
-    ))
-  }
-
   function updateHistoryState(
     data: SessionReadHistoryPage,
     prepend: boolean,
     initialLoadError = false,
-    metadataLimited = responseMetadataLimited(data),
+    metadataLimited = historyPageHasLimitedMetadata(data),
   ) {
     const nextOldestCursor = data.oldestCursor
     const requestedCursor = prepend ? historyState.value.oldestCursor : null
@@ -571,7 +561,7 @@ export function useChatHistory(options: UseChatHistoryOptions) {
       const maintenanceMessages = compactionSummaryMessages(data)
       const installedCompactions = () => maintenanceMessages.flatMap(message => message.maintenance ? [message.maintenance] : [])
       let historyData = data
-      let metadataLimited = responseMetadataLimited(data)
+      let metadataLimited = historyPageHasLimitedMetadata(data)
       let bridgeContinuationNeeded = false
       const needsForwardBridge = canonicalAvailable !== false
         && !params.prepend
@@ -639,7 +629,7 @@ export function useChatHistory(options: UseChatHistoryOptions) {
           }
 
           notifyTerminalTasks(bridgeData)
-          metadataLimited ||= responseMetadataLimited(bridgeData)
+          metadataLimited ||= historyPageHasLimitedMetadata(bridgeData)
 
           const page = attachHistoryTurnOutcomes(
             bridgeData.messages.map(message =>

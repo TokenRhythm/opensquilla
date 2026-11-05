@@ -193,6 +193,14 @@
           <span>{{ t('chat.find.historyContext') }}</span>
           <button type="button" @click="chatFind.close()">{{ t('chat.find.returnToConversation') }}</button>
         </div>
+        <div
+          v-if="findContextMessages && findPresentation.metadataLimited.value"
+          class="chat-find-context"
+          role="status"
+          data-testid="chat-find-metadata-limited"
+        >
+          <span>{{ t('chat.earlierHistoryFailure.metadataLimited') }}</span>
+        </div>
         <div v-if="findPresentation.sourceSnippet.value" class="chat-find-context" role="status">
           <span>{{ findPresentation.sourceSnippet.value }}</span>
         </div>

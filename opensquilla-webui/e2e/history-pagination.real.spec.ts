@@ -68,3 +68,23 @@ test('loads through oversized summaries and activity metadata without skipping o
   await expect(page.getByTestId('history-load-failure')).toHaveCount(0)
   await expect(page.getByTestId('history-metadata-limited')).toContainText('Messages are still available.')
 })
+
+test('explains limited metadata in an independent search context window', async ({ page, isolatedRealGateway }) => {
+  await page.addInitScript(() => localStorage.setItem('opensquilla-locale', 'en'))
+  await page.goto(isolatedRealGateway.controlUrl + 'chat?session=' + encodeURIComponent(SESSION))
+  await expect(page.locator('[data-message-id="history-message-60"]')).toBeVisible({ timeout: 20_000 })
+  await expect(page.getByTestId('history-metadata-limited')).toHaveCount(1)
+
+  await page.getByTestId('chat-session-actions-trigger').click()
+  await page.getByTestId('chat-session-action-find').click()
+  await page.getByRole('textbox', { name: 'Find in conversation', exact: true }).fill('Historical answer 5.')
+  await expect(page.getByTestId('chat-find-metadata-limited')).toContainText('Messages are still available.', { timeout: 20_000 })
+  await expect(page.locator('[data-message-id="history-message-5"]')).toBeVisible()
+  await expect(page.getByText('Showing context around a search result', { exact: true })).toBeVisible()
+  await expect(page.getByTestId('history-load-sentinel')).toHaveCount(0)
+
+  await page.getByRole('button', { name: 'Close find (Esc)', exact: true }).click()
+  await expect(page.getByTestId('chat-find-metadata-limited')).toHaveCount(0)
+  await expect(page.getByTestId('history-metadata-limited')).toHaveCount(1)
+  await expect(page.locator('[data-message-id="history-message-60"]')).toBeVisible()
+})

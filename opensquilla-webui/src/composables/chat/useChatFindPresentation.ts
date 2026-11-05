@@ -1,9 +1,10 @@
-import { nextTick, onScopeDispose, ref, type Ref } from 'vue'
+import { nextTick, onScopeDispose, ref, watch, type Ref } from 'vue'
 import type { ChatMessage, ChatRenderedMessage } from '@/types/chat'
 import type { ChatMessageListVirtualizer, ChatViewportSnapshot } from '@/types/chatVirtualizer'
 import type { SessionMessageSearch, SessionMessageSearchMatch } from '@/modules/sessionMessageSearch'
 import type { SessionReadHistoryPage } from '@/modules/sessionReadLifecycle'
 import { createChatFindHighlighter } from '@/utils/chat/chatFindHighlight'
+import { historyPageHasLimitedMetadata } from '@/utils/chat/conversationHistory'
 
 /** A search window is presentation only; live messages and task ownership stay intact. */
 export function useChatFindPresentation(options: {
@@ -20,6 +21,7 @@ export function useChatFindPresentation(options: {
 }) {
   const fallbackIndex = ref(-1)
   const sourceSnippet = ref('')
+  const metadataLimited = ref(false)
   let repaint: (() => void) | undefined
   let repaintTimer: ReturnType<typeof setTimeout> | undefined
   const highlighter = createChatFindHighlighter(() => {
@@ -36,6 +38,7 @@ export function useChatFindPresentation(options: {
   let releaseHandoff: (() => void) | undefined
 
   function clear(preserveCache = false) {
+    // The current context and its notice stay readable while a new query loads.
     sequence += 1
     if (repaintTimer !== undefined) clearTimeout(repaintTimer)
     repaintTimer = undefined
@@ -57,6 +60,7 @@ export function useChatFindPresentation(options: {
   async function reset(restore: boolean) {
     clear()
     options.contextMessages.value = null
+    metadataLimited.value = false
     if (!restore || savedKey !== options.sessionKey.value) return
     const key = savedKey
     const ownSequence = sequence
@@ -78,17 +82,22 @@ export function useChatFindPresentation(options: {
     options.autoScroll.value = false
     const inLive = options.messages.value.some(message => message.messageId === match.messageId)
     let nextContext: ChatMessage[] | null | undefined = inLive ? null : undefined
+    let nextMetadataLimited = inLive ? false : metadataLimited.value
     if (!inLive && !options.displayMessages.value.some(message => message.messageId === match.messageId)) {
       if (!options.source) throw new Error('Search unavailable')
       const page = await options.source.context({ key, messageId: match.messageId,
         sessionId: context.sessionId, sessionEpoch: context.sessionEpoch, signal: context.signal })
       if (!current()) return
       nextContext = options.project(page)
+      nextMetadataLimited = historyPageHasLimitedMetadata(page)
     }
     if (!current()) return
     clear(true)
     ownSequence = sequence
-    if (nextContext !== undefined) options.contextMessages.value = nextContext
+    if (nextContext !== undefined) {
+      options.contextMessages.value = nextContext
+      metadataLimited.value = nextMetadataLimited
+    }
     await nextTick()
     if (!current()) return
     const index = options.displayMessages.value.findIndex(message => message.messageId === match.messageId)
@@ -129,8 +138,16 @@ export function useChatFindPresentation(options: {
     }) }
     await paint()
   }
-  onScopeDispose(clear)
-  return { fallbackIndex, sourceSnippet, capture, reset, clear, select,
+  watch(options.sessionKey, () => {
+    clear()
+    options.contextMessages.value = null
+    metadataLimited.value = false
+  }, { flush: 'sync' })
+  onScopeDispose(() => {
+    clear()
+    metadataLimited.value = false
+  })
+  return { fallbackIndex, sourceSnippet, metadataLimited, capture, reset, clear, select,
     capturedViewport: () => savedViewport,
   }
 }
