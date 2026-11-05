@@ -90,6 +90,7 @@ COMPAT_THINKING_MODELS: dict[str, tuple[str, str]] = {
     "mimo": (_NEUTRAL_MODEL, "none"),
     "mistral": (_NEUTRAL_MODEL, "none"),
     "groq": (_NEUTRAL_MODEL, "none"),
+    "ionet": (_NEUTRAL_MODEL, "none"),
     # glm-5 prefix in the zai ladder (model_catalog) -> "zai".
     "zhipu": ("glm-5", "zai"),
     "qianfan": (_NEUTRAL_MODEL, "none"),
