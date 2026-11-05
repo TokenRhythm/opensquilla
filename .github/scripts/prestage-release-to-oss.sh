@@ -25,6 +25,11 @@ fi
 version="${tag#v}"
 python_bin="${PYTHON_BIN:-python3}"
 ossutil_bin="${OSSUTIL_BIN:-ossutil}"
+repair_mode="${OPENSQUILLA_ALLOW_IMMUTABLE_REPAIR:-0}"
+if [[ "${repair_mode}" == "1" && "${tag}" != "v0.5.8" ]]; then
+  echo "Immutable repair mode is restricted to v0.5.8" >&2
+  exit 2
+fi
 desktop_version="$("${python_bin}" - "${version}" <<'PY'
 import re
 import sys
@@ -127,13 +132,15 @@ put_immutable_object() {
   local source="$1"
   local name="$2"
   local source_path source_size staging_key staging_object
+  local forbid_overwrite="true"
+  [[ "${repair_mode}" == "1" ]] && forbid_overwrite="false"
   local -a options=(
     api
     put-object
     --addressing-style "${OSS_ADDRESSING_STYLE_NORMALIZED}"
     --bucket "${ALIYUN_OSS_BUCKET}"
     --key "${ALIYUN_OSS_PREFIX_NORMALIZED}/${tag}/${name}"
-    --forbid-overwrite true
+    --forbid-overwrite "${forbid_overwrite}"
   )
   source_path="$(realpath -- "${source}")"
   source_size="$(wc -c < "${source_path}")"
@@ -164,7 +171,7 @@ put_immutable_object() {
       --addressing-style "${OSS_ADDRESSING_STYLE_NORMALIZED}"
       --bucket "${ALIYUN_OSS_BUCKET}"
       --key "${ALIYUN_OSS_PREFIX_NORMALIZED}/${tag}/${name}"
-      --forbid-overwrite true
+      --forbid-overwrite "${forbid_overwrite}"
       --copy-source "/${ALIYUN_OSS_BUCKET}/${staging_key}"
       --metadata-directive COPY
     )
@@ -182,9 +189,12 @@ upload_immutable_object() {
   local name="$2"
   local object="${dest_prefix}/${name}"
   if object_exists "${object}"; then
-    verify_immutable_object "${source}" "${name}" "${object}"
-    echo "Immutable OSS Draft asset already matches: ${object}"
-    return 0
+    if [[ "${repair_mode}" != "1" ]]; then
+      verify_immutable_object "${source}" "${name}" "${object}"
+      echo "Immutable OSS Draft asset already matches: ${object}"
+      return 0
+    fi
+    echo "Repair mode replacing the versioned OSS Draft asset: ${object}"
   else
     local exists_status="$?"
     if (( exists_status != 1 )); then
