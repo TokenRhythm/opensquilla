@@ -1,0 +1,81 @@
+name: Reconcile unpublished 0.5.8 OSS assets
+
+on:
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: Inspect the pinned Draft, or apply its bounded OSS repair
+        required: true
+        type: choice
+        default: dry-run
+        options:
+          - dry-run
+          - apply
+
+permissions:
+  contents: read
+
+# Match the normal release lock before acquiring the shared OSS writer lock.
+concurrency:
+  group: release-assets-v0.5.8
+  cancel-in-progress: false
+
+jobs:
+  reconcile:
+    name: Reconcile the pinned unpublished Draft
+    if: ${{ github.repository == 'TokenRhythm/opensquilla' && github.ref == 'refs/heads/main' && github.event_name == 'workflow_dispatch' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    environment: desktop-release-oss-prestage
+    concurrency:
+      group: oss-release-mirror-latest-aliases
+      cancel-in-progress: false
+    permissions:
+      # Authenticated Draft downloads require push access; the script never writes GitHub.
+      contents: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      ALIYUN_OSS_BUCKET: ${{ vars.ALIYUN_OSS_BUCKET }}
+      ALIYUN_OSS_PREFIX: ${{ vars.ALIYUN_OSS_PREFIX }}
+      OSS_ACCESS_KEY_ID: ${{ secrets.ALIYUN_OSS_ACCESS_KEY_ID }}
+      OSS_ACCESS_KEY_SECRET: ${{ secrets.ALIYUN_OSS_ACCESS_KEY_SECRET }}
+      OSS_REGION: ${{ vars.ALIYUN_OSS_REGION }}
+      OSS_ENDPOINT: ${{ vars.ALIYUN_OSS_ENDPOINT }}
+      OSS_ADDRESSING_STYLE: ${{ vars.ALIYUN_OSS_ADDRESSING_STYLE }}
+      MODE: ${{ inputs.mode }}
+    steps:
+      - name: Check out the reviewed maintenance implementation
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install pinned ossutil
+        shell: bash
+        run: |
+          set -euo pipefail
+          curl -fsSLO https://gosspublic.alicdn.com/ossutil/v2/2.3.0/ossutil-2.3.0-linux-amd64.zip
+          echo '3ae4d9fc85a7a6e9f5654d1599766f1a3a42a3692870887b5ae9338d582ef65a  ossutil-2.3.0-linux-amd64.zip' | sha256sum -c -
+          unzip -q ossutil-2.3.0-linux-amd64.zip
+          sudo install -m 0755 ossutil-2.3.0-linux-amd64/ossutil /usr/local/bin/ossutil
+
+      - name: Inspect or reconcile the fixed asset set
+        shell: bash
+        run: |
+          set -euo pipefail
+          python .github/scripts/reconcile-v058-draft-oss.py \
+            --mode "$MODE" --work-dir "$RUNNER_TEMP/v058-reconcile"
+
+      - name: Preserve maintenance and recovery evidence
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: v058-oss-reconciliation-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/v058-reconcile/*.json
+          if-no-files-found: ignore
+          retention-days: 30
