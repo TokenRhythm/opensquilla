@@ -17,7 +17,14 @@ from rich.cells import cell_len
 from rich.console import Console
 from typer.testing import CliRunner
 
-from opensquilla.cli import agents_cmd, channels_cmd, doctor_cmd, providers_cmd, search_cmd
+from opensquilla.cli import (
+    agents_cmd,
+    channels_cmd,
+    config_cmd,
+    doctor_cmd,
+    providers_cmd,
+    search_cmd,
+)
 from opensquilla.cli.main import app
 from opensquilla.onboarding.provider_specs import list_provider_setup_specs
 
@@ -156,6 +163,26 @@ def test_research_results_preserve_complete_url(
     _assert_fits(output, width)
     assert _column_text(output, 3) == "example-search"
     assert _column_text(output, 5) == url
+
+
+@pytest.mark.parametrize("width", [40, 80])
+def test_config_get_preserves_complete_keys_and_values(
+    tmp_path: Path,
+    monkeypatch,
+    width: int,
+) -> None:
+    monkeypatch.setenv("OPENSQUILLA_GATEWAY_CONFIG_PATH", str(tmp_path / "c.toml"))
+    monkeypatch.setenv("COLUMNS", str(width))
+    rows: list[tuple[str, str]] = []
+    recorder = SimpleNamespace(add_row=lambda key, value: rows.append((key, value)))
+    from opensquilla.gateway.config import GatewayConfig
+
+    config_cmd._add_flat(recorder, GatewayConfig.load(str(tmp_path / "c.toml")).to_public_dict())
+    result = runner.invoke(app, ["config", "get"])
+    assert result.exit_code == 0
+    _assert_fits(result.stdout, width)
+    assert "\u2026" not in result.stdout
+    assert _column_text(result.stdout, 0) == "".join("".join(key.split()) for key, _ in rows)
 
 
 def test_cli_modules_have_no_hardcoded_console_width() -> None:
