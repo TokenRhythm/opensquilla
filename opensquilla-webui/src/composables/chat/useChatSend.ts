@@ -1,3 +1,4 @@
+import type { RegenerateInputPayload } from './useChatMessageActions'
 import { isRetiredControlMessage } from '@/utils/retiredFeatureState'
 import { copySelectedSkills, sameSelectedSkills, type SelectedSkillRef } from '@/types/selectedSkills'
 import { copyLocalPathReferences, localPathPresentation } from '@/types/localPathReferences'
@@ -263,6 +264,8 @@ interface DispatchSendOptions {
   acceptedVisibleReplay?: { forkBeforeMessageId: string }
   /** Protocol replays keep a rejected attempt on their own surface. */
   suppressRejectedFailureMessage?: boolean
+  /** Surface an explicit-input rejection without replacing the current draft/history. */
+  notifyRejectedFailure?: boolean
   /** Preserve an explicit empty attachment list on the chat.send wire. */
   includeEmptyAttachments?: boolean
   /** Revalidate protocol-owned sends after every awaited pre-dispatch step. */
@@ -652,6 +655,12 @@ export interface UseChatSendOptions {
 
 export function useChatSend(options: UseChatSendOptions) {
   let disposed = false
+  let replayViewGeneration = 0
+  const stopReplayViewWatch = watch(
+    [options.sessionKey, () => options.deliveryIdentity?.value],
+    () => { replayViewGeneration += 1 },
+    { flush: 'sync' },
+  )
   const observedAttempts = new Map<string, SendAttempt>()
   const { pushToast } = useToasts()
   const acceptanceStopPending = options.acceptanceStopPending || ref(false)
@@ -2913,6 +2922,7 @@ export function useChatSend(options: UseChatSendOptions) {
   ): Promise<ChatSendOutcome> {
     const requestSessionKey = options.sessionKey.value
     const requestDeliveryIdentity = options.deliveryIdentity?.value
+    const requestReplayViewGeneration = replayViewGeneration
     if (!requestSessionKey) return 'not_sent'
     const blockedReason = sendOpts.idempotentReplay
       ? options.idempotentReplayBlockedReason || options.sendBlockedReason
@@ -3144,6 +3154,12 @@ export function useChatSend(options: UseChatSendOptions) {
     }): boolean => {
       const replay = sendOpts.acceptedVisibleReplay
       if (!replay || acceptedVisibleReplayCommitted || !attempt) return true
+      // A late ACK still belongs to its durable handoff, but may no longer
+      // own the visible transcript. Full forks can share the anchor id, and
+      // navigating away and back must not revive an older view's authority.
+      if (disposed || options.sessionKey.value !== requestSessionKey
+        || options.deliveryIdentity?.value !== requestDeliveryIdentity
+        || replayViewGeneration !== requestReplayViewGeneration) return false
       const anchorIndex = options.messages.value.findIndex(message => (
         message.role === 'user'
         && message.messageId === replay.forkBeforeMessageId
@@ -3155,6 +3171,7 @@ export function useChatSend(options: UseChatSendOptions) {
         text: userText,
         ts: new Date().toISOString(),
         clientId: attempt.clientMessageId,
+        ...(attempt.attachments.length ? { attachments: attempt.attachments.map(serializeDisplayAttachment) } : {}),
         ...(attempt.selectedSkills.length ? { selectedSkills: copySelectedSkills(attempt.selectedSkills) } : {}),
         ...(attempt.localPathReferences.length ? { localPathReferences: [...attempt.localPathReferences] } : {}),
         ...(accepted?.messageId ? { messageId: accepted.messageId } : {}),
@@ -3787,6 +3804,9 @@ export function useChatSend(options: UseChatSendOptions) {
       const recoveringDelivery = !acceptedError && commandError?.retryable !== false
         && ['transport', 'timeout', 'aborted', 'session-changed', 'unavailable'].includes(commandError?.kind || '')
         && (hasUnknownAcceptance(err) || attempt.requiresIdempotentReplay === true)
+      if (!recoveringDelivery && !acceptedError && sendOpts.notifyRejectedFailure) {
+        pushToast(sendFailureMessage(err), { tone: 'danger' })
+      }
       if (!recoveringDelivery && !preserveComposer && !acceptedError && !sendOpts.suppressRejectedFailureMessage) {
         const restoredSnapshot = captureComposerSnapshot()
         const separateExplicitDraft = explicitComposerChanged(attempt)
@@ -3897,6 +3917,54 @@ export function useChatSend(options: UseChatSendOptions) {
       finishResponseHandoff(responseHandoff)
       await finishAcceptanceObservation(attempt)
       if (!responseHandoff) await retireAcceptedComposerHandoff(attempt)
+    }
+  }
+
+  let regenerationInFlight = false
+
+  async function sendRegeneratedInput(
+    payload: RegenerateInputPayload,
+    isCurrent: () => boolean,
+  ): Promise<boolean> {
+    const requestSessionKey = options.sessionKey.value
+    const blocked = (allowOwnedStream = false) => (
+      disposed || !isCurrent() || options.sessionKey.value !== requestSessionKey
+      || Boolean(options.sendBlockedReason?.value)
+      || Boolean(options.taskOwnership && !options.taskOwnership.hydrationResolved.value)
+      || (!allowOwnedStream && options.stream.isStreaming.value)
+      || hasAuthoritativeWork()
+      || options.isCompactInFlightForCurrentSession()
+      || responseHandoffBlocksCurrentSession()
+      || Boolean(handoffRecoveryPromise)
+      || options.hasPendingQueueWork?.() === true
+      || options.pendingQueueOwnerContext.value?.sessionKey === requestSessionKey
+    )
+    if (!requestSessionKey || !payload.forkBeforeMessageId || regenerationInFlight || blocked()) return false
+    regenerationInFlight = true
+    try {
+      if (options.validateActiveProjectBeforeSend && await refreshedActiveProjectBlocksSend()) return false
+      if (blocked()) return false
+      const outcome = await dispatchSend(payload.text, {
+        payload: {
+          attachments: payload.attachments.map(snapshotAttachment),
+          selectedSkills: copySelectedSkills(payload.selectedSkills),
+          localPathReferences: copyLocalPathReferences(payload.localPathReferences, payload.text),
+          intent: null, forkBeforeMessageId: payload.forkBeforeMessageId,
+          workspaceId: null, initialCollaborationMode: null, initialRoutingMode: null,
+          initialModel: null, initialProvider: null,
+        },
+        draftIds: [],
+        preserveComposer: true,
+        acceptedVisibleReplay: { forkBeforeMessageId: payload.forkBeforeMessageId },
+        suppressRejectedFailureMessage: true,
+        notifyRejectedFailure: true,
+        includeEmptyAttachments: true,
+        requirePreparedHandoff: true,
+        preDispatchGuard: stage => !blocked(stage === 'before_rpc'),
+      })
+      return outcome === 'accepted'
+    } finally {
+      regenerationInFlight = false
     }
   }
 
@@ -4224,6 +4292,7 @@ export function useChatSend(options: UseChatSendOptions) {
   return {
     dispose() {
       disposed = true
+      stopReplayViewWatch()
       stopDeliveryObserver()
       stopDeliverySubscription()
       observedAttempts.clear()
@@ -4241,6 +4310,7 @@ export function useChatSend(options: UseChatSendOptions) {
     supportsSameTurnSteer,
     recoverResponseHandoffs,
     sendUsageBarrierReplay,
+    sendRegeneratedInput,
     acceptanceRecoveryPendingForCurrentSession,
     acceptanceStopAvailableForCurrentSession,
     durableStopPendingForCurrentSession,

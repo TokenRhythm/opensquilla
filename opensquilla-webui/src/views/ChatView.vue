@@ -887,7 +887,8 @@ import { useChatHistory } from '@/composables/chat/useChatHistory'
 import ChatDeliveryRecoveryStatus from '@/components/chat/ChatDeliveryRecoveryStatus.vue'
 import { useChatHistoryDetails } from '@/composables/chat/useChatHistoryDetails'
 import { useChatMarkdownExport } from '@/composables/chat/useChatMarkdownExport'
-import { useChatMessageActions } from '@/composables/chat/useChatMessageActions'
+import { recoverMessageAttachments } from '@/utils/chat/regenerateAttachments'
+import { useChatMessageActions, type RegenerateInputPayload } from '@/composables/chat/useChatMessageActions'
 import { useChatMessageContent } from '@/composables/chat/useChatMessageContent'
 import {
   resolveChatHeaderTitle,
@@ -2086,6 +2087,7 @@ watch(
 )
 
 let sendCurrentInput: () => void = () => {}
+let sendRegeneratedInput: (payload: RegenerateInputPayload, isCurrent: () => boolean) => Promise<boolean> = async () => false
 let sendAutomaticInput: () => void = () => {}
 let sendUsageBarrierReplay: (payload: {
   text: string
@@ -2908,6 +2910,8 @@ const voiceReady = computed(() => voiceCapability.data.value?.audioConfigured ==
 const { readMessageText } = useChatMessageContent(sessionKey)
 const messageActionSessionIdentity = () => JSON.stringify([sessionKey.value, currentEpoch.value])
 const chatMessageActions = useChatMessageActions({
+  pendingAttachments,
+  attachmentWorkBusy: () => attachmentWorkBusy.value,
   sessionIdentity: messageActionSessionIdentity,
   readMessageText,
   selectedSkills,
@@ -2919,7 +2923,9 @@ const chatMessageActions = useChatMessageActions({
   sanitizeCopyText,
   stripTimePrefix,
   autoResizeTextarea,
-  sendCurrentInput: () => sendCurrentInput(),
+  readAttachments: (message, signal) => recoverMessageAttachments(artifactWorkbench.content, message, sessionKey.value, signal),
+  sendRegeneratedInput: (payload, isCurrent) => sendRegeneratedInput(payload, isCurrent),
+  notifyAttachmentRecoveryFailed: name => pushToast(t('chat.toast.couldNotReadFile', { name }), { tone: 'danger' }),
   sendUsageBarrierReplay: payload => sendUsageBarrierReplay(payload),
   focusComposer: () => composerRef.value?.focusTextarea(),
   pendingForkBeforeMessageId,
@@ -2929,9 +2935,9 @@ const chatMessageActions = useChatMessageActions({
     && !deliveryBlockedReason.value
   ),
   notifyDeliveryBlocked: () => {
-    if (deliveryBlockedReason.value) {
-      pushToast(deliveryBlockedReason.value, { tone: 'info' })
-    }
+    const reason = deliveryBlockedReason.value || composerSendBlockedMessage.value
+      || (attachmentWorkBusy.value ? t('chat.toast.waitAttachments') : '')
+    if (reason) pushToast(reason, { tone: 'info' })
   },
   notifyMessagePending: () => pushToast(t('chat.toast.messageStillSaving'), { tone: 'info' }),
   notifyEditBlocked: () => pushToast(t('chat.pending.editWhileStreaming'), { tone: 'info' }),
@@ -4153,6 +4159,7 @@ const {
   recoverResponseHandoffs,
 } = chatSend
 sendUsageBarrierReplay = dispatchUsageBarrierReplay
+sendRegeneratedInput = chatSend.sendRegeneratedInput
 void recoverResponseHandoffs()
 watch(
   [() => gatewayAccess.availability, sessionKey],

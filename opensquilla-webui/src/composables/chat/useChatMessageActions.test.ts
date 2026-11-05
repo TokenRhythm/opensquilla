@@ -1,12 +1,16 @@
 // @vitest-environment happy-dom
 
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
-import { effectScope, nextTick, ref } from 'vue'
+import { effectScope, nextTick, ref, toRaw } from 'vue'
 
 import { useChatMessageActions, type UseChatMessageActionsOptions } from './useChatMessageActions'
 import { useChatTextRendering } from './useChatTextRendering'
 import { useLocalPathDraft } from './useLocalPathDraft'
+import { useChatAttachments } from './useChatAttachments'
+import type { ArtifactContentAccess } from '@/modules/artifactWorkbench'
+import { snapshotAttachment } from '@/utils/chat/attachments'
 import type {
+  Attachment,
   ChatMessage,
   ChatRenderedMessage,
   ChatTurnOutcome,
@@ -73,11 +77,12 @@ function makeOptions(
   const options: UseChatMessageActionsOptions = {
     messages: ref(messages),
     inputText: ref(''),
+    pendingAttachments: ref<Attachment[]>([]),
     isStreaming: ref(false),
     sanitizeCopyText,
     stripTimePrefix: text => text,
     autoResizeTextarea: vi.fn(),
-    sendCurrentInput: vi.fn(),
+    sendRegeneratedInput: vi.fn(async () => true),
     sendUsageBarrierReplay: vi.fn(async () => true),
     focusComposer: vi.fn(),
     pendingForkBeforeMessageId,
@@ -125,12 +130,14 @@ describe('useChatMessageActions branching edits', () => {
     options.localPathReferences = draft.localPaths
     options.restoreInput = draft.restoreInput
     const api = useChatMessageActions(options)
-    expect(api.regenerateMessage(renderedMessage({ role: 'assistant', sourceIndex: 1 }))).toBe(true)
+    expect(await api.regenerateMessage(renderedMessage({ role: 'assistant', sourceIndex: 1 }))).toBe(true)
     await nextTick()
     expect(draft.composerText.value).toBe('')
-    expect(draft.inputText.value).toBe(path)
-    expect(draft.localPaths.value).toEqual([path])
-    expect(options.sendCurrentInput).toHaveBeenCalledOnce()
+    expect(draft.inputText.value).toBe('')
+    expect(draft.localPaths.value).toEqual([])
+    expect(options.sendRegeneratedInput).toHaveBeenCalledWith(expect.objectContaining({
+      text: path, localPathReferences: [path], attachments: [], forkBeforeMessageId: 'durable',
+    }), expect.any(Function))
   })
 
   it('records the edited user message id before trimming local history', () => {
@@ -402,10 +409,10 @@ describe('useChatMessageActions branching edits', () => {
     }))
     await nextTick()
 
-    expect(pendingForkBeforeMessageId.value).toBe('msg-B')
-    expect(options.messages.value.map(message => message.text)).toEqual(['A', 'ack A'])
-    expect(options.inputText.value).toBe('B')
-    expect(options.sendCurrentInput).toHaveBeenCalledOnce()
+    expect(pendingForkBeforeMessageId.value).toBeNull()
+    expect(options.messages.value.map(message => message.text)).toEqual(['A', 'ack A', 'B', 'ack B', 'C'])
+    expect(options.inputText.value).toBe('')
+    expect(options.sendRegeneratedInput).toHaveBeenCalledWith(expect.objectContaining({ text: 'B', forkBeforeMessageId: 'msg-B' }), expect.any(Function))
     expect(accepted).toBe(true)
   })
 
@@ -456,7 +463,7 @@ describe('useChatMessageActions branching edits', () => {
     expect(pendingForkBeforeMessageId.value).toBeNull()
     expect(options.messages.value).toHaveLength(3)
     expect(options.inputText.value).toBe('unrelated draft')
-    expect(options.sendCurrentInput).not.toHaveBeenCalled()
+    expect(options.sendRegeneratedInput).not.toHaveBeenCalled()
     expect(accepted).toBe(true)
   })
 
@@ -501,7 +508,7 @@ describe('useChatMessageActions branching edits', () => {
       expect(options.inputText.value).toBe('unrelated draft')
       expect(pendingForkBeforeMessageId.value).toBeNull()
       expect(options.sendUsageBarrierReplay).not.toHaveBeenCalled()
-      expect(options.sendCurrentInput).not.toHaveBeenCalled()
+      expect(options.sendRegeneratedInput).not.toHaveBeenCalled()
     },
   )
 
@@ -551,7 +558,7 @@ describe('useChatMessageActions branching edits', () => {
     expect(pendingForkBeforeMessageId.value).toBeNull()
     expect(options.messages.value).toHaveLength(3)
     expect(options.inputText.value).toBe('')
-    expect(options.sendCurrentInput).not.toHaveBeenCalled()
+    expect(options.sendRegeneratedInput).not.toHaveBeenCalled()
   })
 
   it('blocks an unsafe usage barrier on an assistant status-only bubble', async () => {
@@ -600,7 +607,7 @@ describe('useChatMessageActions branching edits', () => {
     expect(options.messages.value).toEqual(messages)
     expect(options.inputText.value).toBe('')
     expect(pendingForkBeforeMessageId.value).toBeNull()
-    expect(options.sendCurrentInput).not.toHaveBeenCalled()
+    expect(options.sendRegeneratedInput).not.toHaveBeenCalled()
   })
 
   it('blocks an assistant bubble when normalized error classes conflict around a barrier', () => {
@@ -664,7 +671,7 @@ describe('useChatMessageActions branching edits', () => {
     expect(options.messages.value).toEqual(messages)
     expect(options.inputText.value).toBe('')
     expect(pendingForkBeforeMessageId.value).toBeNull()
-    expect(options.sendCurrentInput).not.toHaveBeenCalled()
+    expect(options.sendRegeneratedInput).not.toHaveBeenCalled()
   })
 
   it('retries the exact primary from a safe assistant status-only bubble', async () => {
@@ -711,7 +718,7 @@ describe('useChatMessageActions branching edits', () => {
     expect(pendingForkBeforeMessageId.value).toBeNull()
     expect(options.messages.value).toHaveLength(3)
     expect(options.inputText.value).toBe('')
-    expect(options.sendCurrentInput).not.toHaveBeenCalled()
+    expect(options.sendRegeneratedInput).not.toHaveBeenCalled()
   })
 
   it.each([
@@ -803,7 +810,7 @@ describe('useChatMessageActions branching edits', () => {
     expect(options.messages.value).toEqual(messages)
     expect(options.inputText.value).toBe('')
     expect(pendingForkBeforeMessageId.value).toBeNull()
-    expect(options.sendCurrentInput).not.toHaveBeenCalled()
+    expect(options.sendRegeneratedInput).not.toHaveBeenCalled()
   })
 
   it.each([
@@ -874,7 +881,7 @@ describe('useChatMessageActions branching edits', () => {
     expect(options.messages.value).toEqual(messages)
     expect(options.inputText.value).toBe('')
     expect(pendingForkBeforeMessageId.value).toBeNull()
-    expect(options.sendCurrentInput).not.toHaveBeenCalled()
+    expect(options.sendRegeneratedInput).not.toHaveBeenCalled()
   })
 
   it('preserves history, fork state, and the current draft when live delivery is unavailable', async () => {
@@ -898,7 +905,7 @@ describe('useChatMessageActions branching edits', () => {
     expect(options.messages.value).toEqual(messages)
     expect(options.inputText.value).toBe('unrelated draft')
     expect(pendingForkBeforeMessageId.value).toBeNull()
-    expect(options.sendCurrentInput).not.toHaveBeenCalled()
+    expect(options.sendRegeneratedInput).not.toHaveBeenCalled()
     expect(options.notifyDeliveryBlocked).toHaveBeenCalledOnce()
     expect(accepted).toBe(false)
   })
@@ -970,17 +977,17 @@ describe('useChatMessageActions branching edits', () => {
     expect(options.messages.value).toEqual(messages)
     expect(options.inputText.value).toBe('')
     expect(pendingForkBeforeMessageId.value).toBeNull()
-    expect(options.sendCurrentInput).not.toHaveBeenCalled()
+    expect(options.sendRegeneratedInput).not.toHaveBeenCalled()
     expect(options.notifyMessagePending).toHaveBeenCalledOnce()
 
     options.messages.value[0]!.messageId = 'msg-now-durable'
-    const secondAccepted = api.regenerateMessage(rendered)
+    const secondAccepted = await api.regenerateMessage(rendered)
     await nextTick()
 
     expect(firstAccepted).toBe(false)
     expect(secondAccepted).toBe(true)
-    expect(pendingForkBeforeMessageId.value).toBe('msg-now-durable')
-    expect(options.sendCurrentInput).toHaveBeenCalledOnce()
+    expect(pendingForkBeforeMessageId.value).toBeNull()
+    expect(options.sendRegeneratedInput).toHaveBeenCalledWith(expect.objectContaining({ forkBeforeMessageId: 'msg-now-durable' }), expect.any(Function))
   })
 
   it('regenerates and edits without pending feedback when ids are durable', async () => {
@@ -998,7 +1005,7 @@ describe('useChatMessageActions branching edits', () => {
     }))
     await nextTick()
 
-    expect(options.sendCurrentInput).toHaveBeenCalledOnce()
+    expect(options.sendRegeneratedInput).toHaveBeenCalledOnce()
     expect(options.notifyMessagePending).not.toHaveBeenCalled()
   })
 })
@@ -1457,13 +1464,24 @@ describe('complete historical message actions', () => {
     expect(options.inputText.value).toBe('prior draft')
   })
 
+  it('restores the full historical body and its attachments together before editing', async () => {
+    const { api, options, user } = fixture()
+    options.messages.value[0]!.attachments = [displayAttachment('staged')]
+    const attachments: Attachment[] = [{ kind: 'inline', local_id: -21, name: 'restored.txt', mime: 'text/plain', data: 'cmVxdWVzdA==' }]
+    options.readAttachments = vi.fn(async () => attachments)
+    expect(await api.editMessage(user)).toBe(true)
+    expect(options.inputText.value).toBe(body)
+    expect(options.pendingAttachments!.value).toEqual(attachments)
+    expect(options.readAttachments).toHaveBeenCalledWith(expect.objectContaining({ text: body }), expect.any(AbortSignal))
+  })
+
   it('regenerates with the full user body, even when the rendered answer has already hydrated', async () => {
     const { api, options, assistant } = fixture()
     expect(await api.regenerateMessage(assistant)).toBe(true)
     await nextTick()
-    expect(options.inputText.value).toBe(body)
-    expect(options.sendCurrentInput).toHaveBeenCalledOnce()
-    expect(options.pendingForkBeforeMessageId.value).toBe('long-user')
+    expect(options.inputText.value).toBe('prior draft')
+    expect(options.sendRegeneratedInput).toHaveBeenCalledWith(expect.objectContaining({ text: body }), expect.any(Function))
+    expect(options.pendingForkBeforeMessageId.value).toBeNull()
   })
 
   it.each(['edit', 'regenerate'] as const)('does not use a preview when %s cannot read the body', async operation => {
@@ -1474,11 +1492,11 @@ describe('complete historical message actions', () => {
     expect(options.messages.value).toBe(transcript)
     expect(options.inputText.value).toBe('prior draft')
     expect(options.pendingForkBeforeMessageId.value).toBeNull()
-    expect(options.sendCurrentInput).not.toHaveBeenCalled()
+    expect(options.sendRegeneratedInput).not.toHaveBeenCalled()
     expect(options.sendUsageBarrierReplay).not.toHaveBeenCalled()
   })
 
-  it.each(['cancel', 'session', 'epoch', 'revision', 'draft', 'streaming', 'discard'] as const)(
+  it.each(['cancel', 'session', 'epoch', 'revision', 'draft', 'attachment-draft', 'source-attachment', 'streaming', 'discard'] as const)(
     'discards a late complete edit after %s changes', async change => {
       const { api, options, read, user, session } = fixture()
       let resolve!: (text: string) => void
@@ -1490,6 +1508,8 @@ describe('complete historical message actions', () => {
       if (change === 'epoch') session.value = 'session-a:1'
       if (change === 'revision') options.messages.value[0]!.contentRef!.revision = 'new-revision'
       if (change === 'draft') options.inputText.value = 'new draft'
+      if (change === 'attachment-draft') options.pendingAttachments!.value.push({ kind: 'inline', local_id: 20, name: 'new.txt', mime: 'text/plain', data: 'bmV3' })
+      if (change === 'source-attachment') options.messages.value[0]!.attachments = [displayAttachment('inline')]
       if (change === 'streaming') options.isStreaming.value = true
       if (change === 'discard') api.discardEditRestorePoint()
       resolve(body)
@@ -1497,7 +1517,7 @@ describe('complete historical message actions', () => {
       expect(options.messages.value).toBe(transcript)
       expect(options.inputText.value).toBe(change === 'draft' ? 'new draft' : 'prior draft')
       expect(options.pendingForkBeforeMessageId.value).toBeNull()
-      expect(options.sendCurrentInput).not.toHaveBeenCalled()
+      expect(options.sendRegeneratedInput).not.toHaveBeenCalled()
     },
   )
 
@@ -1510,19 +1530,19 @@ describe('complete historical message actions', () => {
     resolve(body + 'STALE')
     expect(await edit).toBe(false)
     await nextTick()
-    expect(options.inputText.value).toBe(body)
-    expect(options.sendCurrentInput).toHaveBeenCalledOnce()
+    expect(options.inputText.value).toBe('prior draft')
+    expect(options.sendRegeneratedInput).toHaveBeenCalledWith(expect.objectContaining({ text: body }), expect.any(Function))
   })
 
   it('does not send a queued synchronous regenerate after navigating away and back', async () => {
     const { api, options, assistant, session } = fixture()
     options.messages.value[0]!.previewComplete = true
     options.messages.value[0]!.text = body
-    expect(api.regenerateMessage(assistant)).toBe(true)
+    const regeneration = api.regenerateMessage(assistant)
     session.value = 'session-b:0'
     session.value = 'session-a:0'
-    await nextTick()
-    expect(options.sendCurrentInput).not.toHaveBeenCalled()
+    expect(await regeneration).toBe(false)
+    expect(options.sendRegeneratedInput).not.toHaveBeenCalled()
   })
 
   it('reads the full body before a proven usage-barrier replay', async () => {
@@ -1533,7 +1553,7 @@ describe('complete historical message actions', () => {
     assistant.turnOutcome = outcome
     expect(await api.regenerateMessage(assistant)).toBe(true)
     expect(options.sendUsageBarrierReplay).toHaveBeenCalledWith({ text: body, forkBeforeMessageId: 'long-user' })
-    expect(options.sendCurrentInput).not.toHaveBeenCalled()
+    expect(options.sendRegeneratedInput).not.toHaveBeenCalled()
   })
 })
 
@@ -1642,7 +1662,7 @@ describe('complete historical message copy', () => {
     expect(await pending).toBe(true)
     expect(copyTextWithFallback).toHaveBeenCalledExactlyOnceWith(body)
     expect(options.inputText.value).toBe('Keep this unrelated draft')
-    expect(options.sendCurrentInput).not.toHaveBeenCalled()
+    expect(options.sendRegeneratedInput).not.toHaveBeenCalled()
   })
 
   it('restores full timeline text before choosing and sanitizing the assistant answer', async () => {
@@ -1791,5 +1811,273 @@ describe('complete historical message copy', () => {
     resolve(chunks[0]!)
     expect(await pending).toBe(false)
     expect(copyTextWithFallback).toHaveBeenCalledTimes(3)
+  })
+})
+
+describe('editing original attachments', () => {
+  const originalAttachment = (name = 'original.png'): DisplayAttachment => ({
+    kind: 'file', displayId: name, renderKey: name, name, mime: 'image/png', sha256_ref: 'a'.repeat(64),
+  })
+  const recoveredAttachment = (name = 'original.png', id = -1): Attachment => ({
+    kind: 'inline', local_id: id, name, mime: 'image/png', data: btoa(name),
+    file: new File([name], name, { type: 'image/png' }),
+  })
+  function imageEdit(text = '', count = 1) {
+    const originals = Array.from({ length: count }, (_, index) => originalAttachment(`original-${index}.png`))
+    const recovered = originals.map((attachment, index) => recoveredAttachment(attachment.name, -index - 1))
+    const h = makeOptions([
+      { role: 'user', text, ts: null, messageId: 'original-user', attachments: originals },
+      { role: 'assistant', text: 'original answer', ts: null, messageId: 'original-answer' },
+    ])
+    h.options.readAttachments = vi.fn(async () => recovered)
+    h.options.notifyAttachmentRecoveryFailed = vi.fn()
+    const clicked = renderedMessage({ sourceIndex: 0, messageId: 'original-user' })
+    return { ...h, recovered, clicked }
+  }
+  function deferred<T>() {
+    let resolve!: (value: T) => void
+    const promise = new Promise<T>(yes => { resolve = yes })
+    return { promise, resolve }
+  }
+
+  it.each([['', 1], ['describe these', 1], ['', 3], ['compare these', 3]] as const)(
+    'restores complete original input for text %j and %i images', async (text, count) => {
+      const h = imageEdit(text, count)
+      const transcript = h.options.messages.value
+      const result = h.api.editMessage(h.clicked)
+      expect(h.options.messages.value).toBe(transcript)
+      expect(await result).toBe(true)
+      expect(h.options.inputText.value).toBe(text)
+      expect(h.options.pendingAttachments!.value).toEqual(h.recovered)
+      expect(h.options.messages.value).toEqual([])
+      expect(h.pendingForkBeforeMessageId.value).toBe('original-user')
+      expect(h.options.focusComposer).toHaveBeenCalledOnce()
+    },
+  )
+
+  it('restores the existing attachment draft when cancelling the edit', async () => {
+    const h = imageEdit()
+    const draft = recoveredAttachment('draft.png', 12)
+    h.options.inputText.value = 'existing draft'
+    h.options.pendingAttachments!.value = [draft]
+    const transcript = h.options.messages.value
+    await h.api.editMessage(h.clicked)
+    expect(h.api.cancelEdit()).toBe(true)
+    expect(h.options.messages.value).toBe(transcript)
+    expect(h.options.inputText.value).toBe('existing draft')
+    expect(h.options.pendingAttachments!.value).toEqual([draft])
+    expect(toRaw(h.options.pendingAttachments!.value[0]!.file)).toBe(draft.file)
+    expect(h.pendingForkBeforeMessageId.value).toBeNull()
+  })
+
+  it('clears unrelated attachments for a text-only edit and restores them on cancel', () => {
+    const h = makeOptions([{ role: 'user', text: 'text only', ts: null, messageId: 'text' }])
+    const draft = recoveredAttachment('draft.png', 12)
+    h.options.pendingAttachments!.value = [draft]
+    expect(h.api.editMessage(renderedMessage({ sourceIndex: 0 }))).toBe(true)
+    expect(h.options.pendingAttachments!.value).toEqual([])
+    expect(h.api.cancelEdit()).toBe(true)
+    expect(h.options.pendingAttachments!.value).toEqual([draft])
+  })
+
+  it.each(['append', 'remove', 'replace-file', 'workspace-change'])(
+    'does not overwrite newer attachment changes on cancel: %s', async (change) => {
+      const h = imageEdit()
+      h.options.pendingAttachments!.value = [recoveredAttachment('old-draft.png', 12)]
+      await h.api.editMessage(h.clicked)
+      if (change === 'append') h.options.pendingAttachments!.value.push(recoveredAttachment('new.png', 13))
+      if (change === 'remove') h.options.pendingAttachments!.value = []
+      if (change === 'replace-file') h.options.pendingAttachments!.value[0]!.file = new File(['different'], 'original-0.png')
+      if (change === 'workspace-change') h.options.pendingAttachments!.value[0]!.workspaceFile = {
+        workspaceId: 'current', relativePath: 'new.png', name: 'new.png', mime: 'image/png',
+      }
+      const newer = h.options.pendingAttachments!.value
+      expect(h.api.cancelEdit()).toBe(true)
+      expect(h.options.pendingAttachments!.value).toBe(newer)
+      expect(h.options.messages.value).toHaveLength(2)
+    },
+  )
+
+  it('restores the first draft after consecutive unsubmitted attachment edits', async () => {
+    const h = imageEdit('earlier')
+    h.options.messages.value.push(
+      { role: 'user', text: 'later', ts: null, messageId: 'later-user', attachments: [originalAttachment('later.png')] },
+      { role: 'assistant', text: 'later answer', ts: null },
+    )
+    const firstDraft = recoveredAttachment('first-draft.png', 12)
+    h.options.pendingAttachments!.value = [firstDraft]
+    await h.api.editMessage(renderedMessage({ sourceIndex: 2, messageId: 'later-user' }))
+    await h.api.editMessage(h.clicked)
+    expect(h.api.cancelEdit()).toBe(true)
+    expect(h.options.messages.value).toHaveLength(4)
+    expect(h.options.pendingAttachments!.value).toEqual([firstDraft])
+  })
+
+  it('recognizes sender-cloned recovery attachments after a rejected edit send', async () => {
+    const h = imageEdit()
+    const oldDraft = recoveredAttachment('draft.png', 12)
+    h.options.pendingAttachments!.value = [oldDraft]
+    await h.api.editMessage(h.clicked)
+    h.pendingForkBeforeMessageId.value = null
+    h.options.pendingAttachments!.value = []
+    expect(h.api.cancelEdit()).toBe(false)
+    h.pendingForkBeforeMessageId.value = 'original-user'
+    h.options.pendingAttachments!.value = h.recovered.map(attachment => ({ ...attachment }))
+    expect(h.api.cancelEdit()).toBe(true)
+    expect(h.options.pendingAttachments!.value).toEqual([oldDraft])
+  })
+
+  function stagedEdit() {
+    const h = imageEdit('original prompt')
+    const oldDraft = recoveredAttachment('draft.png', 12)
+    const staged: Attachment = {
+      local_id: -1, name: 'original.png', mime: 'image/png', size: 8,
+      file: new File(['original'], 'original.png', { type: 'image/png' }),
+      kind: 'staged', file_uuid: 'expired', expires_at: 1, ttl_seconds: 3600,
+    }
+    h.options.inputText.value = 'original draft'
+    h.options.pendingAttachments!.value = [oldDraft]
+    h.options.readAttachments = vi.fn(async () => [staged])
+    return { ...h, oldDraft, staged }
+  }
+
+  it('restores the prior attachment draft after staging refresh and rejected-send recovery', async () => {
+    const h = stagedEdit()
+    await h.api.editMessage(h.clicked)
+    const unused = async (): Promise<never> => { throw new Error('Unexpected content operation') }
+    const uploadAttachment = vi.fn(async () => ({ fileUuid: 'refreshed', expiresAt: Date.now() / 1000 + 3600, ttlSeconds: 3600 }))
+    const content: ArtifactContentAccess = {
+      fetchArtifact: unused, openArtifact: unused, openArtifactBlob: unused,
+      clearPreviewStorage: unused, fetchAttachment: unused, uploadAttachment,
+    }
+    const intake = useChatAttachments(content)
+    // Ordinary sends prepare an independent payload, then restore that payload
+    // if admission rejects it. Refresh must not count as a user's image edit.
+    const payload = h.options.pendingAttachments!.value.map(snapshotAttachment)
+    expect(await intake.prepareAttachmentsForSend({ attachments: payload })).toBe(true)
+    expect(uploadAttachment).toHaveBeenCalledOnce()
+    expect(payload[0]!.file_uuid).toBe('refreshed')
+    h.options.pendingAttachments!.value = []
+    h.pendingForkBeforeMessageId.value = null
+    h.options.pendingAttachments!.value = payload
+    h.pendingForkBeforeMessageId.value = 'original-user'
+    expect(h.api.cancelEdit()).toBe(true)
+    expect(h.options.pendingAttachments!.value).toEqual([h.oldDraft])
+    expect(h.options.inputText.value).toBe('original draft')
+  })
+
+  it.each(['file', 'id', 'name', 'mime', 'data', 'kind', 'missing-file'] as const)(
+    'does not discard a staged attachment changed beyond its upload receipt: %s', async change => {
+      const h = stagedEdit()
+      await h.api.editMessage(h.clicked)
+      const changed: Attachment = { ...h.staged, file_uuid: 'refreshed', expires_at: 99999 }
+      if (change === 'file') changed.file = new File(['different'], 'original.png', { type: 'image/png' })
+      if (change === 'id') changed.local_id = 27
+      if (change === 'name') changed.name = 'new-name.png'
+      if (change === 'mime') changed.mime = 'image/jpeg'
+      if (change === 'data') changed.data = btoa('new image bytes')
+      if (change === 'kind') changed.kind = 'failed'
+      if (change === 'missing-file') changed.file = undefined
+      h.options.pendingAttachments!.value = [changed]
+      const current = h.options.pendingAttachments!.value
+      expect(h.api.cancelEdit()).toBe(true)
+      expect(h.options.pendingAttachments!.value).toBe(current)
+    },
+  )
+
+  it('still invalidates a pending edit if the existing draft upload receipt changes', async () => {
+    const h = imageEdit()
+    const read = deferred<Attachment[]>()
+    h.options.readAttachments = vi.fn(() => read.promise)
+    h.options.pendingAttachments!.value = [{ ...recoveredAttachment('draft.png', 12), kind: 'staged', file_uuid: 'old' }]
+    const transcript = h.options.messages.value
+    const pending = h.api.editMessage(h.clicked)
+    h.options.pendingAttachments!.value[0]!.file_uuid = 'refreshed'
+    read.resolve(h.recovered)
+    expect(await pending).toBe(false)
+    expect(h.options.messages.value).toBe(transcript)
+    expect(h.options.pendingAttachments!.value[0]!.file_uuid).toBe('refreshed')
+  })
+
+  it.each(['reject', 'incomplete', 'missing-reader', 'missing-composer'])(
+    'keeps the transcript and draft intact if recovery fails: %s', async (failure) => {
+      const h = imageEdit()
+      h.options.inputText.value = 'existing draft'
+      h.options.pendingAttachments!.value = [recoveredAttachment('draft.png', 12)]
+      const transcript = h.options.messages.value
+      const attachments = h.options.pendingAttachments!.value
+      if (failure === 'reject') h.options.readAttachments = vi.fn(async () => { throw new Error('expired') })
+      if (failure === 'incomplete') h.options.readAttachments = vi.fn(async () => [])
+      if (failure === 'missing-reader') h.options.readAttachments = undefined
+      if (failure === 'missing-composer') h.options.pendingAttachments = undefined
+      expect(await h.api.editMessage(h.clicked)).toBe(false)
+      expect(h.options.messages.value).toBe(transcript)
+      expect(h.options.inputText.value).toBe('existing draft')
+      if (h.options.pendingAttachments) expect(h.options.pendingAttachments.value).toBe(attachments)
+      expect(h.pendingForkBeforeMessageId.value).toBeNull()
+      expect(h.options.notifyAttachmentRecoveryFailed).toHaveBeenCalledOnce()
+      expect(h.options.focusComposer).not.toHaveBeenCalled()
+    },
+  )
+
+  it.each(['cancel', 'draft-text', 'draft-attachments', 'source-attachments', 'streaming', 'navigate', 'dispose', 'new-edit'])(
+    'ignores a stale original attachment read after %s', async (change) => {
+      const h = imageEdit()
+      h.options.messages.value.push({ role: 'user', text: 'other message', ts: null, messageId: 'other' })
+      const read = deferred<Attachment[]>()
+      h.options.readAttachments = vi.fn(() => read.promise)
+      const session = ref('original-session')
+      h.options.sessionIdentity = () => session.value
+      const scope = effectScope()
+      const actions = scope.run(() => useChatMessageActions(h.options))!
+      const result = actions.editMessage(h.clicked)
+      const transcript = h.options.messages.value
+      expect(h.pendingForkBeforeMessageId.value).toBeNull()
+      if (change === 'cancel') expect(actions.cancelEdit()).toBe(true)
+      if (change === 'draft-text') h.options.inputText.value = 'newer draft'
+      if (change === 'draft-attachments') h.options.pendingAttachments!.value.push(recoveredAttachment('new.png', 99))
+      if (change === 'source-attachments') h.options.messages.value[0]!.attachments![0]!.sha256_ref = 'b'.repeat(64)
+      if (change === 'streaming') h.options.isStreaming.value = true
+      if (change === 'navigate') session.value = 'another-session'
+      if (change === 'dispose') scope.stop()
+      if (change === 'new-edit') expect(actions.editMessage(renderedMessage({ sourceIndex: 2 }))).toBe(true)
+      const draftBeforeCompletion = h.options.inputText.value
+      const attachmentsBeforeCompletion = h.options.pendingAttachments!.value
+      const messagesBeforeCompletion = h.options.messages.value
+      read.resolve(h.recovered)
+      expect(await result).toBe(false)
+      expect(h.options.inputText.value).toBe(draftBeforeCompletion)
+      expect(h.options.pendingAttachments!.value).toBe(attachmentsBeforeCompletion)
+      expect(h.options.messages.value).toBe(messagesBeforeCompletion)
+      if (change !== 'new-edit') expect(h.options.messages.value).toBe(transcript)
+      expect(h.options.notifyAttachmentRecoveryFailed).not.toHaveBeenCalled()
+      scope.stop()
+    },
+  )
+
+  it('does not switch away from an attachment draft whose intake is unfinished', () => {
+    const h = imageEdit()
+    h.options.attachmentWorkBusy = () => true
+    h.options.pendingAttachments!.value = [{ kind: 'uploading', local_id: 12, name: 'draft.png', mime: 'image/png' }]
+    expect(h.api.editMessage(h.clicked)).toBe(false)
+    expect(h.options.messages.value).toHaveLength(2)
+    expect(h.options.pendingAttachments!.value[0]!.kind).toBe('uploading')
+    expect(h.options.readAttachments).not.toHaveBeenCalled()
+    expect(h.options.notifyDeliveryBlocked).toHaveBeenCalledOnce()
+  })
+
+  it('does not commit an edit if attachment intake starts while recovering history', async () => {
+    const h = imageEdit()
+    const read = deferred<Attachment[]>()
+    let busy = false
+    h.options.attachmentWorkBusy = () => busy
+    h.options.readAttachments = vi.fn(() => read.promise)
+    const result = h.api.editMessage(h.clicked)
+    busy = true
+    read.resolve(h.recovered)
+    expect(await result).toBe(false)
+    expect(h.options.messages.value).toHaveLength(2)
+    expect(h.pendingForkBeforeMessageId.value).toBeNull()
+    expect(h.options.notifyDeliveryBlocked).toHaveBeenCalledOnce()
   })
 })

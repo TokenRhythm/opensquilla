@@ -70,7 +70,7 @@ describe('background process notice presentation', () => {
       const actions = useChatMessageActions({
         messages: ref([source]), inputText: ref(''), isStreaming: ref(false),
         sanitizeCopyText: text => text, stripTimePrefix: text => text,
-        autoResizeTextarea: vi.fn(), sendCurrentInput: vi.fn(),
+        autoResizeTextarea: vi.fn(), sendRegeneratedInput: vi.fn(async () => false),
         sendUsageBarrierReplay: vi.fn(async () => true), focusComposer: vi.fn(),
         pendingForkBeforeMessageId: ref(null),
       })

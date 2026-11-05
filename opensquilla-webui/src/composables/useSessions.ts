@@ -8,6 +8,7 @@ import type {
   SessionItem,
 } from '@/modules/sessionDirectory'
 import { sessionRunStatusLabel, summarizeSessionTask } from '@/modules/sessionRunStatus'
+import { sessionDirectoryErrorLogValue } from '@/utils/sessionDirectoryDiagnostics'
 
 const SESSION_LIST_PAGE_SIZE = 200
 
@@ -532,7 +533,7 @@ export function useSessions(directory: SessionDirectory) {
       return 'applied'
     } catch (err: unknown) {
       if (generation !== requestGeneration) return 'superseded'
-      console.error('[useSessions] session directory error:', err instanceof Error ? err.message : err)
+      console.error('[useSessions] session directory error:', sessionDirectoryErrorLogValue(err))
       // A reconnect/event refresh must not collapse an already useful ledger.
       // Keep the last complete traversal and its retry cursor until a whole
       // replacement snapshot succeeds.
@@ -572,7 +573,7 @@ export function useSessions(directory: SessionDirectory) {
       nextCursor.value = hasMore.value ? nextPageState.nextCursor : null
     } catch (err: unknown) {
       if (generation !== requestGeneration) return
-      console.error('[useSessions] session directory next-page error:', err instanceof Error ? err.message : err)
+      console.error('[useSessions] session directory next-page error:', sessionDirectoryErrorLogValue(err))
       loadMoreError.value = true
     } finally {
       if (generation === requestGeneration) isLoadingMore.value = false
