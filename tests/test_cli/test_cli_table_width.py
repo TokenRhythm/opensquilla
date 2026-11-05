@@ -173,6 +173,8 @@ def test_config_get_preserves_complete_keys_and_values(
 ) -> None:
     monkeypatch.setenv("OPENSQUILLA_GATEWAY_CONFIG_PATH", str(tmp_path / "c.toml"))
     monkeypatch.setenv("COLUMNS", str(width))
+    # The shared console reads COLUMNS once at import; build one after the env is set.
+    monkeypatch.setattr(config_cmd, "console", Console(highlight=False))
     rows: list[tuple[str, str]] = []
     recorder = SimpleNamespace(add_row=lambda key, value: rows.append((key, value)))
     from opensquilla.gateway.config import GatewayConfig
