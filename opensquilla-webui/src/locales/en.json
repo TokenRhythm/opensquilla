@@ -4453,6 +4453,16 @@
     "loadingEllipsis": "Loading...",
     "loadingEarlier": "Loading earlier messages…",
     "loadEarlierFailedRetry": "Earlier messages failed to load · Retry",
+    "earlierHistoryFailure": {
+      "tooLarge": "Earlier messages exceed the loading limit. Repeated retries cannot load this part of the history. Loaded messages remain available.",
+      "timeout": "Loading earlier messages timed out. Try again.",
+      "busy": "History is temporarily busy. Try again shortly.",
+      "unavailable": "Earlier messages could not be loaded. Check your connection and try again.",
+      "cursor": "The conversation history changed. Reload the latest messages to continue.",
+      "failed": "Earlier messages could not be loaded. Reopen this conversation; if this continues, update OpenSquilla.",
+      "reloadLatest": "Reload latest messages",
+      "metadataLimited": "Some summaries or activity details are too large to display in full. Messages are still available."
+    },
     "legacyHistoryUnavailable": "Earlier original messages were not saved by the older version.",
     "scopeCompacted": "Older content is represented by session summaries.",
     "scopeLatestWindow": "Showing the latest message window.",

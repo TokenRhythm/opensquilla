@@ -20,6 +20,7 @@ from typing import Any
 from opensquilla import token_estimation
 from opensquilla.gateway.boot import start_gateway_server
 from opensquilla.gateway.config import AuthConfig, GatewayConfig
+from opensquilla.gateway.terminal_activity import terminal_activity_snapshot
 from opensquilla.gateway.websocket import SubscriptionManager
 from opensquilla.provider import (
     ChatConfig,
@@ -30,7 +31,13 @@ from opensquilla.provider import (
     ToolUseEndEvent,
     ToolUseStartEvent,
 )
-from opensquilla.session.models import SessionNode
+from opensquilla.session.models import (
+    AgentTaskRecord,
+    AgentTaskStatus,
+    SessionNode,
+    SessionSummary,
+    TranscriptEntry,
+)
 from opensquilla.session.storage import SessionStorage
 
 MODEL = "qwen3:4b"
@@ -323,6 +330,49 @@ class DeterministicGoalSelector:
         return []
 
 
+async def seed_history(storage: SessionStorage, fixture: dict[str, Any]) -> None:
+    key = fixture["sessionKey"]
+    node = await storage.get_session(key)
+    if node is None:
+        node = SessionNode(session_key=key, agent_id="main")
+        await storage.upsert_session(node)
+    for index in range(1, fixture["messageCount"] + 1):
+        turn_id = f"history-turn-{index}"
+        await storage.append_transcript_entry(TranscriptEntry(
+            session_id=node.session_id, session_key=key,
+            message_id=f"history-message-{index}", role="assistant",
+            content=f"Historical answer {index}. " + "Synthetic conversation content. " * 8,
+            turn_context={"turn_id": turn_id}, created_at=1_800_000_000_000 + index * 1000,
+        ))
+        if index != fixture.get("oversizedActivityMessage"):
+            continue
+        snapshot = terminal_activity_snapshot({
+            "version": 2, "task_id": turn_id, "turn_id": turn_id, "complete": True,
+            "reasoning_utf16_length": 0,
+            "entries": [{
+                "type": "segment", "id": f"step-{step:04d}-" + "a" * 220,
+                "order": step + 1, "segment_type": "tool",
+                "tool_use_id": f"call-{step:04d}-" + "b" * 180,
+                "name": "inspect_" + "x" * 120, "started_at": 1, "ended_at": 2,
+                "is_error": False,
+            } for step in range(2048)],
+        }, task_id=turn_id, turn_id=turn_id)
+        assert snapshot is not None
+        await storage.create_agent_task(AgentTaskRecord(
+            task_id=turn_id, session_key=key, status=AgentTaskStatus.SUCCEEDED,
+            details={"turn_id": turn_id, "turn_outcome": {"kind": "completed"},
+                     "activity_snapshot": snapshot},
+        ))
+    for index in range(1, fixture["summaryCount"] + 1):
+        await storage.save_summary(SessionSummary(
+            session_id=node.session_id, session_key=key, compaction_index=index,
+            compaction_id=f"history-compaction-{index}", summary_text="摘要。" * 2000,
+            created_at=1_800_000_000_000 + index * 1000,
+        ))
+    await storage.update_session_fields(key, {"compaction_count": fixture["summaryCount"]})
+    assert await storage.is_canonical_transcript_complete(node.session_id)
+
+
 async def main() -> None:
     # Every fixture gets a fresh temporary directory, including tiktoken's
     # default download cache. Use the production conservative fallback so a
@@ -349,11 +399,16 @@ async def main() -> None:
     initial_keys = json.loads(
         os.environ.get("OPENSQUILLA_WEBUI_GOAL_E2E_INITIAL_SESSION_KEYS", "[]"),
     )
-    if initial_keys:
+    initial_history = json.loads(
+        os.environ.get("OPENSQUILLA_WEBUI_GOAL_E2E_INITIAL_HISTORY", "[]"),
+    )
+    if initial_keys or initial_history:
         storage = await SessionStorage.open(state_dir / "sessions.db")
         try:
             for key in initial_keys:
                 await storage.upsert_session(SessionNode(session_key=key, agent_id="main"))
+            for fixture in initial_history:
+                await seed_history(storage, fixture)
         finally:
             await storage.close()
 

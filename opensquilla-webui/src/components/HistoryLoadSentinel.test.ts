@@ -177,4 +177,57 @@ describe('HistoryLoadSentinel', () => {
     expect(host.querySelector('[data-testid="history-load-sentinel"]')).toBeNull()
     expect(host.querySelector('button')).toBeNull()
   })
+
+  it('explains a size limit without offering the same failing request again', async () => {
+    i18n.global.locale.value = 'zh-Hans'
+    const { host, onLoadEarlier } = await mountSentinel({
+      error: true, hasMore: true, cursor: 'cursor-1',
+      failure: { kind: 'too-large', action: 'none' },
+    })
+
+    expect(host.querySelector('[data-testid="history-load-failure"]')?.getAttribute('role')).toBe('alert')
+    expect(host.textContent).toContain('超过当前加载上限')
+    expect(host.textContent).toContain('重复重试也无法加载')
+    expect(host.textContent).toContain('已加载的消息仍可查看')
+    expect(host.querySelector('button')).toBeNull()
+    expect(observerCallback).toBeNull()
+    expect(onLoadEarlier).not.toHaveBeenCalled()
+  })
+
+  it.each([
+    ['timeout', 'Loading earlier messages timed out. Try again.', 'retry', 'Retry'],
+    ['busy', 'History is temporarily busy. Try again shortly.', 'retry', 'Retry'],
+    ['unavailable', 'Earlier messages could not be loaded. Check your connection and try again.', 'retry', 'Retry'],
+    ['cursor', 'The conversation history changed. Reload the latest messages to continue.', 'reload-latest', 'Reload latest messages'],
+  ])('explains %s failures with the corresponding recovery action', async (kind, label, action, button) => {
+    const { host, state, onLoadEarlier } = await mountSentinel({
+      error: true, hasMore: true, cursor: 'cursor-1', failure: { kind, action },
+    })
+
+    expect(host.querySelector('[data-testid="history-load-failure"]')?.textContent).toContain(label)
+    const retry = host.querySelector('[data-testid="history-load-retry"]') as HTMLButtonElement
+    expect(retry.textContent?.trim()).toBe(button)
+    retry.click()
+    retry.click()
+    expect(onLoadEarlier).toHaveBeenCalledOnce()
+    state.loading = true
+    await nextTick()
+    state.loading = false
+    await nextTick()
+    ;(host.querySelector('[data-testid="history-load-retry"]') as HTMLButtonElement).click()
+    expect(onLoadEarlier).toHaveBeenCalledTimes(2)
+  })
+
+  it('shows limited metadata as a nonblocking note while continuing earlier pagination', async () => {
+    const { host, onLoadEarlier } = await mountSentinel({
+      metadataLimited: true, hasMore: true, cursor: 'cursor-1',
+    })
+
+    expect(host.querySelector('[data-testid="history-metadata-limited"]')?.textContent)
+      .toContain('Messages are still available.')
+    expect(host.querySelector('[role="alert"]')).toBeNull()
+    expect(host.querySelector('button')).toBeNull()
+    observerCallback?.([{ isIntersecting: true } as IntersectionObserverEntry], {} as IntersectionObserver)
+    expect(onLoadEarlier).toHaveBeenCalledOnce()
+  })
 })

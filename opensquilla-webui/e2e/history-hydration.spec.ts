@@ -869,7 +869,8 @@ test('keeps loaded messages visible when an earlier page fails and retries inlin
   await expect.poll(() => earlierHistoryRequests).toBe(1)
 
   const retry = page.getByTestId('history-load-retry')
-  await expect(retry).toContainText('Earlier messages failed to load · Retry')
+  await expect(page.getByTestId('history-load-failure')).toContainText('Earlier messages could not be loaded.')
+  await expect(retry).toContainText('Retry')
   await expect(loadState).toHaveCount(0)
   await expect(page.getByText(/History row 1\./).first()).toBeVisible()
 

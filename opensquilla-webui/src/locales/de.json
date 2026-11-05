@@ -4350,6 +4350,16 @@
     "loadingEllipsis": "Wird geladen...",
     "loadingEarlier": "Frühere Nachrichten werden geladen…",
     "loadEarlierFailedRetry": "Frühere Nachrichten konnten nicht geladen werden · Erneut versuchen",
+    "earlierHistoryFailure": {
+      "tooLarge": "Frühere Nachrichten überschreiten das Ladelimit. Auch wiederholte Versuche können diesen Teil des Verlaufs nicht laden. Bereits geladene Nachrichten bleiben verfügbar.",
+      "timeout": "Das Laden früherer Nachrichten hat zu lange gedauert. Versuchen Sie es erneut.",
+      "busy": "Der Verlauf ist vorübergehend ausgelastet. Versuchen Sie es in Kürze erneut.",
+      "unavailable": "Frühere Nachrichten konnten nicht geladen werden. Prüfen Sie Ihre Verbindung und versuchen Sie es erneut.",
+      "cursor": "Der Gesprächsverlauf hat sich geändert. Laden Sie die neuesten Nachrichten erneut, um fortzufahren.",
+      "failed": "Frühere Nachrichten konnten nicht geladen werden. Öffnen Sie diese Unterhaltung erneut. Falls das Problem weiterhin besteht, aktualisieren Sie OpenSquilla.",
+      "reloadLatest": "Neueste Nachrichten neu laden",
+      "metadataLimited": "Einige Zusammenfassungen oder Aktivitätsdetails sind zu groß, um vollständig angezeigt zu werden. Nachrichten sind weiterhin verfügbar."
+    },
     "legacyHistoryUnavailable": "Frühere Originalnachrichten wurden von der älteren Version nicht gespeichert.",
     "scopeCompacted": "Älterer Inhalt wird durch Sitzungszusammenfassungen dargestellt.",
     "scopeLatestWindow": "Es wird das neueste Nachrichtenfenster angezeigt.",

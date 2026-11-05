@@ -36,6 +36,13 @@ export type RealGoalGateway = {
 
 export type RealGoalGatewayScenario = 'continuation' | 'lifecycle' | 'silent-reply'
 
+export type InitialHistoryFixture = {
+  sessionKey: string
+  messageCount: number
+  summaryCount: number
+  oversizedActivityMessage?: number
+}
+
 async function reserveLoopbackPort(): Promise<number> {
   const server = createServer()
   server.listen(0, '127.0.0.1')
@@ -106,6 +113,7 @@ export async function startRealGoalGateway(options: {
   scenario?: RealGoalGatewayScenario
   authMode?: 'none' | 'token'
   initialSessionKeys?: readonly string[]
+  initialHistory?: readonly InitialHistoryFixture[]
 }): Promise<RealGoalGateway> {
   const requestedFlow = process.env.OPENSQUILLA_GATEWAY_WS_TRANSPORT_FLOW_ENABLED
     ?.trim().toLowerCase()
@@ -180,6 +188,7 @@ export async function startRealGoalGateway(options: {
         OPENSQUILLA_WEBUI_GOAL_E2E_SCENARIO: options.scenario || 'continuation',
         OPENSQUILLA_WEBUI_GOAL_E2E_AUTH_MODE: options.authMode || 'none',
         OPENSQUILLA_WEBUI_GOAL_E2E_INITIAL_SESSION_KEYS: JSON.stringify(options.initialSessionKeys ?? []),
+        OPENSQUILLA_WEBUI_GOAL_E2E_INITIAL_HISTORY: JSON.stringify(options.initialHistory ?? []),
         OPENSQUILLA_WEBUI_GOAL_E2E_ORIGIN: options.webuiOrigin,
         OPENSQUILLA_HOME: stateDir,
         OPENSQUILLA_STATE_DIR: stateDir,

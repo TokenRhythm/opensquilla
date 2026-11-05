@@ -9,6 +9,7 @@ import {
   startRealGoalGateway,
   type RealGoalGateway,
   type RealGoalGatewayScenario,
+  type InitialHistoryFixture,
 } from './real-goal-gateway'
 
 export type IsolatedRealGateway = RealGoalGateway & {
@@ -43,6 +44,7 @@ export async function withIsolatedRealGateway(
     scenario?: RealGoalGatewayScenario
     authMode?: 'none' | 'token'
     initialSessionKeys?: readonly string[]
+    initialHistory?: readonly InitialHistoryFixture[]
   },
   use: (gateway: IsolatedRealGateway) => Promise<void>,
 ): Promise<void> {
@@ -56,6 +58,7 @@ export async function withIsolatedRealGateway(
     scenario: options.scenario,
     authMode: options.authMode,
     initialSessionKeys: options.initialSessionKeys,
+    initialHistory: options.initialHistory,
   })
   const gatewayHttpUrl = gateway.wsUrl.replace(/^ws:/, 'http:').replace(/\/ws$/, '')
   const webuiRoot = fileURLToPath(new URL('..', import.meta.url))
@@ -105,18 +108,21 @@ export const test = base.extend<{
   isolatedRealGatewayScenario: RealGoalGatewayScenario
   isolatedRealGatewayAuthMode: 'none' | 'token'
   isolatedRealGatewayInitialSessionKeys: readonly string[]
+  isolatedRealGatewayInitialHistory: readonly InitialHistoryFixture[]
   isolatedRealGatewayNativeDesktop: boolean
 }>({
   isolatedRealGatewayScenario: ['lifecycle', { option: true }],
   isolatedRealGatewayAuthMode: ['none', { option: true }],
   isolatedRealGatewayInitialSessionKeys: [[], { option: true }],
+  isolatedRealGatewayInitialHistory: [[], { option: true }],
   isolatedRealGatewayNativeDesktop: [false, { option: true }],
-  isolatedRealGateway: async ({ isolatedRealGatewayScenario, isolatedRealGatewayAuthMode, isolatedRealGatewayInitialSessionKeys }, use, testInfo) =>
+  isolatedRealGateway: async ({ isolatedRealGatewayScenario, isolatedRealGatewayAuthMode, isolatedRealGatewayInitialSessionKeys, isolatedRealGatewayInitialHistory }, use, testInfo) =>
     withIsolatedRealGateway({
       outputDir: testInfo.outputPath('isolated-real-gateway'),
       scenario: isolatedRealGatewayScenario,
       authMode: isolatedRealGatewayAuthMode,
       initialSessionKeys: isolatedRealGatewayInitialSessionKeys,
+      initialHistory: isolatedRealGatewayInitialHistory,
     }, use),
   page: async ({ page, isolatedRealGateway, isolatedRealGatewayNativeDesktop }, use, testInfo) => {
     // Native-capable specs explicitly opt in: other tests may use the browser

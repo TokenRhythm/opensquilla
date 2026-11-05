@@ -44,6 +44,8 @@ GENERAL_SPECS = (
     "router-provider-save.spec.ts",
     "activity-disclosure-scroll-overflow.spec.ts",
     "model-recommendations.spec.ts",
+    "history-pagination.real.spec.ts",
+    "history-size-limit.spec.ts",
 )
 GENERAL_SHARDS = tuple(f"general-{index}" for index in range(1, 5))
 VIRTUALIZATION_SPECS = (

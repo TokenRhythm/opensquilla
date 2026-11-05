@@ -2667,10 +2667,91 @@ describe('useChatHistory canonical pagination', () => {
     await api.loadHistory()
     await api.loadEarlierHistory()
     expect(api.historyState.value.loadEarlierError).toBe(true)
+    expect(api.historyState.value.loadEarlierFailure).toEqual({ kind: 'unavailable', action: 'retry' })
 
     await api.loadEarlierHistory()
     expect(api.historyState.value.loadEarlierError).toBe(false)
+    expect(api.historyState.value.loadEarlierFailure).toBeNull()
     expect(readHistory).toHaveBeenCalledTimes(3)
+  })
+
+  it.each([
+    ['too-large', false, 'too-large', 'none'],
+    ['timeout', true, 'timeout', 'retry'],
+    ['busy', true, 'busy', 'retry'],
+    ['unavailable', false, 'failed', 'none'],
+  ] as const)('retains loaded messages with a classified %s earlier-page failure', async (kind, retryable, expectedKind, action) => {
+    const { api, historyFixture, messages } = makeHistory(false, {
+      response: { messages: [historyMessage('m4')], hasMore: true, oldestCursor: 'cursor-4' },
+    })
+    await api.loadHistory()
+    historyFixture.mockRejectedValueOnce(new SessionReadFailure(kind, 'private diagnostic', retryable))
+
+    await api.loadEarlierHistory()
+
+    expect(messages.value.map(message => message.messageId)).toEqual(['m4'])
+    expect(api.historyState.value).toMatchObject({
+      loading: false, loadingEarlier: false, loadEarlierError: true,
+      oldestCursor: 'cursor-4', loadEarlierFailure: { kind: expectedKind, action },
+    })
+    expect(JSON.stringify(api.historyState.value)).not.toContain('private diagnostic')
+  })
+
+  it.each(['summary_text_omitted', 'summary_markers_omitted', 'activity_snapshot_omitted'])(
+    'treats %s as limited metadata rather than failed history', async marker => {
+      const { api } = makeHistory(false, {
+        response: {
+          messages: [historyMessage('m4')], hasMore: true, oldestCursor: 'cursor-4',
+          compactionSummaries: marker === 'activity_snapshot_omitted' ? [] : [{
+            id: 'compaction-1', summaryText: '',
+            additional: { [marker]: marker === 'summary_markers_omitted' ? 3 : 'history_page_budget' },
+          }],
+          turnOutcomes: marker === 'activity_snapshot_omitted' ? [{
+            turnId: 'turn-4', status: 'succeeded', additional: { [marker]: 'history_page_budget' },
+          }] : [],
+        },
+      })
+      await api.loadHistory()
+
+      expect(api.historyState.value).toMatchObject({
+        hasMore: true, metadataLimited: true, loadEarlierError: false, loadEarlierFailure: null,
+      })
+    },
+  )
+
+  it('retains the metadata notice across prepend and refresh until canonical replacement or session change', async () => {
+    const sessionKey = ref('session-a')
+    const { api, historyFixture } = makeHistory(false, { sessionKey })
+    historyFixture
+      .mockResolvedValueOnce({ messages: [historyMessage('m4')], hasMore: true, oldestCursor: 'cursor-4' })
+      .mockResolvedValueOnce({
+        messages: [historyMessage('m3')], hasMore: true, oldestCursor: 'cursor-3',
+        compactionSummaries: [{ id: 'compaction-1', additional: { summary_text_omitted: 'history_page_budget' } }],
+      })
+      .mockResolvedValueOnce({ messages: [historyMessage('m4'), historyMessage('m5')], hasMore: true, oldestCursor: 'cursor-4' })
+      .mockRejectedValueOnce(new SessionReadHistoryCursorError('stale', 'old anchor'))
+      .mockResolvedValueOnce({ messages: [historyMessage('m6')], hasMore: true, oldestCursor: 'cursor-6' })
+    await api.loadHistory()
+    expect(api.historyState.value.metadataLimited).toBe(false)
+    await api.loadEarlierHistory()
+    expect(api.historyState.value.metadataLimited).toBe(true)
+    await api.loadHistory()
+    expect(api.historyState.value.metadataLimited).toBe(true)
+    await api.loadEarlierHistory()
+    expect(api.historyState.value.loadEarlierFailure).toEqual({ kind: 'cursor', action: 'reload-latest' })
+    await api.retryHistory()
+    expect(api.historyState.value.metadataLimited).toBe(false)
+
+    historyFixture.mockResolvedValueOnce({
+      messages: [historyMessage('m7')],
+      turnOutcomes: [{ turnId: 'turn-7', status: 'succeeded', additional: { activity_snapshot_omitted: 'history_page_budget' } }],
+    })
+    await api.loadHistory()
+    expect(api.historyState.value.metadataLimited).toBe(true)
+    sessionKey.value = 'session-b'
+    api.resetForSession('session-b')
+    expect(api.historyState.value.metadataLimited).toBe(false)
+    expect(api.historyState.value.loadEarlierFailure).toBeNull()
   })
 
   it('refreshes background history after an unrelated earlier-page failure', async () => {

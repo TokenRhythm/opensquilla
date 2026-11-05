@@ -4,9 +4,9 @@
     ref="sentinelRef"
     class="history-load-sentinel"
     :class="{ 'history-load-sentinel--idle': idle }"
-    :role="busy || retryable || unavailable ? 'status' : undefined"
-    :aria-live="busy || retryable || unavailable ? 'polite' : undefined"
-    :aria-atomic="busy || retryable || unavailable ? 'true' : undefined"
+    :role="busy || hasFailure || unavailable ? 'status' : undefined"
+    :aria-live="busy || hasFailure || unavailable ? 'polite' : undefined"
+    :aria-atomic="busy || hasFailure || unavailable ? 'true' : undefined"
     data-testid="history-load-sentinel"
   >
     <Transition name="history-load-feedback">
@@ -18,8 +18,26 @@
         <span class="history-load-sentinel__spinner" aria-hidden="true" />
         <span>{{ t('chat.loadingEarlier') }}</span>
       </span>
+      <div
+        v-else-if="failure"
+        key="failure"
+        class="history-load-sentinel__feedback history-load-sentinel__failure"
+        role="alert"
+        data-testid="history-load-failure"
+      >
+        <span>{{ failureLabel }}</span>
+        <button
+          v-if="failure.action !== 'none'"
+          type="button"
+          class="history-load-sentinel__action"
+          data-testid="history-load-retry"
+          @click="requestRetry"
+        >
+          {{ failure.action === 'reload-latest' ? t('chat.earlierHistoryFailure.reloadLatest') : t('chat.retry') }}
+        </button>
+      </div>
       <button
-        v-else-if="retryable"
+        v-else-if="hasFailure"
         key="retry"
         type="button"
         class="history-load-sentinel__feedback history-load-sentinel__retry"
@@ -36,18 +54,29 @@
         {{ t('chat.legacyHistoryUnavailable') }}
       </span>
     </Transition>
+    <span
+      v-if="metadataLimited"
+      class="history-load-sentinel__metadata"
+      role="status"
+      data-testid="history-metadata-limited"
+    >
+      {{ t('chat.earlierHistoryFailure.metadataLimited') }}
+    </span>
   </div>
 </template>
 
 <script setup lang="ts">
 import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import { useI18n } from 'vue-i18n'
+import type { HistoryLoadFailure } from '@/utils/chat/historyLoadFailure'
 
 const props = defineProps<{
   scrollContainer: HTMLElement | null
   hasMore: boolean
   loading: boolean
   error: boolean
+  failure?: HistoryLoadFailure | null
+  metadataLimited?: boolean
   canonicalAvailable: boolean | null
   canonicalComplete: boolean | null
   cursor: string | number | null
@@ -62,22 +91,32 @@ const emit = defineEmits<{
 
 const { t } = useI18n()
 const sentinelRef = ref<HTMLElement | null>(null)
-const retryable = computed(() => (
-  props.error
+const hasFailure = computed(() => (
+  Boolean(props.failure) || props.error
   || (props.canonicalAvailable === false && props.canonicalComplete !== true)
 ))
 const busy = computed(() => (
-  props.loading || Boolean(props.blocked && retryable.value)
+  props.loading || Boolean(props.blocked && hasFailure.value)
 ))
 const unavailable = computed(() => (
   !props.hasMore
   && props.canonicalAvailable === true
   && props.canonicalComplete === false
 ))
-const visible = computed(() => props.hasMore || busy.value || retryable.value || unavailable.value)
+const visible = computed(() => props.hasMore || busy.value || hasFailure.value || unavailable.value || props.metadataLimited)
 const idle = computed(() => (
-  props.hasMore && !props.loading && !props.blocked && !retryable.value
+  props.hasMore && !props.loading && !props.blocked && !hasFailure.value
 ))
+const failureLabel = computed(() => {
+  switch (props.failure?.kind) {
+    case 'too-large': return t('chat.earlierHistoryFailure.tooLarge')
+    case 'timeout': return t('chat.earlierHistoryFailure.timeout')
+    case 'busy': return t('chat.earlierHistoryFailure.busy')
+    case 'unavailable': return t('chat.earlierHistoryFailure.unavailable')
+    case 'cursor': return t('chat.earlierHistoryFailure.cursor')
+    default: return t('chat.earlierHistoryFailure.failed')
+  }
+})
 
 let observer: IntersectionObserver | null = null
 let lastAutoCursor = ''
@@ -100,14 +139,14 @@ function requestEarlier() {
     || !props.hasMore
     || props.loading
     || props.blocked
-    || retryable.value
+    || hasFailure.value
   ) return
   lastAutoCursor = key
   emit('loadEarlier')
 }
 
 function requestRetry() {
-  if (retryRequested.value || props.blocked || props.loading) return
+  if (retryRequested.value || props.blocked || props.loading || props.failure?.action === 'none') return
   retryRequested.value = true
   emit('retry')
   void nextTick(() => props.scrollContainer?.focus({ preventScroll: true }))
@@ -141,6 +180,8 @@ watch(
     props.cursor,
     props.sessionKey,
     props.blocked,
+    props.failure,
+    props.metadataLimited,
   ],
   (next, previous) => {
     if (next[6] !== previous?.[6]) retryRequested.value = false
@@ -170,9 +211,11 @@ onBeforeUnmount(disconnect)
   align-items: center;
   color: var(--text-muted);
   display: flex;
+  flex-direction: column;
   font-size: var(--fs-xs);
   justify-content: center;
   margin: 0 auto var(--sp-2);
+  gap: var(--sp-2);
   min-height: 32px;
   width: var(--chat-col, min(calc(100% - 48px), 980px));
 }
@@ -212,6 +255,27 @@ onBeforeUnmount(disconnect)
 
 .history-load-sentinel__retry:hover {
   color: var(--text);
+}
+
+.history-load-sentinel__failure {
+  flex-wrap: wrap;
+  max-width: 100%;
+  text-align: center;
+  white-space: normal;
+}
+
+.history-load-sentinel__action {
+  background: transparent;
+  border: 0;
+  color: var(--text);
+  cursor: pointer;
+  font: inherit;
+  padding: 0;
+  text-decoration: underline;
+}
+
+.history-load-sentinel__metadata {
+  text-align: center;
 }
 
 @keyframes history-load-spin {
