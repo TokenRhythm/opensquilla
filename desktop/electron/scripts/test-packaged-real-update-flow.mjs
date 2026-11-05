@@ -43,8 +43,8 @@ const baselineVersion = process.argv.includes('--baseline-version')
 if (signedHandoff && (!stableVersion.test(baselineVersion) || ['0.5.3', '0.5.4'].includes(baselineVersion))) {
   throw new Error('signed-handoff requires a canonical stable baseline containing the new installer capability; 0.5.3/0.5.4 use manual mode')
 }
-if (!signedHandoff && !['0.5.3', '0.5.4'].includes(baselineVersion)) {
-  throw new Error('--baseline-version must be 0.5.3 or 0.5.4')
+if (!signedHandoff && !['0.5.3', '0.5.4', '0.5.7'].includes(baselineVersion)) {
+  throw new Error('--baseline-version must be 0.5.3, 0.5.4, or 0.5.7')
 }
 if (!stableVersion.test(expectedVersion)) {
   throw new Error('--expected-version must be a canonical stable version')

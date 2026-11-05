@@ -124,8 +124,9 @@ prefix, versioned paths, `latest/` aliases, or `channels/` manifests. OSS
 promotion remains downstream of the canonical GitHub Release and must preserve
 the legacy v1 `releaseUrl` in generated manifests.
 
-Before publishing a final release after the transfer, both official 0.5.3 and
-0.5.4 baselines must pass the Draft upgrade audits on macOS and Windows.
+Before publishing a final release after the transfer, the official 0.5.3 and
+0.5.4 baselines and the previous stable release (0.5.7 for this release) must
+pass the Draft upgrade audits on macOS and Windows.
 Pre-stage immutable assets for those audits, publish only after they pass, and
 advance the moving OSS channels last. An RC must be tested through an in-place
 installer replacement: installed stable builds cannot discover a prerelease as

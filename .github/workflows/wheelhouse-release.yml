@@ -1462,7 +1462,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        baseline-version: ['0.5.3', '0.5.4']
+        baseline-version: ['0.5.3', '0.5.4', '0.5.7']
     steps:
       - name: Checkout release verification helpers
         uses: actions/checkout@v4
@@ -1663,7 +1663,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        baseline-version: ['0.5.3', '0.5.4']
+        baseline-version: ['0.5.3', '0.5.4', '0.5.7']
         install-mode: [default, custom]
     steps:
       - name: Checkout release verification helpers

@@ -401,7 +401,7 @@ def _config_change_summary(expected: str, actual: str) -> str:
 def _upgrade_config_baseline(home: Path, label: str, path: Path, version: str) -> str:
     """Validate the old client's snapshot before trusting it as an upgrade baseline."""
     snapshot = json.loads(path.read_text(encoding="utf-8"))
-    assert version in {"0.5.3", "0.5.4"}, "unsupported upgrade baseline"
+    assert version in {"0.5.3", "0.5.4", "0.5.7"}, "unsupported upgrade baseline"
     assert snapshot["baselineVersion"] == version, "upgrade baseline version differs"
     # Match Path.read_text's universal-newline handling on Windows; the Node
     # snapshot preserves the original CRLF bytes inside its JSON string.
@@ -411,7 +411,7 @@ def _upgrade_config_baseline(home: Path, label: str, path: Path, version: str) -
     # These are the only independently reproduced old-client startup writes.
     # Missing fields may stay absent, but existing values may never be ignored.
     if "config_version" in actual:
-        expected["config_version"] = 1
+        expected["config_version"] = 2 if version == "0.5.7" else 1
     if "control_ui" in actual:
         expected["control_ui"] = {"default_locale": "en"}
     if version == "0.5.4" and "sandbox" in actual:
@@ -583,7 +583,7 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--home", type=Path, required=True)
     parser.add_argument("--label", type=_validated_label, required=True)
     parser.add_argument("--external-root", type=Path)
-    parser.add_argument("--baseline-version", choices=("0.5.3", "0.5.4"))
+    parser.add_argument("--baseline-version", choices=("0.5.3", "0.5.4", "0.5.7"))
     parser.add_argument("--config-baseline", type=Path)
     parser.add_argument("--allow-runtime-config", action="store_true")
     return parser

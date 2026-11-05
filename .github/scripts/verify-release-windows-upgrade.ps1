@@ -13,7 +13,7 @@ param(
   [ValidateSet('custom', 'default')]
   [string]$InstallMode = 'custom',
   [Parameter(ParameterSetName = 'Manual')]
-  [ValidateSet('0.5.3', '0.5.4')]
+  [ValidateSet('0.5.3', '0.5.4', '0.5.7')]
   [string]$BaselineVersion = '0.5.3',
   [Parameter(Mandatory = $true, ParameterSetName = 'Signed')]
   [string]$SignedAuditConfigPath
