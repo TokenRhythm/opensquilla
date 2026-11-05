@@ -170,6 +170,8 @@
           :loading="historyState.loadingEarlier"
           :blocked="historyState.loading"
           :error="historyState.loadEarlierError"
+          :failure="historyState.loadEarlierFailure"
+          :metadata-limited="historyState.metadataLimited"
           :canonical-available="historyState.canonicalAvailable"
           :canonical-complete="historyState.canonicalComplete"
           :cursor="historyState.oldestCursor"

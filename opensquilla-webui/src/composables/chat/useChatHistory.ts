@@ -31,6 +31,7 @@ import {
 import { normalizeTurnOutcome } from '@/utils/chat/turnOutcome'
 import { dedupeTerminalErrorNotices } from '@/utils/chat/terminalErrorNotices'
 import { interleaveHistoryModelCallSegments, interleaveHydratedHistoryModelCallSegments } from '@/utils/chat/historyModelCallSegments'
+import { classifyHistoryLoadFailure, type HistoryLoadFailure } from '@/utils/chat/historyLoadFailure'
 
 export interface UseChatHistoryOptions {
   /** The bootstrap owner supplies the one lease shared with live subscription. */
@@ -69,6 +70,8 @@ export interface ChatHistoryState {
   retrying: boolean
   initialLoadStatus: InitialHistoryLoadStatus
   loadEarlierError: boolean
+  loadEarlierFailure?: HistoryLoadFailure | null
+  metadataLimited?: boolean
   recoveryError: boolean
   sessionMissing: boolean
 }
@@ -154,6 +157,8 @@ export function useChatHistory(options: UseChatHistoryOptions) {
     retrying: false,
     initialLoadStatus: 'pending',
     loadEarlierError: false,
+    loadEarlierFailure: null,
+    metadataLimited: false,
     recoveryError: false,
     sessionMissing: false,
   })
@@ -303,10 +308,21 @@ export function useChatHistory(options: UseChatHistoryOptions) {
     return data.canonicalAvailable
   }
 
+  function responseMetadataLimited(data: SessionReadHistoryPage): boolean {
+    return data.compactionSummaries.some(summary => (
+      summary.additional.summary_text_omitted === 'history_page_budget'
+      || (typeof summary.additional.summary_markers_omitted === 'number'
+        && summary.additional.summary_markers_omitted > 0)
+    )) || data.turnOutcomes.some(outcome => (
+      outcome.additional.activity_snapshot_omitted === 'history_page_budget'
+    ))
+  }
+
   function updateHistoryState(
     data: SessionReadHistoryPage,
     prepend: boolean,
     initialLoadError = false,
+    metadataLimited = responseMetadataLimited(data),
   ) {
     const nextOldestCursor = data.oldestCursor
     const requestedCursor = prepend ? historyState.value.oldestCursor : null
@@ -330,6 +346,8 @@ export function useChatHistory(options: UseChatHistoryOptions) {
         ? historyState.value.initialLoadStatus
         : initialLoadError ? 'error' : 'ready',
       loadEarlierError: false,
+      loadEarlierFailure: null,
+      metadataLimited: metadataLimited || Boolean((prepend || preserveLoadedBoundary) && historyState.value.metadataLimited),
       recoveryError: prepend ? historyState.value.recoveryError : initialLoadError,
       sessionMissing: false,
     }
@@ -359,6 +377,8 @@ export function useChatHistory(options: UseChatHistoryOptions) {
       retrying: false,
       initialLoadStatus: 'pending',
       loadEarlierError: false,
+      loadEarlierFailure: null,
+      metadataLimited: false,
       recoveryError: false,
       sessionMissing: false,
     }
@@ -380,6 +400,7 @@ export function useChatHistory(options: UseChatHistoryOptions) {
       retrying: false,
       initialLoadStatus: 'ready',
       loadEarlierError: false,
+      loadEarlierFailure: null,
       recoveryError: false,
       sessionMissing: true,
     }
@@ -443,6 +464,7 @@ export function useChatHistory(options: UseChatHistoryOptions) {
         retrying: Boolean(params.retry && !params.prepend),
         initialLoadStatus: isInitialLoad ? 'loading' : historyState.value.initialLoadStatus,
         loadEarlierError: false,
+        loadEarlierFailure: null,
         recoveryError: params.prepend ? historyState.value.recoveryError : false,
       }
     }
@@ -519,6 +541,7 @@ export function useChatHistory(options: UseChatHistoryOptions) {
             loadingEarlier: false,
             retrying: false,
             loadEarlierError: false,
+            loadEarlierFailure: null,
             recoveryError: !params.prepend,
           }
           flushPendingHistorySync()
@@ -548,6 +571,7 @@ export function useChatHistory(options: UseChatHistoryOptions) {
       const maintenanceMessages = compactionSummaryMessages(data)
       const installedCompactions = () => maintenanceMessages.flatMap(message => message.maintenance ? [message.maintenance] : [])
       let historyData = data
+      let metadataLimited = responseMetadataLimited(data)
       let bridgeContinuationNeeded = false
       const needsForwardBridge = canonicalAvailable !== false
         && !params.prepend
@@ -560,6 +584,7 @@ export function useChatHistory(options: UseChatHistoryOptions) {
         historyState.value = {
           ...historyState.value,
           loadEarlierError: false,
+          loadEarlierFailure: null,
         }
 
         const anchor = [...previousTranscript]
@@ -606,6 +631,7 @@ export function useChatHistory(options: UseChatHistoryOptions) {
               loadingEarlier: false,
               retrying: false,
               loadEarlierError: false,
+              loadEarlierFailure: null,
               recoveryError: true,
             }
             flushPendingHistorySync()
@@ -613,6 +639,7 @@ export function useChatHistory(options: UseChatHistoryOptions) {
           }
 
           notifyTerminalTasks(bridgeData)
+          metadataLimited ||= responseMetadataLimited(bridgeData)
 
           const page = attachHistoryTurnOutcomes(
             bridgeData.messages.map(message =>
@@ -684,6 +711,7 @@ export function useChatHistory(options: UseChatHistoryOptions) {
         historyData,
         Boolean(params.prepend),
         initialCanonicalLoadFailed,
+        metadataLimited,
       )
       if (params.prepend && params.before != null) {
         hasLoadedEarlier = true
@@ -846,6 +874,7 @@ export function useChatHistory(options: UseChatHistoryOptions) {
             ? 'error'
             : historyState.value.initialLoadStatus,
           loadEarlierError: Boolean(params.prepend),
+          loadEarlierFailure: params.prepend ? classifyHistoryLoadFailure(error) : null,
           recoveryError: !params.prepend,
           sessionMissing: !params.prepend
             && error instanceof SessionReadSessionMissingError,

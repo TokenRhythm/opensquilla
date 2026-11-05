@@ -4350,6 +4350,16 @@
     "loadingEllipsis": "Chargement...",
     "loadingEarlier": "Chargement des messages précédents…",
     "loadEarlierFailedRetry": "Échec du chargement des messages précédents · Réessayer",
+    "earlierHistoryFailure": {
+      "tooLarge": "Les messages précédents dépassent la limite de chargement. De nouvelles tentatives ne permettent pas de charger cette partie de l’historique. Les messages déjà chargés restent disponibles.",
+      "timeout": "Le chargement des messages précédents a expiré. Réessayez.",
+      "busy": "L’historique est temporairement occupé. Réessayez dans un instant.",
+      "unavailable": "Impossible de charger les messages précédents. Vérifiez votre connexion et réessayez.",
+      "cursor": "L’historique de la conversation a changé. Rechargez les derniers messages pour continuer.",
+      "failed": "Impossible de charger les messages précédents. Rouvrez cette conversation. Si le problème persiste, mettez OpenSquilla à jour.",
+      "reloadLatest": "Recharger les derniers messages",
+      "metadataLimited": "Certains résumés ou détails d’activité sont trop volumineux pour être affichés intégralement. Les messages restent disponibles."
+    },
     "legacyHistoryUnavailable": "Les messages originaux précédents n’ont pas été enregistrés par l’ancienne version.",
     "scopeCompacted": "Le contenu plus ancien est représenté par des résumés de session.",
     "scopeLatestWindow": "Affichage de la fenêtre de messages la plus récente.",

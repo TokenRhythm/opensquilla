@@ -4452,6 +4452,16 @@
     "loadingEllipsis": "加载中……",
     "loadingEarlier": "正在加载更早的消息…",
     "loadEarlierFailedRetry": "更早的消息加载失败 · 重试",
+    "earlierHistoryFailure": {
+      "tooLarge": "这部分历史记录超过当前加载上限，重复重试也无法加载。已加载的消息仍可查看。",
+      "timeout": "加载更早的消息超时，请重试。",
+      "busy": "历史记录暂时繁忙，请稍后重试。",
+      "unavailable": "无法加载更早的消息，请检查连接后重试。",
+      "cursor": "会话历史已发生变化，请重新加载最新消息后继续查看。",
+      "failed": "无法加载更早的消息，请重新打开会话；若问题持续，请更新 OpenSquilla。",
+      "reloadLatest": "重新加载最新消息",
+      "metadataLimited": "部分摘要或活动详情过大，无法完整显示。消息记录仍然可用。"
+    },
     "legacyHistoryUnavailable": "更早的原始消息未被旧版本保存",
     "scopeCompacted": "较早的内容已用会话摘要表示。",
     "scopeLatestWindow": "正在显示最新的消息窗口。",

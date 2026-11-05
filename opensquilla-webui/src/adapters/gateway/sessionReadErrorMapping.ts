@@ -20,7 +20,7 @@ export function mapSessionReadError(error: unknown): Error {
   if (code === 'NOT_FOUND' || code === 'SESSION_NOT_FOUND') {
     return new SessionReadSessionMissingError(failure.message, error)
   }
-  if (code === 'HISTORY_CURSOR_INVALID' || code === 'HISTORY_CURSOR_INVALIDATED') {
+  if (code === 'HISTORY_CURSOR_INVALID' || code === 'HISTORY_CURSOR_INVALIDATED' || code === 'HISTORY_STALE') {
     return new SessionReadHistoryCursorError(
       code === 'HISTORY_CURSOR_INVALID' ? 'invalid' : 'stale',
       failure.message,
@@ -29,7 +29,7 @@ export function mapSessionReadError(error: unknown): Error {
   }
   const kind = code === 'REBASE_REQUIRED' || code === 'READ_STALE'
     ? 'rebase-required'
-    : code === 'SNAPSHOT_TOO_LARGE'
+    : code === 'SNAPSHOT_TOO_LARGE' || code === 'RESPONSE_TOO_LARGE'
     ? 'too-large'
     : code === 'RPC_ABORTED' || (error instanceof Error && error.name === 'AbortError')
     ? 'aborted'
@@ -41,7 +41,7 @@ export function mapSessionReadError(error: unknown): Error {
   return new SessionReadFailure(
     kind,
     failure.message,
-    code !== 'SNAPSHOT_TOO_LARGE' && (failure.retryable === true || kind === 'timeout'
+    kind !== 'too-large' && (failure.retryable === true || kind === 'timeout'
       || kind === 'busy' || kind === 'rebase-required' || code === 'SNAPSHOT_EXPIRED' || code === 'SNAPSHOT_STALE' || !code),
     failure.retryAfterMs ?? 0,
     error,

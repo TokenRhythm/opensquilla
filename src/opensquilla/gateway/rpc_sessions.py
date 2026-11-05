@@ -8,6 +8,7 @@ import contextlib
 import hashlib
 import inspect
 import json
+import math
 import re
 import threading
 import time
@@ -5374,6 +5375,119 @@ def _history_page_outcomes(
     ]
 
 
+def _history_page_bytes(result: Mapping[str, Any]) -> int:
+    return len(json.dumps(result, ensure_ascii=False, separators=(",", ":")).encode("utf-8"))
+
+
+def _cap_history_summary_markers(result: dict[str, Any], *, target_bytes: int) -> bool:
+    summaries = result["compaction_summaries"]
+    if len(summaries) < 2:
+        return False
+
+    def timestamp_ms(value: object) -> float:
+        if isinstance(value, bool) or not isinstance(value, int | float):
+            return 0
+        timestamp = float(value)
+        if not math.isfinite(timestamp):
+            return 0
+        # Older summary records may use epoch seconds; current transcript and
+        # summary rows use milliseconds. This only ranks display checkpoints.
+        return timestamp * 1000 if abs(timestamp) < 100_000_000_000 else timestamp
+
+    timestamps = [
+        timestamp_ms(item["message"]["timestamp"])
+        for item in result["items"]
+        if isinstance(item["message"].get("timestamp"), int | float)
+    ]
+    oldest = min(timestamps) if timestamps else None
+    newest = max(timestamps) if timestamps else None
+
+    def priority(index: int) -> tuple[float, float]:
+        timestamp = timestamp_ms(summaries[index].get("created_at"))
+        if oldest is None or newest is None:
+            return -timestamp, -index
+        distance = max(oldest - timestamp, timestamp - newest, 0)
+        return distance, -timestamp
+
+    previously_omitted = sum(
+        value for summary in summaries
+        if isinstance(value := summary.get("summary_markers_omitted"), int) and value > 0
+    )
+    base_bytes = _history_page_bytes({**result, "compaction_summaries": []})
+    nearest = [
+        index for index in sorted(range(len(summaries)), key=priority)
+        if base_bytes + _history_page_bytes({
+            **summaries[index],
+            "summary_markers_omitted": previously_omitted + len(summaries) - 1,
+        }) <= target_bytes
+    ]
+    if not nearest:
+        return False
+
+    def selected(count: int) -> list[dict[str, Any]]:
+        retained = sorted(nearest[:count])
+        values = [
+            {key: value for key, value in summaries[index].items()
+             if key != "summary_markers_omitted"}
+            for index in retained
+        ]
+        values[retained.index(nearest[0])]["summary_markers_omitted"] = (
+            previously_omitted + len(summaries) - count
+        )
+        return values
+
+    # Keep a real checkpoint identity so old clients retain their ordinary
+    # maintenance row and newer clients can explain omitted display metadata.
+    result["compaction_summaries"] = selected(1)
+    if _history_page_bytes(result) > target_bytes:
+        result["compaction_summaries"] = summaries
+        return False
+    lower, upper = 1, len(nearest)
+    while lower < upper:
+        middle = (lower + upper + 1) // 2
+        result["compaction_summaries"] = selected(middle)
+        if _history_page_bytes(result) <= target_bytes:
+            lower = middle
+        else:
+            upper = middle - 1
+    result["compaction_summaries"] = selected(lower)
+    return True
+
+
+def _reduce_history_page_metadata(result: dict[str, Any], *, target_bytes: int) -> bool:
+    """Let one transcript item progress when optional display metadata cannot fit.
+
+    The dictionaries belong to this response; stored summaries, snapshots and
+    terminal outcomes retain their full representation. Normal pages never
+    enter this fallback, including pages split between complete turn snapshots.
+    """
+
+    if _history_page_bytes(result) <= target_bytes:
+        return True
+    for summary in result["compaction_summaries"]:
+        if summary.get("summary_text"):
+            summary["summary_text"] = ""
+            summary["summary_text_omitted"] = "history_page_budget"
+    if _history_page_bytes(result) <= target_bytes:
+        return True
+    if _cap_history_summary_markers(result, target_bytes=target_bytes):
+        return True
+
+    snapshots = sorted(
+        (outcome for outcome in result["turn_outcomes"] if "activity_snapshot" in outcome),
+        key=lambda outcome: _history_page_bytes(outcome["activity_snapshot"]),
+        reverse=True,
+    )
+    for outcome in snapshots:
+        outcome.pop("activity_snapshot")
+        outcome["activity_snapshot_omitted"] = "history_page_budget"
+        if _history_page_bytes(result) <= target_bytes:
+            return True
+        if _cap_history_summary_markers(result, target_bytes=target_bytes):
+            return True
+    return False
+
+
 def _bound_projected_history_page(
     result: dict[str, Any], params: dict, *, key: str,
 ) -> None:
@@ -5384,10 +5498,10 @@ def _bound_projected_history_page(
     items = result["items"]
     candidate_turn_ids = _history_page_turn_ids(items)
     outcomes = result["turn_outcomes"]
-    while (
-        len(json.dumps(result, ensure_ascii=False, separators=(",", ":")).encode()) > target_bytes
-    ):
+    while _history_page_bytes(result) > target_bytes:
         if len(items) <= 1:
+            if _reduce_history_page_metadata(result, target_bytes=target_bytes):
+                return
             raise RpcHandlerError(
                 "RESPONSE_TOO_LARGE", "History metadata exceeds the requested page byte budget",
                 accepted=False,
@@ -5508,8 +5622,10 @@ async def _read_sessions_history_page_v2(
         "canonical_available": bool(legacy.get("canonical_available", False)),
         "canonical_complete": bool(legacy.get("canonical_complete", False)),
         "history_scope": legacy.get("history_scope", "latest_window"),
-        "compaction_summaries": legacy.get("compaction_summaries", []),
-        "turn_outcomes": legacy.get("turn_outcomes", []),
+        "compaction_summaries": [
+            dict(summary) for summary in legacy.get("compaction_summaries", [])
+        ],
+        "turn_outcomes": [dict(outcome) for outcome in legacy.get("turn_outcomes", [])],
     }
 
     def boundary(item: Mapping[str, Any], edge: str) -> str:
@@ -5573,7 +5689,12 @@ async def _read_sessions_history_page_v2(
             ).encode("utf-8")
         )
         if overhead + item_bytes + encoded_size + candidate_count - 1 > target_bytes:
-            break
+            if bounded:
+                break
+            candidate = {**result, "items": [item], "turn_outcomes": next_outcomes}
+            if not _reduce_history_page_metadata(candidate, target_bytes=target_bytes):
+                break
+            result["compaction_summaries"] = candidate["compaction_summaries"]
         bounded.append(item)
         retained_turn_ids = next_turn_ids
         result["turn_outcomes"] = next_outcomes
@@ -5615,9 +5736,8 @@ async def _read_sessions_history_page_v2(
             session_id, session_epoch,
         ):
             raise RpcHandlerError('REBASE_REQUIRED', 'Session identity changed', accepted=False)
-    if (
-        len(json.dumps(result, ensure_ascii=False, separators=(",", ":")).encode("utf-8"))
-        > target_bytes
+    if _history_page_bytes(result) > target_bytes and not _reduce_history_page_metadata(
+        result, target_bytes=target_bytes,
     ):
         raise RpcHandlerError(
             "RESPONSE_TOO_LARGE",
