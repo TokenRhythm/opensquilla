@@ -411,6 +411,7 @@ class Backend:
             ALIYUN_OSS_PREFIX_NORMALIZED="releases",
             OSS_ENDPOINT="https://oss-cn-beijing.aliyuncs.com",
             OSS_ADDRESSING_STYLE_NORMALIZED="virtual",
+            OPENSQUILLA_ALLOW_IMMUTABLE_REPAIR="1",
         )
         helper = Path(__file__).with_name("prestage-release-to-oss.sh")
         self.run(["bash", str(helper), str(folder), TAG], environment=environment, stream=True)
