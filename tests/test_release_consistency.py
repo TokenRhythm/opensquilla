@@ -1055,6 +1055,8 @@ def test_release_workflow_prestages_draft_without_advancing_channels() -> None:
     assert "verify_immutable_object" in script
     assert "--parallel 64" in script
     assert "--copy-source" in script
+    assert '"${repair_mode}" == "1" && "${source_size}" -ge 8388608' in script
+    assert '"${source_path}" "${dest_prefix}/${name}"' in script
     assert ".upload-staging/" in script
     assert "OPENSQUILLA_ALLOW_IMMUTABLE_REPAIR" in script
     assert "Immutable repair mode is restricted to v0.5.8" in script
