@@ -557,7 +557,12 @@ export class TokenRhythmAccount {
         // Only an explicit exchange can leave this offer. A restored session,
         // polling, or key repair cannot create an activation request.
         this.offerPrimaryActivation()
-        this.publish({ status: 'signed_in', profile, errorCode: null })
+        // Restoring a profile after bridge invalidation does not restore its
+        // model lease. Publish readiness only after ensureKey recreates it.
+        this.publish({
+          status: 'signed_in', profile, errorCode: null,
+          keyStatus: this.lease ? this.state.keyStatus : 'loading',
+        })
         await Promise.all([this.refreshWallet(epoch), this.ensureKey(epoch)])
         if (epoch === this.epoch && !this.admissionClosed && this.saved.recoveryPending && this.state.keyStatus === 'ready') {
           // The old binding was encrypted with the lost key. Explicit recovery

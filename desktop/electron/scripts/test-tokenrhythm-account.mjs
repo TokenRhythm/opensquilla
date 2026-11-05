@@ -232,6 +232,77 @@ test('scheduled and manual wallet refreshes retain balances and only mark real f
 })
 test('refresh is singleflight and atomically persisted',async t=>{const f=await fixture(t);await f.login();f.advance(40_000);await Promise.all([f.account.verify(true),f.account.verify(true),f.account.verify(true)]);assert.equal(f.refreshes,1);assert.ok(f.deps.decrypt(await readFile(join(f.directory,'account.enc'),'utf8')).includes('refresh-a-1'))})
 test('network loss keeps login but closes model authorization',async t=>{const f=await fixture(t);await f.login();await f.account.selectSource('account');const old=(await f.account.runtimeState()).credential;f.env.offline=true;await f.account.verify(true);assert.equal(f.account.snapshot().status,'unverified');await assert.rejects(()=>f.account.modelCredential(old));f.env.offline=false;await f.account.verify(true);assert.notEqual((await f.account.runtimeState()).credential,old)})
+test('account recovery waits for a new bridge lease before publishing model readiness', async t => {
+ let holdKey = false, releaseKey
+ const f = await fixture(t, { beforeFetch: async url => {
+  if (holdKey && new URL(url).pathname.endsWith('/managed-key')) {
+   await new Promise(resolve => { releaseKey = resolve })
+  }
+ } })
+ await f.login()
+ await f.account.selectSource('account')
+ const oldLease = (await f.account.runtimeState()).credential
+ assert.ok(oldLease)
+ f.env.offline = true
+ await f.account.verify(true)
+ assert.equal(f.account.snapshot().status, 'unverified')
+
+ const events = []
+ f.deps.onState = state => events.push(state)
+ f.env.offline = false
+ holdKey = true
+ const recovering = f.account.verify(true)
+ try {
+  await until(() => Boolean(releaseKey))
+  const pending = f.account.snapshot()
+  assert.equal(pending.status, 'signed_in')
+  assert.equal(pending.keyStatus === 'ready', false)
+  assert.ok(events.every(state => state.status !== 'signed_in' || state.keyStatus !== 'ready'))
+  const runtime = await f.account.runtimeState()
+  assert.equal(runtime.ready, false)
+  assert.equal(Boolean(runtime.credential), false)
+ } finally {
+  holdKey = false
+  releaseKey?.()
+  await recovering
+ }
+ const recovered = f.account.snapshot()
+ const runtime = await f.account.runtimeState()
+ assert.equal(recovered.status, 'signed_in')
+ assert.equal(recovered.keyStatus, 'ready')
+ assert.equal(runtime.ready, true)
+ assert.ok(runtime.credential)
+ assert.notEqual(runtime.credential, oldLease)
+ assert.equal(events.at(-1).keyStatus, 'ready')
+})
+test('account revalidation preserves model readiness while its bridge lease remains valid', async t => {
+ let holdKey = false, releaseKey
+ const f = await fixture(t, { beforeFetch: async url => {
+  if (holdKey && new URL(url).pathname.endsWith('/managed-key')) {
+   await new Promise(resolve => { releaseKey = resolve })
+  }
+ } })
+ await f.login()
+ await f.account.selectSource('account')
+ const lease = (await f.account.runtimeState()).credential
+ const events = []
+ f.deps.onState = state => events.push(state)
+ f.advance(60_000)
+ holdKey = true
+ const refreshing = f.account.verify()
+ try {
+  await until(() => Boolean(releaseKey))
+  const runtime = await f.account.runtimeState()
+  assert.equal(runtime.ready, true)
+  assert.equal(runtime.credential, lease)
+ } finally {
+  holdKey = false
+  releaseKey?.()
+  await refreshing
+ }
+ assert.ok(events.length > 0)
+ assert.ok(events.every(state => state.status === 'signed_in' && state.keyStatus === 'ready'))
+})
 test('logout preserves old binding, revokes only old session, and isolates video jobs',async t=>{const f=await fixture(t);await f.login();await f.account.selectSource('account');const lease=(await f.account.runtimeState()).credential;await f.account.recordVideoJob('video-a',lease);assert.ok(f.account.ownsVideoJob('video-a'));f.env.offline=true;await f.account.logout();assert.equal(f.account.snapshot().status,'signed_out');assert.equal(f.account.snapshot().source,'account');assert.equal(f.account.snapshot().selectedAccountId,'a');assert.equal(f.account.snapshot().pendingRevocation,true);await assert.rejects(()=>f.account.modelCredential(lease));f.env.offline=false;f.setIdentity('b');await f.login();assert.equal(f.account.snapshot().selectedAccountId,'a');assert.equal(f.account.ownsVideoJob('video-a'),false);const revoked=f.calls.filter(c=>c.path.endsWith('/session'));assert.ok(revoked.some(c=>c.headers.Authorization==='Bearer access-a'));assert.ok(!revoked.some(c=>c.headers.Authorization==='Bearer access-b'))})
 test('credential save failure cannot enable models',async t=>{const f=await fixture(t,{storageFailure:true});try {await f.login();assert.equal(f.account.snapshot().profile,null);await assert.rejects(()=>f.account.selectSource('account'))} finally {f.env.storageFailure=false}})
 test('storage failure on restore cannot silently select manual credentials',async t=>{const f=await fixture(t);await f.login();await f.account.selectSource('account');f.env.secure=false;const restored=new TokenRhythmAccount(f.deps);t.after(()=>restored.close());await restored.initialize();assert.equal(restored.snapshot().status,'storage_unavailable');assert.equal((await restored.runtimeState()).source,'account');await assert.rejects(()=>restored.login())})
