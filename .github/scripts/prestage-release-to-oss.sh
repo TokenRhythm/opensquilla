@@ -144,6 +144,25 @@ put_immutable_object() {
   )
   source_path="$(realpath -- "${source}")"
   source_size="$(wc -c < "${source_path}")"
+  if [[ "${repair_mode}" == "1" && "${source_size}" -ge 8388608 ]]; then
+    # The repair workflow has already verified the exact GitHub bytes and
+    # created the allow-listed delete marker under the shared writer lock.
+    # Upload the large object directly with ossutil's multipart writer so the
+    # new version becomes the latest target object; the normal release path
+    # retains its staged copy-object commit and write-once checks.
+    echo "Uploading repaired multipart object directly: ${name} (${source_size} bytes)"
+    "${ossutil_bin}" cp \
+      --force \
+      --addressing-style "${OSS_ADDRESSING_STYLE_NORMALIZED}" \
+      --parallel 64 \
+      --part-size 262144 \
+      --bigfile-threshold 8388608 \
+      --read-timeout 30 \
+      --retry-times 3 \
+      --cache-control "${versioned_cache_control}" \
+      "${source_path}" "${dest_prefix}/${name}"
+    return 0
+  fi
   if (( source_size >= 8388608 )); then
     staging_key="${ALIYUN_OSS_PREFIX_NORMALIZED}/.upload-staging/${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}/${name}"
     staging_object="oss://${ALIYUN_OSS_BUCKET}/${staging_key}"
