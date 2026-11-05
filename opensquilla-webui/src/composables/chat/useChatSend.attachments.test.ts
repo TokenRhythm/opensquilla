@@ -1162,6 +1162,78 @@ describe('useChatSend durable application lifetime integration', () => {
   })
 })
 
+describe('explicit replay late acceptance view isolation', () => {
+  const replay = (h: ReturnType<typeof makeOptions>, kind: 'regenerate' | 'usage') => kind === 'regenerate'
+    ? h.api.sendRegeneratedInput({ text: '/reset', attachments: [], forkBeforeMessageId: 'usage-primary' }, () => true)
+    : h.api.sendUsageBarrierReplay({ text: '/reset', forkBeforeMessageId: 'usage-primary' })
+
+  it.each(['regenerate', 'usage'] as const)('keeps the current %s projection and accepted handoff working', async kind => {
+    const h = makeOptions({ messages: ref(usageReplayMessages()), inputText: ref('unrelated draft') })
+    h.rpc.call.mockResolvedValue({ sessionKey: 'agent:main:webchat:accepted-child',
+      task_id: 'accepted-task', user_message_id: 'accepted-user' })
+    expect(await replay(h, kind)).toBe(true)
+    expect(h.options.messages.value).toEqual([expect.objectContaining({ messageId: 'accepted-user', text: '/reset' })])
+    expect(h.options.adoptResponseSession).toHaveBeenCalledWith('agent:main:webchat:accepted-child', expect.any(String))
+    expect(h.options.inputText.value).toBe('unrelated draft')
+  })
+
+  it.each((['regenerate', 'usage'] as const).flatMap(kind =>
+    (['other-session', 'session-roundtrip', 'identity-roundtrip'] as const).map(change => ({ kind, change })),
+  ))('preserves the newer visible history on late $kind acceptance after $change', async ({ kind, change }) => {
+    const wal = memoryDeliveryWal()
+    const identity = ref('synthetic-identity')
+    const h = makeOptions({ messages: ref(usageReplayMessages()), pendingInputWal: wal,
+      deliveryIdentity: identity, inputText: ref('unrelated draft') })
+    let accept!: (response: unknown) => void
+    h.rpc.call.mockImplementationOnce(() => new Promise(resolve => { accept = resolve }))
+    const sending = replay(h, kind)
+    await vi.waitFor(() => expect(h.rpc.call).toHaveBeenCalledOnce())
+    const originalKey = h.options.sessionKey.value
+    const requestId = h.rpc.call.mock.calls[0]![1].clientRequestId
+    if (change === 'identity-roundtrip') {
+      identity.value = 'another-identity'
+      identity.value = 'synthetic-identity'
+    } else {
+      h.options.sessionKey.value = 'agent:main:webchat:existing-full-fork'
+      if (change === 'session-roundtrip') h.options.sessionKey.value = originalKey
+    }
+    // Full-transcript forks retain inherited message ids. A different view
+    // may therefore contain the exact same anchor without owning this send.
+    h.options.messages.value = [...usageReplayMessages(), {
+      role: 'user', text: 'work in the newly loaded view', ts: null, messageId: 'new-view-only',
+    }]
+    const current = h.options.messages.value
+    accept({ sessionKey: 'agent:main:webchat:accepted-child', task_id: 'accepted-task', user_message_id: 'accepted-user' })
+    expect(await sending).toBe(true)
+    expect(h.options.messages.value).toBe(current)
+    expect(h.options.messages.value[h.options.messages.value.length - 1]?.messageId).toBe('new-view-only')
+    expect(h.options.inputText.value).toBe('unrelated draft')
+    // Rejecting a stale UI projection must never lose the durable receipt.
+    expect(await wal.getDelivery!(requestId)).toMatchObject({ phase: 'accepted',
+      response: { sessionKey: 'agent:main:webchat:accepted-child' } })
+    expect(h.rpc.call).toHaveBeenCalledOnce()
+  })
+
+  it.each(['regenerate', 'usage'] as const)('does not truncate another full fork on a late accepted %s error', async kind => {
+    const h = makeOptions({ messages: ref(usageReplayMessages()) })
+    let reject!: (error: unknown) => void
+    h.rpc.call.mockImplementationOnce(() => new Promise((_resolve, fail) => { reject = fail }))
+    const sending = replay(h, kind)
+    await vi.waitFor(() => expect(h.rpc.call).toHaveBeenCalledOnce())
+    h.options.sessionKey.value = 'agent:main:webchat:existing-full-fork'
+    h.options.messages.value = [...usageReplayMessages(), {
+      role: 'user', text: 'new view', ts: null, messageId: 'new-view-only',
+    }]
+    const current = h.options.messages.value
+    reject(Object.assign(new Error('synthetic accepted queue error'), { code: 'QUEUE_FULL_DIRTY',
+      accepted: true, retryable: false,
+      details: { session_key: 'agent:main:webchat:accepted-child', orphan_message_id: 'accepted-user' } }))
+    expect(await sending).toBe(true)
+    expect(h.options.messages.value).toBe(current)
+    expect(h.options.messages.value[h.options.messages.value.length - 1]?.messageId).toBe('new-view-only')
+  })
+})
+
 describe('useChatSend dedicated usage-barrier replay', () => {
   it('atomically admits only one of two cross-tab clicks for the same barrier', async () => {
     const pendingInputWal = memoryHandoffWal()
@@ -4212,7 +4284,7 @@ describe('useChatSend attachment payloads', () => {
       sanitizeCopyText: text => text,
       stripTimePrefix: text => text,
       autoResizeTextarea: vi.fn(),
-      sendCurrentInput: vi.fn(),
+      sendRegeneratedInput: vi.fn(async () => false),
       sendUsageBarrierReplay: vi.fn(async () => false),
       focusComposer: vi.fn(),
       pendingForkBeforeMessageId,

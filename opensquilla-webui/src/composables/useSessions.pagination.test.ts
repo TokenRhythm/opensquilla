@@ -375,6 +375,41 @@ describe('useSessions pagination', () => {
     errorLog.mockRestore()
   })
 
+  it('keeps existing rows and the same retry cursor while logging redacted storage-busy details', async () => {
+    const errorLog = vi.spyOn(console, 'error').mockImplementation(() => {})
+    const error = Object.assign(new Error('private message must not be logged'), {
+      code: 'STORAGE_BUSY', retry_after_ms: 100,
+      details: {
+        operation: 'session_titles', stage: 'permit',
+        resource: 'session_storage_recovery_read_pool', waited_ms: 2000,
+        session_id: 'private-session', params: { message: 'private message' },
+      },
+    })
+    const { call, sessions } = setup([
+      { sessions: rows(0, 2), has_more: true, next_cursor: 'same-cursor' },
+      Promise.reject(error),
+      { sessions: rows(2, 3), has_more: false, next_cursor: null },
+    ])
+    await sessions.loadSessions()
+    const previous = sessions.sessionsList.value
+    await sessions.loadMoreSessions()
+    expect(sessions.sessionsList.value).toBe(previous)
+    expect(sessions.loadMoreError.value).toBe(true)
+    expect(sessions.hasMore.value).toBe(true)
+    expect(call).toHaveBeenCalledTimes(2)
+    expect(errorLog).toHaveBeenCalledExactlyOnceWith('[useSessions] session directory next-page error:', {
+      code: 'STORAGE_BUSY', operation: 'session_titles', stage: 'permit',
+      resource: 'session_storage_recovery_read_pool', waited_ms: 2000, retry_after_ms: 100,
+    })
+    await sessions.loadMoreSessions()
+    expect(sessions.sessionsList.value).toHaveLength(3)
+    expect(sessions.loadMoreError.value).toBe(false)
+    expect(call).toHaveBeenCalledTimes(3)
+    expect(call.mock.calls.slice(1).map(([, params]) => params?.cursor))
+      .toEqual(['same-cursor', 'same-cursor'])
+    errorLog.mockRestore()
+  })
+
   it('discards a late append after refresh resets the traversal', async () => {
     const latePage = deferred<SessionPageFixture>()
     const { call, sessions } = setup([

@@ -19,6 +19,11 @@ const page = (title: string, runStatus = 'idle') => ({
 
 const titleReadBusy = () => Object.assign(new Error('Session storage is busy'), {
   code: 'STORAGE_BUSY', retryable: true, retry_after_ms: 100, accepted: false,
+  details: {
+    operation: 'session_titles', stage: 'deadline',
+    resource: 'session_storage_recovery_read_pool', waited_ms: 2000,
+    session_id: 'private-session-must-not-be-logged',
+  },
 })
 
 function setup(initiallyAvailable = false) {
@@ -517,7 +522,7 @@ describe('App automatic RPC lifecycle with the real directory adapter', () => {
   })
 
   it('recovers cold-start title storage contention without publishing fallback names or waiting for another event', async () => {
-    vi.spyOn(console, 'error').mockImplementation(() => {})
+    const errorLog = vi.spyOn(console, 'error').mockImplementation(() => {})
     const app = setup(true)
     app.request.mockRejectedValueOnce(titleReadBusy())
       .mockResolvedValueOnce(page('First user message title'))
@@ -527,6 +532,10 @@ describe('App automatic RPC lifecycle with the real directory adapter', () => {
     expect(app.sessions.sessionsList.value).toEqual([])
     expect(app.sessions.sessionListError.value).toBe(true)
     expect(app.sessions.isLoading.value).toBe(false)
+    expect(errorLog).toHaveBeenCalledExactlyOnceWith('[useSessions] session directory error:', {
+      code: 'STORAGE_BUSY', operation: 'session_titles', stage: 'deadline',
+      resource: 'session_storage_recovery_read_pool', waited_ms: 2000, retry_after_ms: 100,
+    })
     await vi.advanceTimersByTimeAsync(499)
     expect(app.request).toHaveBeenCalledOnce()
     await vi.advanceTimersByTimeAsync(1)
