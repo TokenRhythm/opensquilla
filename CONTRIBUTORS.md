@@ -26,6 +26,22 @@ trailers.
 | [@ab2ence](https://github.com/ab2ence) | macOS Seatbelt backend execution, denial escalation, and release-candidate type-check cleanup. | [#46](https://github.com/opensquilla/opensquilla/pull/46), [`fb1e6225`](https://github.com/opensquilla/opensquilla/pull/46/commits/fb1e6225e4db9cb0801ea347a89c2066e3e0601b), [`f73ac3eb`](https://github.com/opensquilla/opensquilla/pull/46/commits/f73ac3eb0044c64c79cfd18f9ec03d1bba9128ff), [`cf3b046f`](https://github.com/opensquilla/opensquilla/pull/46/commits/cf3b046f42a42efc951320b0af80e9d066dcf7d2) |
 | [@kimjune01](https://github.com/kimjune01) | Provider stream timeout cleanup fix that prevents double-closing provider streams. | [#46](https://github.com/opensquilla/opensquilla/pull/46), [`06e3126d`](https://github.com/opensquilla/opensquilla/pull/46/commits/06e3126d8ebda4ad4cf349ca7be0d0804e0c008d) |
 
+## OpenSquilla 0.5.8
+
+Thanks to the maintainers and community contributors whose work is included
+since 0.5.7. Historical attribution below remains unchanged.
+
+| Contributor | 0.5.8 contribution | Evidence |
+| --- | --- | --- |
+| [@LiuXinchen1997](https://github.com/LiuXinchen1997) | Refresh local intent classification and model-tier routing. | [#2020](https://github.com/TokenRhythm/opensquilla/pull/2020), [#2043](https://github.com/TokenRhythm/opensquilla/pull/2043), [#2051](https://github.com/TokenRhythm/opensquilla/pull/2051), [#2052](https://github.com/TokenRhythm/opensquilla/pull/2052) |
+| [@angri450](https://github.com/angri450) | Improve tool-detail scrolling and preserve running-turn order above queued follow-ups. | [#1985](https://github.com/TokenRhythm/opensquilla/pull/1985), [#1986](https://github.com/TokenRhythm/opensquilla/pull/1986) |
+| [@fengchen122123-sudo](https://github.com/fengchen122123-sudo) | Synchronize translated README capability and installation guidance. | [#2001](https://github.com/TokenRhythm/opensquilla/pull/2001) |
+| [@hejie905205173](https://github.com/hejie905205173) | Add Desktop TokenRhythm account sign-in, balance, and account-backed model and media access. | [#2008](https://github.com/TokenRhythm/opensquilla/pull/2008) |
+| [@lihongguang-0014](https://github.com/lihongguang-0014) | Improve compaction, long-session history pagination, and image routing continuity. | [#2007](https://github.com/TokenRhythm/opensquilla/pull/2007), [#2048](https://github.com/TokenRhythm/opensquilla/pull/2048), [#2055](https://github.com/TokenRhythm/opensquilla/pull/2055) |
+| [@mirzasnowy](https://github.com/mirzasnowy) | Make CLI tables adapt to terminal width while preserving complete values. | [#2012](https://github.com/TokenRhythm/opensquilla/pull/2012) |
+| [@pcbeingused333](https://github.com/pcbeingused333) | Mark incomplete activity snapshots and keep historical activity ordering accurate. | [#1958](https://github.com/TokenRhythm/opensquilla/pull/1958) |
+| [@xh123637](https://github.com/xh123637) | Support adaptive thinking and fixed-sampling requests for newer Claude models. | [#2030](https://github.com/TokenRhythm/opensquilla/pull/2030) |
+
 ## OpenSquilla 0.5.7
 
 Thanks to the maintainers and community contributors whose work is included

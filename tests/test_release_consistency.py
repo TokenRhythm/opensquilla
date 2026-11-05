@@ -15,8 +15,8 @@ from pathlib import Path
 import pytest
 import yaml
 
-CURRENT_VERSION = "0.5.7"
-CURRENT_DESKTOP_VERSION = "0.5.7"
+CURRENT_VERSION = "0.5.8"
+CURRENT_DESKTOP_VERSION = "0.5.8"
 CURRENT_TAG = f"v{CURRENT_VERSION}"
 HISTORICAL_PREVIEW_VERSION = "0.2.0rc1"
 HISTORICAL_PREVIEW_TAG = f"v{HISTORICAL_PREVIEW_VERSION}"
@@ -366,7 +366,7 @@ def test_release_profile_config_diagnostics_omit_values(
     assert parsed["actual_text_sha256"] != parsed["expected_text_sha256"]
 
 
-@pytest.mark.parametrize("version", ["0.5.3", "0.5.4"])
+@pytest.mark.parametrize("version", ["0.5.3", "0.5.4", "0.5.7"])
 @pytest.mark.parametrize("started", [False, True])
 def test_upgrade_config_snapshot_preserves_known_old_startup_only(
     tmp_path: Path, version: str, started: bool,
@@ -378,6 +378,8 @@ def test_upgrade_config_snapshot_preserves_known_old_startup_only(
     config = probe["_config_text"](home, label)
     if started:
         config = probe["_runtime_config_text"](home)
+        if version == "0.5.7":
+            config = config.replace("config_version = 1", "config_version = 2")
         if version == "0.5.4":
             config += '\n[sandbox]\nrun_mode = "full"\n'
     (home / "config.toml").write_text(config, encoding="utf-8")
@@ -395,7 +397,10 @@ def test_upgrade_config_snapshot_preserves_known_old_startup_only(
             probe["_verify_runtime_config"](config, candidate)
     else:
         (home / "config.toml").write_text(candidate, encoding="utf-8")
-        with pytest.raises(AssertionError, match="config.toml changed"):
+        if candidate != config:
+            with pytest.raises(AssertionError, match="config.toml changed"):
+                probe["verify_profile"](home, label, **options)
+        else:
             probe["verify_profile"](home, label, **options)
         probe["verify_profile"](home, label, allow_runtime_config=True, **options)
     # No config exemption may bypass the existing identity/data checks.
@@ -429,6 +434,31 @@ def test_upgrade_baseline_rejects_protected_mutations(
     snapshot.write_text(json.dumps({"baselineVersion": "0.5.4", "config": changed}))
     with pytest.raises(AssertionError, match="protected config"):
         probe["_upgrade_config_baseline"](home, label, snapshot, "0.5.4")
+
+
+@pytest.mark.parametrize("mutation", [
+    ("config_version = 2", "config_version = 1"),
+    ("config_version = 2", "config_version = 3"),
+    ('model = "opensquilla-release-session-recovery-smoke"', 'model = "wrong"'),
+    ('default_locale = "en"', 'default_locale = "zh-Hans"'),
+    ("enabled = false", "enabled = true"),
+])
+def test_previous_stable_baseline_rejects_protected_startup_mutations(
+    tmp_path: Path, mutation: tuple[str, str],
+) -> None:
+    probe = runpy.run_path(".github/scripts/verify-release-profile-preservation.py")
+    home = tmp_path / "profile"
+    label = "previous-stable-baseline"
+    original = probe["_runtime_config_text"](home).replace(
+        "config_version = 1", "config_version = 2",
+    )
+    snapshot = tmp_path / "baseline.json"
+    snapshot.write_text(json.dumps({
+        "baselineVersion": "0.5.7", "config": original.replace(*mutation),
+    }))
+
+    with pytest.raises(AssertionError, match="protected config"):
+        probe["_upgrade_config_baseline"](home, label, snapshot, "0.5.7")
 
 
 def test_downloaded_upgrade_audits_upload_failure_diagnostics_only() -> None:
@@ -1555,7 +1585,7 @@ def test_current_release_notes_cover_upgrade_and_containers() -> None:
     assert "Supported database migrations run automatically" in normalized
     assert f"No Windows Portable assets are published for {CURRENT_VERSION}" in notes
     assert f"{CURRENT_VERSION} Portable zip" in notes
-    assert "## Upgrading from 0.5.6" in notes
+    assert "## Upgrading from 0.5.7" in notes
     assert "Upgrading from 0.5.5 or earlier" in notes
     assert "must not\n> uninstall that build first" in notes
     assert r"%APPDATA%\OpenSquilla" in notes
@@ -1566,6 +1596,8 @@ def test_current_release_notes_cover_upgrade_and_containers() -> None:
     )
     assert "Ordinary channel authoring is unavailable on Windows" in normalized
     assert "Node.js 22.12+" in notes
+    assert "legacy_v4_phase3" in notes
+    assert "lightgbm_model_dir" in notes
     for asset in ("OpenSquilla-mac-arm64.dmg", "OpenSquilla-win-x64.exe"):
         assert (
             "https://opensquilla-releases.oss-cn-beijing.aliyuncs.com/releases/latest/"

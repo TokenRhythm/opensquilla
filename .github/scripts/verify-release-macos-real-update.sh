@@ -7,8 +7,8 @@ if [[ "$#" -lt 2 || "$#" -gt 3 ]]; then
 fi
 
 baseline_version="${3-0.5.3}"
-if [[ "${baseline_version}" != "0.5.3" && "${baseline_version}" != "0.5.4" ]]; then
-  echo "baseline version must be 0.5.3 or 0.5.4" >&2
+if [[ "${baseline_version}" != "0.5.3" && "${baseline_version}" != "0.5.4" && "${baseline_version}" != "0.5.7" ]]; then
+  echo "baseline version must be 0.5.3, 0.5.4, or 0.5.7" >&2
   exit 2
 fi
 channel_manifest="$(cd "$(dirname "$1")" && pwd)/$(basename "$1")"

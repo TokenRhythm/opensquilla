@@ -709,14 +709,14 @@ def test_packaged_recovery_preserves_original_failure_after_cleanup(
         )
 
 
-def test_downloaded_release_audits_cover_both_official_baselines() -> None:
+def test_downloaded_release_audits_cover_legacy_and_previous_stable_baselines() -> None:
     workflow = yaml.safe_load(
         (ROOT / ".github/workflows/wheelhouse-release.yml").read_text(encoding="utf-8")
     )
     jobs = workflow["jobs"]
     for platform in ("macos", "windows"):
         audit = jobs[f"audit-downloaded-{platform}-release"]
-        assert audit["strategy"]["matrix"]["baseline-version"] == ["0.5.3", "0.5.4"]
+        assert audit["strategy"]["matrix"]["baseline-version"] == ["0.5.3", "0.5.4", "0.5.7"]
         assert audit["strategy"]["fail-fast"] is False
         assert audit["needs"] == "prestage-draft-updater-assets"
         updater_steps = [
@@ -750,7 +750,9 @@ def test_macos_workflow_helpers_are_executable() -> None:
 @pytest.mark.parametrize(
     "script", ["verify-release-macos-upgrade.sh", "verify-release-macos-real-update.sh"]
 )
-@pytest.mark.parametrize("baseline", ["", "0.5.2", "0.5.4rc1", "../0.5.4", "0.5.4;false"])
+@pytest.mark.parametrize(
+    "baseline", ["", "0.5.2", "0.5.6", "0.5.4rc1", "../0.5.4", "0.5.4;false"]
+)
 def test_macos_helpers_reject_unsupported_baseline_before_side_effects(
     tmp_path: Path, script: str, baseline: str
 ) -> None:
@@ -764,12 +766,12 @@ def test_macos_helpers_reject_unsupported_baseline_before_side_effects(
         timeout=10,
     )
     assert result.returncode == 2
-    assert "baseline version must be 0.5.3 or 0.5.4" in result.stderr
+    assert "baseline version must be 0.5.3, 0.5.4, or 0.5.7" in result.stderr
     assert not sandbox.exists()
 
 
 @pytest.mark.skipif(os.name == "nt", reason="macOS Bash helper validation runs on POSIX hosts")
-@pytest.mark.parametrize("baseline", [None, "0.5.3", "0.5.4"])
+@pytest.mark.parametrize("baseline", [None, "0.5.3", "0.5.4", "0.5.7"])
 def test_macos_download_selects_exact_official_baseline(
     tmp_path: Path, baseline: str | None
 ) -> None:
@@ -1073,13 +1075,16 @@ def _run_rehearsal_driver(
     )
 
 
-@pytest.mark.parametrize("baseline", [None, "0.5.3", "0.5.4"])
+@pytest.mark.parametrize("baseline", [None, "0.5.3", "0.5.4", "0.5.7"])
 @pytest.mark.ci_serial
 def test_rehearsal_driver_accepts_selected_baseline(
     rehearsal_driver: tuple[str, Path], baseline: str | None
 ) -> None:
     selected = baseline or "0.5.3"
-    result = _run_rehearsal_driver(rehearsal_driver, baseline=baseline, installed=selected)
+    result = _run_rehearsal_driver(
+        rehearsal_driver, baseline=baseline, installed=selected,
+        candidate="0.5.8" if selected == "0.5.7" else "0.5.5",
+    )
     assert result.returncode != 0  # The stub deliberately stops before downloading.
     assert f"DOWNLOAD_REACHED:{selected}" in result.stderr
 
@@ -1104,6 +1109,8 @@ def test_rehearsal_driver_rejects_mislabeled_official_baseline(
         ("0.5.4", "0.5.4", "candidate must be newer"),
         ("0.5.4", "0.5.3", "candidate must be newer"),
         ("0.5.4", "0.5.5rc1", "must be a canonical stable version"),
+        ("0.5.7", "0.5.7", "candidate must be newer"),
+        ("0.5.7", "0.5.6", "candidate must be newer"),
     ],
 )
 @pytest.mark.ci_serial
