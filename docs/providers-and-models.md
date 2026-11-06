@@ -73,6 +73,24 @@ default**:
 API keys follow the same explicit-config-first rule via `api_key` /
 `api_key_env`.
 
+### Tsubasa
+
+Use Tsubasa through the existing OpenAI-compatible chat backend:
+
+```sh
+opensquilla configure provider --provider tsubasa --model tsubasa-fast --api-key-env TSUBASA_API_KEY
+```
+
+Set `TSUBASA_API_KEY` in the environment before starting OpenSquilla. The
+provider defaults to `https://api.tsubasa.sh/v1`; use `tsubasa-pro` to select
+Tsubasa Pro. Both models have a 32,768-token context window. Fast supports
+up to 8,192 output tokens and Pro up to 16,384. A smaller `llm.max_tokens`
+value leaves more room for conversation history.
+
+These model profiles expose text chat without tools, vision, or reasoning.
+Enter the model ID explicitly; this provider does not offer a verified live
+model picker.
+
 ## Onboarding-Verified Providers
 
 This build exposes onboarding support for:
