@@ -40,8 +40,8 @@ def config_get(
         console.print(f"[{ACCENT_MARKUP}]{escape(key)}[/] = [green]{escape(repr(val))}[/green]")
     else:
         table = Table(title="Gateway Config", show_header=True, header_style=ACCENT_HEADER)
-        table.add_column("Key")
-        table.add_column("Value")
+        table.add_column("Key", overflow="fold")
+        table.add_column("Value", overflow="fold")
         _add_flat(table, data)
         console.print(table)
 
