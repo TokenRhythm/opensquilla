@@ -154,6 +154,34 @@ def test_onboard_catalog_overview_names_voice_audio_without_raw_key(
     assert "opensquillaonboardcatalogaudio" in compact
 
 
+def test_onboard_catalog_video_prints_provider_rows(tmp_path, monkeypatch):
+    target = tmp_path / "c.toml"
+    monkeypatch.setenv("OPENSQUILLA_GATEWAY_CONFIG_PATH", str(target))
+
+    result = runner.invoke(app, ["onboard", "catalog", "video"])
+
+    assert result.exit_code == 0, result.stdout
+    assert result.stdout.strip()
+    assert "video generation provider options" in result.stdout
+    assert "openrouter" in result.stdout
+    assert "tokenrhythm" in result.stdout
+    assert "Try:" in result.stdout
+    assert not target.exists()
+
+
+def test_onboard_catalog_overview_names_video_without_raw_key(tmp_path, monkeypatch):
+    target = tmp_path / "c.toml"
+    monkeypatch.setenv("OPENSQUILLA_GATEWAY_CONFIG_PATH", str(target))
+
+    result = runner.invoke(app, ["onboard", "catalog"])
+
+    assert result.exit_code == 0, result.stdout
+    assert "Video generation providers" in result.stdout
+    assert "videoGenerationProviders" not in result.stdout
+    compact = "".join(result.stdout.split())
+    assert "opensquillaonboardcatalogvideo" in compact
+
+
 # ---------------------------------------------------------------------------
 # B2-3: an explicitly stored enabled=false must survive an image key rotation
 # that omits --image-enabled/--no-image-enabled.
