@@ -51,10 +51,9 @@ enfichable dialogue avec TokenRhythm, OpenRouter, OpenAI, Anthropic, Ollama, Dee
 Qwen/DashScope et plus de 20 autres fournisseurs de LLM, sans aucun changement dans
 votre code ni dans votre schéma de configuration.
 
-OpenSquilla 0.5.8 est en préparation ; la version stable publique reste 0.5.7.
-Les liens 0.5.8 ci-dessous seront accessibles après publication.
+OpenSquilla 0.5.8 est la version stable actuelle.
 
-Version stable publique : [OpenSquilla 0.5.7](https://github.com/TokenRhythm/opensquilla/releases/tag/v0.5.7).
+Téléchargements : [OpenSquilla 0.5.8](https://github.com/TokenRhythm/opensquilla/releases/tag/v0.5.8).
 
 Pour une documentation produit orientée tâches, commencez par le
 [Guide produit OpenSquilla](README.product.md) ou par l'[index de la

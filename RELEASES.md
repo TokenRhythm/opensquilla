@@ -2,7 +2,7 @@
 
 | Version | Tag | Date | Notes |
 |---|---|---|---|
-| 0.5.8 | v0.5.8 | 2026-11-05 | Planned: Desktop account sign-in, task-aware routing, and reviewable model recommendations |
+| 0.5.8 | v0.5.8 | 2026-11-05 | Stable: Desktop account sign-in, task-aware routing, and reviewable model recommendations |
 | 0.5.7 | v0.5.7 | 2026-10-23 | Stable: document annotations, project Workbench, inline visualizations, and video generation |
 | 0.5.6 | v0.5.6 | 2026-09-30 | Stable: core reliability fixes, clearer local file references, and Browser Use (Beta) |
 | 0.5.5 | v0.5.5 | 2026-09-23 | Stable: C5 fusion, reliable task continuity, workspace previews, SkillHub, and signed Windows installers |

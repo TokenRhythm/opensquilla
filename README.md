@@ -45,11 +45,9 @@ TokenRhythm, OpenRouter, OpenAI, Anthropic, Ollama, DeepSeek, Gemini,
 Qwen/DashScope, and 20+ other LLM providers with no change to your code or config
 schema.
 
-OpenSquilla 0.5.8 is being prepared for release; 0.5.7 is the current public
-stable release. The 0.5.8 download links below become public when the release
-is published.
+OpenSquilla 0.5.8 is the current stable release.
 
-Public stable downloads: [OpenSquilla 0.5.7](https://github.com/TokenRhythm/opensquilla/releases/tag/v0.5.7).
+Downloads: [OpenSquilla 0.5.8](https://github.com/TokenRhythm/opensquilla/releases/tag/v0.5.8).
 
 For task-oriented product documentation, start with the
 [OpenSquilla Product Guide](README.product.md) or the
