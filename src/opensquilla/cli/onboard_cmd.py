@@ -11,6 +11,7 @@ import typer
 from pydantic import ValidationError
 from rich.table import Table
 
+from opensquilla.cli.config_errors import exit_config_load_error
 from opensquilla.cli.output import print_json
 from opensquilla.cli.ui import (
     ACCENT,
@@ -23,7 +24,7 @@ from opensquilla.cli.ui import (
 )
 from opensquilla.gateway.config import GatewayConfig
 from opensquilla.gateway.config_migration import ConfigParseError
-from opensquilla.onboarding.config_store import load_config, resolve_config_path
+from opensquilla.onboarding.config_store import load_config
 from opensquilla.onboarding.errors import UserCancelledError
 from opensquilla.onboarding.flow import (
     OnboardOptions,
@@ -183,17 +184,6 @@ def _format_action_sections(status: OnboardingStatus, names: list[str]) -> str:
     return ", ".join(parts) if parts else "none"
 
 
-def _format_config_load_error(exc: Exception) -> str:
-    if isinstance(exc, ValidationError):
-        errors = exc.errors()
-        if errors:
-            first = errors[0]
-            loc = ".".join(str(part) for part in first.get("loc", ()))
-            msg = str(first.get("msg") or "invalid value")
-            return f"{loc}: {msg}" if loc else msg
-    return str(exc).splitlines()[0]
-
-
 def _format_validation_error(exc: ValidationError) -> str:
     """Render a ValidationError as a field-naming summary.
 
@@ -234,28 +224,11 @@ def _print_restart_guidance(result: object, config_path: Path | None = None) -> 
     )
 
 
-def _exit_config_load_error(exc: Exception, path: str | Path | None = None) -> NoReturn:
-    target, _ = resolve_config_path(path)
-    config_arg = _config_cli_arg(target)
-    error_console.print(
-        f"[red]OpenSquilla config error:[/red] {markup_escape(str(target))}"
-    )
-    error_console.print(
-        f"[dim]Reason: {markup_escape(_format_config_load_error(exc))}[/dim]"
-    )
-    error_console.print("[dim]Fix: edit or move this config, then rerun onboarding:[/dim]")
-    error_console.print(
-        f"  [{ACCENT_SOFT}]opensquilla onboard --if-needed"
-        f"{markup_escape(config_arg)}[/]"
-    )
-    raise typer.Exit(code=2) from exc
-
-
 def _load_config_for_cli(path: str | Path | None = None):
     try:
         return load_config(path)
     except (OSError, tomllib.TOMLDecodeError, ConfigParseError, ValidationError) as exc:
-        _exit_config_load_error(exc, path)
+        exit_config_load_error(exc, path)
 
 
 def _has_stored_setup_state(cfg) -> bool:
@@ -702,7 +675,7 @@ def onboard_command(
         # Corrupt config discovered mid-wizard (e.g. re-loaded after an
         # out-of-band edit): route through the same productized handoff as
         # `--if-needed`/`status` instead of a raw traceback.
-        _exit_config_load_error(exc, config_path)
+        exit_config_load_error(exc, config_path)
     except OSError as exc:
         # The config loaded fine above, so an OSError out of the wizard is a
         # runtime I/O failure (disk full at persist time, permissions revoked
@@ -1781,7 +1754,7 @@ def configure_command(
                 # instead of silently forwarding nothing to the wizard.
                 _exit_incomplete_headless_flags(normalized, given)
         except (OSError, tomllib.TOMLDecodeError, ConfigParseError, ValidationError) as exc:
-            _exit_config_load_error(exc, config_path)
+            exit_config_load_error(exc, config_path)
         except (KeyError, TypeError, ValueError) as exc:
             error_console.print(f"[red]Error:[/red] {markup_escape(exc)}")
             raise typer.Exit(code=2) from exc
@@ -1803,7 +1776,7 @@ def configure_command(
         # same operator intent as Esc/Ctrl+C, so the same productized exit.
         _exit_cancelled(exc)
     except (OSError, tomllib.TOMLDecodeError, ConfigParseError, ValidationError) as exc:
-        _exit_config_load_error(exc, config_path)
+        exit_config_load_error(exc, config_path)
     except (KeyError, TypeError, ValueError) as exc:
         # Mutation-level validation failures reachable from the wizard (e.g.
         # a blank required channel secret) must surface like the headless

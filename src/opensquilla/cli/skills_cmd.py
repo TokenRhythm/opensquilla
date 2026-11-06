@@ -12,6 +12,7 @@ from rich.panel import Panel
 from rich.table import Table
 from rich.text import Text
 
+from opensquilla.cli.config_errors import CONFIG_LOAD_ERRORS, exit_config_load_error
 from opensquilla.cli.gateway_rpc import (
     default_gateway_token,
     default_gateway_url,
@@ -223,7 +224,11 @@ def _build_offline_skill_loader() -> tuple[Any, Any]:
     from opensquilla.skills.loader import SkillLoader
     from opensquilla.skills.paths import resolve_skill_layer_dirs
 
-    config = GatewayConfig.load(os.environ.get("OPENSQUILLA_GATEWAY_CONFIG_PATH"))
+    config_path = os.environ.get("OPENSQUILLA_GATEWAY_CONFIG_PATH")
+    try:
+        config = GatewayConfig.load(config_path)
+    except CONFIG_LOAD_ERRORS as exc:
+        exit_config_load_error(exc, config_path)
     workspace_root = Path(config.workspace_dir) if config.workspace_dir else None
     workspace_override = Path(config.skills.workspace_dir) if config.skills.workspace_dir else None
     layer_dirs = resolve_skill_layer_dirs(

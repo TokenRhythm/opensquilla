@@ -17,7 +17,7 @@ from rich.table import Table
 from opensquilla.cli.gateway_rpc import (
     GatewayTarget,
     default_gateway_target,
-    gateway_url_from_config,
+    gateway_url_from_config_or_exit,
 )
 from opensquilla.cli.output import print_json
 from opensquilla.cli.url_utils import normalize_gateway_url
@@ -722,7 +722,7 @@ def _target_for_doctor(
         return GatewayTarget(normalize_gateway_url(gateway_url))
     if config_path is not None:
         return GatewayTarget(
-            gateway_url_from_config(config_path),
+            gateway_url_from_config_or_exit(config_path),
             config_path,
             config_owns_target=True,
         )
