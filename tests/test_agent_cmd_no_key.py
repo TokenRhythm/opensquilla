@@ -140,3 +140,51 @@ def test_exit_code_nonzero_when_no_key(
         result = runner.invoke(app, ["-m", "hi"])
 
     assert result.exit_code != 0
+
+
+def _flattened_output(output: str) -> str:
+    """Drop panel borders and whitespace so a long path that Rich wrapped still matches."""
+    return re.sub(r"[│\s]", "", output)
+
+
+def test_panel_names_the_state_dir_config_file(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """With OPENSQUILLA_STATE_DIR set, the panel points at the config file the CLI reads."""
+    for key in _PROVIDER_ENV_VARS:
+        monkeypatch.delenv(key, raising=False)
+    monkeypatch.delenv("OPENSQUILLA_GATEWAY_CONFIG_PATH", raising=False)
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    monkeypatch.setenv("USERPROFILE", str(tmp_path / "home"))
+    monkeypatch.chdir(tmp_path)
+    state_dir = tmp_path / "state"
+    monkeypatch.setenv("OPENSQUILLA_STATE_DIR", str(state_dir))
+
+    with _mock_patch():
+        result = CliRunner().invoke(_make_app(), ["-m", "hi"])
+
+    combined = _flattened_output(result.output or "")
+    assert str(state_dir / "config.toml").replace(" ", "") in combined
+    assert "~/.opensquilla/config.toml" not in combined
+
+
+def test_panel_names_the_explicit_config_file(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """With OPENSQUILLA_GATEWAY_CONFIG_PATH set, the panel points at that file."""
+    for key in _PROVIDER_ENV_VARS:
+        monkeypatch.delenv(key, raising=False)
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    monkeypatch.setenv("USERPROFILE", str(tmp_path / "home"))
+    monkeypatch.chdir(tmp_path)
+    config_file = tmp_path / "custom" / "my-config.toml"
+    monkeypatch.setenv("OPENSQUILLA_GATEWAY_CONFIG_PATH", str(config_file))
+
+    with _mock_patch():
+        result = CliRunner().invoke(_make_app(), ["-m", "hi"])
+
+    combined = _flattened_output(result.output or "")
+    assert str(config_file).replace(" ", "") in combined
+    assert "~/.opensquilla/config.toml" not in combined
