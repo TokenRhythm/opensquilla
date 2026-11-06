@@ -82,9 +82,11 @@ def _install_fake_ossutil(tmp_path: Path) -> tuple[Path, Path, Path]:
 
             if args[:2] == ["api", "put-object"]:
                 destination = root / option("--bucket") / option("--key")
-                if destination.exists() and os.environ.get("FAKE_OSS_VERSIONED") != "true":
+                repair = os.environ.get("FAKE_OSS_REPAIR") == "true"
+                versioned = os.environ.get("FAKE_OSS_VERSIONED") == "true"
+                if destination.exists() and not repair and not versioned:
                     raise SystemExit(9)
-                assert option("--forbid-overwrite") == "true"
+                assert option("--forbid-overwrite") == ("false" if repair else "true")
                 source = native_path(option("--body").removeprefix("file://"))
                 destination.parent.mkdir(parents=True, exist_ok=True)
                 shutil.copyfile(source, destination)
@@ -148,7 +150,13 @@ def _bash_executable() -> str:
     raise RuntimeError("Git for Windows Bash is required for the OSS prestage contract test")
 
 
-def _run(tmp_path: Path, assets: Path) -> subprocess.CompletedProcess[str]:
+def _run(
+    tmp_path: Path,
+    assets: Path,
+    *,
+    repair: bool = False,
+    tag: str = _TAG,
+) -> subprocess.CompletedProcess[str]:
     fake_bin, remote_root, call_log = (
         _install_fake_ossutil(tmp_path)
         if not (tmp_path / "bin").exists()
@@ -166,6 +174,8 @@ def _run(tmp_path: Path, assets: Path) -> subprocess.CompletedProcess[str]:
             "OSS_ADDRESSING_STYLE_NORMALIZED": "virtual",
             "OSSUTIL_BIN": (fake_bin / "ossutil").as_posix(),
             "PYTHON_BIN": (fake_bin / "opensquilla-test-python").as_posix(),
+            "FAKE_OSS_REPAIR": "true" if repair else "false",
+            "OPENSQUILLA_ALLOW_IMMUTABLE_REPAIR": "1" if repair else "0",
         }
     )
     if os.name == "nt":
@@ -183,7 +193,7 @@ def _run(tmp_path: Path, assets: Path) -> subprocess.CompletedProcess[str]:
             _bash_executable(),
             ".github/scripts/prestage-release-to-oss.sh",
             str(assets),
-            _TAG,
+            tag,
         ],
         cwd=Path.cwd(),
         env=env,
@@ -239,3 +249,34 @@ def test_prestage_rejects_non_exact_release_asset_set(tmp_path: Path) -> None:
     assert result.returncode != 0
     assert "Draft release asset set is not exact" in result.stderr
     assert not (tmp_path / "oss").exists()
+
+
+def test_repair_uses_versioned_put_object_for_existing_assets(tmp_path: Path) -> None:
+    version = "0.5.8"
+    tag = f"v{version}"
+    assets = tmp_path / "release-assets"
+    assets.mkdir(parents=True)
+    lines: list[str] = []
+    names = tuple(name.replace(_VERSION, version) for name in _ASSETS)
+    for name in names:
+        payload = f"synthetic-{name}".encode()
+        if name.endswith(".dmg"):
+            payload += b"-changed"
+        (assets / name).write_bytes(payload)
+        lines.append(f"{hashlib.sha256(payload).hexdigest()}  {name}")
+    (assets / "SHA256SUMS").write_text("\n".join(lines) + "\n", encoding="utf-8")
+    fake_bin, remote_root, _ = _install_fake_ossutil(tmp_path)
+    remote = remote_root / "release-bucket" / "releases" / tag
+    remote.mkdir(parents=True)
+    old_dmg = f"synthetic-OpenSquilla-{version}-mac-arm64.dmg".encode()
+    (remote / f"OpenSquilla-{version}-mac-arm64.dmg").write_bytes(old_dmg)
+
+    result = _run(tmp_path, assets, repair=True, tag=tag)
+    assert result.returncode == 0, result.stderr
+    assert (remote / f"OpenSquilla-{version}-mac-arm64.dmg").read_bytes() == (
+        old_dmg + b"-changed"
+    )
+    calls = [json.loads(line) for line in (tmp_path / "calls.jsonl").read_text().splitlines()]
+    put_calls = [call for call in calls if call[:2] == ["api", "put-object"]]
+    assert len(put_calls) == len(_ASSETS) + 1
+    assert all(call[call.index("--forbid-overwrite") + 1] == "false" for call in put_calls)

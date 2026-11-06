@@ -147,26 +147,16 @@ put_immutable_object() {
   if [[ "${repair_mode}" == "1" ]]; then
     # The repair workflow has already verified the exact GitHub bytes and
     # created the allow-listed delete marker under the shared writer lock.
-    # Use ossutil's overwrite path for every object size.  This creates a
-    # fresh latest version after the delete marker; the normal release path
-    # retains its staged multipart copy-object commit and write-once checks.
-    echo "Uploading repaired object directly: ${name} (${source_size} bytes)"
-    local -a repair_options=(
-      cp
-      --force
-      --addressing-style "${OSS_ADDRESSING_STYLE_NORMALIZED}"
+    # Use an explicit PutObject for every object size.  In a versioned bucket
+    # this creates a fresh current version after the delete marker, while the
+    # normal release path retains its staged multipart copy-object commit and
+    # write-once checks.
+    echo "Uploading repaired object with versioned PutObject: ${name} (${source_size} bytes)"
+    options+=(
+      --body "file://${source_path}"
       --cache-control "${versioned_cache_control}"
     )
-    if (( source_size >= 8388608 )); then
-      repair_options+=(
-        --parallel 64
-        --part-size 262144
-        --bigfile-threshold 8388608
-        --read-timeout 30
-        --retry-times 3
-      )
-    fi
-    "${ossutil_bin}" "${repair_options[@]}" "${source_path}" "${dest_prefix}/${name}"
+    "${ossutil_bin}" "${options[@]}"
     return 0
   fi
   if (( source_size >= 8388608 )); then

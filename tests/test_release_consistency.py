@@ -1056,9 +1056,9 @@ def test_release_workflow_prestages_draft_without_advancing_channels() -> None:
     assert "--parallel 64" in script
     assert "--copy-source" in script
     assert '"${repair_mode}" == "1"' in script
-    assert 'local -a repair_options=(' in script
-    assert '"${ossutil_bin}" "${repair_options[@]}"' in script
-    assert '"${source_path}" "${dest_prefix}/${name}"' in script
+    assert "versioned PutObject" in script
+    assert '--body "file://${source_path}"' in script
+    assert '"${ossutil_bin}" "${options[@]}"' in script
     assert '--forbid-overwrite "${forbid_overwrite}"' in script
     assert ".upload-staging/" in script
     assert "OPENSQUILLA_ALLOW_IMMUTABLE_REPAIR" in script
