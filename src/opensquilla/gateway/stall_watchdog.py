@@ -87,6 +87,7 @@ class GatewayStallWatchdog:
         self._heartbeat_seq = 0
         self._heartbeat_alive = True
         self._event_count = 0
+        self._budget_warned = False
         self._bytes_written = 0
         self._stall_started_at: float | None = None
         self._stall_detected_lag_ms: int | None = None
@@ -402,10 +403,22 @@ class GatewayStallWatchdog:
         stack.reverse()
         return stack
 
+    def _warn_budget_exhausted(self) -> None:
+        if self._budget_warned:
+            return
+        self._budget_warned = True
+        log.warning(
+            "gateway.stall_diagnostics_budget_exhausted",
+            path=str(self.output_path),
+            max_events=_MAX_EVENTS,
+            max_bytes=_MAX_BYTES,
+        )
+
     def _write(
         self, payload: dict[str, Any], *, force: bool = False, reserve_bytes: int = 0,
     ) -> bool:
         if not force and self._event_count >= _MAX_EVENTS:
+            self._warn_budget_exhausted()
             return False
         encoded = (json.dumps({"ts": time.time(), **payload}, ensure_ascii=False) + "\n").encode()
         with self._write_lock:
@@ -426,6 +439,7 @@ class GatewayStallWatchdog:
                 (not force and self._event_count >= _MAX_EVENTS)
                 or self._bytes_written + len(encoded) > byte_limit
             ):
+                self._warn_budget_exhausted()
                 return False
             try:
                 with self.output_path.open("ab") as stream:
