@@ -1677,6 +1677,8 @@ def _apply_router_section(
         default_tier=payload.get("defaultTier"),
         tiers=payload.get("tiers"),
     )
+    for warning in result.warnings:
+        console.print(warning_panel(warning))
     return result.config
 
 
@@ -1704,6 +1706,8 @@ def run_interactive_router_configure(
         default_tier=payload.get("defaultTier"),
         tiers=payload.get("tiers"),
     )
+    for warning in result.warnings:
+        console.print(warning_panel(warning))
     return persist_config(result.config, path=config_path, restart_required=False)
 
 
