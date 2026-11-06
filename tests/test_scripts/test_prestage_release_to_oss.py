@@ -264,7 +264,7 @@ def test_repair_uses_versioned_put_object_for_existing_assets(tmp_path: Path) ->
             payload += b"-changed"
         (assets / name).write_bytes(payload)
         lines.append(f"{hashlib.sha256(payload).hexdigest()}  {name}")
-    (assets / "SHA256SUMS").write_text("\n".join(lines) + "\n", encoding="utf-8")
+    (assets / "SHA256SUMS").write_bytes(("\n".join(lines) + "\n").encode("ascii"))
     fake_bin, remote_root, _ = _install_fake_ossutil(tmp_path)
     remote = remote_root / "release-bucket" / "releases" / tag
     remote.mkdir(parents=True)
