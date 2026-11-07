@@ -45,6 +45,7 @@ _SEARCH_PROVIDER_LABELS: dict[str, str] = {
     "brave": "Brave Search",
     "duckduckgo": "DuckDuckGo",
     "iqs": "Alibaba Cloud IQS",
+    "keenable": "Keenable",
     "tavily": "Tavily",
     "exa": "Exa",
     "perplexity": "Perplexity",
@@ -119,11 +120,12 @@ def _fields_for(spec: SearchProviderSpec) -> tuple[SearchProviderSetupField, ...
 
 
 def _to_setup_spec(spec: SearchProviderSpec) -> SearchProviderSetupSpec:
-    what_you_need = (
-        (f"API key via {spec.env_key} or a one-time paste.",)
-        if spec.requires_api_key
-        else ("No API key required.",)
-    )
+    if spec.requires_api_key:
+        what_you_need: tuple[str, ...] = (f"API key via {spec.env_key} or a one-time paste.",)
+    elif spec.env_key:
+        what_you_need = (f"No API key required; {spec.env_key} raises rate limits.",)
+    else:
+        what_you_need = ("No API key required.",)
     return SearchProviderSetupSpec(
         provider_id=spec.provider_id,
         label=_SEARCH_PROVIDER_LABELS.get(spec.provider_id, spec.provider_id),
@@ -131,7 +133,7 @@ def _to_setup_spec(spec: SearchProviderSpec) -> SearchProviderSetupSpec:
         metadata_supported=spec.metadata_supported,
         requires_api_key=spec.requires_api_key,
         env_key=spec.env_key,
-        deployment="cloud" if spec.requires_api_key else "local",
+        deployment="cloud" if spec.requires_api_key or spec.env_key else "local",
         blocking=False,
         can_probe=False,
         readme_scenarios=("built-in web search", "first-run setup"),
