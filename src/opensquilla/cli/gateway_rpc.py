@@ -34,7 +34,7 @@ def default_gateway_target() -> GatewayTarget:
         )
     if config_path := os.environ.get("OPENSQUILLA_GATEWAY_CONFIG_PATH"):
         return GatewayTarget(
-            gateway_url_from_config(config_path),
+            gateway_url_from_config_or_exit(config_path),
             config_path,
             config_owns_target=True,
         )
@@ -90,6 +90,17 @@ def gateway_url_from_config(config_path: str | Path) -> str:
     return normalize_gateway_url(f"ws://{host}:{int(config.port)}/ws")
 
 
+def gateway_url_from_config_or_exit(config_path: str | Path) -> str:
+    """Like ``gateway_url_from_config``, for a config path the user named."""
+
+    from opensquilla.cli.config_errors import CONFIG_LOAD_ERRORS, exit_config_load_error
+
+    try:
+        return gateway_url_from_config(config_path)
+    except CONFIG_LOAD_ERRORS as exc:
+        exit_config_load_error(exc, config_path)
+
+
 def _target_gateway(
     *,
     gateway_url: str | None,
@@ -99,7 +110,7 @@ def _target_gateway(
         return GatewayTarget(normalize_gateway_url(gateway_url), config_path)
     if config_path is not None:
         return GatewayTarget(
-            gateway_url_from_config(config_path),
+            gateway_url_from_config_or_exit(config_path),
             config_path,
             config_owns_target=True,
         )
