@@ -77,6 +77,7 @@ _PROVIDER_LABELS: dict[str, str] = {
     "mimo_anthropic": "MiMo Anthropic-compatible",
     "mistral": "Mistral",
     "groq": "Groq",
+    "tsubasa": "Tsubasa",
     "zhipu": "Zhipu (Z.AI)",
     "qianfan": "Baidu Qianfan",
     "siliconflow": "SiliconFlow",
