@@ -6,6 +6,7 @@ import threading
 from concurrent.futures import ThreadPoolExecutor
 
 import pytest
+import structlog.testing
 
 from opensquilla.gateway import stall_watchdog
 from opensquilla.gateway.stall_watchdog import GatewayStallWatchdog
@@ -451,3 +452,17 @@ def test_loop_lag_timeline_disabled_or_unwritten_never_claims_coverage(
     assert summary["loop_lag_timeline_missing"] == 1
     assert summary["loop_lag_timeline_complete"] is False
     assert summary["loop_lag_max_ms"] == 650.0
+
+
+def test_event_budget_exhaustion_warns_once(tmp_path) -> None:
+    watchdog = GatewayStallWatchdog(output_path=tmp_path / "stalls.jsonl")
+    with structlog.testing.capture_logs() as captured:
+        for _ in range(stall_watchdog._MAX_EVENTS + 3):
+            watchdog._write({"type": "test"})
+    warnings = [
+        entry for entry in captured
+        if entry["event"] == "gateway.stall_diagnostics_budget_exhausted"
+    ]
+    assert len(warnings) == 1
+    assert warnings[0]["log_level"] == "warning"
+    assert warnings[0]["max_events"] == stall_watchdog._MAX_EVENTS
