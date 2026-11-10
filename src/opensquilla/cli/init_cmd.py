@@ -6,6 +6,7 @@ import tomli_w
 import typer
 
 from opensquilla.cli.ui import console
+from opensquilla.onboarding.config_store import _stage_bytes
 from opensquilla.paths import default_opensquilla_home
 
 
@@ -55,7 +56,12 @@ def run_init() -> None:
     existing_env = env_path.read_text(encoding="utf-8") if env_path.exists() else ""
     lines = [line for line in existing_env.splitlines() if not line.startswith(f"{key_name}=")]
     lines.append(f"{key_name}={api_key}")
-    env_path.write_text("\n".join(lines).rstrip() + "\n", encoding="utf-8")
+    env_payload = ("\n".join(lines).rstrip() + "\n").encode("utf-8")
+    staged_env = _stage_bytes(env_path, env_payload, mode=0o600, suffix=".tmp")
+    try:
+        staged_env.replace(env_path)
+    finally:
+        staged_env.unlink(missing_ok=True)
 
     config = {
         "llm": {
@@ -64,7 +70,13 @@ def run_init() -> None:
         },
         "state_dir": str(home / "state"),
     }
-    config_path.write_text(tomli_w.dumps(config), encoding="utf-8")
+    staged_config = _stage_bytes(
+        config_path, tomli_w.dumps(config).encode("utf-8"), mode=0o600, suffix=".tmp"
+    )
+    try:
+        staged_config.replace(config_path)
+    finally:
+        staged_config.unlink(missing_ok=True)
 
     console.print(f"[green]Wrote[/green] {env_path}")
     console.print(f"[green]Wrote[/green] {config_path}")
