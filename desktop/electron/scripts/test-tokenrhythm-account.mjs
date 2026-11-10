@@ -165,6 +165,7 @@ test('UAT OAuth, account APIs and model requests all use the packaged test origi
  const origin = 'https://gpt.tokenrhythm.studio'
  const f = await fixture(t, { origin, beforeFetch: async url => assert.equal(new URL(url).origin, origin) })
  await f.login()
+ await f.account.selectSource('account')
  assert.equal(new URL(f.opened).origin, origin)
  assert.equal(new URL(f.opened).pathname, '/api/oauth/authorize')
  const { PassThrough } = await import('node:stream')
@@ -231,8 +232,95 @@ test('scheduled and manual wallet refreshes retain balances and only mark real f
  assert.equal(f.account.snapshot().walletErrorCode, null)
 })
 test('refresh is singleflight and atomically persisted',async t=>{const f=await fixture(t);await f.login();f.advance(40_000);await Promise.all([f.account.verify(true),f.account.verify(true),f.account.verify(true)]);assert.equal(f.refreshes,1);assert.ok(f.deps.decrypt(await readFile(join(f.directory,'account.enc'),'utf8')).includes('refresh-a-1'))})
-test('network loss keeps login but closes model authorization',async t=>{const f=await fixture(t);await f.login();await f.account.selectSource('account');const old=(await f.account.runtimeState()).credential;f.env.offline=true;await f.account.verify(true);assert.equal(f.account.snapshot().status,'unverified');await assert.rejects(()=>f.account.modelCredential(old));f.env.offline=false;await f.account.verify(true);assert.notEqual((await f.account.runtimeState()).credential,old)})
-test('account recovery waits for a new bridge lease before publishing model readiness', async t => {
+test('network loss keeps the locally bound model authorization',async t=>{const f=await fixture(t);await f.login();await f.account.selectSource('account');const old=(await f.account.runtimeState()).credential;f.env.offline=true;await f.account.verify(true);assert.equal(f.account.snapshot().status,'signed_in');assert.equal(f.account.snapshot().keyStatus,'ready');assert.equal(await f.account.modelCredential(old),'model-secret-a');f.env.offline=false;await f.account.verify(true);assert.equal((await f.account.runtimeState()).credential,old)})
+test('managed-key metadata failure keeps the locally bound model authorization', async t => {
+ let fail = false
+ const f = await fixture(t, { beforeFetch: async url => {
+  if (fail && new URL(url).pathname.endsWith('/managed-key')) throw new Error('temporary managed-key outage')
+ } })
+ await f.login(); await f.account.selectSource('account')
+ const lease = (await f.account.runtimeState()).credential
+ fail = true
+ await f.account.verify(true)
+ assert.equal(f.account.snapshot().status, 'signed_in')
+ assert.equal(f.account.snapshot().keyStatus, 'ready')
+ assert.equal(await f.account.modelCredential(lease), 'model-secret-a')
+})
+test('structured remote 401 clears the local account model binding', async t => {
+ const f = await fixture(t); await f.login(); await f.account.selectSource('account'); await f.account.close()
+ const original = f.deps.fetch
+ const restored = new TokenRhythmAccount({ ...f.deps, fetch: async (url, init = {}) => {
+  if (new URL(url).pathname.endsWith('/account')) return Response.json({ error: 'unauthorized' }, { status: 401 })
+  return original(url, init)
+ } })
+ t.after(() => restored.close())
+ await restored.initialize()
+ const lease = (await restored.runtimeState()).credential
+ await restored.verify(true)
+ assert.equal(restored.snapshot().status, 'reauth_required')
+ assert.equal(restored.snapshot().keyStatus, 'missing')
+ assert.equal(restored.saved.key, null)
+ assert.equal((await restored.runtimeState()).ready, false)
+ await assert.rejects(() => restored.modelCredential(lease), /ACCOUNT_MODEL_UNAVAILABLE/)
+})
+test('malformed remote 401 is terminal instead of an invalid-response retry', async t => {
+ const f = await fixture(t); await f.login(); await f.account.selectSource('account'); await f.account.close()
+ const original = f.deps.fetch
+ const restored = new TokenRhythmAccount({ ...f.deps, fetch: async (url, init = {}) => {
+  if (new URL(url).pathname.endsWith('/account')) return new Response('unauthorized', { status: 401 })
+  return original(url, init)
+ } })
+ t.after(() => restored.close())
+ await restored.initialize()
+ await restored.verify(true)
+ assert.equal(restored.snapshot().status, 'reauth_required')
+ assert.equal(restored.snapshot().errorCode, 'ACCOUNT_HTTP_401')
+})
+test('a model 401 fences an in-flight key refresh', async t => {
+ let holdKey = false, releaseKey
+ const f = await fixture(t, { beforeFetch: async url => {
+  if (holdKey && new URL(url).pathname.endsWith('/managed-key')) {
+   await new Promise(resolve => { releaseKey = resolve })
+  }
+ } })
+ await f.login(); await f.account.selectSource('account')
+ holdKey = true
+ const verifying = f.account.verify(true)
+ await until(() => Boolean(releaseKey))
+ await f.account.modelKeyRejected()
+ releaseKey()
+ await verifying
+ assert.equal(f.account.saved.key, null)
+ assert.equal(f.account.snapshot().keyStatus, 'unavailable')
+ assert.equal(await readFile(join(f.directory, 'model-key-rejected'), 'utf8'), '1')
+})
+test('a stale model 401 cannot clear a newer account lease', async t => {
+ const f = await fixture(t); await f.login(); await f.account.selectSource('account')
+ const oldLease = (await f.account.runtimeState()).credential
+ const oldSecret = f.account.saved.key.secret
+ await f.account.logout(); f.setIdentity('b'); await f.login(); await f.account.selectSource('account')
+ const current = await f.account.runtimeState()
+ await f.account.modelKeyRejected(oldLease, oldSecret)
+ assert.equal((await f.account.runtimeState()).credential, current.credential)
+ assert.equal(f.account.saved.key.secret, 'model-secret-b')
+ assert.equal(f.account.snapshot().keyStatus, 'ready')
+})
+test('account model test works before selecting the account as primary', async t => {
+ const f = await fixture(t); await f.login()
+ assert.equal(f.account.snapshot().source, 'manual')
+ await f.account.testModel()
+ assert.equal(f.account.snapshot().status, 'signed_in')
+})
+test('a model 401 is persisted during maintenance admission closure', async t => {
+ const f = await fixture(t); await f.login(); await f.account.selectSource('account')
+ const pause = f.account.pauseForMaintenance()
+ await f.account.modelKeyRejected()
+ assert.equal(f.account.saved.key, null)
+ assert.equal(await readFile(join(f.directory, 'model-key-rejected'), 'utf8'), '1')
+ await pause.drained
+ pause.resume()
+})
+test('account recovery keeps the existing bridge lease while validation is pending', async t => {
  let holdKey = false, releaseKey
  const f = await fixture(t, { beforeFetch: async url => {
   if (holdKey && new URL(url).pathname.endsWith('/managed-key')) {
@@ -245,7 +333,8 @@ test('account recovery waits for a new bridge lease before publishing model read
  assert.ok(oldLease)
  f.env.offline = true
  await f.account.verify(true)
- assert.equal(f.account.snapshot().status, 'unverified')
+ assert.equal(f.account.snapshot().status, 'signed_in')
+ assert.equal(f.account.snapshot().keyStatus, 'ready')
 
  const events = []
  f.deps.onState = state => events.push(state)
@@ -256,11 +345,11 @@ test('account recovery waits for a new bridge lease before publishing model read
   await until(() => Boolean(releaseKey))
   const pending = f.account.snapshot()
   assert.equal(pending.status, 'signed_in')
-  assert.equal(pending.keyStatus === 'ready', false)
-  assert.ok(events.every(state => state.status !== 'signed_in' || state.keyStatus !== 'ready'))
+  assert.equal(pending.keyStatus, 'ready')
+  assert.ok(events.every(state => state.status === 'signed_in' && state.keyStatus === 'ready'))
   const runtime = await f.account.runtimeState()
-  assert.equal(runtime.ready, false)
-  assert.equal(Boolean(runtime.credential), false)
+  assert.equal(runtime.ready, true)
+  assert.equal(runtime.credential, oldLease)
  } finally {
   holdKey = false
   releaseKey?.()
@@ -272,7 +361,7 @@ test('account recovery waits for a new bridge lease before publishing model read
  assert.equal(recovered.keyStatus, 'ready')
  assert.equal(runtime.ready, true)
  assert.ok(runtime.credential)
- assert.notEqual(runtime.credential, oldLease)
+ assert.equal(runtime.credential, oldLease)
  assert.equal(events.at(-1).keyStatus, 'ready')
 })
 test('account revalidation preserves model readiness while its bridge lease remains valid', async t => {
@@ -310,21 +399,39 @@ test('revoked sessions hide account without changing billing source',async t=>{c
 test('bridge requires private auth and rejects targets, queries, health, wallet and browser origins',async t=>{const f=await fixture(t);await f.login();const proxy=new TokenRhythmModelProxy(f.account);t.after(()=>proxy.close());const env=await proxy.start(),url=env.OPENSQUILLA_DESKTOP_ACCOUNT_URL,Authorization='Bearer '+env.OPENSQUILLA_DESKTOP_ACCOUNT_TOKEN;assert.equal((await fetch(url+'/state')).status,401);assert.equal((await fetch(url+'/state',{headers:{Authorization}})).status,200);assert.equal((await fetch(url+'/state',{headers:{Authorization,Origin:'https://evil.invalid'}})).status,403);for(const path of ['/health','/api/v1/integrations/opensquilla/wallet','/v1/models?url=https://evil.invalid','https://evil.invalid/v1/models'])assert.equal(allowedModelRoute('GET',path),false);assert.ok(allowedModelRoute('POST','/v1/chat/completions'));assert.ok(allowedModelRoute('GET','/v1/videos/task-123'));assert.equal((await fetch(url+'/v1/models',{headers:{Authorization:'Bearer expired'}})).status,503)})
 
 test('model proxy streams, fixes upstream identity and authorization, retains billing receipts',async t=>{
- const {PassThrough}=await import('node:stream');const f=await fixture(t);await f.login();const seen=[]
+ const {PassThrough}=await import('node:stream');const f=await fixture(t);await f.login();await f.account.selectSource('account');const seen=[]
  const request=(url,options,callback)=>{const stream=new PassThrough();stream.setTimeout=()=>stream;let body='';stream.on('data',chunk=>{body+=chunk});stream.on('finish',()=>{seen.push({url:String(url),options,body});const response=new PassThrough();response.statusCode=200;response.headers={'content-type':'text/event-stream'};callback(response);response.write('data: {"choices":[{"delta":{"tool_calls":[]}}]}\n\n');response.end('data: {"usage":{"billing_receipt":"receipt-1"}}\n\ndata: [DONE]\n\n')});return stream}
  const proxy=new TokenRhythmModelProxy(f.account,request);t.after(()=>proxy.close());const env=await proxy.start();const lease=(await f.account.runtimeState()).credential
  const response=await fetch(env.OPENSQUILLA_DESKTOP_ACCOUNT_URL+'/v1/chat/completions',{method:'POST',headers:{Authorization:'Bearer '+lease,'Content-Type':'application/json','X-Api-Key':'override','X-OpenSquilla-Execution-Id':'execution-1','X-OpenSquilla-Install-Id':'install-1'},body:JSON.stringify({stream:true,tools:[{type:'function'}]})})
  assert.equal(response.status,200);assert.match(await response.text(),/receipt-1/);assert.equal(seen.length,1);assert.equal(seen[0].url,'https://tokenrhythm.studio/v1/chat/completions');assert.equal(seen[0].options.headers.Authorization,'Bearer model-secret-a');assert.equal(seen[0].options.headers['x-api-key'],undefined);assert.equal(seen[0].options.headers['x-opensquilla-execution-id'],'execution-1');assert.equal(seen[0].options.headers['x-opensquilla-install-id'],'install-1')
 })
+test('model proxy upstream 401 clears the rejected local model key', async t => {
+ const { PassThrough } = await import('node:stream')
+ const f = await fixture(t); await f.login(); await f.account.selectSource('account')
+ const request = (url, options, callback) => {
+  const stream = new PassThrough(); stream.setTimeout = () => stream; stream.resume()
+  stream.on('finish', () => {
+   const response = new PassThrough(); response.statusCode = 401; response.headers = { 'content-type': 'application/json' }
+   callback(response); response.end(JSON.stringify({ error: 'unauthorized' }))
+  })
+  return stream
+ }
+ const proxy = new TokenRhythmModelProxy(f.account, request); t.after(() => proxy.close())
+ const env = await proxy.start(); const lease = (await f.account.runtimeState()).credential
+ const response = await fetch(env.OPENSQUILLA_DESKTOP_ACCOUNT_URL + '/v1/chat/completions', { method: 'POST', headers: { Authorization: 'Bearer ' + lease }, body: '{}' })
+ assert.equal(response.status, 401); await response.text(); await until(() => f.account.saved.key === null)
+ assert.equal(f.account.snapshot().keyStatus, 'unavailable')
+ assert.equal((await f.account.runtimeState()).ready, false)
+})
 test('model proxy refuses upstream redirects and records video ownership before returning a job',async t=>{
- const {PassThrough}=await import('node:stream');const f=await fixture(t);await f.login();let redirect=true
+ const {PassThrough}=await import('node:stream');const f=await fixture(t);await f.login();await f.account.selectSource('account');let redirect=true
  const request=(url,options,callback)=>{const stream=new PassThrough();stream.setTimeout=()=>stream;stream.resume();stream.on('finish',()=>{const response=new PassThrough();response.statusCode=redirect?302:200;response.headers={'content-type':'application/json',location:'https://evil.invalid'};callback(response);if(!redirect)response.end(JSON.stringify({id:'video-1'}))});return stream}
  const proxy=new TokenRhythmModelProxy(f.account,request);t.after(()=>proxy.close());const env=await proxy.start(),url=env.OPENSQUILLA_DESKTOP_ACCOUNT_URL,lease=(await f.account.runtimeState()).credential,headers={Authorization:'Bearer '+lease}
  assert.equal((await fetch(url+'/v1/models',{headers})).status,502);redirect=false
  const response=await fetch(url+'/v1/videos/generations',{method:'POST',headers,body:'{}'});assert.equal(response.status,200);assert.equal((await response.json()).id,'video-1');assert.ok(f.account.ownsVideoJob('video-1'));assert.equal((await fetch(url+'/v1/videos/unknown',{headers})).status,403)
 })
 test('logout immediately interrupts an open model stream',async t=>{
- const {PassThrough}=await import('node:stream');const f=await fixture(t);await f.login();let upstreamResponse
+ const {PassThrough}=await import('node:stream');const f=await fixture(t);await f.login();await f.account.selectSource('account');let upstreamResponse
  const request=(url,options,callback)=>{const stream=new PassThrough();stream.setTimeout=()=>stream;stream.resume();stream.on('finish',()=>{upstreamResponse=new PassThrough();upstreamResponse.statusCode=200;upstreamResponse.headers={'content-type':'text/event-stream'};callback(upstreamResponse);upstreamResponse.write('data: first\n\n')});return stream}
  const proxy=new TokenRhythmModelProxy(f.account,request);f.deps.onInvalidate=()=>proxy.invalidate();t.after(()=>{upstreamResponse?.destroy();return proxy.close()});const env=await proxy.start(),lease=(await f.account.runtimeState()).credential
  const response=await fetch(env.OPENSQUILLA_DESKTOP_ACCOUNT_URL+'/v1/chat/completions',{method:'POST',headers:{Authorization:'Bearer '+lease},body:'{}'}),reader=response.body.getReader();await reader.read();await f.account.logout();await assert.rejects(()=>reader.read())
@@ -566,10 +673,10 @@ test('renderer destruction invalidates every account while normal admission is c
  first.deps.onState=undefined
  await closing
 })
-test('restart restores encrypted login and validates before exposing a lease',async t=>{
+test('restart restores encrypted login and exposes the local model lease before remote validation',async t=>{
  const f=await fixture(t);await f.login();await f.account.selectSource('account');const old=(await f.account.runtimeState()).credential;f.account.close()
- const restored=new TokenRhythmAccount(f.deps);t.after(()=>restored.close());await restored.initialize();await restored.verify(true)
- assert.equal(restored.snapshot().status,'signed_in');assert.equal(restored.snapshot().selectedAccountId,'a');assert.notEqual((await restored.runtimeState()).credential,old)
+ const restored=new TokenRhythmAccount(f.deps);t.after(()=>restored.close());await restored.initialize()
+ assert.equal(restored.snapshot().status,'signed_in');assert.equal(restored.snapshot().keyStatus,'ready');assert.equal(restored.snapshot().selectedAccountId,'a');const restoredRuntime=await restored.runtimeState();assert.equal(restoredRuntime.ready,true);assert.ok(restoredRuntime.credential);assert.notEqual(restoredRuntime.credential,old);await restored.verify(true)
  assert.ok(!JSON.stringify(restored.snapshot()).includes('model-secret'))
 })
 
@@ -578,6 +685,34 @@ test('failed media-source persistence rolls back its account binding',async t=>{
  await assert.rejects(()=>f.account.selectMediaSource('image','account'))
  assert.equal(f.account.snapshot().mediaSources.image,'inherit')
  assert.equal((await f.account.runtimeState()).mediaAccountIds.image,null)
+})
+test('independent media account binding keeps the local model lease with a manual text source', async t => {
+ const f = await fixture(t); await f.login(); await f.account.selectMediaSource('image', 'account')
+ assert.equal(f.account.snapshot().source, 'manual')
+ const runtime = await f.account.runtimeState()
+ assert.equal(runtime.ready, true)
+ assert.ok(runtime.credential)
+ assert.equal(runtime.mediaAccountIds.image, 'a')
+ assert.equal(await f.account.modelCredential(runtime.credential), 'model-secret-a')
+})
+test('model 401 invalidation survives failed encrypted persistence', async t => {
+ const f = await fixture(t); await f.login(); await f.account.selectSource('account')
+ f.env.storageFailure = true
+ await assert.rejects(() => f.account.modelKeyRejected(), /ACCOUNT_STORAGE_UNAVAILABLE/)
+ assert.equal(f.account.snapshot().status, 'storage_unavailable')
+ assert.equal(f.account.saved.key, null)
+ assert.equal(await readFile(join(f.directory, 'model-key-rejected'), 'utf8'), '1')
+ f.env.storageFailure = false
+ await f.account.close()
+ const restored = new TokenRhythmAccount(f.deps); t.after(() => restored.close())
+ await restored.initialize()
+ assert.equal(restored.saved.key, null)
+ assert.equal((await restored.runtimeState()).ready, false)
+ await restored.verify(true)
+ assert.equal(restored.snapshot().status, 'signed_in')
+ assert.equal(restored.snapshot().keyStatus, 'ready')
+ assert.equal(restored.saved.key?.secret, 'model-secret-a')
+ await assert.rejects(() => readFile(join(f.directory, 'model-key-rejected')), error => error.code === 'ENOENT')
 })
 test('cancel after the token exchange clears local authorization immediately',async t=>{
  const f=await fixture(t);const original=f.deps.fetch;let release

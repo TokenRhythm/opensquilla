@@ -94,7 +94,7 @@ export class TokenRhythmModelProxy {
           res.end(body)
         })().catch(() => failure(res, 502, 'ACCOUNT_VIDEO_OWNERSHIP_UNAVAILABLE')) })
       } else response.pipe(res)
-      if (status === 401) void this.account.modelKeyRejected().catch(() => {})
+      if (status === 401) void this.account.modelKeyRejected(bearer, credential).catch(() => {})
     })
     const abort = () => { upstream.destroy(); res.destroy() }
     this.requests.add(abort)

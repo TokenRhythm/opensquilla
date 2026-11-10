@@ -136,6 +136,9 @@ export class TokenRhythmAccount {
   private refreshPromise: Promise<void> | null = null
   private revokePromise: Promise<void> | null = null
   private keyPromise: Promise<void> | null = null
+  private modelKeyRejectedPromise: Promise<void> | null = null
+  private modelKeyFence = 0
+  private modelKeyRejectedPersistencePending = false
   private verifyPromise: Promise<void> | null = null
   private initialized: Promise<void> | null = null
   private loginStartPromise: Promise<TokenRhythmAccountState> | null = null
@@ -207,6 +210,23 @@ export class TokenRhythmAccount {
     this.lease = ''
     this.deps.onInvalidate?.()
   }
+  /** Whether any account-backed model binding is still tied to the selected account. */
+  private hasLocalModelBinding(): boolean {
+    const accountId = this.saved.tokens?.accountId
+    if (this.saved.recoveryPending === true || !accountId || this.saved.key?.accountId !== accountId) return false
+    const primary = this.saved.source === 'account' && this.saved.selectedAccountId === accountId
+    const media = (['image', 'video'] as const).some(kind => this.saved.mediaSources[kind] === 'account' && this.saved.mediaAccountIds[kind] === accountId)
+    return primary || media
+  }
+  /** Restore a process-local lease without waiting for remote account verification. */
+  private primeLocalModel(): boolean {
+    if (!this.hasLocalModelBinding()) return false
+    if (!this.lease) this.lease = `os_local_${randomToken()}`
+    if (this.state.status !== 'signed_in' || this.state.keyStatus !== 'ready' || this.state.errorCode !== null) {
+      this.publish({ status: 'signed_in', keyStatus: 'ready', errorCode: null })
+    }
+    return true
+  }
   private queueWrite(write: () => Promise<void>): Promise<void> {
     const operation = this.writes.then(write)
     this.writes = operation.catch(() => {})
@@ -229,6 +249,29 @@ export class TokenRhythmAccount {
         }
       } finally { await rm(temp, { force: true }).catch(() => {}) }
     })
+  }
+  private async markModelKeyRejected(): Promise<void> {
+    await this.queueWrite(async () => {
+      await mkdir(this.deps.directory, { recursive: true, mode: 0o700 })
+      const target = join(this.deps.directory, 'model-key-rejected')
+      try {
+        await readFile(target)
+        return
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error
+      }
+      const temp = `${target}.${randomUUID()}.tmp`
+      try {
+        await writeFile(temp, '1', { mode: 0o600, flag: 'wx' })
+        await rename(temp, target)
+      } catch (error) {
+        // Another rejection may have won the race to create the marker.
+        if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error
+      } finally { await rm(temp, { force: true }).catch(() => {}) }
+    })
+  }
+  private async clearModelKeyRejected(): Promise<void> {
+    await this.queueWrite(async () => { await rm(join(this.deps.directory, 'model-key-rejected'), { force: true }) })
   }
   async initialize(): Promise<void> {
     this.assertOpen()
@@ -264,7 +307,17 @@ export class TokenRhythmAccount {
         this.saved.tokens = null; this.saved.key = null
         await this.persist()
       } catch (error) { if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error }
-      this.publish({ status: this.saved.tokens ? 'verifying' : 'signed_out' })
+      try {
+        await readFile(join(this.deps.directory, 'model-key-rejected'))
+        this.saved.key = null
+        this.invalidate()
+      } catch (error) { if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error }
+      const localModelReady = this.hasLocalModelBinding()
+      if (localModelReady && !this.lease) this.lease = `os_local_${randomToken()}`
+      this.publish({
+        status: localModelReady ? 'signed_in' : this.saved.tokens ? 'verifying' : 'signed_out',
+        keyStatus: localModelReady ? 'ready' : this.saved.tokens ? 'loading' : 'missing',
+      })
     } catch (error) {
       if (error instanceof AccountError && error.code === 'ACCOUNT_STORAGE_REAUTH_REQUIRED') {
         this.saved.source = 'account'
@@ -328,6 +381,7 @@ export class TokenRhythmAccount {
     } catch { throw new AccountError('ACCOUNT_RECOVERY_FAILED') }
     this.saved = next
     this.epoch++
+    this.modelKeyFence++
     this.sourceSelectionVersion++
     this.suppressPrimaryActivation()
     this.invalidate()
@@ -351,7 +405,7 @@ export class TokenRhythmAccount {
     // installation. Finish its cleanup before accepting a new authorization.
     await Promise.all([
       this.loginCompletionPromise, this.logoutPromise,
-      this.verifyPromise, this.refreshPromise, this.keyPromise,
+      this.verifyPromise, this.refreshPromise, this.keyPromise, this.modelKeyRejectedPromise,
     ].map(task => task?.catch(() => {})))
     this.assertOpen()
     if (this.state.status === 'verifying') throw new AccountError('ACCOUNT_LOGIN_IN_PROGRESS')
@@ -450,12 +504,15 @@ export class TokenRhythmAccount {
     try { response = await this.request(this.origin + path, { ...init, redirect: 'error', signal: AbortSignal.timeout(20_000), cache: 'no-store' }) }
     catch { throw new AccountError('ACCOUNT_NETWORK_UNAVAILABLE') }
     if (response.status === 204) return {}
-    let body: Record<string, unknown>
-    try { body = object(await response.json()) } catch { throw new AccountError('INVALID_ACCOUNT_RESPONSE') }
     if (!response.ok) {
-      const value = typeof body.error === 'string' ? body.error : body.code
+      let body: Record<string, unknown> | null = null
+      try { body = object(await response.json()) } catch { /* Status is authoritative for malformed error bodies. */ }
+      const value = body && (typeof body.error === 'string' ? body.error : body.code)
+      if (response.status === 401) throw new AccountError(path === '/api/oauth/token' && value === 'invalid_grant' ? 'invalid_grant' : 'ACCOUNT_HTTP_401')
       throw new AccountError(typeof value === 'string' && /^[a-zA-Z][a-zA-Z0-9_]{0,95}$/.test(value) ? value : `ACCOUNT_HTTP_${response.status}`)
     }
+    let body: Record<string, unknown>
+    try { body = object(await response.json()) } catch { throw new AccountError('INVALID_ACCOUNT_RESPONSE') }
     if (path === '/api/oauth/token') return body
     if (body.code !== 0) throw new AccountError('INVALID_ACCOUNT_RESPONSE')
     return object(body.data)
@@ -539,10 +596,11 @@ export class TokenRhythmAccount {
     if (!this.saved.tokens) { void this.retryRevocations().catch(() => {}); return }
     if (!force && this.state.status === 'signed_in' && this.now() - this.verifiedAt < 60_000) return
     const epoch = this.epoch
+    const modelKeyFence = this.modelKeyFence
     this.verifyPromise = (async () => {
       try {
         const raw = await this.resource('account')
-        if (epoch !== this.epoch || this.admissionClosed) return
+        if (epoch !== this.epoch || this.admissionClosed || modelKeyFence !== this.modelKeyFence) return
         if (raw.account_id !== this.saved.tokens?.accountId || raw.session_id !== this.saved.tokens?.sessionId) throw new AccountError('ACCOUNT_IDENTITY_MISMATCH')
         const profile: AccountProfile = { accountId: string(raw.account_id, 256), sessionId: string(raw.session_id, 256), displayName: typeof raw.display_name === 'string' ? raw.display_name : '', maskedPhone: typeof raw.masked_phone === 'string' ? raw.masked_phone : '' }
         this.links = {}
@@ -557,8 +615,8 @@ export class TokenRhythmAccount {
         // Only an explicit exchange can leave this offer. A restored session,
         // polling, or key repair cannot create an activation request.
         this.offerPrimaryActivation()
-        // Restoring a profile after bridge invalidation does not restore its
-        // model lease. Publish readiness only after ensureKey recreates it.
+        // Keep a locally bound model lease ready while the remote profile and
+        // managed-key checks finish in the background.
         this.publish({
           status: 'signed_in', profile, errorCode: null,
           keyStatus: this.lease ? this.state.keyStatus : 'loading',
@@ -578,15 +636,20 @@ export class TokenRhythmAccount {
           this.publish()
         }
       } catch (error) {
-        if (epoch !== this.epoch || this.admissionClosed) return
-        this.invalidate()
-        if (ENDED.has(code(error)) || !this.saved.tokens) {
+        if (epoch !== this.epoch || this.admissionClosed || modelKeyFence !== this.modelKeyFence) return
+        const errorCode = code(error)
+        const terminal = ENDED.has(errorCode) || errorCode === 'ACCOUNT_HTTP_401' || !this.saved.tokens
+          || ['ACCOUNT_IDENTITY_MISMATCH', 'ACCOUNT_STORAGE_UNAVAILABLE', 'ACCOUNT_LOCAL_DATA_INVALID', 'ACCOUNT_STORAGE_INVALID'].includes(errorCode)
+        if (terminal) {
+          this.invalidate()
           await this.logoutTombstone().catch(() => {})
           this.saved.tokens = null; this.saved.key = null
           this.suppressPrimaryActivation()
           await this.persist().catch(() => {})
-          this.publish({ status: 'reauth_required', profile: null, wallet: null, walletStatus: 'idle', keyStatus: 'missing', errorCode: code(error) })
-        } else this.publish({ status: 'unverified', errorCode: code(error) })
+          this.publish({ status: 'reauth_required', profile: null, wallet: null, walletStatus: 'idle', keyStatus: 'missing', errorCode })
+        } else if (!this.primeLocalModel()) {
+          this.publish({ status: 'unverified', errorCode: errorCode })
+        }
       }
       // An old session's offline revocation must not delay a new account's
       // validation, activation or model requests.
@@ -613,47 +676,66 @@ export class TokenRhythmAccount {
   }
   private async ensureKey(epoch: number, force = false): Promise<void> {
     if (this.keyPromise) return this.keyPromise
-    this.keyPromise = this.loadKey(epoch, force).finally(() => { this.keyPromise = null })
+    const modelKeyFence = this.modelKeyFence
+    this.keyPromise = this.loadKey(epoch, force, modelKeyFence).finally(() => { this.keyPromise = null })
     return this.keyPromise
   }
-  private async loadKey(epoch: number, force: boolean): Promise<void> {
+  private async loadKey(epoch: number, force: boolean, modelKeyFence: number): Promise<void> {
     if (!this.saved.key || force) this.publish({ keyStatus: 'loading' })
     try {
       let obtain = force || !this.saved.key
       if (!obtain) {
         const metadata = await this.resource('managed-key')
-        if (epoch !== this.epoch) return
+        if (epoch !== this.epoch || modelKeyFence !== this.modelKeyFence) return
         if (metadata.account_id !== this.saved.tokens?.accountId || metadata.app_id !== 'opensquilla') throw new AccountError('ACCOUNT_IDENTITY_MISMATCH')
         if (metadata.status !== 'active') throw new AccountError('MANAGED_KEY_DISABLED')
         obtain = metadata.key_id !== this.saved.key?.keyId || metadata.generation !== this.saved.key?.generation
       }
       if (obtain) {
         const raw = await this.resource('managed-key/credential', 'POST')
-        if (epoch !== this.epoch) return
+        if (epoch !== this.epoch || modelKeyFence !== this.modelKeyFence) return
         if (raw.account_id !== this.saved.tokens?.accountId || raw.app_id !== 'opensquilla' || raw.status !== 'active' || !Number.isInteger(raw.generation)) throw new AccountError('ACCOUNT_IDENTITY_MISMATCH')
         this.saved.key = { secret: string(raw.secret), keyId: string(raw.key_id, 256), generation: Number(raw.generation), accountId: string(raw.account_id, 256) }
         await this.persist()
+        if (epoch !== this.epoch || modelKeyFence !== this.modelKeyFence) return
+        try { await this.clearModelKeyRejected() } catch { throw new AccountError('ACCOUNT_STORAGE_UNAVAILABLE') }
       }
-      if (epoch !== this.epoch) return
+      if (epoch !== this.epoch || modelKeyFence !== this.modelKeyFence) return
       if (!this.lease) this.lease = `os_local_${randomToken()}`
       this.publish({ keyStatus: 'ready', errorCode: null })
     } catch (error) {
-      if (epoch !== this.epoch) return
-      this.invalidate()
-      this.saved.key = null
-      this.publish({ keyStatus: code(error) === 'MANAGED_KEY_DISABLED' ? 'disabled' : 'unavailable', errorCode: code(error) })
-      if (ENDED.has(code(error))) throw error
+      if (epoch !== this.epoch || modelKeyFence !== this.modelKeyFence) return
+      const errorCode = code(error)
+      const terminal = ENDED.has(errorCode) || errorCode === 'ACCOUNT_HTTP_401'
+        || ['ACCOUNT_IDENTITY_MISMATCH', 'MANAGED_KEY_DISABLED', 'ACCOUNT_STORAGE_UNAVAILABLE'].includes(errorCode)
+      if (terminal) {
+        this.invalidate()
+        this.saved.key = null
+        this.publish({ keyStatus: errorCode === 'MANAGED_KEY_DISABLED' ? 'disabled' : 'unavailable', errorCode })
+        this.modelKeyRejectedPersistencePending = true
+        try {
+          await this.markModelKeyRejected()
+          await this.persist()
+          this.modelKeyRejectedPersistencePending = false
+        } catch {
+          this.publish({ status: 'storage_unavailable', keyStatus: 'missing', errorCode: 'ACCOUNT_STORAGE_UNAVAILABLE' })
+        }
+        if (ENDED.has(errorCode)) throw error
+      } else if (!this.primeLocalModel()) {
+        this.publish({ keyStatus: this.saved.key ? 'ready' : 'unavailable' })
+      }
     }
   }
   async testModel(): Promise<TokenRhythmAccountState> {
     this.assertOpen()
     await this.verify(true)
-    const secret = await this.modelCredential(this.lease)
+    const lease = this.lease
+    const secret = this.readModelCredential(lease, false)
     let response: Response
     try { response = await this.request(this.origin + '/v1/models', { headers: { Authorization: `Bearer ${secret}` }, redirect: 'error', signal: AbortSignal.timeout(20_000) }) }
     catch { throw new AccountError('ACCOUNT_MODEL_TEST_FAILED') }
     await response.body?.cancel()
-    if (!response.ok) { if (response.status === 401) await this.modelKeyRejected(); throw new AccountError('ACCOUNT_MODEL_TEST_FAILED') }
+    if (!response.ok) { if (response.status === 401) await this.modelKeyRejected(lease, secret); throw new AccountError('ACCOUNT_MODEL_TEST_FAILED') }
     return this.snapshot()
   }
   async retryKey(): Promise<TokenRhythmAccountState> {
@@ -794,7 +876,7 @@ export class TokenRhythmAccount {
     this.sourceSelectionVersion++
     this.suppressPrimaryActivation()
     this.loginResult?.finish('cancelled')
-    this.epoch++; this.closeAttempt(); this.invalidate()
+    this.epoch++; this.modelKeyFence++; this.closeAttempt(); this.invalidate()
     const tombstone = this.logoutTombstone()
     if (this.saved.tokens) this.saved.pending.push(this.saved.tokens)
     this.saved.tokens = null; this.saved.key = null; this.links = {}
@@ -807,16 +889,18 @@ export class TokenRhythmAccount {
   /** Private Gateway boundary; never expose this through preload. */
   async runtimeState(): Promise<Record<string, unknown>> {
     await this.initialize()
+    const localModelReady = this.primeLocalModel()
     if (this.state.status !== 'storage_unavailable') void this.verify().catch(() => {})
-    return { revision: this.state.revision, source: this.saved.source, selectedAccountId: this.saved.selectedAccountId, accountId: this.saved.tokens?.accountId ?? null, ready: this.state.status === 'signed_in' && this.state.keyStatus === 'ready', credential: this.lease, origin: this.origin, mediaSources: this.saved.mediaSources, mediaAccountIds: this.saved.mediaAccountIds }
+    return { revision: this.state.revision, source: this.saved.source, selectedAccountId: this.saved.selectedAccountId, accountId: this.saved.tokens?.accountId ?? null, ready: localModelReady, credential: localModelReady ? this.lease : '', origin: this.origin, mediaSources: this.saved.mediaSources, mediaAccountIds: this.saved.mediaAccountIds }
   }
-  async modelCredential(lease: string): Promise<string> {
+  private readModelCredential(lease: string, requireBinding: boolean): string {
     this.assertOpen()
-    await this.verify()
-    this.assertOpen()
-    if (!equalToken(lease, this.lease) || this.state.status !== 'signed_in' || this.state.keyStatus !== 'ready' || !this.saved.key || this.saved.key.accountId !== this.saved.tokens?.accountId) throw new AccountError('ACCOUNT_MODEL_UNAVAILABLE')
-    return this.saved.key.secret
+    const key = this.saved.key
+    const accountId = this.saved.tokens?.accountId
+    if (!equalToken(lease, this.lease) || !accountId || this.saved.recoveryPending === true || !key || key.accountId !== accountId || requireBinding && !this.hasLocalModelBinding()) throw new AccountError('ACCOUNT_MODEL_UNAVAILABLE')
+    return key.secret
   }
+  async modelCredential(lease: string): Promise<string> { return this.readModelCredential(lease, true) }
   async recordVideoJob(id: string, lease: string): Promise<void> {
     this.assertOpen()
     if (!/^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/.test(id) || !equalToken(lease, this.lease) || !this.saved.tokens) throw new AccountError('ACCOUNT_VIDEO_UNAVAILABLE')
@@ -826,20 +910,45 @@ export class TokenRhythmAccount {
   ownsVideoJob(id: string): boolean {
     return !!this.saved.tokens && this.saved.videoJobs[id] === this.saved.tokens.accountId
   }
-  async modelKeyRejected(): Promise<void> {
-    if (this.admissionClosed) return
-    if (this.state.status === 'signed_in') {
-      await this.ensureKey(this.epoch, true)
-      if (!this.admissionClosed && this.state.keyStatus === 'ready') await this.deps.onSignedIn?.().catch(() => {})
-    }
+  async modelKeyRejected(lease?: string, secret?: string): Promise<void> {
+    if (lease !== undefined && !equalToken(lease, this.lease)) return
+    if (secret !== undefined && this.saved.key?.secret !== secret) return
+    if (this.modelKeyRejectedPromise) return this.modelKeyRejectedPromise
+    if (!this.saved.tokens && !this.saved.key) return
+    this.modelKeyRejectedPromise = (async () => {
+      // An upstream 401 is a terminal rejection of the credential currently in
+      // use. Drop the process lease and persisted managed key so the next model
+      // request cannot replay a credential the provider has rejected.
+      this.modelKeyFence++
+      this.modelKeyRejectedPersistencePending = true
+      this.invalidate()
+      this.saved.key = null
+      if (!this.closing) this.publish({ keyStatus: 'unavailable', errorCode: 'ACCOUNT_MODEL_UNAUTHORIZED' })
+      try {
+        // The marker is written before the encrypted record so a failed record
+        // write cannot resurrect the rejected key after restart.
+        await this.markModelKeyRejected()
+        await this.persist()
+        this.modelKeyRejectedPersistencePending = false
+      } catch (error) {
+        if (!this.closing) this.publish({ status: 'storage_unavailable', keyStatus: 'missing', errorCode: 'ACCOUNT_STORAGE_UNAVAILABLE' })
+        throw error instanceof AccountError ? error : new AccountError('ACCOUNT_STORAGE_UNAVAILABLE')
+      }
+    })().finally(() => { this.modelKeyRejectedPromise = null })
+    return this.modelKeyRejectedPromise
   }
   private async drainOperations(): Promise<void> {
     await Promise.allSettled([
       this.initialized, this.loginStartPromise, this.loginCompletionPromise, this.recoveryPromise,
-      this.verifyPromise, this.refreshPromise, this.keyPromise,
+      this.verifyPromise, this.refreshPromise, this.keyPromise, this.modelKeyRejectedPromise,
       this.logoutPromise, this.revokePromise,
     ])
     await this.writes
+    if (this.modelKeyRejectedPersistencePending) {
+      await this.markModelKeyRejected()
+      await this.persist()
+      this.modelKeyRejectedPersistencePending = false
+    }
     if (this.logoutPersistencePending || this.revocationPersistencePending) {
       await this.persist()
       this.logoutPersistencePending = false
