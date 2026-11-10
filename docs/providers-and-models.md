@@ -44,7 +44,7 @@ Direct provider examples:
 
 ```sh
 opensquilla configure provider --provider openai --model gpt-5.4-mini --api-key-env OPENAI_API_KEY
-opensquilla configure provider --provider anthropic --model claude-sonnet-4-5 --api-key-env ANTHROPIC_API_KEY
+opensquilla configure provider --provider anthropic --model claude-sonnet-4-6 --api-key-env ANTHROPIC_API_KEY
 opensquilla configure provider --provider gemini --model gemini-2.5-flash --api-key-env GEMINI_API_KEY
 opensquilla configure provider --provider ollama --model llama3.1
 ```

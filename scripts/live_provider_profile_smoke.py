@@ -133,7 +133,7 @@ _BASE_ENV = {
 }
 
 _DEFAULT_MODELS = {
-    "anthropic": "claude-sonnet-4-5",
+    "anthropic": "claude-sonnet-4-6",
     "openai": "gpt-5.4-mini",
     "openai_responses": "gpt-5.4-mini",
     "openrouter": "deepseek/deepseek-v4-flash",

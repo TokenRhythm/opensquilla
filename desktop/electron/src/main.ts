@@ -1970,7 +1970,7 @@ const PROVIDER_CATALOG: ProviderCatalogEntry[] = ([
   {
     id: 'anthropic',
     label: 'Anthropic',
-    model: 'claude-sonnet-4-5',
+    model: 'claude-sonnet-4-6',
     baseUrl: 'https://api.anthropic.com',
     apiKeyEnv: 'ANTHROPIC_API_KEY',
     requiresApiKey: true,
