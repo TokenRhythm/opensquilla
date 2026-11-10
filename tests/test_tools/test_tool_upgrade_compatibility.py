@@ -180,6 +180,7 @@ def test_tool_context_appends_new_runtime_fields_after_ordinary_fields() -> None
         "process_event_emitter",
         "memory_notes_dir",
         "bootstrap_source_dir",
+        "browser_open_attempts",
     ]
 
     assert ToolContext().skill_install_turn is None
@@ -194,6 +195,11 @@ def test_tool_context_appends_new_runtime_fields_after_ordinary_fields() -> None
     assert ToolContext().process_event_emitter is None
     assert ToolContext().memory_notes_dir is None
     assert ToolContext().bootstrap_source_dir is None
+    context = ToolContext()
+    another_context = ToolContext()
+    assert context.browser_open_attempts == {}
+    context.browser_open_attempts[("turn", "session", "url-digest")] = "pending"
+    assert another_context.browser_open_attempts == {}
 
 
 def test_tool_context_preserves_workspace_authoring_positional_constructor() -> None:
