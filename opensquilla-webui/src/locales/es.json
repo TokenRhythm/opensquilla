@@ -4830,7 +4830,7 @@
       "voiceUnsupported": "La entrada de voz no es compatible con este navegador",
       "voiceUnavailable": "La entrada de voz no está disponible. Actívala en Ajustes.",
       "voiceTranscribeFailed": "No se pudo transcribir tu grabación. Inténtalo de nuevo.",
-      "voiceSetupNeeded": "La entrada de voz necesita una clave de API de ElevenLabs: abriendo Ajustes…",
+      "voiceSetupNeeded": "La entrada de voz necesita un proveedor de conversión de voz a texto: abriendo Ajustes…",
       "voiceCancelledHidden": "La grabación se detuvo al ocultarse la ventana. Empieza de nuevo para dictar.",
       "voiceMicDenied": "Se denegó el acceso al micrófono. Permítelo en los ajustes del navegador.",
       "voiceMicDeniedDesktop": "El acceso al micrófono está bloqueado. Permítelo en los ajustes del sistema e inténtalo de nuevo.",

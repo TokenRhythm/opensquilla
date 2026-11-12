@@ -4830,7 +4830,7 @@
       "voiceUnsupported": "Spracheingabe wird in diesem Browser nicht unterstützt",
       "voiceUnavailable": "Spracheingabe ist nicht verfügbar. Aktivieren Sie sie in den Einstellungen.",
       "voiceTranscribeFailed": "Aufnahme konnte nicht transkribiert werden. Bitte erneut versuchen.",
-      "voiceSetupNeeded": "Spracheingabe benötigt einen ElevenLabs-API-Schlüssel – Einstellungen werden geöffnet…",
+      "voiceSetupNeeded": "Spracheingabe erfordert einen Speech-to-Text-Dienst – die Einstellungen werden geöffnet…",
       "voiceCancelledHidden": "Die Aufnahme wurde beendet, als das Fenster ausgeblendet wurde. Starten Sie erneut, um zu diktieren.",
       "voiceMicDenied": "Der Mikrofonzugriff wurde verweigert. Erlauben Sie ihn in den Browsereinstellungen.",
       "voiceMicDeniedDesktop": "Der Mikrofonzugriff ist blockiert. Erlauben Sie ihn in den Systemeinstellungen und versuchen Sie es dann erneut.",

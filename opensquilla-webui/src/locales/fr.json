@@ -4830,7 +4830,7 @@
       "voiceUnsupported": "L'entrée vocale n'est pas prise en charge dans ce navigateur",
       "voiceUnavailable": "L'entrée vocale n'est pas disponible. Activez-la dans les Paramètres.",
       "voiceTranscribeFailed": "Impossible de transcrire votre enregistrement. Veuillez réessayer.",
-      "voiceSetupNeeded": "L'entrée vocale nécessite une clé API ElevenLabs — ouverture des Paramètres…",
+      "voiceSetupNeeded": "L'entrée vocale nécessite un fournisseur de transcription vocale — ouverture des Paramètres…",
       "voiceCancelledHidden": "L'enregistrement s'est arrêté lorsque la fenêtre a été masquée. Recommencez pour dicter.",
       "voiceMicDenied": "L'accès au micro a été refusé. Autorisez-le dans les paramètres du navigateur.",
       "voiceMicDeniedDesktop": "L'accès au micro est bloqué. Autorisez-le dans les paramètres système, puis réessayez.",

@@ -4932,7 +4932,7 @@
       "voiceUnsupported": "此浏览器不支持语音输入",
       "voiceUnavailable": "语音输入不可用，请在设置中启用。",
       "voiceTranscribeFailed": "无法转写你的录音，请重试。",
-      "voiceSetupNeeded": "语音识别需要配置 ElevenLabs API key —— 正在打开设置……",
+      "voiceSetupNeeded": "语音输入需要配置语音转写服务 —— 正在打开设置……",
       "voiceCancelledHidden": "窗口隐藏时已停止录音。重新开始即可继续口述。",
       "voiceMicDenied": "麦克风访问被拒绝，请在浏览器设置中允许。",
       "voiceMicDeniedDesktop": "麦克风访问被拒绝。请在系统设置中允许后重试。",

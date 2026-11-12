@@ -4830,7 +4830,7 @@
       "voiceUnsupported": "このブラウザーでは音声入力がサポートされていません",
       "voiceUnavailable": "音声入力は利用できません。設定で有効にしてください。",
       "voiceTranscribeFailed": "録音を文字起こしできませんでした。もう一度お試しください。",
-      "voiceSetupNeeded": "音声入力には ElevenLabs API キーが必要です — 設定を開きます…",
+      "voiceSetupNeeded": "音声入力には音声認識プロバイダーの設定が必要です — 設定を開きます…",
       "voiceCancelledHidden": "ウィンドウが非表示になったため録音を停止しました。もう一度開始すると口述できます。",
       "voiceMicDenied": "マイクへのアクセスが拒否されました。ブラウザーの設定で許可してください。",
       "voiceMicDeniedDesktop": "マイクへのアクセスがブロックされています。システム設定で許可してから、もう一度お試しください。",

@@ -4933,7 +4933,7 @@
       "voiceUnsupported": "Voice input is not supported in this browser",
       "voiceUnavailable": "Voice input isn't available. Enable it in Settings.",
       "voiceTranscribeFailed": "Couldn't transcribe your recording. Please try again.",
-      "voiceSetupNeeded": "Voice input needs an ElevenLabs API key — opening Settings…",
+      "voiceSetupNeeded": "Voice input needs a speech-to-text provider — opening Settings…",
       "voiceCancelledHidden": "Recording stopped when the window was hidden. Start again to dictate.",
       "voiceMicDenied": "Microphone access was denied — allow it in your browser settings.",
       "voiceMicDeniedDesktop": "Microphone access is blocked. Allow it in your system settings, then try again.",
