@@ -21,6 +21,13 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 - Voice input moves from the composer's Add menu to a persistent toolbar
   button between model routing and send. It stays visible before setup and
   points at Settings, so the feature is discoverable instead of buried.
+- Auto-grant microphone-only `getUserMedia` from the app's own loopback gateway
+  origin inside an embedded Workbench preview. A confirmation request aimed at
+  the application asking to use its own interface has no actionable answer, and
+  in preview hosts without a confirmation surface it expired into a silent
+  denial, leaving voice input impossible to start. Camera requests, audio+video
+  requests, and every non-loopback or uninterpretable request still take the
+  existing prompt path, which remains authoritative.
 
 ## [0.5.8] - 2026-11-05
 
