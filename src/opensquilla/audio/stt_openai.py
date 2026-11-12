@@ -22,6 +22,7 @@ import os
 import httpx
 
 from opensquilla.audio.stt_types import SttAudio, SttProviderError, SttResult
+from opensquilla.env import trust_env as _trust_env
 from opensquilla.provider.metered_http import accounted_request, audio_duration_seconds
 from opensquilla.secrets import clean_header_secret
 from opensquilla.usage_metering import UsageMeter
@@ -154,7 +155,9 @@ class _OpenAISttBase:
             )
         headers = {"Authorization": f"Bearer {api_key}"}
         async with httpx.AsyncClient(
-            timeout=self._timeout_seconds, transport=self._transport
+            timeout=self._timeout_seconds,
+            transport=self._transport,
+            trust_env=_trust_env(),
         ) as client:
             response = await accounted_request(
                 client,

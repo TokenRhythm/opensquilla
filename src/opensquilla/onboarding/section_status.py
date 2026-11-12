@@ -24,6 +24,7 @@ from collections.abc import Callable, Collection
 from enum import StrEnum
 from typing import Any
 
+from opensquilla.audio.stt_registry import resolve_stt_api_key_env
 from opensquilla.gateway.config import GatewayConfig, ImageGenerationConfig
 from opensquilla.onboarding.audio_specs import get_audio_provider_setup_spec
 from opensquilla.onboarding.image_generation_specs import (
@@ -254,10 +255,56 @@ def image_generation_section_status(cfg: GatewayConfig) -> SectionStatus:
     return aggregate
 
 
+_STT_PROVIDER_IDS = ("openai_transcriptions", "openai_chat")
+
+
+def stt_provider_annotation(cfg: GatewayConfig) -> tuple[str, str, str]:
+    """Annotate the ``[audio.stt]`` provider as ``(source, provider_id, env_key)``.
+
+    ``source`` mirrors the onboarding key-source vocabulary (``explicit`` /
+    ``env`` / ``missing_env`` / ``none`` / ``unknown``). ``elevenlabs`` is
+    reported as-is so callers keep using the legacy ``[audio].providers``
+    block that also backs TTS. The env reference is resolved through the same
+    per-origin rule the runtime provider uses, so readiness never claims a
+    key the provider would refuse to reuse across origins.
+    """
+    stt = getattr(getattr(cfg, "audio", None), "stt", None)
+    if stt is None:
+        return "none", "", ""
+    provider_id = str(getattr(stt, "provider", "elevenlabs") or "elevenlabs").strip()
+    if provider_id == "elevenlabs":
+        return "elevenlabs", provider_id, ""
+    if provider_id not in _STT_PROVIDER_IDS:
+        return "unknown", provider_id, ""
+    provider_cfg = getattr(stt, provider_id, None)
+    if provider_cfg is None:
+        return "none", provider_id, ""
+    if getattr(provider_cfg, "api_key", ""):
+        return "explicit", provider_id, ""
+    env_key = resolve_stt_api_key_env(provider_cfg)
+    if env_key:
+        source = "env" if os.environ.get(env_key) else "missing_env"
+        return source, provider_id, env_key
+    return "none", provider_id, ""
+
+
 def audio_section_status(cfg: GatewayConfig) -> SectionStatus:
     audio_cfg = getattr(cfg, "audio", None)
     if audio_cfg is None or not bool(getattr(audio_cfg, "enabled", False)):
         return SectionStatus.OPTIONAL
+    stt_source, stt_provider, _stt_env = stt_provider_annotation(cfg)
+    if stt_provider and stt_provider != "elevenlabs":
+        # The selected [audio.stt] provider is the only backend the
+        # transcription route will call, so its own credential state is
+        # authoritative; never borrow ElevenLabs readiness for it.
+        if stt_source in ("explicit", "env"):
+            return SectionStatus.OK
+        if stt_source == "missing_env":
+            return SectionStatus.DEGRADED
+        if stt_source == "unknown":
+            return SectionStatus.UNKNOWN
+        return SectionStatus.MISSING
+    # provider == elevenlabs: fall through to the legacy block shared with TTS.
     provider_id = "elevenlabs"
     try:
         _spec = get_audio_provider_setup_spec(provider_id)

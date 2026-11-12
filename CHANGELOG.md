@@ -13,6 +13,11 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
   `/audio/transcriptions` (Whisper, SiliconFlow, Groq, ...) and chat-completion
   `input_audio` (MiMo-style) backends, selected through `[audio.stt]` with an
   ordered `fallback` chain and per-origin credential-env scoping.
+- The Web UI microphone entry now reports readiness for any configured STT
+  provider, not only ElevenLabs. Readiness resolves the selected provider's
+  credential through the same per-origin rule the runtime provider uses, so a
+  missing or non-reusable key degrades the control panel instead of lighting
+  up a microphone that would fail at request time.
 
 ## [0.5.8] - 2026-11-05
 
