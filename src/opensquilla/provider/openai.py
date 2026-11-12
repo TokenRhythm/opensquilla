@@ -248,9 +248,16 @@ def _post_terminal_stream_violation(
     metadata. Keep that exception narrow; return a field path and a fixed rule
     name for diagnostics, never a provider-supplied value.
     """
+    sglang_metadata_epilogue = (
+        policy.allow_sglang_metadata_epilogue
+        and chunk.get("choices") == []
+        and isinstance(chunk.get("sglext"), Mapping)
+    )
     allowed_chunk_keys = _OPENAI_STREAM_USAGE_ONLY_KEYS.union(
         policy.post_terminal_metadata_keys
     )
+    if sglang_metadata_epilogue:
+        allowed_chunk_keys = allowed_chunk_keys.union({"sglext"})
     if set(chunk).difference(allowed_chunk_keys):
         key = next(key for key in chunk if key not in allowed_chunk_keys)
         return (f"$.{_stream_diagnostic_key(key)}", "unexpected_fields")
@@ -261,7 +268,7 @@ def _post_terminal_stream_violation(
     has_null_usage_noop = (
         usage_present
         and usage_payload is None
-        and policy.allow_post_terminal_null_usage_noop_choice
+        and (policy.allow_post_terminal_null_usage_noop_choice or sglang_metadata_epilogue)
     )
     if usage_present and not has_usage and not has_null_usage_noop:
         return ("usage", "invalid_type")
@@ -3368,6 +3375,13 @@ class OpenAIProvider:
                 compat_policy,
                 allow_post_terminal_empty_choices=True,
             )
+        endpoint_host = base_url_hostname(self._base_url)
+        if (
+            self._provider_kind == "openai"
+            and endpoint_host
+            and endpoint_host != "api.openai.com"
+        ):
+            compat_policy = replace(compat_policy, allow_sglang_metadata_epilogue=True)
         self._compat = compat_policy
         self._replay_provider_state = replay_provider_state
         self._replay_source = _openai_replay_source(self._provider_kind, self._base_url)
