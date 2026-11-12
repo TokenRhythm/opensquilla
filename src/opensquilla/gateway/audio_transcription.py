@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import uuid
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from dataclasses import replace
 from typing import Any
 
@@ -12,36 +12,32 @@ from starlette.requests import Request
 from starlette.responses import JSONResponse
 from starlette.routing import Route
 
+from opensquilla.audio.stt_registry import SttConfigError, build_stt_chain
+from opensquilla.audio.stt_types import SttAudio, SttProvider, SttResult
 from opensquilla.gateway.config import GatewayConfig
 from opensquilla.gateway.origin_guard import forbidden_origin_response, request_origin_allowed
 from opensquilla.gateway.uploads import _authorization_token_matches
-from opensquilla.provider.audio import (
-    ElevenLabsAudioProductionProvider,
-    ElevenLabsSpeechToTextRequest,
-    resolve_elevenlabs_api_key_env,
-)
 
 _MAX_TRANSCRIPTION_BYTES = 30 * 1024 * 1024
 
 
-def _default_provider_factory(config: GatewayConfig) -> ElevenLabsAudioProductionProvider:
-    provider_cfg = config.audio.providers.elevenlabs
-    return ElevenLabsAudioProductionProvider(
-        api_key=getattr(provider_cfg, "api_key", ""),
-        api_key_env=resolve_elevenlabs_api_key_env(provider_cfg),
-        base_url=getattr(provider_cfg, "base_url", "https://api.elevenlabs.io"),
-    )
+def _default_stt_chain(config: GatewayConfig) -> Sequence[SttProvider]:
+    return build_stt_chain(config)
 
 
 def register_audio_transcription_routes(
     app: Starlette,
     *,
     config: GatewayConfig,
-    provider_factory: Callable[[GatewayConfig], Any] = _default_provider_factory,
+    stt_chain_factory: Callable[[GatewayConfig], Sequence[SttProvider]] = _default_stt_chain,
     usage_event_sink: Any | None = None,
     session_manager: Any | None = None,
 ) -> None:
-    """Register POST /api/audio/transcribe for browser-recorded audio."""
+    """Register POST /api/audio/transcribe for browser-recorded audio.
+
+    Providers are tried in configured order (``[audio.stt].provider`` plus
+    ``fallback``); the first success wins.
+    """
 
     async def transcribe_handler(request: Request) -> JSONResponse:
         if not request_origin_allowed(request, config):
@@ -62,6 +58,22 @@ def register_audio_transcription_routes(
         if not getattr(config.audio, "enabled", False):
             return JSONResponse(
                 {"error": "audio transcription is disabled", "code": "UNAVAILABLE"},
+                status_code=503,
+            )
+
+        try:
+            chain = list(stt_chain_factory(config))
+        except SttConfigError as exc:
+            return JSONResponse(
+                {"error": str(exc), "code": "STT_PROVIDER_MISCONFIGURED"},
+                status_code=503,
+            )
+        if not chain:
+            return JSONResponse(
+                {
+                    "error": "no speech-to-text provider configured",
+                    "code": "STT_PROVIDER_MISCONFIGURED",
+                },
                 status_code=503,
             )
 
@@ -96,14 +108,14 @@ def register_audio_transcription_routes(
                 status_code=413,
             )
 
-        provider_cfg = config.audio.providers.elevenlabs
-        model_id = str(
-            form.get("model_id")
-            or getattr(provider_cfg, "speech_to_text_model", "scribe_v2")
-            or "scribe_v2"
+        model_value = form.get("model_id")
+        request_model_id = str(model_value).strip() if isinstance(model_value, str) else ""
+        language_value = form.get("language_code")
+        language = (
+            language_value
+            if isinstance(language_value, str) and language_value.strip()
+            else str(getattr(config.audio.stt, "language", "") or "").strip() or None
         )
-        language_code_value = form.get("language_code")
-        language_code = language_code_value if isinstance(language_code_value, str) else None
 
         from opensquilla.engine.usage_accounting import (
             UsageAccountingScope,
@@ -153,20 +165,25 @@ def register_audio_transcription_routes(
                     ),
                 )
 
-        try:
-            with bind_usage_accounting_scope(scope):
-                result = await provider_factory(config).transcribe_audio(
-                    ElevenLabsSpeechToTextRequest(
-                        audio_bytes=payload,
-                        filename=str(filename),
-                        mime_type=mime_type,
-                        model_id=model_id,
-                        language_code=language_code or None,
+        audio = SttAudio(data=payload, filename=str(filename), mime_type=mime_type)
+        errors: list[str] = []
+        result: SttResult | None = None
+        for provider in chain:
+            accepts_model = bool(getattr(provider, "accepts_request_model", False))
+            model_id_arg = (request_model_id or None) if accepts_model else None
+            try:
+                with bind_usage_accounting_scope(scope):
+                    result = await provider.transcribe(
+                        audio,
+                        model_id=model_id_arg,
+                        language=language,
                     )
-                )
-        except Exception as exc:
+                break
+            except Exception as exc:
+                errors.append(str(exc) if len(chain) == 1 else f"{provider.provider_id}: {exc}")
+        if result is None:
             return JSONResponse(
-                {"error": str(exc), "code": "PROVIDER_ERROR"},
+                {"error": "; ".join(errors) or "transcription failed", "code": "PROVIDER_ERROR"},
                 status_code=502,
             )
 

@@ -6,6 +6,14 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ## [Unreleased]
 
+### Added
+
+- Multi-provider speech-to-text for `POST /api/audio/transcribe`: the ElevenLabs
+  Scribe path (unchanged default) is joined by OpenAI-compatible
+  `/audio/transcriptions` (Whisper, SiliconFlow, Groq, ...) and chat-completion
+  `input_audio` (MiMo-style) backends, selected through `[audio.stt]` with an
+  ordered `fallback` chain and per-origin credential-env scoping.
+
 ## [0.5.8] - 2026-11-05
 
 ### Added

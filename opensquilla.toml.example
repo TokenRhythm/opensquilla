@@ -567,3 +567,26 @@ default_mode = "bypass"                 # off | on | bypass | full
 # signing_secret = ""         # required for Slack webhook mode
 # slack_channel_id = "C12345"
 # reply_in_thread = false
+
+# [audio]
+# Speech features for the Web UI microphone and future voice paths.
+# enabled = false keeps every audio route disabled (503) — the default.
+
+# [audio.stt]
+# Provider selection for speech-to-text (POST /api/audio/transcribe).
+# "elevenlabs" is the default and keeps the historical Scribe behaviour.
+# provider = "elevenlabs"        # or openai_transcriptions | openai_chat
+# language = ""                  # ISO-639-1 hint, e.g. "zh"; empty = auto
+# fallback = []                  # ordered retry list, e.g. ["openai_transcriptions"]
+
+# [audio.stt.openai_transcriptions]
+# Multipart /audio/transcriptions: OpenAI Whisper, SiliconFlow, Groq, ...
+# base_url = "https://api.openai.com/v1"
+# model = ""                     # e.g. "whisper-1"; required when selected
+# api_key_env = "OPENAI_API_KEY" # implicit default applies only on api.openai.com
+
+# [audio.stt.openai_chat]
+# Chat-completion ASR with inline input_audio: MiMo (mimo-v2.5-asr), ...
+# base_url = "https://api.openai.com/v1"
+# model = ""
+# api_key_env = "OPENAI_API_KEY" # set explicitly to follow a custom base_url

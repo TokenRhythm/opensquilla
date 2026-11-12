@@ -1987,6 +1987,34 @@ class AudioProvidersConfig(BaseModel):
     elevenlabs: AudioElevenLabsProviderConfig = Field(default_factory=AudioElevenLabsProviderConfig)
 
 
+class AudioSttOpenAIProviderConfig(BaseModel):
+    """One OpenAI-compatible STT endpoint (transcriptions or chat style)."""
+
+    base_url: str = "https://api.openai.com/v1"
+    api_key: str = ""
+    api_key_env: str = "OPENAI_API_KEY"
+    model: str = ""
+    timeout_seconds: float = 120.0
+
+
+class AudioSttConfig(BaseModel):
+    """``[audio.stt]`` — provider selection for speech-to-text.
+
+    ``provider`` stays ``elevenlabs`` by default so the WebUI microphone
+    path is unchanged until an operator opts in to another backend.
+    """
+
+    provider: str = "elevenlabs"
+    language: str = ""
+    fallback: list[str] = Field(default_factory=list)
+    openai_transcriptions: AudioSttOpenAIProviderConfig = Field(
+        default_factory=AudioSttOpenAIProviderConfig
+    )
+    openai_chat: AudioSttOpenAIProviderConfig = Field(
+        default_factory=AudioSttOpenAIProviderConfig
+    )
+
+
 class AudioTTSConfig(BaseModel):
     model: str = "eleven_multilingual_v2"
     voice: str = "21m00Tcm4TlvDq8ikWAM"
@@ -2009,6 +2037,7 @@ class AudioConfig(BaseSettings):
     enabled: bool = False
     tts: AudioTTSConfig = Field(default_factory=AudioTTSConfig)
     providers: AudioProvidersConfig = Field(default_factory=AudioProvidersConfig)
+    stt: AudioSttConfig = Field(default_factory=AudioSttConfig)
 
 
 # ---------------------------------------------------------------------------
