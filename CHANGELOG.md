@@ -18,6 +18,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
   credential through the same per-origin rule the runtime provider uses, so a
   missing or non-reusable key degrades the control panel instead of lighting
   up a microphone that would fail at request time.
+- Voice input moves from the composer's Add menu to a persistent toolbar
+  button between model routing and send. It stays visible before setup and
+  points at Settings, so the feature is discoverable instead of buried.
 
 ## [0.5.8] - 2026-11-05
 

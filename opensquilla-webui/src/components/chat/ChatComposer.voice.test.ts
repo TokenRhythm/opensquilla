@@ -35,22 +35,12 @@ async function mount(overrides: Record<string, unknown> = {}) {
   return { app: app as App<Element>, el }
 }
 
-// The mic button carries the recordVoice aria-label when ready and the
-// "unavailable" hint when gated — resolve both from i18n so the test never
-// hard-codes English copy.
+// The persistent toolbar mic carries the recordVoice aria-label when ready
+// and the "unavailable" hint when gated — resolve both from i18n so the test
+// never hard-codes English copy. It sits outside the Add menu, so no popover
+// needs to be opened.
 async function micButton(el: HTMLElement): Promise<HTMLButtonElement | null> {
-  const add = el.querySelector<HTMLButtonElement>(
-    `button[aria-label="${i18n.global.t('chat.add')}"]`,
-  )
-  expect(add).toBeTruthy()
-  add?.click()
-  await nextTick()
-  const ready = i18n.global.t('chat.recordVoice')
-  const gated = i18n.global.t('chat.voiceUnavailableHint')
-  return (
-    el.querySelector<HTMLButtonElement>(`button[aria-label="${ready}"]`) ??
-    el.querySelector<HTMLButtonElement>(`button[aria-label="${gated}"]`)
-  )
+  return el.querySelector<HTMLButtonElement>('button.chat-mic-btn')
 }
 
 beforeEach(() => {
@@ -146,7 +136,7 @@ describe('ChatComposer voice-input gate', () => {
     expect(btn).toBeTruthy()
     // Not hard-disabled — the user can click it to be guided to configuration.
     expect(btn?.disabled).toBe(false)
-    expect(btn?.classList.contains('chat-mic--needs-setup')).toBe(true)
+    expect(btn?.classList.contains('chat-mic-btn--needs-setup')).toBe(true)
     expect(btn?.getAttribute('aria-label')).toBe(i18n.global.t('chat.voiceUnavailableHint'))
     expect(btn?.getAttribute('title')).toBe(i18n.global.t('chat.voiceUnavailableHint'))
     btn?.click()

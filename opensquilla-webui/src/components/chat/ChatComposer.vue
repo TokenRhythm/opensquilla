@@ -228,6 +228,7 @@
                 :plan-mode-available="policy.plan && planModeAvailable === true"
                 :plan-mode-busy="planModeBusy === true || planModeDisabled === true"
                 :show-utility-actions="true"
+                :show-voice-action="false"
                 :voice-busy="voiceBusy"
                 :voice-ready="voiceReady"
                 :voice-recording="voiceRecording"
@@ -394,6 +395,22 @@
                 @set-session-routing-mode="emit('setSessionRoutingMode', $event)"
               />
             </div>
+
+            <button
+              type="button"
+              class="btn btn--icon btn--ghost chat-mic-btn"
+              :class="{
+                'is-active': voiceRecording,
+                'chat-mic-btn--needs-setup': !voiceReady,
+              }"
+              :title="voiceReady ? t('chat.recordVoice') : t('chat.voiceUnavailableHint')"
+              :aria-label="voiceReady ? t('chat.recordVoice') : t('chat.voiceUnavailableHint')"
+              :aria-pressed="voiceRecording ? 'true' : 'false'"
+              :disabled="voiceBusy && !voiceRecording"
+              @click="voiceReady ? emit('voiceInput') : emit('voiceSetup')"
+            >
+              <Icon name="microphone" :size="18" />
+            </button>
 
             <button
               v-if="showSkillQueueSend"
@@ -1709,7 +1726,7 @@ button.attachment-chip__primary:focus-visible {
 
 @media (pointer: coarse) {
   .chat-plus-btn, .chat-run-mode-btn, .chat-project-choose,
-  .attachment-action { min-width: 44px; min-height: 44px; }
+  .attachment-action, .chat-mic-btn { min-width: 44px; min-height: 44px; }
   .chat-textarea { font-size: 1rem; }
 }
 .chat-input-wrap {
@@ -1761,6 +1778,20 @@ button.attachment-chip__primary:focus-visible {
 
 .chat-plus-btn {
   color: var(--text-muted);
+}
+
+.chat-mic-btn {
+  color: var(--text-muted);
+}
+
+/* Voice is offered before setup: the button stays clickable (it points at
+   Settings) but reads as unavailable until an STT provider is configured. */
+.chat-mic-btn--needs-setup {
+  opacity: var(--state-disabled-opacity);
+}
+
+.chat-mic-btn--needs-setup:hover {
+  opacity: 1;
 }
 
 .btn--ghost.is-active {
@@ -2090,7 +2121,7 @@ button.attachment-chip__primary:focus-visible {
 }
 
 .chat-input-footer:is([data-composer-density='compact'], [data-composer-density='icons']) :is(
-  .chat-plus-btn, .chat-run-mode-btn, .chat-project-choose, .chat-send-btn
+  .chat-plus-btn, .chat-run-mode-btn, .chat-project-choose, .chat-send-btn, .chat-mic-btn
 ) {
   flex: 0 0 var(--composer-control-size);
   width: var(--composer-control-size);

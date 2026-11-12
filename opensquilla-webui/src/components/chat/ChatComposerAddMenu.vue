@@ -64,6 +64,9 @@ const props = defineProps<{
   planModeAvailable: boolean
   planModeBusy: boolean
   showUtilityActions?: boolean
+  /** When the composer renders voice as a persistent toolbar button, the
+   * menu drops its duplicate entry. */
+  showVoiceAction?: boolean
   voiceBusy?: boolean
   voiceReady?: boolean
   voiceRecording?: boolean
@@ -148,17 +151,18 @@ const promptCacheKeepaliveStatusText = computed(() => {
 })
 const utilityItems = computed(() => {
   if (!props.showUtilityActions) return []
+  const voiceItem = {
+    key: 'voice',
+    label: props.voiceReady ? t('chat.recordVoice') : t('chat.voiceUnavailableHint'),
+    icon: 'microphone',
+    title: props.voiceReady ? t('chat.recordVoice') : t('chat.voiceUnavailableHint'),
+    ariaLabel: props.voiceReady ? t('chat.recordVoice') : t('chat.voiceUnavailableHint'),
+    className: props.voiceReady ? undefined : 'chat-mic--needs-setup',
+    disabled: props.voiceBusy,
+    active: props.voiceRecording,
+  }
   return matching([
-    {
-      key: 'voice',
-      label: props.voiceReady ? t('chat.recordVoice') : t('chat.voiceUnavailableHint'),
-      icon: 'microphone',
-      title: props.voiceReady ? t('chat.recordVoice') : t('chat.voiceUnavailableHint'),
-      ariaLabel: props.voiceReady ? t('chat.recordVoice') : t('chat.voiceUnavailableHint'),
-      className: props.voiceReady ? undefined : 'chat-mic--needs-setup',
-      disabled: props.voiceBusy,
-      active: props.voiceRecording,
-    },
+    ...(props.showVoiceAction === false ? [] : [voiceItem]),
     { key: 'export', label: t('chat.exportMarkdown'), icon: 'download', ariaLabel: t('chat.exportMarkdown') },
     ...(props.promptCacheKeepaliveAvailable ? [{
       key: 'keepalive',
