@@ -53,7 +53,16 @@ def build_context_restart_assessment(
     window = _nonnegative_count(context_window_tokens)
     if not window:
         return None
-    threshold = max(absolute, math.ceil(window * ratio))
+    # The absolute floor protects large-window deployments from a premature
+    # reminder (for example, 32k tokens should not be considered pressure in
+    # a 1M-token context).  It must not make the check unreachable for a
+    # smaller model, though: when the configured floor is larger than the
+    # model's window, use the configured ratio of that window instead.
+    threshold = (
+        math.ceil(window * ratio)
+        if window <= absolute
+        else max(absolute, math.ceil(window * ratio))
+    )
     if history_tokens < threshold:
         return None
     return ContextRestartAssessment(

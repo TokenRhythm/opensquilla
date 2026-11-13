@@ -59,8 +59,8 @@ async def publish(turn, service, *, decision=None, assessment=None, window=2000,
 
 @pytest.mark.parametrize("history,window,eligible", [
     (0, 4096, False), (100_000, 0, False),
-    (799, 1000, False), (800, 1000, False),
-    (1023, 1000, False), (1024, 1000, True),
+    (799, 1000, False), (800, 1000, True),
+    (1023, 1000, True), (1024, 1000, True),
     (1599, 2000, False), (1600, 2000, True),
     (1639, 2049, False), (1640, 2049, True),
 ])
@@ -86,8 +86,14 @@ def test_completed_turns_and_maximum_pressure_threshold_are_both_required(
     (800_000, 1_000_000, 20, True),
     (90_000, 100_000, 19, False),
     (80_000, 100_000, 20, True),
-    (31_999, 32_000, 20, False),
+    (31_999, 32_000, 20, True),
     (32_000, 32_000, 20, True),
+    (25_600, 32_000, 20, True),
+    (25_599, 32_000, 20, False),
+    # A small-window model must still be able to reach the ratio threshold;
+    # the default 32k absolute floor is larger than the whole window.
+    (6_400, 8_000, 20, True),
+    (6_399, 8_000, 20, False),
 ])
 def test_default_thresholds_do_not_confuse_many_turns_or_absolute_tokens_with_pressure(
     history, window, completed, eligible,
