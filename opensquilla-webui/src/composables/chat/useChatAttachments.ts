@@ -393,6 +393,24 @@ export function useChatAttachments(artifactContent?: ArtifactContentAccess, opti
     clearAttachmentState()
   }
 
+  async function restoreContinuationAttachments(attachments: readonly Attachment[], isCurrent: () => boolean): Promise<boolean> {
+    // Let the destination's own recovery settle before copying an explicitly
+    // confirmed continuation draft. Never replace files selected meanwhile.
+    await draftPersistence?.flush()
+    if (!isCurrent() || pendingAttachments.value.length) return false
+    const snapshot = attachments.map(attachment => ({ ...attachment,
+      ...(attachment.workspaceFile ? { workspaceFile: { ...attachment.workspaceFile } } : {}),
+    }))
+    const preparing = snapshot.filter(attachment => attachment.file
+      && (attachment.kind === 'inline_pending' || attachment.kind === 'uploading'))
+    pendingAttachments.value = snapshot.filter(attachment => !preparing.includes(attachment))
+    nextAttachmentId.value = Math.max(nextAttachmentId.value, ...snapshot.map(attachment => attachment.local_id + 1))
+    // The old owner cancelled outstanding reads/uploads. Restart only the
+    // unsent files in the new owner's generation; settled uploads are reused.
+    if (preparing.length) await addAttachments(preparing.map(attachment => attachment.file!))
+    return isCurrent()
+  }
+
   function clearAttachmentState() {
     attachmentGeneration += 1
     intakeInFlightCount.value = 0
@@ -589,6 +607,7 @@ export function useChatAttachments(artifactContent?: ArtifactContentAccess, opti
     addAttachment,
     removeAttachment,
     retireAttachments,
+    restoreContinuationAttachments,
     retryAttachment,
     hasPendingAttachmentWork,
     prepareAttachmentsForSend,

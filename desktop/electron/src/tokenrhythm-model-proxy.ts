@@ -10,7 +10,7 @@ const MAX_BODY = 64 * 1024 * 1024
 const FORWARDED_HEADERS = new Set(['content-type', 'accept', 'x-opensquilla-session-id', 'x-opensquilla-task-id', 'x-opensquilla-project-id', 'x-opensquilla-install-id', 'x-opensquilla-execution-id', 'x-opensquilla-call-kind', 'x-opensquilla-client-version', 'x-opensquilla-turn-id', 'x-opensquilla-request-id', 'x-title', 'http-referer'])
 export function allowedModelRoute(method: string, path: string): boolean {
   return method === 'GET' && (['/v1/models', '/api/models'].includes(path) || /^\/v1\/videos\/[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/.test(path))
-    || method === 'POST' && ['/v1/chat/completions', '/v1/images/generations', '/v1/videos/generations'].includes(path)
+    || method === 'POST' && ['/v1/chat/completions', '/v1/images/generations', '/v1/videos/generations', '/v1/decision', '/v1/systemone'].includes(path)
 }
 function failure(res: ServerResponse, status: number, error: string): void {
   if (res.headersSent) { res.destroy(); return }

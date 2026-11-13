@@ -16,6 +16,7 @@ describe('settings section IA', () => {
       'gateway',
       'provider',
       'modelStrategy',
+      'jev',
       'capabilities',
       'general',
       'interface',

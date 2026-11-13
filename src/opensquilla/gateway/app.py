@@ -1210,6 +1210,7 @@ def create_gateway_app(
 
     app = Starlette(routes=routes, middleware=middleware, debug=config.debug)
     app.state.diagnostics_state = diagnostics_state
+    app.state.turn_runner = turn_runner
 
     # Bridge upload endpoint: self-hosted multipart sink that
     # returns an opaque file_uuid the chat.send validator can resolve.

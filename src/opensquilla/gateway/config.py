@@ -1360,6 +1360,47 @@ class RouterBudgetConfig(BaseModel):
     include_next_turn_estimate: bool = False
 
 
+class JevRouterConfig(BaseSettings):
+    """Optional decision companion; existing model selection remains the default."""
+
+    model_config = SettingsConfigDict(env_prefix="OPENSQUILLA_JEV_ROUTER_", extra="ignore")
+
+    enabled: bool = False
+    mode: Literal["suggest", "trust"] = "suggest"
+    provider: Literal["tokenrhythm"] = "tokenrhythm"
+    model: str = Field(default="NeoHorse-Jev-4B", min_length=1, max_length=200)
+    timeout_seconds: float = Field(default=5.0, ge=0.1, le=30.0)
+    confidence_threshold: float = Field(default=0.65, ge=0.0, le=1.0)
+    max_prompts_per_hour: int = Field(default=3, ge=0, le=20)
+    cooldown_turns: int = Field(default=3, ge=0, le=100)
+    loop_interval: Literal[3, 5] = 5
+    auto_switch_seconds: int = Field(default=10, ge=1, le=60)
+    ensemble_enabled: bool = True
+    session_restart_enabled: bool = True
+    context_restart_ratio: float = Field(default=0.8, ge=0.5, le=0.95)
+    context_restart_min_tokens: int = Field(default=32_000, ge=1024, le=2_000_000)
+    context_restart_min_turns: int = Field(default=20, ge=2, le=1000)
+
+    @field_validator("auto_switch_seconds", mode="before")
+    @classmethod
+    def _migrate_unbounded_confirmation(cls, value: Any) -> Any:
+        if (type(value) is int and value == 0) or (
+            isinstance(value, str) and value.strip() == "0"
+        ):
+            return 10
+        return value
+
+    @field_validator("model")
+    @classmethod
+    def _nonempty_model(cls, value: str) -> str:
+        if not value.strip():
+            raise ValueError("JEV model must not be blank")
+        # Earlier previews accepted ordinary chat model IDs. JEV now has its
+        # own structured endpoint with one canonical model; keep those saved
+        # configurations readable while moving them to the supported protocol.
+        return "NeoHorse-Jev-4B"
+
+
 class SquillaRouterConfig(BaseSettings):
     model_config = SettingsConfigDict(
         env_prefix="OPENSQUILLA_SQUILLA_ROUTER_",
@@ -2667,6 +2708,7 @@ class GatewayConfig(BaseSettings):
     prompt: PromptConfig = Field(default_factory=PromptConfig)
     memory: MemoryConfig = Field(default_factory=MemoryConfig)
     squilla_router: SquillaRouterConfig = Field(default_factory=SquillaRouterConfig)
+    jev_router: JevRouterConfig = Field(default_factory=JevRouterConfig)
     agent_token_saving: AgentTokenSavingConfig = Field(default_factory=AgentTokenSavingConfig)
     compaction: CompactionLlmConfig = Field(default_factory=CompactionLlmConfig)
     naming: SessionNamingConfig = Field(default_factory=SessionNamingConfig)

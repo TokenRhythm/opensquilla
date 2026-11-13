@@ -257,7 +257,10 @@ class AccountProxyTransport(httpx.AsyncBaseTransport):
                 or re.fullmatch(r"/v1/videos/[A-Za-z0-9][A-Za-z0-9._-]{0,127}", path)
             )
             or request.method == "POST"
-            and path in {"/v1/chat/completions", "/v1/images/generations", "/v1/videos/generations"}
+            and path in {
+                "/v1/chat/completions", "/v1/images/generations", "/v1/videos/generations",
+                "/v1/decision", "/v1/systemone",
+            }
         )
         if not allowed:
             raise httpx.TransportError("Account model route is not supported")

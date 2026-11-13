@@ -13,6 +13,7 @@ export const SETTINGS_SECTIONS = [
   // --- AI configuration: Model Service -> Model Routing ---
   { id: 'provider', label: 'Model Service', icon: 'agents', client: false, desktopOnly: false, group: 'ai' },
   { id: 'modelStrategy', label: 'Model Routing', icon: 'router', client: false, desktopOnly: false, group: 'ai' },
+  { id: 'jev', label: 'Danbao JEV', icon: 'router', client: true, desktopOnly: false, group: 'ai' },
   { id: 'capabilities', label: 'Capabilities', icon: 'skills', client: false, desktopOnly: false, group: 'ai' },
   // --- Preferences: ordinary user-facing defaults and local UI settings ---
   { id: 'general', label: 'General', icon: 'settings', client: false, desktopOnly: false, group: 'preferences' },

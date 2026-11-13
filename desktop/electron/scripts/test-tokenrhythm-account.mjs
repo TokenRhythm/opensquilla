@@ -1220,3 +1220,13 @@ test('local WebUI receipt returns to the browser without exposing the authorizat
   assert.throws(() => new TokenRhythmLoginResult(server, origin, false, async () => {}, 1000, 'https://example.com/control/settings/account'))
  } finally { receipt.close() }
 })
+
+
+test('native decisions use the fixed account upstream route allowlist', () => {
+  for (const route of ['/v1/decision', '/v1/systemone']) {
+    assert.ok(allowedModelRoute('POST', route))
+    assert.equal(allowedModelRoute('GET', route), false)
+    assert.equal(allowedModelRoute('POST', route + '?target=https://untrusted.example'), false)
+    assert.equal(allowedModelRoute('POST', route + '/extra'), false)
+  }
+})

@@ -16945,6 +16945,18 @@ class SessionStorage:
                     ),
                 )
 
+    async def count_completed_conversation_turns(
+        self, session_id: str, *, bound_user_message_id: str | None = None,
+        exclude_last_user: bool = False,
+    ) -> int:
+        """Count completed conversations across active and compacted metadata."""
+        from opensquilla.session.conversation_turns import read_completed_conversation_turns
+
+        return await read_completed_conversation_turns(
+            self, session_id, bound_user_message_id=bound_user_message_id,
+            exclude_last_user=exclude_last_user,
+        )
+
     @_serialized_read
     async def count_transcript_entries(self, session_id: str) -> int:
         async with self.conn.execute(

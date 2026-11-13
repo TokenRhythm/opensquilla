@@ -13,6 +13,7 @@ import { SESSION_DIRECTORY_KEY } from './modules/sessionDirectory'
 import { SESSION_DIRECTORY_CHANGES_KEY } from './modules/sessionDirectoryChanges'
 import { SESSION_LIFECYCLE_KEY } from './modules/sessionLifecycle'
 import { SESSION_ROUTING_KEY } from './modules/sessionRouting'
+import { JEV_ROUTING_KEY } from './modules/jevRouting'
 import { TURN_COMMANDS_KEY } from './modules/turnCommands'
 import { DURABLE_DELIVERY_KEY } from './modules/delivery'
 import { createDurableDelivery } from './runtime/durableDelivery'
@@ -135,6 +136,7 @@ app.provide(
   gatewayAdapters.sessionLifecycle,
 )
 app.provide(SESSION_ROUTING_KEY, gatewayAdapters.sessionRouting)
+app.provide(JEV_ROUTING_KEY, gatewayAdapters.jevRouting)
 app.provide(TURN_COMMANDS_KEY, durableDelivery.commands)
 app.provide(DURABLE_DELIVERY_KEY, durableDelivery)
 app.provide(PENDING_INPUT_QUEUE_KEY, gatewayAdapters.pendingInputQueue)

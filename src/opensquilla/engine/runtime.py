@@ -5268,12 +5268,24 @@ class TurnRunner:
         # config object in accepted_turn_config_scope().
         return accepted
 
+    def _uses_jev_router(self, session_key: str) -> bool:
+        from opensquilla.jev_service import get_jev_service
+
+        config = self._turn_config()
+        defaults = getattr(config, "jev_router", None)
+        if defaults is None or ":subagent:" in session_key:
+            return False
+        return get_jev_service(
+            config, getattr(self, "_session_manager", None), self,
+        ).is_enabled(session_key, defaults)
+
     def _uses_model_tier_policy(self, session_key: str) -> bool:
         config = getattr(self._turn_config(), "squilla_router", None)
         return bool(
             getattr(config, "enabled", False)
             and getattr(config, "strategy", "lightgbm_model") != "legacy_v4_phase3"
             and ":subagent:" not in session_key
+            and not self._uses_jev_router(session_key)
         )
 
     async def _model_router_generation(
@@ -6500,6 +6512,7 @@ class TurnRunner:
         current_text_parts: list[str] = []
         stream_state: _StreamState | None = None
         agent: Agent | None = None
+        jev_execution: Any | None = None
         attachment_cleanup: Callable[[], None] | None = None
         self._emit_turn_event(
             "turn_start",
@@ -7046,6 +7059,21 @@ class TurnRunner:
             )
             ab_out = ab_outcome.require_output()
             agent = ab_out.agent
+            if self._uses_jev_router(session_key) and cloned_selector is not None:
+                from opensquilla.engine.jev_execution import JevExecution
+                from opensquilla.jev_service import get_jev_service
+
+                jev_execution = JevExecution(
+                    turn=turn,
+                    service=get_jev_service(turn.config, self._session_manager, self),
+                    session_manager=self._session_manager,
+                    selector=cloned_selector,
+                    catalog=_TurnRunnerModelCatalogAdapter(self),
+                    ensemble_catalog=self._model_catalog,
+                    expected_session_id=expected_session_id,
+                    expected_session_epoch=expected_session_epoch,
+                )
+                agent.set_model_advice_boundary(jev_execution.before_request)
             tool_reliability_setter = getattr(
                 agent,
                 "set_tool_reliability_sink",
@@ -8791,6 +8819,8 @@ class TurnRunner:
             )
 
         finally:
+            if jev_execution is not None:
+                await jev_execution.close()
             if account_scope is not None:
                 reset_account_state(account_scope)
             if attachment_cleanup is not None:
@@ -10513,6 +10543,7 @@ class TurnRunner:
 
         router_cfg = getattr(self._turn_config(), "squilla_router", None)
         router_timeout = float(getattr(router_cfg, "routing_timeout_seconds", 5.0) or 5.0)
+        jev_active = self._uses_jev_router(session_key)
         model_policy_active = self._uses_model_tier_policy(session_key)
 
         def _copy_router_turn(turn: TurnContext) -> TurnContext:
@@ -10582,6 +10613,9 @@ class TurnRunner:
 
             agent_skill_loader = PinnedSkillLoader(skill_catalog, self._skill_loader)
         turn_config = self._turn_config()
+        if jev_active:
+            turn_config = turn_config.model_copy(deep=True)
+            turn_config.squilla_router.enabled = False
         initial_metadata: dict[str, Any] = {
             "skill_loader": agent_skill_loader,
             "router_control_hold_store": self._router_control_hold_store,
@@ -10735,6 +10769,11 @@ class TurnRunner:
             initial_metadata["router_prev_assistant_usage"] = dict(prev_assistant_usage)
         if history_user_texts:
             initial_metadata["router_history_user_texts"] = list(history_user_texts)
+        if jev_active and model_router_context:
+            initial_metadata["jev_turn_count"] = model_router_context.get("jev_turn_count", 1)
+            initial_metadata["jev_completed_conversation_turns"] = model_router_context.get(
+                "jev_completed_conversation_turns", 0,
+            )
         if model_policy_active:
             from opensquilla.session.model_router_state import prepare_model_router_metadata
 
@@ -10856,15 +10895,58 @@ class TurnRunner:
         from opensquilla.engine.steps.selected_skills import load_selected_skills
 
         turn = await load_selected_skills(turn, tool_context)
+        if jev_active and router_history_replay_request is not None:
+            jev_capacity = await self._router_history_capacity_for_request(
+                session_key, router_history_replay_request, max_history_turns=0,
+                preserve_image_attachments=bool(initial_metadata.get("image_context_has_images")),
+                reachable_provider_kinds=self._route_capacity_provider_kinds(
+                    turn, initial_provider_config=initial_provider_config,
+                ),
+            )
+            turn.metadata["routing_history_capacity_estimated_tokens"] = max(
+                0, int(jev_capacity.get("history_capacity_estimated_tokens") or 0),
+            )
         if model_policy_active and turn.surface_kind and turn.surface_kind != "unknown":
             turn.metadata["router_model_input"]["context"]["entrypoint"] = turn.surface_kind
         pipeline_steps: list[TurnStep] = [resolve_model]
-        pipeline_steps.extend(
-            [
-                _bounded_apply_squilla_router,
-                observe_reasoning_hint,
-            ]
-        )
+        if jev_active:
+            from opensquilla.engine.steps.jev_router import apply_jev_router, jev_input_fingerprint
+            from opensquilla.jev_service import get_jev_service
+
+            jev_service = get_jev_service(turn_config, self._session_manager, self)
+            if expected_session_id is not None and expected_session_epoch is not None:
+                await jev_service.bind_session(
+                    session_key, expected_session_id, expected_session_epoch,
+                )
+
+            async def _apply_jev_advice(turn: TurnContext) -> TurnContext:
+                # The assessment owns a detached request snapshot. Prompt and
+                # provider preparation continue while its result is pending.
+                from dataclasses import replace
+
+                fingerprint = jev_input_fingerprint(turn.semantic_message, turn.attachments)
+                context = replace(turn, metadata=dict(turn.metadata))
+                revision = getattr(tool_context, "router_control_routing_revision", None)
+                if revision is None and self._session_manager is not None:
+                    session = await self._session_manager.get_session(session_key)
+                    revision = int(getattr(session, "model_routing_revision", 0) or 0)
+
+                async def check(generation: int) -> TurnContext:
+                    return await apply_jev_router(
+                        context, service=jev_service, input_id=fingerprint,
+                        inherited=initial_provider_config, routing_revision=revision,
+                        assessment_stage="input", check_generation=generation,
+                    )
+
+                await jev_service.start_check(
+                    session_key, fingerprint, check,
+                )
+                return turn
+
+            pipeline_steps.append(_apply_jev_advice)
+        else:
+            pipeline_steps.append(_bounded_apply_squilla_router)
+        pipeline_steps.append(observe_reasoning_hint)
         pipeline_steps.extend(
             [
                 resolve_skill_catalog,
@@ -10943,6 +11025,9 @@ class TurnRunner:
                 cloned_selector, turn.metadata,
                 reason="Attachment request capacity could not be established.",
             )
+
+        if jev_active and not turn.config.llm_ensemble.enabled:
+            return turn, provider
 
         if (
             turn.metadata.get("router_tier_policy") == "model"
@@ -12419,6 +12504,41 @@ class TurnRunner:
             user_texts.append(text)
 
         context: dict[str, Any] = {**capacity_context, **model_context}
+        if self._uses_jev_router(session_key):
+            context["jev_turn_count"] = len(user_texts) + 1
+            from opensquilla.session.conversation_turns import count_completed_conversation_turns
+
+            completed_turns = count_completed_conversation_turns(
+                entries, bound_user_message_id=bound_user_message_id,
+                exclude_last_user=exclude_last_user,
+            )
+            storage = getattr(self._session_manager, "storage", None)
+            count_method = getattr(storage, "count_completed_conversation_turns", None)
+            if storage is not None and callable(count_method):
+                from opensquilla.session.storage import StaleEpochError
+
+                try:
+                    owner = await storage.get_session(session_key)
+                    if owner is None or (expected_session_id is not None
+                            and owner.session_id != expected_session_id) or (
+                        expected_session_epoch is not None and owner.epoch != expected_session_epoch
+                    ):
+                        raise StaleEpochError("Session owner changed before conversation count")
+                    completed_turns = await count_method(
+                        owner.session_id, bound_user_message_id=bound_user_message_id,
+                        exclude_last_user=exclude_last_user,
+                    )
+                    current_owner = await storage.get_session(session_key)
+                    if current_owner is None or (current_owner.session_id, current_owner.epoch) != (
+                        owner.session_id, owner.epoch,
+                    ):
+                        raise StaleEpochError("Session owner changed during conversation count")
+                except StaleEpochError:
+                    raise
+                except Exception:  # noqa: BLE001 - optional continuity advice fails closed
+                    completed_turns = 0
+                    log.debug("turn_runner.conversation_count_unavailable", session_key=session_key)
+            context["jev_completed_conversation_turns"] = completed_turns
         if user_texts:
             context["history_user_texts"] = user_texts[-_ROUTER_HISTORY_USER_MAX_TURNS:]
         router_cfg = getattr(self._turn_config(), "squilla_router", None)

@@ -19,7 +19,7 @@ import re
 import stat
 import time
 import uuid
-from collections.abc import AsyncIterator, Callable, Iterator, Mapping, Sequence
+from collections.abc import AsyncIterator, Awaitable, Callable, Iterator, Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from datetime import datetime
 from enum import StrEnum
@@ -2341,6 +2341,9 @@ class Agent:
         execution_context: TurnExecutionContext | None = None,
     ) -> None:
         self.provider = provider
+        self._model_advice_boundary: (
+            Callable[[Any, int, list[Message]], Awaitable[bool]] | None
+        ) = None
         self.config = config or AgentConfig()
         configure_retry_policy = getattr(provider, "configure_retry_policy", None)
         if callable(configure_retry_policy):
@@ -5792,6 +5795,12 @@ class Agent:
         self._history = []
         self._request_image_context = []
 
+    def set_model_advice_boundary(
+        self, callback: Callable[[Any, int, list[Message]], Awaitable[bool]] | None,
+    ) -> None:
+        """Install turn-owned advice before preparing each complete provider request."""
+        self._model_advice_boundary = callback
+
     def set_history(self, messages: list[Message]) -> None:
         self._history = list(messages)
 
@@ -7095,6 +7104,53 @@ class Agent:
                     raise TimeoutError(f"Agent total timeout after {self.config.timeout}s")
 
                 iterations += 1
+                if self._model_advice_boundary is not None:
+                    rebound = await self._model_advice_boundary(self, iterations, turn_messages)
+                    if rebound:
+                        thinking_enabled, thinking_budget = self.config.resolve_thinking(
+                            prompt=thinking_prompt,
+                        )
+                        chat_cfg = self._provider_admission_chat_config(
+                            thinking_prompt,
+                            context_window_tokens=self.config.context_window_tokens,
+                            max_output_tokens=self.config.max_tokens,
+                        )
+                        self._compaction_request_context = None
+                        self._compaction_request_context = self.build_compaction_request_context(
+                            thinking_prompt,
+                        )
+                        self.bind_durable_consumer(
+                            provider=self.provider, model_id=self.config.model_id,
+                            context_window_tokens=self.config.context_window_tokens,
+                            context_window_known=self.config.context_window_known,
+                            max_output_tokens=self.config.max_tokens,
+                            model_capabilities=self.config.model_capabilities,
+                            provider_request_proof_max_chars=(
+                                self.config.provider_request_proof_max_chars
+                            ),
+                        )
+                        configured_capabilities = self.config.model_capabilities
+                        tools_supported = bool(
+                            configured_capabilities is None
+                            or getattr(configured_capabilities, "supports_tools", None) is not False
+                        )
+                        provider_tool_definitions = (
+                            (self.tool_definitions or None) if tools_supported else None
+                        )
+                        selector_projects_images = (
+                            getattr(self.provider, "projects_image_input_per_leg", False) is True
+                        )
+                        selector_image_provider = (
+                            self.provider if selector_projects_images else None
+                        )
+                        image_projection_forced = False
+                        image_projection_forced_deployment = None
+                        image_projection_marker_state = ImageMarkerState.NOT_ANALYZED
+                        for key in (
+                            "image_input_forced_rejection_reason", "image_input_rejection_reason",
+                            "image_input_projection_required", "image_input_reason",
+                        ):
+                            self.config.metadata.pop(key, None)
                 # The act-now message answers one reasoning-only failure; a
                 # fresh iteration starts from a clean request.
                 reasoning_only_act_now_message = None

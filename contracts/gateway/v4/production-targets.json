@@ -1381,6 +1381,45 @@
         "params",
         "result"
       ]
+    },
+    {
+      "kind": "method",
+      "wireName": "jev.get",
+      "roles": [
+        "params",
+        "result"
+      ]
+    },
+    {
+      "kind": "method",
+      "wireName": "jev.configure",
+      "roles": [
+        "params",
+        "result"
+      ]
+    },
+    {
+      "kind": "method",
+      "wireName": "jev.respond",
+      "roles": [
+        "params",
+        "result"
+      ]
+    },
+    {
+      "kind": "event",
+      "wireName": "jev.changed",
+      "roles": [
+        "payload"
+      ]
+    },
+    {
+      "kind": "method",
+      "wireName": "jev.preview",
+      "roles": [
+        "params",
+        "result"
+      ]
     }
   ]
 }

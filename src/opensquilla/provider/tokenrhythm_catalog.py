@@ -127,6 +127,21 @@ _DECLARED_ROW_FIELDS = _PUBLISHED_ROW_FIELDS | frozenset(
         "responses",
         "responses_modes",
         "responses_capabilities",
+        "input_price_per_million",
+        "output_price_per_million",
+        "cache_read_price_per_million",
+        "discount_input_price_per_million",
+        "discount_output_price_per_million",
+        "discount_cache_read_price_per_million",
+        "effective_input_price_per_million",
+        "effective_output_price_per_million",
+        "effective_cache_read_price_per_million",
+        "has_discount",
+        "billing_mode",
+        "billing_unit",
+        "pricing",
+        "discount_pricing",
+        "effective_pricing",
     }
 )
 _CAPABILITY_FIELDS = frozenset(
@@ -758,30 +773,83 @@ class TokenRhythmPricing:
             "effectiveInputPrice",
             "effectiveOutputPrice",
             "effectiveCacheReadPrice",
+            "input_price_per_million",
+            "output_price_per_million",
+            "cache_read_price_per_million",
+            "discount_input_price_per_million",
+            "discount_output_price_per_million",
+            "discount_cache_read_price_per_million",
+            "effective_input_price_per_million",
+            "effective_output_price_per_million",
+            "effective_cache_read_price_per_million",
+            "has_discount",
+            "billing_mode",
+            "billing_unit",
+            "pricing",
+            "discount_pricing",
+            "effective_pricing",
         }
         if not pricing_keys.intersection(row):
             return None
+        nested = _mapping(row.get("pricing"))
+        currency = _text(row.get("currency")) or _text(nested.get("currency"))
+        billing_mode = (
+            _text(row.get("billingMode")) or _text(row.get("billing_mode"))
+            or _text(nested.get("unit"))
+        )
+        billing_unit = _positive_int(row.get("billingUnit")) or _positive_int(
+            row.get("billing_unit"),
+        )
+        per_million_rate_known = any(
+            key.endswith("price_per_million") and _decimal_string(value) is not None
+            for key, value in row.items()
+        )
+        if billing_unit is None and (
+            billing_mode == "per_1m_tokens"
+            or (billing_mode is None and per_million_rate_known)
+        ):
+            billing_unit = 1_000_000
+            billing_mode = billing_mode or "per_1m_tokens"
+        has_discount = _bool(row.get("hasDiscount"))
+        if has_discount is None:
+            has_discount = _bool(row.get("has_discount"))
+
+        def bucket(prefix: str, nested_name: str) -> TokenRhythmPriceBuckets:
+            values = _mapping(row.get(nested_name))
+            # Nested rows can carry their own currency/unit. Never interpret
+            # another currency or billing basis as the outer row's prices.
+            if (
+                _text(values.get("currency")) not in {None, currency}
+                or _text(values.get("unit")) not in {None, billing_mode}
+            ):
+                values = {}
+            camel_prefix = prefix
+            snake_prefix = f"{prefix}_" if prefix else ""
+            pairs = (
+                ("input", "InputPrice", "input_price_per_million", "prompt"),
+                ("output", "OutputPrice", "output_price_per_million", "completion"),
+                ("cache_read", "CacheReadPrice", "cache_read_price_per_million", "cache_read"),
+            )
+            rates: dict[str, str | None] = {}
+            for field, camel, snake, alias in pairs:
+                camel_key = f"{camel_prefix}{camel}" if prefix else camel[0].lower() + camel[1:]
+                value = _decimal_string(row.get(camel_key))
+                if value is None:
+                    value = _decimal_string(row.get(snake_prefix + snake))
+                if value is None:
+                    value = _decimal_string(values.get(alias))
+                rates[field] = value
+            return TokenRhythmPriceBuckets(**rates)
+
         return cls(
-            currency=_text(row.get("currency")),
-            billing_mode=_text(row.get("billingMode")),
-            billing_unit=_positive_int(row.get("billingUnit")),
-            has_discount=_bool(row.get("hasDiscount")),
+            currency=currency,
+            billing_mode=billing_mode,
+            billing_unit=billing_unit,
+            has_discount=has_discount,
             price_per_image=_decimal_string(row.get("pricePerImage")),
-            standard=TokenRhythmPriceBuckets(
-                input=_decimal_string(row.get("inputPrice")),
-                output=_decimal_string(row.get("outputPrice")),
-                cache_read=_decimal_string(row.get("cacheReadPrice")),
-            ),
-            discount=TokenRhythmPriceBuckets(
-                input=_decimal_string(row.get("discountInputPrice")),
-                output=_decimal_string(row.get("discountOutputPrice")),
-                cache_read=_decimal_string(row.get("discountCacheReadPrice")),
-            ),
-            effective=TokenRhythmPriceBuckets(
-                input=_decimal_string(row.get("effectiveInputPrice")),
-                output=_decimal_string(row.get("effectiveOutputPrice")),
-                cache_read=_decimal_string(row.get("effectiveCacheReadPrice")),
-            ),
+            standard=bucket("", "pricing"),
+            discount=bucket("discount", "discount_pricing"),
+            effective=bucket("effective", "effective_pricing"),
         )
 
     @classmethod
@@ -1402,27 +1470,31 @@ def tokenrhythm_published_catalog_entries(
             fields["supports_tools"] = model.capabilities.tools
         if model.capabilities.vision is not None:
             fields["supports_vision"] = model.capabilities.vision
-        pricing = model.pricing
-        if pricing is not None:
-            for bucket_name, field_name in (
-                ("input", "input_cost_per_mtok"),
-                ("output", "output_cost_per_mtok"),
-                ("cache_read", "cache_read_cost_per_mtok"),
-            ):
-                effective_value = getattr(pricing.effective, bucket_name)
-                discount_value = getattr(pricing.discount, bucket_name)
-                standard_value = getattr(pricing.standard, bucket_name)
-                raw = effective_value
-                if raw is None and pricing.has_discount is True:
-                    raw = discount_value
-                if raw is None:
-                    raw = standard_value
-                cost = _price_per_mtok(pricing, raw)
-                if cost is not None:
-                    fields[field_name] = cost
+        fields.update(tokenrhythm_pricing_fields(model.pricing))
         if fields:
             entries[model_id] = fields
     return TokenRhythmCatalogEntries(entries, published=published)
+
+
+def tokenrhythm_pricing_fields(pricing: TokenRhythmPricing | None) -> dict[str, float]:
+    """Project known normalized provider prices to canonical USD per million tokens."""
+    fields: dict[str, float] = {}
+    if pricing is None:
+        return fields
+    for bucket_name, field_name in (
+        ("input", "input_cost_per_mtok"),
+        ("output", "output_cost_per_mtok"),
+        ("cache_read", "cache_read_cost_per_mtok"),
+    ):
+        raw = getattr(pricing.effective, bucket_name)
+        if raw is None and pricing.has_discount is True:
+            raw = getattr(pricing.discount, bucket_name)
+        if raw is None:
+            raw = getattr(pricing.standard, bucket_name)
+        cost = _price_per_mtok(pricing, raw)
+        if cost is not None:
+            fields[field_name] = cost
+    return fields
 
 
 def tokenrhythm_published_to_wire(
@@ -1482,6 +1554,7 @@ __all__ = [
     "tokenrhythm_authority_identity",
     "tokenrhythm_public_transport_fingerprint",
     "tokenrhythm_published_catalog_entries",
+    "tokenrhythm_pricing_fields",
     "tokenrhythm_published_from_wire",
     "tokenrhythm_published_to_wire",
     "tokenrhythm_transport_fingerprint",

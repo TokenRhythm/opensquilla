@@ -692,3 +692,47 @@ describe('useChatAttachments', () => {
     )
   })
 })
+
+describe('confirmed continuation attachment drafts', () => {
+  afterEach(() => { vi.unstubAllGlobals() })
+
+  it('reuses settled unsent files after the old owner is retired', async () => {
+    const attachments = useChatAttachments()
+    attachments.pendingAttachments.value = [{ kind: 'staged', local_id: 4, name: 'reference.pdf',
+      mime: 'application/pdf', file_uuid: 'synthetic-upload', expires_at: 9999999999 }]
+    const source = attachments.pendingAttachments.value.map(item => ({ ...item }))
+    attachments.retireAttachments()
+    expect(await attachments.restoreContinuationAttachments(source, () => true)).toBe(true)
+    expect(attachments.pendingAttachments.value).toEqual(source)
+    expect(attachments.pendingAttachments.value[0]).not.toBe(source[0])
+  })
+
+  it('restarts an in-flight unsent upload under the destination owner and ignores late source completion', async () => {
+    let finishSource!: (response: unknown) => void
+    const fetchMock = vi.fn()
+      .mockImplementationOnce(() => new Promise(resolve => { finishSource = resolve }))
+      .mockResolvedValueOnce(successfulUploadResponse('destination-upload'))
+    vi.stubGlobal('fetch', fetchMock)
+    const attachments = useTestChatAttachments()
+    await attachments.addAttachment(stagedPdf('unsent.pdf'))
+    const source = attachments.pendingAttachments.value.map(item => ({ ...item }))
+    expect(source[0]?.kind).toBe('uploading')
+    attachments.retireAttachments()
+    await attachments.restoreContinuationAttachments(source, () => true)
+    await flushUpload()
+    finishSource(successfulUploadResponse('retired-upload'))
+    await flushUpload()
+    expect(attachments.pendingAttachments.value).toMatchObject([
+      { kind: 'staged', name: 'unsent.pdf', file_uuid: 'destination-upload' },
+    ])
+  })
+
+  it('does not replace a destination draft or apply to a different owner', async () => {
+    const attachments = useChatAttachments()
+    const source: Attachment[] = [{ kind: 'inline', local_id: 4, name: 'source.txt', mime: 'text/plain', data: 'draft' }]
+    expect(await attachments.restoreContinuationAttachments(source, () => false)).toBe(false)
+    attachments.pendingAttachments.value = [{ ...source[0]!, name: 'destination.txt' }]
+    expect(await attachments.restoreContinuationAttachments(source, () => true)).toBe(false)
+    expect(attachments.pendingAttachments.value[0]?.name).toBe('destination.txt')
+  })
+})

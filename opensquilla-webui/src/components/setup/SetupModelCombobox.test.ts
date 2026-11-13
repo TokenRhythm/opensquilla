@@ -682,6 +682,59 @@ describe('SetupModelCombobox', () => {
     expect(listbox()).toBeNull()
   })
 
+  it('keeps unmatched catalog-only searches local without offering a custom model', async () => {
+    const onUpdate = vi.fn()
+    const { el } = await mountCombobox({
+      value: MODELS[0]!.id,
+      commitOnSelect: true,
+      allowCustomValue: false,
+      onUpdate,
+    })
+    const input = await openList(el)
+    input.value = 'unlisted-model'
+    input.dispatchEvent(new Event('input'))
+    await nextTick()
+
+    expect(optionRows()).toHaveLength(0)
+    expect(document.querySelector('.setup-model-combobox__row--freetext')).toBeNull()
+    input.dispatchEvent(new KeyboardEvent('keydown', { key: 'ArrowDown', bubbles: true }))
+    input.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', bubbles: true }))
+    expect(onUpdate).not.toHaveBeenCalled()
+
+    input.dispatchEvent(new Event('blur'))
+    await nextTick()
+    expect(input.value).toBe(MODELS[0]!.id)
+    expect(onUpdate).not.toHaveBeenCalled()
+  })
+
+  it.each(['mouse', 'keyboard'])('commits a discovered catalog-only model with %s selection', async method => {
+    const onUpdate = vi.fn()
+    const { el } = await mountCombobox({
+      value: MODELS[0]!.id,
+      commitOnSelect: true,
+      allowCustomValue: false,
+      onUpdate,
+    })
+    const input = await openList(el)
+    input.value = 'beta'
+    input.dispatchEvent(new Event('input'))
+    await nextTick()
+
+    expect(onUpdate).not.toHaveBeenCalled()
+    expect(optionRows()).toHaveLength(1)
+    expect(optionRows()[0]!.textContent).toContain(MODELS[1]!.id)
+    expect(document.querySelector('.setup-model-combobox__row--freetext')).toBeNull()
+    if (method === 'mouse') optionRows()[0]!.click()
+    else {
+      input.dispatchEvent(new KeyboardEvent('keydown', { key: 'ArrowDown', bubbles: true }))
+      input.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', bubbles: true }))
+    }
+    await nextTick()
+
+    expect(onUpdate).toHaveBeenCalledExactlyOnceWith(MODELS[1]!.id)
+    expect(listbox()).toBeNull()
+  })
+
   it('selects the active row with Enter after arrow-key navigation', async () => {
     const onUpdate = vi.fn()
     const { el } = await mountCombobox({ onUpdate })

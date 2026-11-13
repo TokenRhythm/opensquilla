@@ -112,8 +112,18 @@ export interface UseChatDraftPersistenceOptions {
  * pending queue retain their own persistence. Storage failures are swallowed.
  */
 export function useChatDraftPersistence(options: UseChatDraftPersistenceOptions) {
+  let pendingCarry: { from: string; to: string } | null = null
   let pendingRebind: { from: string; to: string } | null = null
   const draftStorage = () => options.storage === undefined ? localStorage : options.storage
+
+  /** Keep the current unsent composer when entering a newly created continuation. */
+  function preserveDraftOnSwitch(key: string): () => void {
+    const existing = loadDraftPayload(key)
+    if (existing.text || existing.selectedSkills.length || existing.localPaths.length) return () => {}
+    const carry = { from: options.sessionKey.value, to: key }
+    pendingCarry = carry
+    return () => { if (pendingCarry === carry) pendingCarry = null }
+  }
 
   /** Move one proven fresh draft without loading another session's composer. */
   function rebindCurrentDraft(key: string): void {
@@ -225,6 +235,15 @@ export function useChatDraftPersistence(options: UseChatDraftPersistenceOptions)
   watch(
     options.sessionKey,
     (key, previousKey) => {
+      const carry = pendingCarry
+      pendingCarry = null
+      if (carry && carry.from === previousKey && carry.to === key) {
+        // Read at the synchronous ownership switch, including edits made while
+        // navigation was waiting. Preserve the outgoing draft for recovery too.
+        saveDraft(previousKey, options.inputText.value, options.selectedSkills?.value, options.localPaths?.value, options.skillPositions?.value)
+        saveDraft(key, options.inputText.value, options.selectedSkills?.value, options.localPaths?.value, options.skillPositions?.value)
+        return
+      }
       const rebind = pendingRebind
       pendingRebind = null
       if (rebind && rebind.from === previousKey && rebind.to === key) {
@@ -256,5 +275,5 @@ export function useChatDraftPersistence(options: UseChatDraftPersistenceOptions)
     saveDraft(options.sessionKey.value, text, options.selectedSkills?.value, options.localPaths?.value, options.skillPositions?.value)
   }, { deep: true })
 
-  return { saveDraft, loadDraft, clearDraft, discardRecentDraft, rebindCurrentDraft, consumeAcceptedDraft }
+  return { saveDraft, loadDraft, clearDraft, discardRecentDraft, rebindCurrentDraft, preserveDraftOnSwitch, consumeAcceptedDraft }
 }

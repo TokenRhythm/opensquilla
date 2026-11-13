@@ -4364,6 +4364,11 @@ async def _delete_session_with_lifecycle(
 
         await get_approval_queue().expire_pending_for_session_async(canonical_key)
         await storage.delete_session(canonical_key)
+        from opensquilla.jev_service import get_jev_service
+
+        await get_jev_service(ctx.config, ctx.session_manager, ctx.turn_runner).forget_session(
+            canonical_key,
+        )
         hold_store = getattr(ctx.turn_runner, "router_control_hold_store", None)
         forget_routing = getattr(hold_store, "forget_session", None)
         if callable(forget_routing):

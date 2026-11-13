@@ -44,6 +44,8 @@ def app_settings_for_rpc(
         GatewayAppSettingsPort(
             ctx.config,
             task_runtime=getattr(ctx, "task_runtime", None),
+            turn_runner=getattr(ctx, "turn_runner", None),
+            session_manager=getattr(ctx, "session_manager", None),
             provider_selector=getattr(ctx, "provider_selector", None),
             subscription_manager=getattr(ctx, "subscription_manager", None),
             source=source,
@@ -177,6 +179,10 @@ class GatewayAppSettingsPort:
     def validate_routing(self, previous: Any, candidate: Any, explicit_paths: set[str]) -> None:
         from opensquilla.onboarding.router_policy import validate_router_reactivation
 
+        self._explicit_jev_settings = any(
+            path == "jev_router" or path.startswith("jev_router.")
+            for path in explicit_paths
+        )
         self._explicit_image_route_paths = preserve_image_routing_provenance(
             previous, candidate, explicit_paths, full_apply=self.source == "config.apply",
         )
@@ -226,16 +232,21 @@ class GatewayAppSettingsPort:
         config: GatewayConfig | None,
         *,
         task_runtime: Any = None,
+        turn_runner: Any = None,
+        session_manager: Any = None,
         provider_selector: Any = None,
         subscription_manager: Any = None,
         source: str = "config.patch",
     ) -> None:
         self.config = config
         self.task_runtime = task_runtime
+        self.turn_runner = turn_runner
+        self.session_manager = session_manager
         self.provider_selector = provider_selector
         self.subscription_manager = subscription_manager
         self.source = source
         self._explicit_image_route_paths = set()
+        self._explicit_jev_settings = False
 
     def read_public_settings(self) -> SettingsObject:
         config = self.config
@@ -312,11 +323,36 @@ class GatewayAppSettingsPort:
         await _notify_goal_config_changed(self.task_runtime, previous)
 
     async def sync_runtime(self, previous: GatewayConfig | None, candidate: GatewayConfig) -> None:
+        await self._sync_jev_settings(previous, candidate)
         sync_media_runtime(candidate)
         _sync_model_catalog_overrides(candidate)
         await _reconcile_tokenrhythm_profile_after_config_change(
             previous, self.config if self.config is not None else candidate
         )
+
+    async def _sync_jev_settings(
+        self, previous: GatewayConfig | None, candidate: GatewayConfig,
+    ) -> None:
+        from opensquilla.jev_service import get_jev_service
+
+        current = self.config if self.config is not None else candidate
+        defaults = current.jev_router
+        fields = set(type(defaults).model_fields)
+        if not self._explicit_jev_settings:
+            before = previous.jev_router if previous is not None else None
+            fields = {
+                name for name in fields
+                if before is not None and getattr(before, name) != getattr(defaults, name)
+            }
+        if not fields:
+            return
+        # A profile-level save replaces the old chat-only preferences. Legacy
+        # session RPCs remain usable after this explicit profile choice.
+        if self.session_manager is None and getattr(self.turn_runner, "jev_service", None) is None:
+            return
+        service = get_jev_service(current, self.session_manager, self.turn_runner)
+        service.defaults_provider = lambda: current.jev_router
+        await service.apply_global_settings(defaults, fields)
 
     async def refresh_catalog(
         self,

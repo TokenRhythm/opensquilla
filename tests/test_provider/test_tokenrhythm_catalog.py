@@ -25,6 +25,7 @@ from opensquilla.provider.tokenrhythm_catalog import (
     tokenrhythm_authority_identity,
     tokenrhythm_declared_from_wire,
     tokenrhythm_declared_to_wire,
+    tokenrhythm_pricing_fields,
     tokenrhythm_published_catalog_entries,
     tokenrhythm_published_from_wire,
     tokenrhythm_published_to_wire,
@@ -103,6 +104,93 @@ def _published_row(**overrides: Any) -> dict[str, Any]:
     }
     row.update(overrides)
     return row
+
+
+def test_declared_per_million_aliases_preserve_rates_and_discount_precedence() -> None:
+    row = {
+        "id": "synthetic-chat",
+        "currency": "CNY",
+        "input_price_per_million": "8.00",
+        "output_price_per_million": "16",
+        "cache_read_price_per_million": "2",
+        "discount_input_price_per_million": "4",
+        "discount_output_price_per_million": "8",
+        "has_discount": True,
+        "effective_input_price_per_million": "0",
+    }
+    model = parse_tokenrhythm_declared({"data": [row]})["synthetic-chat"]
+    assert model.pricing is not None
+    assert model.pricing.billing_unit == 1_000_000
+    assert model.pricing.standard.input == "8.00"
+    assert model.pricing.effective.input == "0"
+    fields = tokenrhythm_pricing_fields(model.pricing)
+    from opensquilla.provider.fx import TOKENRHYTHM_CNY_PER_USD
+
+    assert fields["input_cost_per_mtok"] == 0
+    assert fields["output_cost_per_mtok"] == float(Decimal("8") / TOKENRHYTHM_CNY_PER_USD)
+    assert fields["cache_read_cost_per_mtok"] == float(Decimal("2") / TOKENRHYTHM_CNY_PER_USD)
+    restored = tokenrhythm_declared_from_wire(tokenrhythm_declared_to_wire({"m": model}))["m"]
+    assert restored.pricing == model.pricing
+
+
+def test_declared_nested_pricing_requires_explicit_supported_billing_basis() -> None:
+    rows = [
+        {
+            "id": "nested-known",
+            "pricing": {
+                "currency": "CNY", "unit": "per_1m_tokens", "prompt": "6", "completion": "12",
+            },
+            "effective_pricing": {
+                "currency": "CNY", "unit": "per_1m_tokens", "prompt": "3", "completion": "9",
+            },
+        },
+        {
+            "id": "nested-unknown",
+            "pricing": {"currency": "CNY", "prompt": "6", "completion": "12"},
+        },
+    ]
+    declared = parse_tokenrhythm_declared({"data": rows})
+    known = declared["nested-known"].pricing
+    assert known is not None and known.billing_mode == "per_1m_tokens"
+    assert known.effective.input == "3"
+    assert "input_cost_per_mtok" in tokenrhythm_pricing_fields(known)
+    assert tokenrhythm_pricing_fields(declared["nested-unknown"].pricing) == {}
+
+
+def test_declared_nested_pricing_does_not_mix_currencies_or_units() -> None:
+    row = {
+        "id": "synthetic-chat",
+        "currency": "CNY", "billingUnit": 1_000_000, "billingMode": "per_1m_tokens",
+        "inputPrice": "5", "outputPrice": "10",
+        "effective_pricing": {"currency": "USD", "unit": "per_1m_tokens", "prompt": "1"},
+        "discount_pricing": {"currency": "CNY", "unit": "per_token", "prompt": "0.001"},
+        "has_discount": True,
+    }
+    pricing = parse_tokenrhythm_declared({"data": [row]})["synthetic-chat"].pricing
+    assert pricing is not None
+    assert pricing.effective.input is None
+    assert pricing.discount.input is None
+    assert pricing.standard.input == "5"
+
+
+def test_declared_camelcase_prices_remain_authoritative_and_unknown_currency_is_unpriced() -> None:
+    row = {
+        "id": "synthetic-chat", "currency": "USD", "billingUnit": 1_000_000,
+        "inputPrice": "7", "input_price_per_million": "99", "outputPrice": "14",
+    }
+    pricing = parse_tokenrhythm_declared({"data": [row]})["synthetic-chat"].pricing
+    assert pricing is not None and pricing.standard.input == "7"
+    assert tokenrhythm_pricing_fields(pricing) == {}
+
+
+def test_declared_null_aliases_do_not_invent_a_token_unit_for_other_billing_modes() -> None:
+    row = {
+        "id": "synthetic-chat", "currency": "CNY", "billingMode": "per_image",
+        "inputPrice": "7", "outputPrice": "14", "input_price_per_million": None,
+    }
+    pricing = parse_tokenrhythm_declared({"data": [row]})["synthetic-chat"].pricing
+    assert pricing is not None and pricing.billing_unit is None
+    assert tokenrhythm_pricing_fields(pricing) == {}
 
 
 @pytest.mark.parametrize(

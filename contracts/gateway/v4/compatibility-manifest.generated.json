@@ -107,6 +107,16 @@
     },
     {
       "delivery": "live-only-best-effort",
+      "family": "jev.changed",
+      "schema": "platform/jev-changed.schema.json",
+      "schemaSha256": "39c4f4738e737db35f088b5f008388b410c27b1f25db0d0a0a8a18b83c4ba7bc",
+      "schemaVersion": 1,
+      "wireNames": [
+        "jev.changed"
+      ]
+    },
+    {
+      "delivery": "live-only-best-effort",
       "family": "models.routing.changed",
       "schema": "platform/models-routing-changed-event.schema.json",
       "schemaSha256": "a0830e0df98bbcb5c397fc3e7fe8763d9d355b5d1cc859bd34d43fd1f93a7de7",
@@ -520,6 +530,30 @@
       "name": "goals.status",
       "schema": "goals/goals-status.schema.json",
       "schemaSha256": "cc9780f6b16f0059b4857cbd28294a9bbea6b985c8b223c90feb001466be67f3"
+    },
+    {
+      "lifecycle": "stable",
+      "name": "jev.configure",
+      "schema": "platform/jev-configure.schema.json",
+      "schemaSha256": "99420be253c93cb5a65572b90004a933bcd6511e9079e6323deac71fa7d32b3a"
+    },
+    {
+      "lifecycle": "stable",
+      "name": "jev.get",
+      "schema": "platform/jev-get.schema.json",
+      "schemaSha256": "c56d9d76140df72a6686eb63c7a12a01d149f1d0d1a37fe1dc95ee1982cc07b1"
+    },
+    {
+      "lifecycle": "stable",
+      "name": "jev.preview",
+      "schema": "platform/jev-preview.schema.json",
+      "schemaSha256": "671b6d1dbb36d80c01453e6ef015d58300269298c301567ab0ffe3d39c529817"
+    },
+    {
+      "lifecycle": "stable",
+      "name": "jev.respond",
+      "schema": "platform/jev-respond.schema.json",
+      "schemaSha256": "5fd435c89f693cba8a436c7de8a7d36898faeb5611af619126281783e75a22e1"
     },
     {
       "lifecycle": "stable",
@@ -1469,11 +1503,11 @@
   ],
   "protocol": "opensquilla-websocket-json",
   "source": {
-    "eventFamilyCount": 10,
-    "generatorSha256": "322cf69b630bbced63642484ef9c0579d664caa4f7a741fc5008f1705b1ce82c",
-    "methodCount": 216,
-    "schemaCount": 226,
-    "schemaTreeSha256": "432e1af00cddaac0dc3976c97f48608343d0e5f9f6f1cebf338f43a244a1f606",
+    "eventFamilyCount": 11,
+    "generatorSha256": "e08e8fccb92aa3571e85af7267399b5654cc0217b7554f4fbe481b4bc79ab26d",
+    "methodCount": 220,
+    "schemaCount": 231,
+    "schemaTreeSha256": "bd05adcabdc1fd74c31747606c5876686081df6b504769487f3fe7dfc65830fd",
     "toolchains": {
       "legacyTypes": {
         "python": {

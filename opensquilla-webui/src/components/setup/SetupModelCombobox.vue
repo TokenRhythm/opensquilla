@@ -1,6 +1,6 @@
 <script setup lang="ts">
 // Shared model picker for provider defaults, router tiers, and ensemble roles:
-// the plain text input stays the primary control (free text ALWAYS works —
+// the plain text input stays the primary control (free text works by default —
 // discovery is an accelerator, never a gate), with an optional dropdown of
 // live-discovered models layered on top. Presentational only: props in, events
 // out (panel-contract pattern).
@@ -28,7 +28,7 @@ interface LeadingOption {
   description?: string
 }
 
-const props = defineProps<{
+const props = withDefaults(defineProps<{
   field: FieldSpec
   value: string
   models: DiscoveredModel[]
@@ -54,7 +54,10 @@ const props = defineProps<{
   // chooses a catalog row (or the "use typed value" row). This prevents a
   // search query from changing the saved processing mode while it is typed.
   commitOnSelect?: boolean
-}>()
+  // Catalog-only hosts disable the custom row and use commitOnSelect so
+  // typing remains a local search until a discovered model is selected.
+  allowCustomValue?: boolean
+}>(), { allowCustomValue: undefined })
 
 const emit = defineEmits<{
   update: [value: string]
@@ -185,6 +188,7 @@ watch(visibleModels, (models, previous) => {
 // The escape hatch: whatever was typed is always usable as-is. Shown whenever
 // there is typed text that is not an exact discovered id.
 const showFreeTextRow = computed(() => {
+  if (props.allowCustomValue === false) return false
   if (leadingSelected.value && !(props.commitOnSelect && typedSinceOpen.value)) return false
   const typed = typedValue.value.trim()
   if (!typed) return false

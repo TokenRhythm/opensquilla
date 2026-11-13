@@ -563,6 +563,17 @@
       @check="chatSend.checkDelivery"
     />
     <ChatModelSetupNotice v-if="!shareMode" />
+    <ChatJevRouting
+      v-if="!shareMode && !forkTransition && !sessionViewCache.showingPreview.value"
+      :session-key="sessionKey"
+      :available="optionalSessionRpcAllowed && gatewayAccess.isAvailable && gatewayAccess.isAuthenticated"
+      :connection-epoch="gatewayAccess.subscriptionEpoch"
+      :turn-busy="isStreaming || !!taskOwnership.runningTaskId.value"
+      @open-session="openJevSession"
+      :draft-consumed="jevDraftConsumed"
+      :draft-text="composerText"
+      :composing="composing"
+    />
     <ChatComposer
       ref="composerRef"
       v-model="composerText"
@@ -807,6 +818,7 @@ import { MAIN_CONVERSATION_POLICY, conversationSlashActionAllowed, type Conversa
 import PromptCacheKeepaliveDialog from '@/components/chat/PromptCacheKeepaliveDialog.vue'
 import DeliverablesDrawer from '@/components/chat/DeliverablesDrawer.vue'
 import ChatComposer from '@/components/chat/ChatComposer.vue'
+import ChatJevRouting from '@/components/chat/ChatJevRouting.vue'
 import VisualizeContextChip from '@/components/chat/VisualizeContextChip.vue'
 import { acceptsVisualizeContext, useVisualizeDraft } from '@/visualize/useVisualizeDraft'
 import ChatModelSetupNotice from '@/components/chat/ChatModelSetupNotice.vue'
@@ -3506,6 +3518,7 @@ watch(sessionKey, () => {
   activeRunModeLock.value = null
 })
 
+let captureJevAttachments: (() => void) | null = null
 const chatSessionRuntime = useChatSessionRuntime({
   sessionKey,
   messages,
@@ -3547,7 +3560,7 @@ const chatSessionRuntime = useChatSessionRuntime({
   resetSavingsPopupCooldown,
   restoreWidgetState,
   resetStreamLiveTurnState,
-  retireAttachments,
+  retireAttachments: () => { captureJevAttachments?.(); retireAttachments() },
   resetInputHistory: () => resetComposerInputHistory(),
   resetSessionHistory: chatHistory.resetForSession,
   resetDraftComposer: () => {
@@ -3570,6 +3583,43 @@ async function switchToSession(nextSessionKey: string) {
     await handleAuthoritativeSessionSubscription(nextSessionKey)
   }
   return outcome
+}
+
+const pendingJevSession = ref<{ sourceSessionKey: string; targetSessionKey: string } | null>(null)
+watch([sessionKey, isStreaming, () => taskOwnership.runningTaskId.value], () => {
+  const pending = pendingJevSession.value
+  if (!pending) return
+  if (pending.sourceSessionKey !== sessionKey.value) { pendingJevSession.value = null; return }
+  if (!isStreaming.value && !taskOwnership.runningTaskId.value) {
+    pendingJevSession.value = null
+    void openJevSession(pending)
+  }
+})
+
+async function openJevSession(navigation: { sourceSessionKey: string; targetSessionKey: string }) {
+  if (chatViewDisposed || navigation.sourceSessionKey !== sessionKey.value
+    || navigation.targetSessionKey === sessionKey.value || !navigation.targetSessionKey.trim()
+    || forkTransition.value) return
+  if (isStreaming.value || taskOwnership.runningTaskId.value) {
+    pendingJevSession.value = navigation
+    return
+  }
+  const cancelCarry = draftPersistence.preserveDraftOnSwitch(navigation.targetSessionKey)
+  let attachments: typeof pendingAttachments.value = []
+  const capture = () => { attachments = pendingAttachments.value.map(attachment => ({ ...attachment })) }
+  captureJevAttachments = capture
+  try {
+    await openReferencedSession(navigation.targetSessionKey)
+    if (!props.embedded && attachments.length) {
+      await chatAttachments.restoreContinuationAttachments(attachments, () => !chatViewDisposed
+        && sessionKey.value === navigation.targetSessionKey)
+    }
+  } catch {
+    pushToast(t('chat.jev.sessionOpenFailed'), { tone: 'warn' })
+  } finally {
+    cancelCarry()
+    if (captureJevAttachments === capture) captureJevAttachments = null
+  }
 }
 
 async function openReferencedSession(nextSessionKey: string) {
@@ -3978,6 +4028,14 @@ const {
 } = chatComposerShortcuts
 resetComposerInputHistory = chatComposerShortcuts.resetInputHistory
 
+const jevDraftConsumed = ref(0)
+const jevSendInputText = computed({
+  get: () => inputText.value,
+  set: (value: string) => {
+    if (!value.trim() && inputText.value.trim()) jevDraftConsumed.value += 1
+    inputText.value = value
+  },
+})
 const chatSend = useChatSend({
   durableDelivery,
   selectedSkills,
@@ -4007,7 +4065,7 @@ const chatSend = useChatSend({
     supports: capability => turnCommands.supports(capability),
   },
   activeSteerCapability,
-  inputText,
+  inputText: jevSendInputText,
   commandText: composerText,
   messages,
   sessionKey,

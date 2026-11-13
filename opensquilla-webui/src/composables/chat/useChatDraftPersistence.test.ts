@@ -546,3 +546,45 @@ it('consumes only the exact accepted offscreen skill draft after the session wat
   expect(api.loadDraft('agent:main:webchat:source')).toBe('Pending request')
   scope.stop()
 })
+
+describe('unsent draft continuation handoff', () => {
+  it('preserves the latest text, skills and file references in memory and both session drafts', async () => {
+    const source = 'agent:main:webchat:source'
+    const target = 'agent:main:webchat:continuation'
+    const sessionKey = ref(source)
+    const inputText = ref('Unsent work')
+    const selectedSkills = ref([{ name: 'synthetic-skill', instanceId: 'skill:synthetic', digest: 'b'.repeat(64) }])
+    const skillPositions = ref({ 'skill:synthetic': 3 })
+    const localPaths = ref(['C:/workspace/reference.md'])
+    const scope = effectScope()
+    const api = scope.run(() => useChatDraftPersistence({ sessionKey, inputText, selectedSkills, skillPositions, localPaths }))!
+    const cancel = api.preserveDraftOnSwitch(target)
+    inputText.value += ' edited while waiting'
+    sessionKey.value = target
+    cancel()
+    await nextTick()
+    expect(inputText.value).toBe('Unsent work edited while waiting')
+    expect(selectedSkills.value[0]?.name).toBe('synthetic-skill')
+    expect(localPaths.value).toEqual(['C:/workspace/reference.md'])
+    expect(skillPositions.value).toEqual({ 'skill:synthetic': 3 })
+    expect(api.loadDraft(source)).toBe(inputText.value)
+    expect(api.loadDraft(target)).toBe(inputText.value)
+    scope.stop()
+  })
+
+  it('preserves the composer without durable storage and cancels a failed navigation carry', async () => {
+    const sessionKey = ref('agent:main:webchat:source')
+    const inputText = ref('Private temporary draft')
+    const scope = effectScope()
+    const api = scope.run(() => useChatDraftPersistence({ sessionKey, inputText, storage: null }))!
+    api.preserveDraftOnSwitch('agent:main:webchat:continuation')
+    sessionKey.value = 'agent:main:webchat:continuation'
+    expect(inputText.value).toBe('Private temporary draft')
+    const cancel = api.preserveDraftOnSwitch('agent:main:webchat:cancelled')
+    cancel()
+    sessionKey.value = 'agent:main:webchat:cancelled'
+    await nextTick()
+    expect(inputText.value).toBe('')
+    scope.stop()
+  })
+})

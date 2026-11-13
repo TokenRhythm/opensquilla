@@ -386,3 +386,26 @@ def test_editing_account_only_profile_keeps_its_fail_closed_reference(monkeypatc
         result = upsert_llm_profile(cfg, provider_id="tokenrhythm", model="new-model").config
         assert result.llm_profiles["tokenrhythm"].credential_source == "account"
         assert not resolve_provider_deployment(result, "tokenrhythm", "new-model").ready
+
+
+@pytest.mark.parametrize("path", ["/decision", "/systemone"])
+async def test_proxy_transport_admits_only_exact_native_decision_posts(monkeypatch, path):
+    lease = signed_in()["credential"]
+    monkeypatch.setitem(bridge._leases, lease, "http://127.0.0.1:12345")
+    transport = bridge.AccountProxyTransport(lease)
+    seen = []
+
+    async def upstream(request):
+        seen.append(request)
+        return httpx.Response(200, json={"model": "NeoHorse-Jev-4B", "answers": {}})
+
+    await transport._transport.aclose()
+    transport._transport = httpx.MockTransport(upstream)
+    async with httpx.AsyncClient(transport=transport) as client:
+        await client.post(bridge.OFFICIAL_BASE + path, json={"state": "Synthetic task"})
+        for method, suffix in [("GET", ""), ("POST", "?target=bad"), ("POST", "/extra")]:
+            with pytest.raises(httpx.TransportError):
+                await client.request(method, bridge.OFFICIAL_BASE + path + suffix)
+    assert len(seen) == 1
+    assert seen[0].url.path == "/v1" + path
+    assert seen[0].headers["authorization"] == "Bearer " + lease

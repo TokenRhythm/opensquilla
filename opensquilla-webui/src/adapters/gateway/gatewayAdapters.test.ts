@@ -50,6 +50,7 @@ describe('Gateway Adapter composition', () => {
       'sessionDirectoryChanges',
       'sessionLifecycle',
       'sessionRouting',
+      'jevRouting',
       'turnCommands',
       'pendingInputQueue',
       'approvalCenter',

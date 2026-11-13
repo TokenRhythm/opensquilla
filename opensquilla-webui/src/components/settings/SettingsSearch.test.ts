@@ -28,6 +28,12 @@ async function search(input: HTMLInputElement, value: string) {
   await nextTick()
 }
 describe('SettingsSearch', () => {
+  it('finds the Danbao waiting-time setting in Chinese', async () => {
+    const { input, host, select } = mountSearch('zh-Hans')
+    await search(input, zh.settings.jev.waitLabel)
+    host.querySelector<HTMLButtonElement>('.settings-search__result')!.click()
+    expect(select).toHaveBeenCalledExactlyOnceWith('jev', 'settings.jev.waitLabel')
+  })
   it.each(['isComposing', 'keyCode'])('does not navigate or dismiss while IME owns the keyboard (%s)', async mode => {
     const { input, host, select } = mountSearch('zh-Hans')
     await search(input, zh.settings.appearance.themeLabel)

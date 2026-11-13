@@ -2,6 +2,7 @@ import type { SessionDirectory } from '@/modules/sessionDirectory'
 import type { SessionDirectoryChanges } from '@/modules/sessionDirectoryChanges'
 import type { SessionLifecycle } from '@/modules/sessionLifecycle'
 import type { SessionRouting } from '@/modules/sessionRouting'
+import type { JevRouting } from '@/modules/jevRouting'
 import type { TurnCommands } from '@/modules/turnCommands'
 import type { PendingInputQueuePort } from '@/modules/pendingInputQueue'
 import { createPrivateGatewayTransports } from './privateTransports'
@@ -9,6 +10,7 @@ import { createV4SessionDirectory } from './sessionDirectoryV4'
 import { createV4SessionDirectoryChanges } from './sessionDirectoryChangesV4'
 import { createV4SessionLifecycle } from './sessionLifecycleV4'
 import { createV4SessionRouting } from './sessionRoutingV4'
+import { createV4JevRouting } from './jevRoutingV4'
 import { createV4TurnCommands } from './turnCommandsV4'
 import { createV4PendingInputQueue } from './pendingInputQueueV4'
 import { createApprovalCenterV4 } from './approvalCenterV4'
@@ -96,6 +98,7 @@ export interface GatewayAdapters {
   readonly sessionDirectoryChanges: SessionDirectoryChanges
   readonly sessionLifecycle: SessionLifecycle
   readonly sessionRouting: SessionRouting
+  readonly jevRouting: JevRouting
   readonly turnCommands: TurnCommands
   readonly pendingInputQueue: PendingInputQueuePort
   readonly approvalCenter: ApprovalCenter
@@ -179,6 +182,7 @@ export function createGatewayAdapters(
     ),
     sessionLifecycle: createV4SessionLifecycle(transports.rpc),
     sessionRouting: createV4SessionRouting(transports.rpc, transports.events),
+    jevRouting: createV4JevRouting(transports.rpc, transports.events),
     turnCommands: createV4TurnCommands(transports.rpc),
     pendingInputQueue: createV4PendingInputQueue(transports.rpc),
     approvalCenter: createApprovalCenterV4(transports.rpc, transports.events, { http }),

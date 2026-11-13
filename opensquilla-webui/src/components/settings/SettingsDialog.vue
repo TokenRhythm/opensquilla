@@ -134,6 +134,7 @@
             @update-auto-capture="setMemoryAutoCapture"
             @open-data-maintenance="openDataMaintenance"
           />
+          <template v-else-if="section === 'jev'"></template>
 
           <!-- AI configuration pages wait for complete readiness baselines. -->
           <div v-else-if="!loaded" class="settings-loading" role="status">
@@ -221,13 +222,23 @@
             @dirty-change="videoDirty = $event"
             @busy-change="videoBusy = $event"
           />
+          <SettingsJevPanel
+            v-if="jevSettingsInitialized"
+            :hidden="section !== 'jev'"
+            ref="jevSettingsRef"
+            :ensemble="loaded ? modelStrategyPanel.ensemble : undefined"
+            :ensemble-saved="modelStrategyPanel.router?.tierEnsembleStatusFresh === true"
+            @open-model-strategy="selectSection('modelStrategy')"
+            @dirty-change="jevDirty = $event"
+            @busy-change="jevBusy = $event"
+          />
           </fieldset>
         </div>
         </div>
       </div>
 
       <div
-        v-if="loaded && hasUnsavedSettingsChanges"
+        v-if="(loaded || jevSettingsInitialized) && hasUnsavedSettingsChanges"
         class="settings-dirtybar"
         :aria-busy="settingsInteractionLocked ? 'true' : undefined"
       >
@@ -272,6 +283,7 @@ import SettingsAppearancePanel from '@/components/settings/SettingsAppearancePan
 import SettingsSearch from '@/components/settings/SettingsSearch.vue'
 import SettingsKeyboardPanel from '@/components/settings/SettingsKeyboardPanel.vue'
 import SettingsAdvancedPanel from '@/components/settings/SettingsAdvancedPanel.vue'
+import SettingsJevPanel from '@/components/settings/SettingsJevPanel.vue'
 import SettingsMemoryPanel from '@/components/settings/SettingsMemoryPanel.vue'
 import SettingsGatewayPanel from '@/components/settings/SettingsGatewayPanel.vue'
 import SettingsGeneralPanel from '@/components/settings/SettingsGeneralPanel.vue'
@@ -408,6 +420,13 @@ const videoSettingsRef = ref<InstanceType<typeof VideoGenerationSettings> | null
 const videoDirty = ref(false)
 const videoBusy = ref(false)
 const videoSettingsInitialized = ref(false)
+const jevSettingsRef = ref<InstanceType<typeof SettingsJevPanel> | null>(null)
+const jevDirty = ref(false)
+const jevBusy = ref(false)
+const jevSettingsInitialized = ref(false)
+watch(section, activeSection => {
+  if (activeSection === 'jev') jevSettingsInitialized.value = true
+}, { immediate: true })
 watch([loaded, section], ([ready, activeSection], previous) => {
   if (!ready || activeSection !== 'capabilities') return
   if (!videoSettingsInitialized.value) {
@@ -465,15 +484,19 @@ let userNavigated = false
 
 function sectionDirty(id: string): boolean {
   return catalogSectionDirty(id) || (id === 'capabilities' && videoDirty.value)
+    || (id === 'jev' && jevDirty.value)
 }
 const dirtySections = computed(() => {
-  if (!videoDirty.value || catalogDirtySections.value.some(item => item.id === 'capabilities')) {
-    return catalogDirtySections.value
+  const result = [...catalogDirtySections.value]
+  for (const [id, dirty] of [['capabilities', videoDirty.value], ['jev', jevDirty.value]] as const) {
+    if (dirty && !result.some(item => item.id === id)) {
+      const entry = SETTINGS_SECTIONS.find(item => item.id === id)
+      if (entry) result.push(entry)
+    }
   }
-  const capabilities = SETTINGS_SECTIONS.find(item => item.id === 'capabilities')
-  return capabilities ? [...catalogDirtySections.value, capabilities] : catalogDirtySections.value
+  return result
 })
-const hasUnsavedSettingsChanges = computed(() => hasUnsavedChanges.value || videoDirty.value)
+const hasUnsavedSettingsChanges = computed(() => hasUnsavedChanges.value || videoDirty.value || jevDirty.value)
 const dirtyBarPendingText = computed(() => t(settingsDiscardPending.value
   ? 'shared.loading' : 'settings.dialog.savingChanges'))
 const dirtySectionNames = computed(() => (
@@ -526,6 +549,7 @@ const hasSettingsExitDraft = computed(() => (
 const hasPendingSettingsWrite = computed(() => (
   saveAllPending.value
   || videoBusy.value
+  || jevBusy.value
   || providerSavePending.value
   || primaryMutationPending.value
   || modelStrategyRoutingBusy.value
@@ -536,7 +560,7 @@ const hasPendingSettingsWrite = computed(() => (
 ))
 const settingsInteractionLocked = computed(() => (
   saveAllPending.value || closeSavePending.value || primaryMutationPending.value || sandboxLeavePending.value
-  || settingsSavePending.value || settingsDiscardPending.value || videoBusy.value || recommendationSaving.value
+  || settingsSavePending.value || settingsDiscardPending.value || videoBusy.value || jevBusy.value || recommendationSaving.value
 ))
 // A routing-mode write must not claim that unrelated manual drafts are saving.
 const settingsFormLocked = computed(() => settingsInteractionLocked.value || modelStrategyRoutingBusy.value)
@@ -888,7 +912,7 @@ function confirmExitChanges() {
 // Video owns its provider-scoped patch, but shares the same visible save and
 // discard actions as the other capabilities. Keep a single lock across both
 // requests so a second click cannot interleave writes or lose a newer draft.
-type SettingsSaveResult = 'saved' | 'video-error' | 'incomplete'
+type SettingsSaveResult = 'saved' | 'video-error' | 'jev-error' | 'incomplete'
 async function persistSettingsChanges(): Promise<SettingsSaveResult> {
   if (hasUnsavedChanges.value) {
     await saveDirtySections()
@@ -896,6 +920,9 @@ async function persistSettingsChanges(): Promise<SettingsSaveResult> {
   }
   if (videoDirty.value && !(await videoSettingsRef.value?.save())) {
     return 'video-error'
+  }
+  if (jevDirty.value && !(await jevSettingsRef.value?.save())) {
+    return 'jev-error'
   }
   await nextTick()
   return hasUnsavedSettingsChanges.value ? 'incomplete' : 'saved'
@@ -915,6 +942,16 @@ async function revealVideoSaveError(): Promise<void> {
   }
 }
 
+async function revealJevSaveError(): Promise<void> {
+  if (!(await selectSection('jev'))) return
+  await nextTick()
+  const alert = panelRef.value?.querySelector<HTMLElement>('[data-testid="jev-settings"] [role="alert"]')
+  if (!alert) return
+  alert.tabIndex = -1
+  alert.scrollIntoView?.({ block: 'nearest' })
+  alert.focus({ preventScroll: true })
+}
+
 async function saveSettingsChanges(): Promise<boolean> {
   if (hasPendingSettingsWrite.value || settingsInteractionLocked.value) return false
   settingsSavePending.value = true
@@ -925,6 +962,7 @@ async function saveSettingsChanges(): Promise<boolean> {
   } finally {
     settingsSavePending.value = false
     if (result === 'video-error') await revealVideoSaveError()
+    if (result === 'jev-error') await revealJevSaveError()
   }
 }
 
@@ -934,6 +972,7 @@ async function discardSettingsChanges(): Promise<void> {
   try {
     if (hasUnsavedChanges.value) await discardChanges()
     if (videoDirty.value) videoSettingsRef.value?.discard()
+    if (jevDirty.value) jevSettingsRef.value?.discard()
   } finally {
     settingsDiscardPending.value = false
   }
@@ -954,6 +993,7 @@ async function saveExitChanges(): Promise<boolean> {
   } finally {
     closeSavePending.value = false
     if (result === 'video-error') await revealVideoSaveError()
+    if (result === 'jev-error') await revealJevSaveError()
   }
 }
 

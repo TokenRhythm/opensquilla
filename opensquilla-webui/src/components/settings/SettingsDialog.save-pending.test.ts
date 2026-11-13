@@ -23,6 +23,7 @@ vi.mock('@/composables/setup/useSetupCatalog', () => ({
     { id: 'gateway', label: 'Gateway', icon: 'home', client: false, group: null },
     { id: 'provider', label: 'Model Service', icon: 'settings', client: false, group: 'ai' },
     { id: 'capabilities', label: 'Capabilities', icon: 'skills', client: false, group: 'ai' },
+    { id: 'jev', label: 'Danbao JEV', icon: 'router', client: true, group: 'ai' },
   ],
   useSetupCatalog: () => catalogApi,
 }))
@@ -199,6 +200,54 @@ afterEach(() => {
 })
 
 describe('SettingsDialog save-all pending state', () => {
+  async function mountJevDraft() {
+    const controls = mockCatalog()
+    controls.saveAllPending.value = false
+    controls.hasUnsavedChanges.value = false
+    catalogApi.sectionDirty = () => false
+    catalogApi.dirtySections.value = []
+    catalogApi.section.value = 'jev'
+    routeState.params.section = 'jev'
+    routeState.path = '/settings/jev'
+    const read = vi.fn().mockResolvedValue({ enabled: true, mode: 'suggest', auto_switch_seconds: 10 })
+    const patch = vi.fn().mockResolvedValue({})
+    const el = await mountDialog({}, { read, patch } as unknown as AppSettings)
+    await vi.waitFor(() => expect(el.querySelector('[name="jev_wait"]')).not.toBeNull())
+    const trust = Array.from(el.querySelectorAll<HTMLButtonElement>('.danbao-settings__modes button'))[1]!
+    trust.click()
+    await nextTick()
+    return { el, patch, controls }
+  }
+
+  it('retains a Danbao draft across section navigation and locks exit until its save finishes', async () => {
+    const { el, patch, controls } = await mountJevDraft()
+    expect(el.querySelector('.settings-dirtybar')?.textContent).toContain('Danbao')
+    expect(el.querySelector('#settings-rail-jev .settings-rail__dirty')).not.toBeNull()
+    el.querySelector<HTMLButtonElement>('#settings-rail-general')!.click()
+    await nextTick()
+    expect(el.querySelector('[data-testid="jev-settings"]')?.hasAttribute('hidden')).toBe(true)
+    let finish!: () => void
+    patch.mockImplementation(() => new Promise(resolve => { finish = () => resolve({}) }))
+    el.querySelector<HTMLButtonElement>('.settings-dirtybar button.btn--primary')!.click()
+    await vi.waitFor(() => expect(patch).toHaveBeenCalledOnce())
+    expect(await leaveGuard!({ path: '/sessions' })).toBe(false)
+    expect(el.querySelector<HTMLButtonElement>('.settings-modal__close')?.disabled).toBe(true)
+    expect(controls.saveDirtySections).not.toHaveBeenCalled()
+    finish()
+    await vi.waitFor(() => expect(el.querySelector('.settings-dirtybar')).toBeNull())
+    expect(patch).toHaveBeenCalledWith([{ path: 'jev_router.mode', value: 'trust' }], expect.anything())
+    expect(await leaveGuard!({ path: '/sessions' })).toBe(true)
+  })
+
+  it('discards a Danbao-only draft through the shared action without writing configuration', async () => {
+    const { el, patch } = await mountJevDraft()
+    el.querySelector<HTMLButtonElement>('.settings-dirtybar button')!.click()
+    await nextTick()
+    expect(el.querySelector('.settings-dirtybar')).toBeNull()
+    expect(el.querySelector('.danbao-settings__modes button[aria-pressed="true"]')?.textContent).toBe('Suggest')
+    expect(patch).not.toHaveBeenCalled()
+  })
+
   it('shows the provider warning as a small dot only after status is loaded', async () => {
     mockCatalog()
     catalogApi.sectionDirty = () => false
@@ -709,7 +758,7 @@ describe('SettingsDialog rail keyboard navigation', () => {
     const rail = el.querySelector<HTMLElement>('.settings-rail')!
     const tabs = Array.from(rail.querySelectorAll<HTMLButtonElement>('[role="tab"]'))
     expect(rail.getAttribute('aria-orientation')).toBe(mobile ? 'horizontal' : 'vertical')
-    expect(tabs.map(tab => tab.tabIndex)).toEqual([0, -1, -1, -1])
+    expect(tabs.map(tab => tab.tabIndex)).toEqual([0, -1, -1, -1, -1])
 
     expect((await pressKey(tabs[0], ignored)).defaultPrevented).toBe(false)
     expect(catalogApi.section.value).toBe('general')
@@ -717,19 +766,19 @@ describe('SettingsDialog rail keyboard navigation', () => {
     expect(document.activeElement).toBe(tabs[1])
     expect(catalogApi.section.value).toBe('gateway')
     expect(tabs[1].getAttribute('aria-selected')).toBe('true')
-    expect(tabs.map(tab => tab.tabIndex)).toEqual([-1, 0, -1, -1])
+    expect(tabs.map(tab => tab.tabIndex)).toEqual([-1, 0, -1, -1, -1])
     expect(routerMock.replace).toHaveBeenLastCalledWith({ path: '/settings/gateway' })
 
     await pressKey(tabs[1], 'End')
-    expect(document.activeElement).toBe(tabs[3])
-    expect(catalogApi.section.value).toBe('capabilities')
-    await pressKey(tabs[3], forward)
+    expect(document.activeElement).toBe(tabs[4])
+    expect(catalogApi.section.value).toBe('jev')
+    await pressKey(tabs[4], forward)
     expect(document.activeElement).toBe(tabs[0])
     await pressKey(tabs[0], backward)
-    expect(document.activeElement).toBe(tabs[3])
-    await pressKey(tabs[3], 'Home')
+    expect(document.activeElement).toBe(tabs[4])
+    await pressKey(tabs[4], 'Home')
     expect(document.activeElement).toBe(tabs[0])
-    expect(tabs.map(tab => tab.tabIndex)).toEqual([0, -1, -1, -1])
+    expect(tabs.map(tab => tab.tabIndex)).toEqual([0, -1, -1, -1, -1])
   })
 
   it('does not navigate by keyboard while settings writes are pending', async () => {

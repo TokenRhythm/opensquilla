@@ -18,6 +18,7 @@ const labels: Partial<Record<SettingsRailSectionId, string[]>> = {
   gateway: ['monitorSupport.title', 'monitorSupport.downloadBundle', 'settings.search.supportBundle', 'gatewayLogs.viewLogs'],
   provider: ['setup.provider.defaultModelLabel', 'settings.search.defaultModel'],
   modelStrategy: ['setup.modelStrategy.singleModelLabel', 'setup.modelStrategy.routerTitle', 'setup.modelStrategy.ensembleTitle'],
+  jev: ['chat.jev.mode', 'chat.jev.budget', 'chat.jev.loopInterval', 'settings.jev.waitLabel', 'chat.jev.decisionModelLabel'],
   capabilities: ['setup.search.title', 'setup.memory.title', 'setup.image.title', 'setup.video.title', 'setup.audio.title'],
   general: ['settings.appearance.languageLabel', 'setup.behavior.autoTitlesLabel'],
   interface: ['settings.appearance.themeLabel', 'settings.appearance.sidebarWidthLabel', 'settings.appearance.toolDetailsLabel', 'settings.appearance.visualEffectsLabel', 'settings.appearance.composerFxLabel'],

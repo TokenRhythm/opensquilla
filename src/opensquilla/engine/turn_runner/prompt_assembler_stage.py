@@ -641,7 +641,7 @@ class PromptAssemblerStage:
 
         # 6. Effective runtime message + selector override / fallback wrap
         effective_runtime_message = getattr(turn, "message", inp.runtime_message)
-        if inp.model and inp.cloned_selector is not None:
+        if inp.model and inp.cloned_selector is not None and not turn.metadata.get("jev_target"):
             from opensquilla.engine.selector_override import apply_model_override
 
             prior_route_model = str(

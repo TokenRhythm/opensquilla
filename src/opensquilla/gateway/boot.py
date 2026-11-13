@@ -3009,6 +3009,15 @@ class GatewayServer:
                         )
                 else:
                     log.warning("gateway.mcp_clients_close_skipped_for_live_runtime")
+                if runtime_shutdown_clean and dependencies_settled:
+                    runner = getattr(getattr(self.app, "state", None), "turn_runner", None)
+                    jev_service = getattr(runner, "jev_service", None)
+                    if jev_service is not None:
+                        try:
+                            await wait_phase(jev_service.close(), "jev", dependency=True)
+                        except Exception:
+                            incomplete = True
+                            log.debug("gateway.jev_close_failed", exc_info=True)
                 if (
                     self._services is not None
                     and runtime_shutdown_clean

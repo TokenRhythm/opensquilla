@@ -202,6 +202,7 @@ METHOD_SCOPES: dict[str, str] = {
     # OpenSquilla-only; non-consuming peek at a session's router-control hold
     # plus the valid target menu (see rpc_routing.py).
     "routing.hold.get": READ_SCOPE,
+    "jev.get": READ_SCOPE,
     "search.status": READ_SCOPE,
     "memory.list": READ_SCOPE,
     "memory.search": READ_SCOPE,
@@ -407,6 +408,9 @@ METHOD_SCOPES: dict[str, str] = {
     # mutation is admin-gated like sessions.patch (which rebinds a session's
     # model the same way). The read peek is classified above.
     "routing.hold.set": ADMIN_SCOPE,
+    "jev.configure": ADMIN_SCOPE,
+    "jev.respond": ADMIN_SCOPE,
+    "jev.preview": ADMIN_SCOPE,
     "routing.hold.clear": ADMIN_SCOPE,
     "memory.index": ADMIN_SCOPE,
     "memory.import.preview": ADMIN_SCOPE,
