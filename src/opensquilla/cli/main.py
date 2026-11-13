@@ -145,6 +145,7 @@ from opensquilla.cli.mcp_server_cmd import app as mcp_server_app  # noqa: E402
 from opensquilla.cli.migrate_cmd import migrate_app  # noqa: E402
 from opensquilla.cli.models_cmd import app as models_app  # noqa: E402
 from opensquilla.cli.onboard_cmd import configure_command, onboard_app  # noqa: E402
+from opensquilla.cli.pet_cmd import pet_app  # noqa: E402
 from opensquilla.cli.providers_cmd import providers_app  # noqa: E402
 from opensquilla.cli.recovery_cmd import recovery_app  # noqa: E402
 from opensquilla.cli.replay import replay_app  # noqa: E402
@@ -202,6 +203,7 @@ app.add_typer(providers_app, name="providers")
 app.add_typer(router_app, name="router")
 app.add_typer(sandbox_app, name="sandbox")
 app.add_typer(search_app, name="search")
+app.add_typer(pet_app, name="pet")
 app.add_typer(sessions_app, name="sessions")
 app.add_typer(skills_app, name="skills")
 

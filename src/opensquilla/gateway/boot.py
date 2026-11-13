@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import contextvars
 import inspect
+import itertools
 import logging
 import os
 import secrets
@@ -610,6 +611,9 @@ class ServiceContainer:
     config_revision: str | int = 0
     optional_owners: dict[str, OptionalServiceOwner] = field(default_factory=dict)
     optional_start_task: asyncio.Task[Any] | None = field(default=None, repr=False)
+    # In-process desktop-pet reminder/dispatch service (PR-2/3); None unless
+    # [pet].enabled. Stopped during close() before the task runtime drains.
+    pet_service: Any = None
     _compaction_listener_remove: Callable[[], None] | None = None
     _approval_listener_remove: Callable[[], None] | None = None
     _approval_channel_notifier_remove: Callable[[], None] | None = None
@@ -815,6 +819,18 @@ class ServiceContainer:
             except Exception:
                 log.debug("gateway.goal_service_close_failed", exc_info=True)
             self.goal_service = None
+        if self.pet_service is not None:
+            try:
+                await self.pet_service.stop()
+            except Exception:
+                log.debug("gateway.pet_service_stop_failed", exc_info=True)
+            self.pet_service = None
+            try:
+                from opensquilla.tools.builtin.pet import set_pet_service
+
+                set_pet_service(None)
+            except Exception:
+                pass
         if self.task_runtime is not None:
             try:
                 await self.task_runtime.shutdown()
@@ -5543,6 +5559,87 @@ async def start_gateway_server(
             log.info("build_services.cron_scheduler_deferred")
         else:
             await _start_cron_scheduler()
+
+    # ── Desktop-pet reminder/dispatch service (PR-2/3, opt-in) ──────
+    if config.pet.enabled:
+        async def _start_desktop_pet_service() -> str:
+            from opensquilla.gateway.auth import Principal
+            from opensquilla.gateway.rpc import RpcContext, get_dispatcher
+            from opensquilla.gateway.session_streams import get_session_streams
+            from opensquilla.pet.service import PetReminderService
+
+            # Reuse the exact sessions.resolve/send admission path in-process
+            # via an operator context (same pattern as sidechat lease recovery).
+            pet_context = RpcContext(
+                conn_id="desktop-pet-service",
+                principal=Principal(
+                    role="operator", scopes=frozenset({"operator.admin"}),
+                    is_owner=True, authenticated=True,
+                ),
+                config=config, session_manager=svc.session_manager,
+                turn_runner=turn_runner, task_runtime=task_runtime,
+            )
+            pet_req_counter = itertools.count(1)
+
+            async def _pet_rpc_invoke(method: str, params: dict) -> dict:
+                req_id = f"pet-{method}-{next(pet_req_counter)}"
+                response = await get_dispatcher().dispatch(
+                    req_id, method, params, pet_context
+                )
+                if not response.ok:
+                    err = response.error
+                    raise RuntimeError(
+                        f"{err.code}: {err.message}" if err else "rpc failed"
+                    )
+                return response.payload if isinstance(response.payload, dict) else {}
+
+            async def _pet_session_metadata(session_key: str) -> tuple[str, str]:
+                # Friendly label for the pet card: session title + project
+                # workspace path (the native shows the project dir name).
+                from opensquilla.gateway.project_workspace_runtime import (
+                    resolve_session_project_workspace,
+                )
+                from opensquilla.gateway.session_services import get_session_storage
+
+                try:
+                    session = await svc.session_manager.get_session(session_key)
+                    if session is None:
+                        return ("", "")
+                    title = str(
+                        getattr(session, "display_name", "")
+                        or getattr(session, "derived_title", "")
+                        or ""
+                    )
+                    project = ""
+                    storage = get_session_storage(svc.session_manager)
+                    if storage is not None:
+                        workspace = await resolve_session_project_workspace(
+                            storage, session
+                        )
+                        if workspace is not None:
+                            project = str(getattr(workspace, "canonical_path", "") or "")
+                    return (title[:40], project[:200])
+                except Exception:  # noqa: BLE001 - labeling is best-effort
+                    return ("", "")
+
+            service = PetReminderService(
+                config.pet,
+                event_source=get_session_streams(),
+                rpc_invoke=_pet_rpc_invoke,
+                metadata_resolver=_pet_session_metadata,
+            )
+            svc.pet_service = service
+            from opensquilla.tools.builtin.pet import set_pet_service
+
+            set_pet_service(service)
+            return await service.start()
+
+        _start_desktop_pet_service._optional_service_name = "desktop_pet"  # type: ignore[attr-defined]
+        if run:
+            svc.deferred_warmups.append(_start_desktop_pet_service)
+            log.info("build_services.desktop_pet_deferred")
+        else:
+            await _start_desktop_pet_service()
 
     # Build channel adapters (don't start yet -- app doesn't exist)
     webhook_routes: list = []

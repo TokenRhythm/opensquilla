@@ -602,3 +602,28 @@ default_mode = "bypass"                 # off | on | bypass | full
 # language = ""                  # empty follows [audio.stt].language; else auto|zh|en|ja|ko|yue
 # use_itn = true                 # inverse text normalization (数字/标点)
 # num_threads = 4
+
+# [pet]
+# In-process desktop-pet (AgentRMC) reminder + directed-dispatch service.
+# Disabled by default: no pet, no behavior, no port probes. When enabled, the
+# gateway subscribes to session events and drives the native loopback bridge
+# (/notify /speak /dispatch/*) directly — no external Node bridge/VBS/watchdog.
+# enabled = false
+# bridge_url = "http://127.0.0.1:45915"
+# exe = "OpenSquilla.exe"        # native dispatch queue filter (?exe=...)
+# raise_window = "OpenSquilla.exe"  # foreground window on permission/question; "" disables
+# title = "OpenSquilla"
+# include_cron = false           # also notify for cron-origin sessions
+# dispatch_enabled = true        # pet → session directed dispatch (PR-3)
+# poll_interval_ms = 1500        # dispatch queue poll cadence
+# dedupe_window_ms = 15000       # per-identity notification dedup window
+# request_timeout_ms = 5000
+# send_timeout_ms = 30000
+# spool_dir = ""                 # empty = %APPDATA%/LIG/AgentRMCNative (native importSpool replays)
+# spool_cap_bytes = 1048576      # offline spool cap (keep newest)
+# pause_file = ""                # empty = %TEMP%/opensquilla-pet-bridge.pause; create to mute
+# msg_stop = "OpenSquilla：任务完成"
+# msg_permission = "OpenSquilla：有个操作在等你确认"
+# msg_plan = "OpenSquilla：有个方案等你选择"
+# msg_clarify = "OpenSquilla：有个问题等你回答"   # interactive clarify/choice card
+# msg_turn_start = "新一轮对话开始"

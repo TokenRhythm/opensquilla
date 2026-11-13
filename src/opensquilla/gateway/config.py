@@ -2696,6 +2696,49 @@ class GoalConfig(BaseSettings):
 GatewayPort = Annotated[int, Field(ge=0, le=65535)]
 
 
+class PetConfig(BaseSettings):
+    """``[pet]`` — in-process desktop-pet reminder & dispatch service (PRD F2/F3).
+
+    Disabled by default: users without the AgentRMC pet get zero behavior and
+    zero port probes. Every key lives in this one section so the feature can
+    later move to a built-in plugin without scattering config (PRD §7.4).
+    """
+
+    model_config = SettingsConfigDict(
+        env_prefix="OPENSQUILLA_PET_",
+        env_nested_delimiter="__",
+    )
+
+    enabled: bool = False
+    bridge_url: str = "http://127.0.0.1:45915"
+    # Image name the native dispatch queue filters on (``?exe=...``).
+    exe: str = "OpenSquilla.exe"
+    # Window raised to the foreground on permission/question notifications;
+    # empty disables foreground raising.
+    raise_window: str = "OpenSquilla.exe"
+    title: str = "OpenSquilla"
+    # Notify for cron-origin sessions too (off by default, like the old bridge).
+    include_cron: bool = False
+    dispatch_enabled: bool = True
+    poll_interval_ms: int = Field(default=1500, ge=250, le=60_000)
+    state_poll_interval_ms: int = Field(default=5000, ge=1000, le=120_000)
+    dedupe_window_ms: int = Field(default=15_000, ge=0, le=120_000)
+    request_timeout_ms: int = Field(default=5000, ge=500, le=60_000)
+    send_timeout_ms: int = Field(default=30_000, ge=1000, le=120_000)
+    # Empty spool_dir resolves to the legacy bridge location so the native
+    # importSpool() replays it unchanged (PRD §8.1).
+    spool_dir: str = ""
+    spool_cap_bytes: int = Field(default=1_048_576, ge=4096)
+    # Empty pause_file resolves to %TEMP%/opensquilla-pet-bridge.pause; create
+    # the file to mute, delete it to resume.
+    pause_file: str = ""
+    msg_stop: str = "OpenSquilla：任务完成"
+    msg_permission: str = "OpenSquilla：有个操作在等你确认"
+    msg_plan: str = "OpenSquilla：有个方案等你选择"
+    msg_clarify: str = "OpenSquilla：有个问题等你回答"
+    msg_turn_start: str = "新一轮对话开始"
+
+
 class GatewayConfig(BaseSettings):
     model_config = SettingsConfigDict(
         env_prefix="OPENSQUILLA_GATEWAY_",
@@ -2762,6 +2805,7 @@ class GatewayConfig(BaseSettings):
     image_generation: ImageGenerationConfig = Field(default_factory=ImageGenerationConfig)
     video_generation: VideoGenerationConfig = Field(default_factory=VideoGenerationConfig)
     audio: AudioConfig = Field(default_factory=AudioConfig)
+    pet: PetConfig = Field(default_factory=PetConfig)
     sandbox: SandboxSettings = Field(default_factory=SandboxSettings)
     channels: ChannelsConfig = Field(default_factory=ChannelsConfig)
     agents: list[AgentEntryConfig] = Field(default_factory=list)
