@@ -70,6 +70,23 @@ def _build_elevenlabs(config: GatewayConfig) -> SttProvider:
     )
 
 
+def _build_sensevoice(config: GatewayConfig) -> SttProvider:
+    from opensquilla.audio.stt_sensevoice import SenseVoiceSttProvider
+
+    provider_cfg = config.audio.stt.sensevoice
+    language = (
+        str(getattr(provider_cfg, "language", "") or "").strip()
+        or str(getattr(config.audio.stt, "language", "") or "").strip()
+        or "auto"
+    )
+    return SenseVoiceSttProvider(
+        model_dir=str(getattr(provider_cfg, "model_dir", "") or ""),
+        language=language,
+        use_itn=bool(getattr(provider_cfg, "use_itn", True)),
+        num_threads=int(getattr(provider_cfg, "num_threads", 4) or 4),
+    )
+
+
 def _build_one(name: str, config: GatewayConfig) -> SttProvider:
     normalized = str(name or "").strip().lower()
     if normalized == "elevenlabs":
@@ -79,10 +96,12 @@ def _build_one(name: str, config: GatewayConfig) -> SttProvider:
         return _build_openai(stt_cfg.openai_transcriptions, chat_style=False)
     if normalized == "openai_chat":
         return _build_openai(stt_cfg.openai_chat, chat_style=True)
-    known = "elevenlabs | openai_transcriptions | openai_chat"
+    if normalized in {"sensevoice", "local_sensevoice", "sense_voice"}:
+        return _build_sensevoice(config)
+    known = "elevenlabs | openai_transcriptions | openai_chat | sensevoice"
     raise SttConfigError(
         f"unknown [audio.stt] provider {name!r}; expected one of: {known} "
-        "(local_sensevoice arrives with the optional voice extra)"
+        "(qwen3 arrives with the optional voice extra)"
     )
 
 

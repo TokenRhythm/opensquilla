@@ -1997,6 +1997,24 @@ class AudioSttOpenAIProviderConfig(BaseModel):
     timeout_seconds: float = 120.0
 
 
+class AudioSttSenseVoiceProviderConfig(BaseModel):
+    """Local SenseVoice backend through sherpa-onnx.
+
+    ``model_dir`` follows the AgentRMC layout: a directory holding
+    ``model.int8.onnx`` (or ``model.onnx``) plus ``tokens.txt``. The recognizer
+    loads lazily and never reaches the network, which makes it the cheap
+    default for microphone testing.
+
+    ``language`` is the model hint; an empty value falls back to the global
+    ``[audio.stt].language`` and then to ``"auto"``.
+    """
+
+    model_dir: str = ""
+    language: str = ""
+    use_itn: bool = True
+    num_threads: int = 4
+
+
 class AudioSttConfig(BaseModel):
     """``[audio.stt]`` — provider selection for speech-to-text.
 
@@ -2013,6 +2031,9 @@ class AudioSttConfig(BaseModel):
     openai_chat: AudioSttOpenAIProviderConfig = Field(
         default_factory=AudioSttOpenAIProviderConfig
     )
+    sensevoice: AudioSttSenseVoiceProviderConfig = Field(
+        default_factory=AudioSttSenseVoiceProviderConfig
+    )
 
 
 class AudioTTSConfig(BaseModel):
@@ -2026,6 +2047,41 @@ class AudioTTSConfig(BaseModel):
     style: float | None = None
     use_speaker_boost: bool | None = None
     speed: float = 1.0
+    # Name of a [audio.presets.<name>] voice pack; empty = raw fields above.
+    preset: str = ""
+
+
+class AudioVoicePresetConfig(BaseModel):
+    """``[audio.presets.<name>]`` — a named, reusable TTS parameter pack (PRD F3.6).
+
+    Presets own no credentials: playback resolves the key from
+    ``[audio.providers.<provider>]``. Every optional field overrides the
+    matching ``[audio.tts]`` fallback only when set; unset fields keep the raw
+    TTS config so adopting presets never changes existing behavior.
+    """
+
+    label: str = ""
+    provider: str = "elevenlabs"
+    voice_id: str = ""
+    model_id: str = ""
+    language_code: str = ""
+    stability: float | None = Field(default=None, ge=0.0, le=1.0)
+    similarity_boost: float | None = Field(default=None, ge=0.0, le=1.0)
+    style: float | None = Field(default=None, ge=0.0, le=1.0)
+    use_speaker_boost: bool | None = None
+    # Range mirrors the tts tool contract (0.25–4.0); the previous 0.5–2.0 cap
+    # silently rejected legitimate fast/slow presets the tool already accepted.
+    speed: float | None = Field(default=None, ge=0.25, le=4.0)
+    source: str = "user"  # builtin | user | imported
+
+    @field_validator("source")
+    @classmethod
+    def _known_source(cls, value: str) -> str:
+        allowed = {"builtin", "user", "imported"}
+        normalized = (value or "user").strip().lower()
+        if normalized not in allowed:
+            raise ValueError(f"preset source must be one of: {', '.join(sorted(allowed))}")
+        return normalized
 
 
 class AudioConfig(BaseSettings):
@@ -2038,6 +2094,7 @@ class AudioConfig(BaseSettings):
     tts: AudioTTSConfig = Field(default_factory=AudioTTSConfig)
     providers: AudioProvidersConfig = Field(default_factory=AudioProvidersConfig)
     stt: AudioSttConfig = Field(default_factory=AudioSttConfig)
+    presets: dict[str, AudioVoicePresetConfig] = Field(default_factory=dict)
 
 
 # ---------------------------------------------------------------------------

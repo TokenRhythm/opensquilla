@@ -615,6 +615,8 @@
       :voice-busy="voiceBusy"
       :voice-recording="voiceRecording"
       :voice-ready="voiceReady"
+      :voice-devices="voiceDevices"
+      :voice-device-id="voiceDeviceId"
       :project-workspace="activeWorkspace"
       :project-workspace-status="activeWorkspacePresentationStatus"
       :project-binding-busy="projectBindingBusy || workbenchSessionPreparing || sessionHasActiveWork || goalBusy || planModeBusy || modelRoutingSettingsBusy"
@@ -675,6 +677,8 @@
       @cancel-replan="cancelPlanRevision"
       @voice-input="onVoiceInput"
       @voice-setup="onVoiceSetup"
+      @voice-devices-refresh="void refreshVoiceDevices()"
+      @select-voice-device="setVoiceDevice($event); void refreshVoiceDevices()"
       @export-markdown="exportMarkdown"
       @send="onComposerSend"
       @stop="onComposerStop"
@@ -2884,7 +2888,11 @@ const {
 const voiceInput = useVoiceInput(injectedAudioTranscription, async () => {
   const key = sessionKey.value
   const epoch = currentEpoch.value
-  if (!key) return {}
+  // A fresh draft has no durable session yet: sending its key would make the
+  // gateway fence on a record that only the first send creates, and every
+  // recording would fail with "recording session is unavailable". Returning
+  // no owner routes the transcription into the gateway's draft usage scope.
+  if (!key || isDraftSurface()) return {}
   const resolved = await sessionDirectory.resolve({ key })
   if (key !== sessionKey.value || epoch !== currentEpoch.value) throw new Error('Recording session changed')
   return { sessionKey: key, sessionId: resolved.id, sessionEpoch: epoch }
@@ -2892,6 +2900,10 @@ const voiceInput = useVoiceInput(injectedAudioTranscription, async () => {
 const {
   voiceBusy,
   voiceRecording,
+  voiceDevices,
+  voiceDeviceId,
+  setVoiceDevice,
+  refreshVoiceDevices,
   toggleVoiceInput,
   cleanup: cleanupVoiceInput,
 } = voiceInput

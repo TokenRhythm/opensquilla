@@ -119,6 +119,13 @@ recommended = [
 ]
 matrix = ["matrix-nio>=0.25,<0.26", "markdown>=3.10.3", "h2>=4.4.1"]
 matrix-e2e = ["matrix-nio[e2e]>=0.25,<0.26", "markdown>=3.10.3", "h2>=4.4.1"]
+# Local speech-to-text ([audio.stt].provider = "sensevoice"): sherpa-onnx runs
+# the AgentRMC-style SenseVoice ONNX model fully offline. ffmpeg stays an
+# external requirement (winget install Gyan.FFmpeg) because the browser
+# records audio/webm and sherpa needs decoded PCM.
+# The installed line is 2.0.1; the range stays open so 1.x deployments keep
+# resolving their pinned version instead of forcing a major upgrade.
+voice = ["sherpa-onnx>=1.10"]
 document-extras = [
     "weasyprint>=70.0",
 ]

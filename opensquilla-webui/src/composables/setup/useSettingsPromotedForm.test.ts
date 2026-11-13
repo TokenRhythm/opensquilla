@@ -178,6 +178,94 @@ describe('parseContextWindowInput', () => {
   })
 })
 
+// The STT engine switch persists through config.patch dot-paths. Its dirty
+// baseline must be reactive (a ref): an earlier plain-object baseline made
+// sttDirty keep a stale re-seed comparison, so a saved switch stayed marked
+// unsaved until a full reload.
+describe('useSettingsPromotedForm — STT engine switch', () => {
+  it('seeds from saved audio.stt config and stays pristine', () => {
+    const f = useSettingsPromotedForm()
+    f.initFromConfig({
+      audio: { enabled: true, stt: { provider: 'sensevoice', sensevoice: { model_dir: 'D:\\models\\sv' } } },
+    })
+    expect(f.sttProvider.value).toBe('sensevoice')
+    expect(f.sttModelDir.value).toBe('D:\\models\\sv')
+    expect(f.sttDirty.value).toBe(false)
+    expect(f.sttPatches()).toEqual({})
+  })
+
+  it('marks dirty and patches the provider (plus model dir for sensevoice)', () => {
+    const f = useSettingsPromotedForm()
+    f.initFromConfig({ audio: { enabled: true, providers: { elevenlabs: {} } } })
+    f.updateAudioField('sttProvider', 'sensevoice')
+    f.updateAudioField('sttModelDir', 'D:\\models\\sv')
+    expect(f.sttDirty.value).toBe(true)
+    expect(f.sttPatches()).toEqual({
+      'audio.stt.provider': 'sensevoice',
+      'audio.stt.sensevoice.model_dir': 'D:\\models\\sv',
+    })
+  })
+
+  it('cloud switches patch only the provider key', () => {
+    const f = useSettingsPromotedForm()
+    f.initFromConfig({
+      audio: { stt: { provider: 'sensevoice', sensevoice: { model_dir: 'D:\\models\\sv' } } },
+    })
+    f.updateAudioField('sttProvider', 'elevenlabs')
+    expect(f.sttPatches()).toEqual({ 'audio.stt.provider': 'elevenlabs' })
+  })
+
+  it('clearing the model dir writes the empty-string default (str field, not null)', () => {
+    const f = useSettingsPromotedForm()
+    f.initFromConfig({
+      audio: { stt: { provider: 'sensevoice', sensevoice: { model_dir: 'D:\\old' } } },
+    })
+    f.updateAudioField('sttModelDir', '   ')
+    expect(f.sttPatches()['audio.stt.sensevoice.model_dir']).toBe('')
+  })
+
+  it('selecting and clearing a preset patches audio.tts.preset', () => {
+    const f = useSettingsPromotedForm()
+    f.initFromConfig({ audio: { tts: { preset: '' } } })
+    f.updateAudioField('preset', 'pet-alert')
+    expect(f.sttDirty.value).toBe(true)
+    expect(f.sttPatches()).toEqual({ 'audio.tts.preset': 'pet-alert' })
+    f.acceptSavedPreset('pet-alert')
+    expect(f.sttDirty.value).toBe(false)
+    f.updateAudioField('preset', '')
+    expect(f.sttPatches()).toEqual({ 'audio.tts.preset': '' })
+  })
+
+  it('acceptSavedStt rebaselines so a saved switch is clean again', () => {
+    const f = useSettingsPromotedForm()
+    f.initFromConfig({ audio: { stt: { provider: 'elevenlabs' } } })
+    f.updateAudioField('sttProvider', 'sensevoice')
+    f.updateAudioField('sttModelDir', 'D:\\models\\sv')
+    expect(f.sttDirty.value).toBe(true)
+    f.acceptSavedStt('sensevoice', 'D:\\models\\sv')
+    expect(f.sttProvider.value).toBe('sensevoice')
+    expect(f.sttDirty.value).toBe(false)
+    expect(f.sttPatches()).toEqual({})
+  })
+
+  it('initAudioFromConfig also rebaselines after a config reload', () => {
+    const f = useSettingsPromotedForm()
+    f.initFromConfig({ audio: { stt: { provider: 'elevenlabs' } } })
+    f.updateAudioField('sttProvider', 'sensevoice')
+    expect(f.sttDirty.value).toBe(true)
+    f.initFromConfig({ audio: { stt: { provider: 'sensevoice' } } })
+    expect(f.sttDirty.value).toBe(false)
+  })
+
+  it('an engine switch never marks the key fields dirty', () => {
+    const f = useSettingsPromotedForm()
+    f.initFromConfig({ audio: { enabled: true, providers: { elevenlabs: {} } } })
+    f.updateAudioField('sttProvider', 'sensevoice')
+    expect(f.audioDirty.value).toBe(false)
+    expect(f.sttDirty.value).toBe(true)
+  })
+})
+
 // The global thinking level persists through the provider-save dot-path
 // snapshot; clearing the select writes null so the llm.thinking key is
 // removed (same clear semantics as the context-window override).

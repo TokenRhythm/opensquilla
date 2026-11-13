@@ -24,8 +24,14 @@ interface PromotedConfigData {
   memory?: { auto_capture_enabled?: boolean }
   audio?: {
     enabled?: boolean
-    tts?: { voice?: string; model?: string; language_code?: string }
+    tts?: { voice?: string; model?: string; language_code?: string; preset?: string }
     providers?: Record<string, { api_key?: string; api_key_env?: string; base_url?: string }>
+    stt?: {
+      provider?: string
+      language?: string
+      sensevoice?: { model_dir?: string }
+    }
+    presets?: Record<string, { label?: string; voice_id?: string }>
   }
 }
 
@@ -46,6 +52,22 @@ export function useSettingsPromotedForm() {
   const audioTtsVoice = ref('')
   const audioTtsModel = ref('')
   const audioLanguageCode = ref('')
+  // STT engine switch: which backend POST /api/audio/transcribe routes to.
+  // Persisted with the audio save as a dot-path config patch, not through the
+  // ElevenLabs provider mutation; the gateway reloads the chain per request.
+  const sttProvider = ref('elevenlabs')
+  const sttModelDir = ref('')
+  // Baselines are refs, not plain objects: a dirty computed must be able to
+  // track a rebase (acceptSavedStt / initAudioFromConfig) that happens between
+  // its reads.
+  const sttBaseline = ref({ provider: 'elevenlabs', modelDir: '' })
+  // Generation-axis preset selection (PRD F3.6): '' = raw [audio.tts] fields;
+  // a name switches default TTS output (and, later, pet speech) to that pack.
+  const audioPreset = ref('')
+  // Must be a ref: sttDirty reads it, and acceptSavedPreset rebaselines it
+  // without changing audioPreset.value — a plain let would leave the computed
+  // serving a stale cached "dirty" result.
+  const presetBaseline = ref('')
   const audioProviderId = [101, 108, 101, 118, 101, 110, 108, 97, 98, 115]
     .map(code => String.fromCharCode(code))
     .join('')
@@ -54,6 +76,14 @@ export function useSettingsPromotedForm() {
     audioEnabled.value, audioApiKey.value, audioApiKeyEnv.value,
     audioBaseUrl.value, audioTtsVoice.value, audioTtsModel.value, audioLanguageCode.value,
   ]))
+  // Dirty state for the STT switch and the generation-axis preset choice. The
+  // comparison is plain reactivity: all fields are refs and every write path
+  // (edit, init, accept) goes through them.
+  const sttDirty = computed(() => (
+    sttProvider.value !== sttBaseline.value.provider
+    || sttModelDir.value.trim() !== sttBaseline.value.modelDir
+    || audioPreset.value !== presetBaseline.value
+  ))
 
   // Seed from the initial state so the pristine form is never dirty while config loads.
   const timeoutBaseline = ref(llmTimeoutSeconds.value)
@@ -61,6 +91,10 @@ export function useSettingsPromotedForm() {
   const contextWindowBaseline = ref(contextWindowTokens.value)
   const captureBaseline = ref(memoryAutoCapture.value)
   const audioBaseline = ref(audioSerialized.value)
+
+  // The STT engine choice is a draft on its own: a pending switch must keep
+  // both audio-axis cards (识别 / 生成) visible as drafts until Save.
+  const sttDraftPending = computed(() => sttDirty.value)
 
   const timeoutDirty = computed(() => llmTimeoutSeconds.value !== timeoutBaseline.value)
   const thinkingDirty = computed(() => llmThinking.value !== thinkingBaseline.value)
@@ -116,8 +150,33 @@ export function useSettingsPromotedForm() {
     // config.get redacts stored secrets; presence alone means a key is saved.
     audioKeyConfigured.value = Boolean(audioProvider.api_key)
     audioApiKey.value = ''
+    sttProvider.value = String(config.audio?.stt?.provider || '').trim() || 'elevenlabs'
+    sttModelDir.value = String(config.audio?.stt?.sensevoice?.model_dir || '')
+    audioPreset.value = String(config.audio?.tts?.preset || '').trim()
+    sttBaseline.value = {
+      provider: sttProvider.value,
+      modelDir: sttModelDir.value.trim(),
+    }
+    presetBaseline.value = audioPreset.value
 
     audioBaseline.value = audioSerialized.value
+  }
+
+  // Reseed the STT switch from freshly loaded config (called after a save
+  // reload so the next reload does not preserve a just-persisted draft).
+  function acceptSavedStt(provider: string, modelDir: string) {
+    sttProvider.value = String(provider || '').trim() || 'elevenlabs'
+    sttModelDir.value = String(modelDir || '')
+    sttBaseline.value = {
+      provider: sttProvider.value,
+      modelDir: sttModelDir.value.trim(),
+    }
+  }
+
+  // Reseed the generation-axis preset from its just-persisted value.
+  function acceptSavedPreset(preset: string) {
+    audioPreset.value = String(preset || '').trim()
+    presetBaseline.value = audioPreset.value
   }
 
   function setLlmTimeoutSeconds(value: number) {
@@ -149,6 +208,9 @@ export function useSettingsPromotedForm() {
     else if (key === 'ttsVoice') audioTtsVoice.value = String(value)
     else if (key === 'ttsModel') audioTtsModel.value = String(value)
     else if (key === 'languageCode') audioLanguageCode.value = String(value)
+    else if (key === 'sttProvider') sttProvider.value = String(value)
+    else if (key === 'sttModelDir') sttModelDir.value = String(value)
+    else if (key === 'preset') audioPreset.value = String(value)
   }
 
   function providerPatches(): Record<string, unknown> {
@@ -197,6 +259,27 @@ export function useSettingsPromotedForm() {
     return { 'memory.auto_capture_enabled': memoryAutoCapture.value }
   }
 
+  // Dot-path patches for the STT switch and the preset selection. The gateway
+  // rebuilds the provider chain per transcription request, so this needs no
+  // restart. model_dir and preset are plain `str` config fields, so clearing
+  // them writes "" (the schema default) rather than null — pydantic rejects
+  // null for non-nullable strings, and "" already means "unset / default".
+  function sttPatches(): Record<string, unknown> {
+    if (!sttDirty.value) return {}
+    const patches: Record<string, unknown> = {}
+    if (sttProvider.value !== sttBaseline.value.provider
+      || sttModelDir.value.trim() !== sttBaseline.value.modelDir) {
+      patches['audio.stt.provider'] = sttProvider.value
+      if (sttProvider.value === 'sensevoice') {
+        patches['audio.stt.sensevoice.model_dir'] = sttModelDir.value.trim()
+      }
+    }
+    if (audioPreset.value !== presetBaseline.value) {
+      patches['audio.tts.preset'] = audioPreset.value.trim()
+    }
+    return patches
+  }
+
   function audioPayload(): ConfigureAudio {
     // Configuration implies enablement for new clients. Older clients may
     // continue sending an explicit `enabled` field to the compatible RPC.
@@ -225,11 +308,16 @@ export function useSettingsPromotedForm() {
     audioTtsModel,
     audioLanguageCode,
     audioKeyConfigured,
+    sttProvider,
+    sttModelDir,
+    audioPreset,
     timeoutDirty,
     thinkingDirty,
     contextWindowDirty,
     captureDirty,
     audioDirty,
+    sttDirty,
+    sttDraftPending,
     initFromConfig,
     initProviderFromConfig,
     initMemoryCaptureFromConfig,
@@ -242,10 +330,13 @@ export function useSettingsPromotedForm() {
     reseedContextWindow,
     setMemoryAutoCapture,
     updateAudioField,
+    acceptSavedStt,
+    acceptSavedPreset,
     providerPatches,
     thinkingPatch,
     contextWindowPatch,
     memoryPatches,
     audioPayload,
+    sttPatches,
   }
 }

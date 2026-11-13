@@ -232,6 +232,140 @@ def test_registry_rejects_unknown_fallback_provider() -> None:
         build_stt_chain(config)
 
 
+def test_registry_builds_local_sensevoice_provider() -> None:
+    from opensquilla.audio.stt_sensevoice import SenseVoiceSttProvider
+
+    config = GatewayConfig()
+    config.audio.stt.provider = "sensevoice"
+    config.audio.stt.sensevoice.model_dir = "models/sensevoice"
+
+    chain = build_stt_chain(config)
+    assert [p.provider_id for p in chain] == ["sensevoice"]
+    assert isinstance(chain[0], SenseVoiceSttProvider)
+    assert chain[0].accepts_request_model is False
+
+
+def test_registry_accepts_legacy_local_sensevoice_names() -> None:
+    config = GatewayConfig()
+    for name in ("local_sensevoice", "sense_voice"):
+        config.audio.stt.provider = name
+        assert build_stt_chain(config)[0].provider_id == "sensevoice"
+
+
+# ------------------------------------------------------------------- local --
+
+
+def _sensevoice_provider(tmp_path, **overrides) -> object:
+    from opensquilla.audio.stt_sensevoice import SenseVoiceSttProvider
+
+    (tmp_path / "model.int8.onnx").write_bytes(b"fake-onnx")
+    (tmp_path / "tokens.txt").write_text("hello", encoding="utf-8")
+    kwargs = {"model_dir": str(tmp_path), "language": "auto", "num_threads": 1}
+    kwargs.update(overrides)
+    return SenseVoiceSttProvider(**kwargs)
+
+
+def test_sensevoice_requires_model_files(tmp_path) -> None:
+    from opensquilla.audio.stt_sensevoice import SenseVoiceSttProvider
+
+    provider = SenseVoiceSttProvider(model_dir=str(tmp_path / "missing"))
+    with pytest.raises(SttProviderError, match="model not found"):
+        provider._model_files()
+
+
+def test_sensevoice_accepts_plain_model_onnx(tmp_path) -> None:
+    provider = _sensevoice_provider(tmp_path)
+    provider._model_dir = tmp_path
+    (tmp_path / "model.int8.onnx").unlink()
+    (tmp_path / "model.onnx").write_bytes(b"fake-onnx")
+    model, tokens = provider._model_files()
+    assert model.name == "model.onnx"
+    assert tokens.name == "tokens.txt"
+
+
+def test_sensevoice_language_fallback_chain() -> None:
+    config = GatewayConfig()
+    config.audio.stt.provider = "sensevoice"
+    config.audio.stt.language = "zh"
+    chain = build_stt_chain(config)
+    assert chain[0]._language == "zh"
+    # Explicit provider block wins over the global hint.
+    config.audio.stt.sensevoice.language = "en"
+    chain = build_stt_chain(config)
+    assert chain[0]._language == "en"
+    # Empty everywhere falls back to auto.
+    config.audio.stt.language = ""
+    config.audio.stt.sensevoice.language = ""
+    chain = build_stt_chain(config)
+    assert chain[0]._language == "auto"
+
+
+def test_sensevoice_resolve_language_accepts_known_tags() -> None:
+    from opensquilla.audio.stt_sensevoice import SenseVoiceSttProvider
+
+    provider = SenseVoiceSttProvider(model_dir="models", language="zh")
+    assert provider._resolve_language("EN") == "en"
+    assert provider._resolve_language("nope") == "zh"  # configured language
+    assert provider._resolve_language(None) == "zh"
+    fallback = SenseVoiceSttProvider(model_dir="models", language="乱")
+    assert fallback._resolve_language(None) == "auto"
+
+
+async def test_sensevoice_reports_missing_dependency(
+    tmp_path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import builtins
+
+    provider = _sensevoice_provider(tmp_path)
+    real_import = builtins.__import__
+
+    def fake_import(name, *args, **kwargs):
+        if name == "sherpa_onnx":
+            raise ImportError(name)
+        return real_import(name, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "__import__", fake_import)
+    with pytest.raises(SttProviderError, match="sherpa-onnx"):
+        await provider.transcribe(_audio())
+
+
+def test_sensevoice_decode_wav_and_resample(tmp_path) -> None:
+    import array
+    import io
+    import wave
+
+    provider = _sensevoice_provider(tmp_path)
+    raw = array.array("h", bytes(44100 * 2))  # 1 second of silence @44.1k
+    buf = io.BytesIO()
+    with wave.open(buf, "wb") as wav:
+        wav.setnchannels(1)
+        wav.setsampwidth(2)
+        wav.setframerate(44100)
+        wav.writeframes(raw.tobytes())
+    rate, samples = provider._decode_wav(buf.getvalue())
+    assert rate == 44100
+    assert len(samples) == 44100
+    resampled = provider._resample(rate, samples)
+    assert abs(len(resampled) - 16000) <= 1
+
+
+def test_sensevoice_rejects_non_mono_wav(tmp_path) -> None:
+    import array
+    import io
+    import wave
+
+    provider = _sensevoice_provider(tmp_path)
+    raw = array.array("h", bytes(100 * 2 * 2))
+    buf = io.BytesIO()
+    with wave.open(buf, "wb") as wav:
+        wav.setnchannels(2)
+        wav.setsampwidth(2)
+        wav.setframerate(16000)
+        wav.writeframes(raw.tobytes())
+    with pytest.raises(SttProviderError, match="mono 16-bit"):
+        provider._decode_wav(buf.getvalue())
+
+
 # ------------------------------------------------------- credential scoping --
 
 

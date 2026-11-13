@@ -575,7 +575,7 @@ default_mode = "bypass"                 # off | on | bypass | full
 # [audio.stt]
 # Provider selection for speech-to-text (POST /api/audio/transcribe).
 # "elevenlabs" is the default and keeps the historical Scribe behaviour.
-# provider = "elevenlabs"        # or openai_transcriptions | openai_chat
+# provider = "elevenlabs"        # or openai_transcriptions | openai_chat | sensevoice
 # language = ""                  # ISO-639-1 hint, e.g. "zh"; empty = auto
 # fallback = []                  # ordered retry list, e.g. ["openai_transcriptions"]
 
@@ -590,3 +590,15 @@ default_mode = "bypass"                 # off | on | bypass | full
 # base_url = "https://api.openai.com/v1"
 # model = ""
 # api_key_env = "OPENAI_API_KEY" # set explicitly to follow a custom base_url
+
+# [audio.stt.sensevoice]
+# Fully local SenseVoice (sherpa-onnx): no key, no network — ideal for
+# microphone testing without spending ElevenLabs credits.
+# Install the extra first: uv sync --extra voice
+# model_dir must contain model.int8.onnx (or model.onnx) and tokens.txt,
+# e.g. a SenseVoice sherpa-onnx bundle: D:\models\sensevoice
+# Browser recordings are audio/webm and need ffmpeg on PATH.
+# model_dir = ""
+# language = ""                  # empty follows [audio.stt].language; else auto|zh|en|ja|ko|yue
+# use_itn = true                 # inverse text normalization (数字/标点)
+# num_threads = 4

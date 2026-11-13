@@ -10,13 +10,22 @@ import type { DiscoveredModel } from '@/composables/setup/useSetupProviderForm'
 
 const { t } = useI18n()
 
-type CapabilityId = 'search' | 'memory_embedding' | 'image_generation' | 'audio'
+type CapabilityId = 'search' | 'memory_embedding' | 'image_generation' | 'stt' | 'audio'
 type CapabilityGroup = 'search' | 'image' | 'audio'
 
 interface ProviderOption {
   providerId: string
   label: string
   requiresApiKey?: boolean
+}
+
+interface VoicePresetOption {
+  name: string
+  label: string
+  provider: string
+  voiceId: string
+  modelId: string
+  source: string
 }
 
 interface CapabilitiesPanelContract {
@@ -30,6 +39,9 @@ interface CapabilitiesPanelContract {
     imageKeyConfigured: boolean
     imageCredentialSource: ImageCredentialSource
     audioApiKey: string
+    sttProvider: string
+    sttModelDir: string
+    audioPreset: string
   }
   options: {
     searchProviders: ProviderOption[]
@@ -48,6 +60,15 @@ interface CapabilitiesPanelContract {
       registrationUrl: string
     } | null
     imageModels: DiscoveredModel[]
+    sttProviderOptions: Array<{ value: string; label: string }>
+    audioProviders: Array<{
+      providerId: string
+      label: string
+      envKey: string
+      defaultTtsVoice: string
+      defaultTtsModel: string
+      requiresApiKey: boolean
+    }>
   }
   state: {
     searchRequiresKey: boolean
@@ -64,6 +85,9 @@ interface CapabilitiesPanelContract {
     imageModelSource: string
     audioStatusText: string
     audioKeyPlaceholder: string
+    sttStatusText: string
+    audioGenerationConfigured: boolean
+    voicePresets: VoicePresetOption[]
     capabilityBadgeTone: (name: CapabilityId) => string
     capabilityBadgeLabel: (name: CapabilityId) => string
     resettable: (name: CapabilityId) => boolean
@@ -225,6 +249,7 @@ function resetLabel(capabilityId: CapabilityId): string {
         { id: 'search', title: t('setup.search.title'), status: panel.state.searchStatusText },
         { id: 'memory_embedding', title: t('setup.memory.title'), status: panel.state.memoryStatusText },
         { id: 'image_generation', title: t('setup.image.title'), status: panel.state.imageStatusText },
+        { id: 'stt', title: t('setup.stt.title'), status: panel.state.sttStatusText },
         { id: 'audio', title: t('setup.audio.title'), status: panel.state.audioStatusText },
       ] as const)"
       :key="capability.id"
@@ -463,7 +488,80 @@ function resetLabel(capabilityId: CapabilityId): string {
           </template>
         </template>
 
-        <template v-else>
+        <template v-else-if="capability.id === 'stt'">
+          <label class="control-row" for="setup-stt-provider">
+            <div class="control-row__label-block">
+              <span class="control-row__label">{{ t('setup.stt.engine') }}</span>
+              <span class="control-row__desc">{{ t('setup.stt.engineHint') }}</span>
+            </div>
+            <div class="control-row__control">
+              <ControlSelect
+                class="control-input"
+                :value="panel.form.sttProvider"
+                id="setup-stt-provider"
+                name="setup_stt_provider"
+                :aria-label="t('setup.stt.engine')"
+                @change="emit('updateField', 'audio', 'sttProvider', ($event.target as HTMLSelectElement).value)"
+              >
+                <option
+                  v-for="option in panel.options.sttProviderOptions"
+                  :key="option.value"
+                  :value="option.value"
+                >{{ option.label }}</option>
+              </ControlSelect>
+            </div>
+          </label>
+          <label v-if="panel.form.sttProvider === 'sensevoice'" class="control-row">
+            <div class="control-row__label-block">
+              <span class="control-row__label">{{ t('setup.stt.modelDir') }}</span>
+              <span class="control-row__desc">{{ t('setup.stt.modelDirHint') }}</span>
+            </div>
+            <div class="control-row__control">
+              <input
+                class="control-input"
+                :value="panel.form.sttModelDir"
+                name="setup_stt_model_dir"
+                type="text"
+                autocomplete="off"
+                spellcheck="false"
+                :placeholder="t('setup.stt.modelDirPlaceholder')"
+                :aria-label="t('setup.stt.modelDir')"
+                @input="emit('updateField', 'audio', 'sttModelDir', ($event.target as HTMLInputElement).value)"
+              >
+            </div>
+          </label>
+          <p v-else-if="panel.form.sttProvider === 'elevenlabs' && !panel.state.audioGenerationConfigured" class="capability-card__draft-note">
+            {{ t('setup.stt.engineNeedsGenerationKey') }}
+          </p>
+          <p v-else-if="panel.form.sttProvider === 'elevenlabs'" class="capability-card__draft-note">
+            {{ t('setup.stt.engineUsesGenerationKey') }}
+          </p>
+        </template>
+
+        <template v-else-if="capability.id === 'audio'">
+          <label class="control-row" for="setup-audio-preset">
+            <div class="control-row__label-block">
+              <span class="control-row__label">{{ t('setup.audio.preset') }}</span>
+              <span class="control-row__desc">{{ t('setup.audio.presetHint') }}</span>
+            </div>
+            <div class="control-row__control">
+              <ControlSelect
+                class="control-input"
+                :value="panel.form.audioPreset"
+                id="setup-audio-preset"
+                name="setup_audio_preset"
+                :aria-label="t('setup.audio.preset')"
+                @change="emit('updateField', 'audio', 'preset', ($event.target as HTMLSelectElement).value)"
+              >
+                <option value="">{{ t('setup.audio.presetNone') }}</option>
+                <option
+                  v-for="preset in panel.state.voicePresets"
+                  :key="preset.name"
+                  :value="preset.name"
+                >{{ preset.label || preset.name }}{{ preset.source === 'builtin' ? ` · ${t('setup.audio.presetBuiltin')}` : '' }}</option>
+              </ControlSelect>
+            </div>
+          </label>
           <div class="capability-card__summary">
             <span>{{ t('setup.common.provider') }}</span>
             <strong>ElevenLabs</strong>
@@ -489,9 +587,10 @@ function resetLabel(capabilityId: CapabilityId): string {
               >
             </div>
           </label>
+          <p class="capability-card__draft-note">{{ t('setup.audio.toolsAvailabilityHint') }}</p>
         </template>
 
-        <div v-if="panel.state.resettable(capability.id)" class="capability-card__actions">
+        <div v-if="panel.state.resettable(capability.id) && capability.id !== 'stt'" class="capability-card__actions">
           <button
             type="button"
             class="btn btn--danger-ghost"

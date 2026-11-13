@@ -256,17 +256,20 @@ def image_generation_section_status(cfg: GatewayConfig) -> SectionStatus:
 
 
 _STT_PROVIDER_IDS = ("openai_transcriptions", "openai_chat")
+_LOCAL_STT_PROVIDER_IDS = ("sensevoice", "sense_voice", "local_sensevoice")
 
 
 def stt_provider_annotation(cfg: GatewayConfig) -> tuple[str, str, str]:
     """Annotate the ``[audio.stt]`` provider as ``(source, provider_id, env_key)``.
 
     ``source`` mirrors the onboarding key-source vocabulary (``explicit`` /
-    ``env`` / ``missing_env`` / ``none`` / ``unknown``). ``elevenlabs`` is
-    reported as-is so callers keep using the legacy ``[audio].providers``
-    block that also backs TTS. The env reference is resolved through the same
-    per-origin rule the runtime provider uses, so readiness never claims a
-    key the provider would refuse to reuse across origins.
+    ``env`` / ``missing_env`` / ``local`` / ``missing_local`` / ``none`` /
+    ``unknown``). ``elevenlabs`` is reported as-is so callers keep using the
+    legacy ``[audio].providers`` block that also backs TTS. The env reference
+    is resolved through the same per-origin rule the runtime provider uses, so
+    readiness never claims a key the provider would refuse to reuse across
+    origins. Local providers report ``local`` / ``missing_local`` because
+    readiness is model-file presence, not a credential.
     """
     stt = getattr(getattr(cfg, "audio", None), "stt", None)
     if stt is None:
@@ -274,6 +277,19 @@ def stt_provider_annotation(cfg: GatewayConfig) -> tuple[str, str, str]:
     provider_id = str(getattr(stt, "provider", "elevenlabs") or "elevenlabs").strip()
     if provider_id == "elevenlabs":
         return "elevenlabs", provider_id, ""
+    if provider_id in _LOCAL_STT_PROVIDER_IDS:
+        try:
+            # Import lazily: a module-level import would pull
+            # ``stt_sensevoice`` (and its decode helpers) into every consumer
+            # of onboarding status.
+            from opensquilla.audio.stt_sensevoice import SenseVoiceSttProvider
+
+            SenseVoiceSttProvider(
+                model_dir=str(getattr(stt.sensevoice, "model_dir", "") or "")
+            )._model_files()
+        except Exception:
+            return "missing_local", provider_id, ""
+        return "local", provider_id, ""
     if provider_id not in _STT_PROVIDER_IDS:
         return "unknown", provider_id, ""
     provider_cfg = getattr(stt, provider_id, None)
@@ -297,8 +313,13 @@ def audio_section_status(cfg: GatewayConfig) -> SectionStatus:
         # The selected [audio.stt] provider is the only backend the
         # transcription route will call, so its own credential state is
         # authoritative; never borrow ElevenLabs readiness for it.
-        if stt_source in ("explicit", "env"):
+        if stt_source in ("explicit", "env", "local"):
             return SectionStatus.OK
+        if stt_source == "missing_local":
+            # The operator picked the local model but the files are not
+            # installed; degraded (not missing) keeps the mic clickable and
+            # the status line explains where to place the model directory.
+            return SectionStatus.DEGRADED
         if stt_source == "missing_env":
             return SectionStatus.DEGRADED
         if stt_source == "unknown":

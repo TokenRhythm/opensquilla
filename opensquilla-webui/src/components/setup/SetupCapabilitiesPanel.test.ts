@@ -19,6 +19,9 @@ function panel() {
       imageKeyConfigured: false,
       imageCredentialSource: 'none' as ImageCredentialSource,
       audioApiKey: '',
+      sttProvider: 'elevenlabs',
+      sttModelDir: '',
+      audioPreset: '',
     },
     options: {
       searchProviders: [
@@ -67,6 +70,22 @@ function panel() {
           capabilitySource: '',
         },
       ],
+      sttProviderOptions: [
+        { value: 'sensevoice', label: 'Local SenseVoice' },
+        { value: 'elevenlabs', label: 'ElevenLabs Scribe' },
+        { value: 'openai_transcriptions', label: 'OpenAI transcriptions' },
+        { value: 'openai_chat', label: 'OpenAI chat ASR' },
+      ],
+      audioProviders: [
+        {
+          providerId: 'elevenlabs',
+          label: 'ElevenLabs Audio',
+          envKey: 'ELEVENLABS_API_KEY',
+          defaultTtsVoice: '21m00Tcm4TlvDq8ikWAM',
+          defaultTtsModel: 'eleven_multilingual_v2',
+          requiresApiKey: true,
+        },
+      ],
     },
     state: {
       searchRequiresKey: false,
@@ -83,6 +102,16 @@ function panel() {
       imageModelSource: 'catalog',
       audioStatusText: 'Add an ElevenLabs key.',
       audioKeyPlaceholder: 'Paste key',
+      sttStatusText: 'Speech recognition is ready.',
+      audioGenerationConfigured: false,
+      voicePresets: [] as Array<{
+        name: string
+        label: string
+        provider: string
+        voiceId: string
+        modelId: string
+        source: string
+      }>,
       capabilityBadgeTone: (name: string): string => name === 'search' ? 'is-ok' : 'is-muted',
       capabilityBadgeLabel: (name: string): string => name === 'search' ? 'Available' : 'Set up',
       resettable: (name: string): boolean => name === 'image_generation',
@@ -122,15 +151,17 @@ describe('SetupCapabilitiesPanel', () => {
     const triggers = el.querySelectorAll<HTMLButtonElement>('.capability-card__trigger')
     const chevrons = el.querySelectorAll<SVGElement>('svg.capability-card__chevron')
 
-    expect(triggers).toHaveLength(3)
-    expect(chevrons).toHaveLength(3)
+    expect(triggers).toHaveLength(4)
+    expect(chevrons).toHaveLength(4)
     expect(chevrons[0]?.querySelector('path')?.getAttribute('d')).toBe('m6 8 4 4 4-4')
     expect(el.textContent).not.toContain('⌄')
     expect(triggers[0]?.getAttribute('aria-expanded')).toBe('false')
     expect(triggers[1]?.getAttribute('aria-expanded')).toBe('false')
     expect(triggers[2]?.getAttribute('aria-expanded')).toBe('false')
+    expect(triggers[3]?.getAttribute('aria-expanded')).toBe('false')
     expect(el.querySelector('#capability-search-panel')?.getAttribute('style')).toContain('display: none')
     expect(el.querySelector('#capability-image_generation-panel')?.getAttribute('style')).toContain('display: none')
+    expect(el.querySelector('#capability-stt-panel')?.getAttribute('style')).toContain('display: none')
     expect(el.querySelector('#capability-audio-panel')?.getAttribute('style')).toContain('display: none')
     expect(el.querySelector('[name="setup_image_enabled"]')).not.toBeNull()
     expect(el.querySelector('[name="setup_audio_enabled"]')).toBeNull()
@@ -454,5 +485,65 @@ describe('SetupCapabilitiesPanel', () => {
     expect(resetButtons[0]?.textContent).toContain('Remove configuration')
     resetButtons[0]!.click()
     expect(resetCapability).toHaveBeenCalledWith('image_generation')
+  })
+
+  it('shows the local model directory on the recognition card for sensevoice', async () => {
+    i18n.global.locale.value = 'en'
+    const local = panel()
+    local.form.sttProvider = 'sensevoice'
+    local.form.sttModelDir = 'D:\\models\\sensevoice'
+    const { el, updateField } = await mountPanel(local)
+
+    // The model directory lives on the recognition (stt) card…
+    expect(el.querySelector('[name="setup_stt_model_dir"]')).not.toBeNull()
+    expect(el.querySelector<HTMLInputElement>('[name="setup_stt_model_dir"]')?.value)
+      .toBe('D:\\models\\sensevoice')
+    // …while the ElevenLabs key stays on the generation (audio) card.
+    expect(el.querySelector('[name="setup_audio_api_key"]')).not.toBeNull()
+
+    const dir = el.querySelector<HTMLInputElement>('[name="setup_stt_model_dir"]')!
+    dir.value = 'D:\\other'
+    dir.dispatchEvent(new Event('input'))
+    expect(updateField).toHaveBeenCalledWith('audio', 'sttModelDir', 'D:\\other')
+  })
+
+  it('routes the STT engine select through updateField', async () => {
+    i18n.global.locale.value = 'en'
+    const { el, updateField } = await mountPanel()
+    const select = el.querySelector<HTMLSelectElement>('[name="setup_stt_provider"]')
+
+    expect(select).not.toBeNull()
+    expect(select!.value).toBe('elevenlabs')
+    // The engine list matches the gateway chain; the key lives on the
+    // generation card regardless of the selected recognition engine.
+    expect(el.querySelector('[name="setup_audio_api_key"]')).not.toBeNull()
+    expect(Array.from(select!.options).map(option => option.value)).toEqual([
+      'sensevoice', 'elevenlabs', 'openai_transcriptions', 'openai_chat',
+    ])
+
+    select!.value = 'sensevoice'
+    select!.dispatchEvent(new Event('change'))
+    expect(updateField).toHaveBeenCalledWith('audio', 'sttProvider', 'sensevoice')
+  })
+
+  it('lists voice presets on the generation card and routes selection', async () => {
+    i18n.global.locale.value = 'en'
+    const withPresets = panel()
+    withPresets.state.voicePresets = [
+      { name: 'quiet-male', label: 'Calm male', provider: 'elevenlabs', voiceId: 'v1', modelId: 'm1', source: 'builtin' },
+      { name: 'mine', label: 'My voice', provider: 'elevenlabs', voiceId: 'v2', modelId: 'm2', source: 'user' },
+    ]
+    const { el, updateField } = await mountPanel(withPresets)
+    const select = el.querySelector<HTMLSelectElement>('[name="setup_audio_preset"]')
+
+    expect(select).not.toBeNull()
+    const values = Array.from(select!.options).map(option => option.value)
+    expect(values).toEqual(['', 'quiet-male', 'mine'])
+    // Built-in presets are labelled as such.
+    expect(select!.options[1]?.textContent).toContain('built-in')
+
+    select!.value = 'mine'
+    select!.dispatchEvent(new Event('change'))
+    expect(updateField).toHaveBeenCalledWith('audio', 'preset', 'mine')
   })
 })

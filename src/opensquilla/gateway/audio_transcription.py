@@ -111,11 +111,15 @@ def register_audio_transcription_routes(
         model_value = form.get("model_id")
         request_model_id = str(model_value).strip() if isinstance(model_value, str) else ""
         language_value = form.get("language_code")
-        language = (
-            language_value
+        global_language = str(getattr(config.audio.stt, "language", "") or "").strip()
+        # Hint resolution: per-request form value → global [audio.stt].language
+        # → None (providers apply their own default).
+        form_language = (
+            language_value.strip()
             if isinstance(language_value, str) and language_value.strip()
-            else str(getattr(config.audio.stt, "language", "") or "").strip() or None
+            else None
         )
+        language = form_language or global_language or None
 
         from opensquilla.engine.usage_accounting import (
             UsageAccountingScope,
@@ -173,15 +177,33 @@ def register_audio_transcription_routes(
             model_id_arg = (request_model_id or None) if accepts_model else None
             try:
                 with bind_usage_accounting_scope(scope):
-                    result = await provider.transcribe(
+                    candidate = await provider.transcribe(
                         audio,
                         model_id=model_id_arg,
                         language=language,
                     )
-                break
             except Exception as exc:
                 errors.append(str(exc) if len(chain) == 1 else f"{provider.provider_id}: {exc}")
+                continue
+            # A provider that answers with empty text (silent capture, or a
+            # local model's punctuation artifact) is a miss, not a result:
+            # try the next link in the chain before returning nothing.
+            if not (candidate.text or "").strip():
+                errors.append(f"{provider.provider_id}: empty transcription")
+                continue
+            result = candidate
+            break
         if result is None:
+            if errors and all("empty transcription" in error for error in errors):
+                # Not a failure — nothing was said. Keep the response shape so
+                # the WebUI can distinguish it and the composer stays clean.
+                return JSONResponse(
+                    {
+                        "text": "",
+                        "provider": errors[0].split(":", 1)[0].strip(),
+                        "model": "",
+                    }
+                )
             return JSONResponse(
                 {"error": "; ".join(errors) or "transcription failed", "code": "PROVIDER_ERROR"},
                 status_code=502,

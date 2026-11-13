@@ -17,6 +17,99 @@ import {
 // beyond any plausible success.
 const TRANSCRIBE_TIMEOUT_MS = 60_000
 
+// Silence gate: a recording that never carried signal must not reach the
+// metered provider — ElevenLabs Scribe charges for silence and returns an
+// empty string, which reads as "voice input is broken".
+const SILENCE_FRAME_MS = 30
+const SILENCE_PEAK_THRESHOLD = 0.0045
+const SILENCE_RMS_THRESHOLD = 0.0018
+const SILENCE_ACTIVE_RMS_THRESHOLD = 0.006
+const SILENCE_MIN_ACTIVE_RATIO = 0.02
+
+// One capture-device choice per browser profile. "" follows the system
+// default; an id targets a specific microphone (headset Hands-Free channel,
+// a second physical mic, ...). Persisted so the selection survives reloads
+// and both browser and desktop shells share the mechanism.
+const DEVICE_STORAGE_KEY = 'opensquilla.voiceDeviceId'
+
+export interface VoiceInputDevice {
+  deviceId: string
+  label: string
+}
+
+function readStoredDeviceId(): string {
+  try {
+    return localStorage.getItem(DEVICE_STORAGE_KEY) || ''
+  } catch {
+    return ''
+  }
+}
+
+interface SilenceMeter {
+  /** Ratio of voiced frames; 1 when no frames could be sampled (never blocks). */
+  activeRatio(): number
+  stop(): void
+}
+
+// Sample the live microphone stream with a throwaway audio graph. Returns null
+// when unavailable (unsupported browser, blocked analyser), and an
+// un-sampled meter reports "voiced" — a metering problem must never drop a
+// real recording.
+function startSilenceMeter(stream: MediaStream): SilenceMeter | null {
+  const AudioCtx = window.AudioContext
+    ?? (window as unknown as { webkitAudioContext?: typeof AudioContext }).webkitAudioContext
+  if (!AudioCtx) return null
+  let context: AudioContext | null = null
+  let timer: number | null = null
+  let stopped = false
+  const levels: number[] = []
+  try {
+    context = new AudioCtx()
+    const source = context.createMediaStreamSource(stream)
+    const analyser = context.createAnalyser()
+    analyser.fftSize = 2048
+    source.connect(analyser)
+    const buffer = new Float32Array(analyser.fftSize)
+    const collect = () => {
+      if (stopped || !context) return
+      analyser.getFloatTimeDomainData(buffer)
+      let peak = 0
+      let sumSq = 0
+      for (let i = 0; i < buffer.length; i++) {
+        const value = Math.abs(buffer[i])
+        if (value > peak) peak = value
+        sumSq += buffer[i] * buffer[i]
+      }
+      levels.push(Math.sqrt(sumSq / buffer.length) + peak * 0.25)
+    }
+    timer = window.setInterval(collect, SILENCE_FRAME_MS)
+  } catch {
+    void context?.close().catch(() => {})
+    return null
+  }
+  return {
+    activeRatio() {
+      if (!levels.length) return 1
+      let active = 0
+      let peakMax = 0
+      let rmsSum = 0
+      for (const level of levels) {
+        rmsSum += level
+        if (level > SILENCE_ACTIVE_RMS_THRESHOLD) active += 1
+        if (level > peakMax) peakMax = level
+      }
+      const rms = rmsSum / levels.length
+      if (peakMax < SILENCE_PEAK_THRESHOLD || rms < SILENCE_RMS_THRESHOLD) return 0
+      return active / levels.length
+    },
+    stop() {
+      stopped = true
+      if (timer !== null) window.clearInterval(timer)
+      void context?.close().catch(() => {})
+    },
+  }
+}
+
 // getUserMedia failures need different remedies, so map the error to the toast
 // naming its fix: a permission denial is fixable by allowing microphone
 // access, a missing input device is not, and anything else (device busy,
@@ -41,8 +134,11 @@ export function useVoiceInput(transcription: AudioTranscription, recordingOwner?
   const platform = usePlatform()
   const voiceBusy = ref(false)
   const voiceRecording = ref(false)
+  const voiceDevices = ref<VoiceInputDevice[]>([])
+  const voiceDeviceId = ref(readStoredDeviceId())
   let recorder: MediaRecorder | null = null
   let activeStream: MediaStream | null = null
+  let silenceMeter: SilenceMeter | null = null
   let chunks: BlobPart[] = []
   let recordingGeneration = 0
   let transcriptionController: AbortController | null = null
@@ -52,6 +148,66 @@ export function useVoiceInput(transcription: AudioTranscription, recordingOwner?
   // before the user can ever see it — they would just come back to a dead mic.
   // Remember the pending notice and deliver it once the surface is visible.
   let pendingCancelNotice = false
+
+  // deviceId-scoped labels are only exposed after a permission grant; before
+  // that enumerateDevices lists the devices with empty labels. One probe keeps
+  // the picker honest: if a saved id is no longer present, fall back to the
+  // system default instead of failing with an unanswerable OverconstrainedError.
+  async function refreshVoiceDevices(): Promise<void> {
+    if (!navigator.mediaDevices?.enumerateDevices) return
+    try {
+      const all = await navigator.mediaDevices.enumerateDevices()
+      const inputs = all.filter(device => device.kind === 'audioinput')
+      // Before the first permission grant, enumerateDevices reports empty
+      // labels. One throwaway getUserMedia unlocks the real device names so
+      // the picker is usable from the first open, not just after the first
+      // recording.
+      if (inputs.length && inputs.every(device => !device.label)
+        && navigator.mediaDevices.getUserMedia) {
+        try {
+          const probe = await navigator.mediaDevices.getUserMedia({ audio: true })
+          probe.getTracks().forEach(track => track.stop())
+          const named = await navigator.mediaDevices.enumerateDevices()
+          inputs.length = 0
+          inputs.push(...named.filter(device => device.kind === 'audioinput'))
+        } catch {
+          // Permission was refused or the device is busy; the id-only list is
+          // still functional and labels arrive after the first recording.
+        }
+      }
+      voiceDevices.value = inputs.map(device => ({
+        deviceId: device.deviceId,
+        label: device.label,
+      }))
+      const stored = voiceDeviceId.value
+      if (stored && (!inputs.length || deviceIdsMatch(inputs.map(device => device.deviceId), stored))) {
+        return
+      }
+      if (stored) setVoiceDevice('')
+    } catch {
+      // Device enumeration is an enhancement; recording never depends on it.
+    }
+  }
+
+  function deviceIdsMatch(ids: string[], wanted: string): boolean {
+    return ids.some(id => id === wanted)
+  }
+
+  function setVoiceDevice(deviceId: string): void {
+    voiceDeviceId.value = deviceId
+    try {
+      if (deviceId) localStorage.setItem(DEVICE_STORAGE_KEY, deviceId)
+      else localStorage.removeItem(DEVICE_STORAGE_KEY)
+    } catch { /* storage unavailable */ }
+  }
+
+  function audioConstraints(): MediaStreamConstraints {
+    const deviceId = voiceDeviceId.value
+    if (deviceId) {
+      return { audio: { deviceId: { exact: deviceId } } }
+    }
+    return { audio: true }
+  }
 
   async function toggleVoiceInput(onText: (text: string) => void) {
     if (voiceRecording.value) {
@@ -72,12 +228,26 @@ export function useVoiceInput(transcription: AudioTranscription, recordingOwner?
     try {
       const owner = await recordingOwner?.()
       if (cleanedUp || generation !== recordingGeneration) return
-      const stream = await navigator.mediaDevices.getUserMedia({ audio: true })
+      let stream: MediaStream
+      try {
+        stream = await navigator.mediaDevices.getUserMedia(audioConstraints())
+      } catch (err) {
+        // A saved device may have been unplugged since the last recording.
+        // Retry once with the system default so the mic never dies on a stale
+        // selection, and keep the picker in sync with reality.
+        const name = err instanceof Error ? err.name : ''
+        const stale = (name === 'OverconstrainedError' || name === 'NotFoundError')
+          && voiceDeviceId.value
+        if (!stale || cleanedUp || generation !== recordingGeneration) throw err
+        setVoiceDevice('')
+        stream = await navigator.mediaDevices.getUserMedia({ audio: true })
+      }
       if (cleanedUp || generation !== recordingGeneration) {
         stream.getTracks().forEach(track => track.stop())
         return
       }
       activeStream = stream
+      silenceMeter = startSilenceMeter(stream)
       chunks = []
       const mediaRecorder = new MediaRecorder(stream)
       recorder = mediaRecorder
@@ -92,12 +262,16 @@ export function useVoiceInput(transcription: AudioTranscription, recordingOwner?
       }
       mediaRecorder.start()
       voiceRecording.value = true
+      // Labels become readable once permission is held; refresh in the
+      // background so the picker lists friendly names on first open.
+      void refreshVoiceDevices()
     } catch (err) {
       if (generation !== recordingGeneration || cleanedUp) return
       console.warn('Voice recording failed:', err instanceof Error ? err.message : String(err))
       // Silent failure here is indistinguishable from a broken mic button, so
       // tell the user why nothing is recording (denied vs missing vs other).
       pushToast(i18n.global.t(recordingFailureKey(err)), { tone: 'danger' })
+      stopSilenceMeter()
       stopTracks()
     } finally {
       if (generation === recordingGeneration) voiceBusy.value = false
@@ -108,6 +282,7 @@ export function useVoiceInput(transcription: AudioTranscription, recordingOwner?
     const mediaRecorder = recorder
     if (!mediaRecorder || mediaRecorder.state === 'inactive') {
       voiceRecording.value = false
+      stopSilenceMeter()
       stopTracks()
       return
     }
@@ -127,6 +302,7 @@ export function useVoiceInput(transcription: AudioTranscription, recordingOwner?
     } finally {
       // Releasing the device does not discard the recorder's buffered final
       // data; its queued dataavailable event still owns the Blob chunks.
+      stopSilenceMeter()
       stopTracks()
     }
   }
@@ -140,9 +316,19 @@ export function useVoiceInput(transcription: AudioTranscription, recordingOwner?
     if (generation !== recordingGeneration || cleanedUp) return
     const payload = new Blob(chunks, { type: mime })
     chunks = []
+    const activeRatio = silenceMeter?.activeRatio() ?? 1
+    stopSilenceMeter()
     stopTracks()
     recorder = null
     if (!payload.size) {
+      if (generation === recordingGeneration) voiceBusy.value = false
+      return
+    }
+    // A capture device that never carried signal (wrong mic, muted headset)
+    // would cost the provider a request and the user a confusing empty
+    // input. Skip the request and name the fix directly.
+    if (activeRatio < SILENCE_MIN_ACTIVE_RATIO) {
+      pushToast(i18n.global.t('chat.toast.voiceNoSignal'), { tone: 'info' })
       if (generation === recordingGeneration) voiceBusy.value = false
       return
     }
@@ -184,6 +370,11 @@ export function useVoiceInput(transcription: AudioTranscription, recordingOwner?
     }
   }
 
+  function stopSilenceMeter() {
+    silenceMeter?.stop()
+    silenceMeter = null
+  }
+
   function stopTracks() {
     if (!activeStream) return
     activeStream.getTracks().forEach(track => track.stop())
@@ -209,6 +400,7 @@ export function useVoiceInput(transcription: AudioTranscription, recordingOwner?
         mediaRecorder.stop()
       } catch {}
     }
+    stopSilenceMeter()
     voiceBusy.value = false
     voiceRecording.value = false
     stopTracks()
@@ -232,6 +424,10 @@ export function useVoiceInput(transcription: AudioTranscription, recordingOwner?
     }
   }
 
+  // Device discovery is left to the caller (the composer requests it when the
+  // picker opens, and after permission unlocks friendly labels): a probe at
+  // mount would fire getUserMedia on every ChatView mount and can strand a
+  // pending permission dialog nobody started.
   if (typeof window !== 'undefined') {
     const unsubscribe = platform.window.onHidden?.(() => cancelRecording({ notify: true }))
     if (typeof unsubscribe === 'function') unsubscribeWindowHidden = unsubscribe
@@ -258,6 +454,10 @@ export function useVoiceInput(transcription: AudioTranscription, recordingOwner?
   return {
     voiceBusy,
     voiceRecording,
+    voiceDevices,
+    voiceDeviceId,
+    setVoiceDevice,
+    refreshVoiceDevices,
     toggleVoiceInput,
     cancel: cancelRecording,
     cleanup,

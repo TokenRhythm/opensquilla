@@ -396,21 +396,83 @@
               />
             </div>
 
-            <button
-              type="button"
-              class="btn btn--icon btn--ghost chat-mic-btn"
-              :class="{
-                'is-active': voiceRecording,
-                'chat-mic-btn--needs-setup': !voiceReady,
-              }"
-              :title="voiceReady ? t('chat.recordVoice') : t('chat.voiceUnavailableHint')"
-              :aria-label="voiceReady ? t('chat.recordVoice') : t('chat.voiceUnavailableHint')"
-              :aria-pressed="voiceRecording ? 'true' : 'false'"
-              :disabled="voiceBusy && !voiceRecording"
-              @click="voiceReady ? emit('voiceInput') : emit('voiceSetup')"
-            >
-              <Icon name="microphone" :size="18" />
-            </button>
+            <div ref="voiceMenuAnchorEl" class="chat-settings-anchor chat-voice-anchor">
+              <button
+                type="button"
+                class="btn btn--icon btn--ghost chat-mic-btn"
+                :class="{
+                  'is-active': voiceRecording,
+                  'chat-mic-btn--needs-setup': !voiceReady,
+                }"
+                :title="voiceReady ? t('chat.recordVoice') : t('chat.voiceUnavailableHint')"
+                :aria-label="voiceReady ? t('chat.recordVoice') : t('chat.voiceUnavailableHint')"
+                :aria-pressed="voiceRecording ? 'true' : 'false'"
+                :disabled="voiceBusy && !voiceRecording"
+                @click="voiceReady ? emit('voiceInput') : emit('voiceSetup')"
+              >
+                <Icon name="microphone" :size="18" />
+              </button>
+              <button
+                type="button"
+                class="btn btn--icon btn--ghost chat-voice-devices-btn"
+                :class="{ 'is-active': voiceMenuOpen }"
+                :title="t('chat.voiceDevices')"
+                :aria-label="t('chat.voiceDevices')"
+                aria-haspopup="menu"
+                :aria-expanded="voiceMenuOpen ? 'true' : 'false'"
+                :disabled="voiceRecording || voiceBusy"
+                @click="toggleVoiceMenu"
+              >
+                <Icon name="chevronDown" :size="14" />
+              </button>
+              <div
+                v-if="voiceMenuOpen"
+                class="chat-voice-menu"
+                role="menu"
+                :aria-label="t('chat.voiceDevices')"
+              >
+                <button
+                  type="button"
+                  class="chat-voice-menu__item"
+                  :class="{ 'is-active': !voiceDeviceId }"
+                  role="menuitemradio"
+                  :aria-checked="!voiceDeviceId ? 'true' : 'false'"
+                  @click="emit('selectVoiceDevice', ''); voiceMenuOpen = false"
+                >
+                  <span>{{ t('chat.voiceDeviceDefault') }}</span>
+                  <Icon v-if="!voiceDeviceId" name="check" :size="14" />
+                </button>
+                <button
+                  v-for="device in voiceDevices"
+                  :key="device.deviceId"
+                  type="button"
+                  class="chat-voice-menu__item"
+                  :class="{ 'is-active': voiceDeviceId === device.deviceId }"
+                  role="menuitemradio"
+                  :aria-checked="voiceDeviceId === device.deviceId ? 'true' : 'false'"
+                  @click="emit('selectVoiceDevice', device.deviceId); voiceMenuOpen = false"
+                >
+                  <span class="chat-voice-menu__name">{{ device.label || t('chat.voiceDeviceUnnamed') }}</span>
+                  <Icon v-if="voiceDeviceId === device.deviceId" name="check" :size="14" />
+                </button>
+                <div
+                  v-if="!voiceDevices.length"
+                  class="chat-voice-menu__empty"
+                >
+                  {{ t('chat.voiceDevicesEmpty') }}
+                </div>
+                <button
+                  type="button"
+                  class="chat-voice-menu__item chat-voice-menu__rescan"
+                  role="menuitem"
+                  @pointerdown.stop
+                  @click="void emit('voiceDevicesRefresh')"
+                >
+                  <span>{{ t('chat.voiceDevicesRefresh') }}</span>
+                  <Icon name="refresh" :size="14" />
+                </button>
+              </div>
+            </div>
 
             <button
               v-if="showSkillQueueSend"
@@ -599,6 +661,10 @@ const props = withDefaults(defineProps<{
   voiceBusy: boolean
   voiceRecording: boolean
   voiceReady: boolean
+  /** Known capture devices for the microphone picker; empty while unprobed. */
+  voiceDevices?: { deviceId: string; label: string }[]
+  /** Selected capture device id; empty string follows the system default. */
+  voiceDeviceId?: string
   projectWorkspace?: { id: string; name: string; path: string } | null
   /** Settled presentation; sendBlockedMessage independently gates operations. */
   projectWorkspaceStatus?: 'none' | 'resolving' | 'ready' | 'unavailable' | 'removed' | 'unknown' | 'error'
@@ -635,6 +701,8 @@ const props = withDefaults(defineProps<{
   skillPositions: () => ({}),
   draftKey: '',
   localPaths: () => [],
+  voiceDevices: () => [],
+  voiceDeviceId: '',
 })
 
 const emit = defineEmits<{
@@ -666,6 +734,8 @@ const emit = defineEmits<{
   cancelReplan: []
   voiceInput: []
   voiceSetup: []
+  voiceDevicesRefresh: []
+  selectVoiceDevice: [deviceId: string]
   exportMarkdown: []
   stop: []
   chooseProject: []
@@ -757,6 +827,7 @@ async function onAttachFiles() {
 }
 
 const addMenuOpen = ref(false)
+const voiceMenuOpen = ref(false)
 const modelRoutingOpen = ref(false)
 const modelRoutingPanelRef = ref<{ element: () => HTMLElement | null } | null>(null)
 const modelRoutingVisible = computed(() => Boolean(props.sessionRoutingAvailable || props.modelSelectionAvailable || props.modelSelection))
@@ -832,9 +903,11 @@ const runModeOpen = ref(false)
 const addMenuAnchorEl = ref<HTMLElement | null>(null)
 const modelRoutingAnchorEl = ref<HTMLElement | null>(null)
 const runModeAnchorEl = ref<HTMLElement | null>(null)
+const voiceMenuAnchorEl = ref<HTMLElement | null>(null)
 
 const anyPopoverOpen = computed(() =>
   addMenuOpen.value
+  || voiceMenuOpen.value
   || modelRoutingOpen.value
   || runModeOpen.value,
 )
@@ -856,6 +929,9 @@ function closeOpenPopoversFromOutside(event: PointerEvent) {
   }
   if (runModeOpen.value && !eventInsideRoot(event, runModeAnchorEl.value)) {
     runModeOpen.value = false
+  }
+  if (voiceMenuOpen.value && !eventInsideRoot(event, voiceMenuAnchorEl.value)) {
+    voiceMenuOpen.value = false
   }
 }
 
@@ -950,8 +1026,19 @@ watch(() => props.runModeLocked, (locked) => {
 
 function closeAllPopovers() {
   addMenuOpen.value = false
+  voiceMenuOpen.value = false
   modelRoutingOpen.value = false
   runModeOpen.value = false
+}
+
+function toggleVoiceMenu() {
+  voiceMenuOpen.value = !voiceMenuOpen.value
+  if (voiceMenuOpen.value) {
+    emit('voiceDevicesRefresh')
+    addMenuOpen.value = false
+    modelRoutingOpen.value = false
+    runModeOpen.value = false
+  }
 }
 
 // The retract animation collapses the footer with overflow clipping; any open
@@ -1792,6 +1879,73 @@ button.attachment-chip__primary:focus-visible {
 
 .chat-mic-btn--needs-setup:hover {
   opacity: 1;
+}
+
+/* Capture-device picker beside the mic: opens the list of audioinput devices
+   so a virtual mic (Steam, VB-Cable) or a headset Hands-Free channel can be
+   chosen explicitly instead of silently following the system default. */
+.chat-voice-anchor {
+  display: inline-flex;
+  align-items: center;
+}
+
+.chat-voice-devices-btn {
+  margin-left: -4px;
+}
+
+.chat-voice-menu {
+  position: absolute;
+  left: 0;
+  bottom: calc(100% + 8px);
+  width: min(280px, calc(100vw - 48px));
+  padding: 0.375rem;
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius-md);
+  background: var(--bg-surface);
+  box-shadow: var(--shadow-xl);
+  z-index: 30;
+  display: grid;
+  gap: 0.125rem;
+  max-height: 260px;
+  overflow-y: auto;
+}
+
+.chat-voice-menu__item {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.5rem;
+  width: 100%;
+  min-height: 34px;
+  padding: 0.375rem 0.5rem;
+  border: 1px solid transparent;
+  border-radius: var(--radius-sm);
+  background: transparent;
+  color: var(--text);
+  font-size: 0.8125rem;
+  text-align: left;
+  cursor: pointer;
+}
+
+.chat-voice-menu__item:hover {
+  background: var(--bg-hover);
+}
+
+.chat-voice-menu__item.is-active {
+  color: var(--ok);
+  font-weight: 700;
+}
+
+.chat-voice-menu__name {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.chat-voice-menu__empty {
+  padding: 0.5rem;
+  color: var(--text-muted);
+  font-size: 0.75rem;
 }
 
 .btn--ghost.is-active {

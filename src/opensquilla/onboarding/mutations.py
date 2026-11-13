@@ -2413,6 +2413,13 @@ def capability_resettable(config: GatewayConfig, *, capability_id: str) -> bool:
             audio_managed = persisted.get("audio")
             if audio_managed is None:
                 return False
+            # stt (engine routing) and presets (voice parameter packs) are UI-
+            # managed audio state too: their presence must keep the card
+            # resettable even when the ElevenLabs provider block is absent.
+            if isinstance(audio_managed, Mapping) and any(
+                audio_managed.get(key) for key in ("stt", "presets")
+            ):
+                return True
             return not (
                 isinstance(audio_managed, Mapping)
                 and dict(audio_managed) in ({}, {"enabled": False})
@@ -2520,7 +2527,15 @@ def reset_capability(config: GatewayConfig, *, capability_id: str) -> MutationRe
     elif capability == "audio":
         default_audio = AudioConfig.model_construct()
         changed = capability_resettable(config, capability_id=capability)
-        new_cfg.audio = default_audio
+        # Reset only the UI-managed provider surface (ElevenLabs credentials +
+        # TTS defaults). STT routing ([audio.stt]) and voice presets
+        # ([audio.presets]) are owned by config.patch and the two-axis cards:
+        # clearing them here would silently revert a configured local engine or
+        # delete user presets the operator never asked to remove.
+        for key, value in default_audio.model_dump(mode="python").items():
+            if key in {"stt", "presets"}:
+                continue
+            setattr(new_cfg.audio, key, value)
         remove_paths = ("audio",)
         new_cfg.mark_force_persist("audio.enabled")
         audio_secret_paths = {
