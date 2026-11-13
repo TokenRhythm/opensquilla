@@ -56,6 +56,26 @@ async def test_explicit_missing_key_never_constructs_or_calls_provider(
     assert "Do not retry" in payload["error"]
 
 
+async def test_explicit_keenable_without_opt_in_never_constructs_provider() -> None:
+    runtime = runtime_config.resolve_search_runtime(runtime_config.SearchRuntimeConfig())
+
+    def unexpected_factory(name: str) -> None:
+        pytest.fail(f"Opt-in provider was constructed without opt-in: {name}")
+
+    payload = await canonical.run_canonical_web_search(
+        SearchOptions(query="synthetic release information", provider="keenable"),
+        runtime=runtime,
+        provider_factory=unexpected_factory,
+    )
+
+    assert payload["ok"] is False
+    assert payload["provider_attempts"] == [
+        {"provider": "keenable", "status": "error", "error_kind": "unknown"}
+    ]
+    with pytest.raises(SearchProviderError, match="opt-in"):
+        runtime.require_available("keenable")
+
+
 @pytest.mark.parametrize("provider", KEYED_PROVIDERS)
 async def test_runtime_builder_rejects_missing_key_before_factory(
     monkeypatch: pytest.MonkeyPatch,

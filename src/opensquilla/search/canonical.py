@@ -245,6 +245,7 @@ def _ensure_builtin_search_providers() -> None:
         "opensquilla.search.providers.tavily",
         "opensquilla.search.providers.brave",
         "opensquilla.search.providers.exa",
+        "opensquilla.search.providers.keenable",
         "opensquilla.search.providers.duckduckgo",
     ):
         importlib.import_module(module_name)

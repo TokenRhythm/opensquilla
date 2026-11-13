@@ -23,6 +23,7 @@ _PROVIDER_API_URL_ATTRS = {
     "duckduckgo": ("opensquilla.search.providers.duckduckgo", "_DDHTML_URL"),
     "exa": ("opensquilla.search.providers.exa", "_API_URL"),
     "iqs": ("opensquilla.search.providers.iqs", "_API_URL"),
+    "keenable": ("opensquilla.search.providers.keenable", "_API_URL"),
     "tavily": ("opensquilla.search.providers.tavily", "_API_URL"),
 }
 
