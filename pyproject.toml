@@ -106,9 +106,9 @@ recommended = [
     "lightgbm>=4.7.0",
     "joblib>=1.6.0",
     # Frozen transformers were persisted with scikit-learn 1.8.0.
-    "scikit-learn==1.8.0",
+    "scikit-learn==1.9.1",
     # Newer ORT changes the frozen BGE features; 1.24.4 matches reference bytes.
-    "onnxruntime==1.24.4",
+    "onnxruntime==1.31.1",
     "tokenizers>=0.23.2",
     "fsspec>=2026.6.0",
     # Standard installations include the managed execution PTY backend.  The
@@ -271,7 +271,7 @@ ignore_missing_imports = true
 
 [dependency-groups]
 desktop-build = ["pyinstaller==6.22.3"]
-wheelhouse-build = ["pip==26.2.1"]
+wheelhouse-build = ["pip==26.3"]
 # Frozen sessions.list types are regenerated in a separate, locked environment.
 legacy-contract-codegen = ["datamodel-code-generator==0.81.0"]
 dev = [
