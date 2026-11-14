@@ -1,0 +1,13 @@
+{
+  "name": "opensquilla-pet",
+  "version": "0.1.0",
+  "description": "蛋仔 — OpenSquilla 桌面 Q 版桌宠（语音提示 / 权限确认 / 方案选择 / 直接回复会话）。零运行时依赖，复用 desktop/electron 的 Electron 二进制。",
+  "main": "main.js",
+  "private": true,
+  "scripts": {
+    "start": "electron .",
+    "probe": "node scripts/probe-gateway.mjs"
+  },
+  "author": "OpenSquilla",
+  "license": "MIT"
+}

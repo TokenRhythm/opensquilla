@@ -37,6 +37,9 @@ import {
 import { configuredDesktopDataDirectory, inspectDesktopStartupMetadata } from './desktop-startup-preflight.js'
 import { DesktopWriterAdmission } from './desktop-writer-admission.js'
 import {
+  initDesktopPet, toggleDesktopPet, isDesktopPetEnabled, isDesktopPetAvailable, stopDesktopPet,
+} from './desktop-pet.js'
+import {
   DESKTOP_QUIT_TERMINATION_MS,
   DesktopQuitBudget,
   DesktopQuitConfirmation,
@@ -5484,6 +5487,14 @@ function rebuildWindowsTrayMenu(): void {
     {
       label: desktopT(appExitStatusKey),
       enabled: false,
+    },
+    { type: 'separator' },
+    {
+      label: '蛋仔桌宠 (Eggy)',
+      type: 'checkbox',
+      checked: isDesktopPetEnabled(),
+      enabled: isDesktopPetAvailable(),
+      click: () => toggleDesktopPet(),
     },
     { type: 'separator' },
     {
@@ -17273,6 +17284,7 @@ app.on('activate', () => {
 
 app.on('will-quit', () => {
   desktopReliabilityTelemetry.finishSession()
+  stopDesktopPet()
   destroyWindowsTray()
   void desktopBrowser.close()
 })
@@ -17430,6 +17442,12 @@ if (!gotSingleInstanceLock) {
     desktopLocale = loadPersistedDesktopLocale() ?? resolveDesktopLocale()
     createApplicationMenu()
     createWindowsTray()
+    initDesktopPet({
+      repoRoot,
+      gatewayWsUrl: () => (gatewayState.url ? gatewayState.url.replace(/^http/i, 'ws') + '/ws' : ''),
+      onChange: () => rebuildWindowsTrayMenu(),
+      log: desktopLog,
+    })
     registerDesktopDeepLinkProtocolClient()
     desktopDeepLinkActivationReady = true
     powerMonitor.on('suspend', () => desktopReliabilityTelemetry.setForeground(false))
