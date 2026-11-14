@@ -340,6 +340,20 @@ async function main() {
       renderer.requestRender?.();
     });
   });
+  // Alt+V push-to-talk (PR-4): hold to record, release to transcribe. Python
+  // owns the recorder. On kitty terminals the release event stops capture; on
+  // raw terminals (no release events) a second press toggles it off instead.
+  const isAltV = (key) =>
+    key?.name === "v" && (key?.alt || key?.meta || key?.option) && !key?.ctrl;
+  renderer.keyInput.on?.("keypress", (key) => {
+    if (!isAltV(key) || overlayLayer.visible) return;
+    if (key?.eventType === "repeat") return; // held-key auto-repeat is not a new press
+    ipc.send({ type: "input.voice", action: "press" });
+  });
+  renderer.keyInput.on?.("keyrelease", (key) => {
+    if (!isAltV(key)) return;
+    ipc.send({ type: "input.voice", action: "release" });
+  });
   // Scrollback + notice lines live outside any turn view; register each with
   // the semantic token its color came from so a live /theme switch can
   // re-point it (renderables capture the color VALUE at creation).

@@ -206,11 +206,13 @@
             <SetupCapabilitiesPanel
               v-else-if="section === 'capabilities'"
               :panel="capabilitiesPanel"
+              :initial-expanded="capabilitiesFocusTarget"
               @update-field="updateCapabilityField"
               @search-provider-change="onSearchProviderChange"
               @image-provider-change="onImageProviderChange"
               @use-image-recommendation="useImageRecommendation"
               @reset-capability="resetCapability"
+              @fetch-stt-models="fetchSttCloudModels"
             />
           </template>
           <VideoGenerationSettings
@@ -376,6 +378,7 @@ const {
   removeProviderProfile,
   updateTierField,
   updateCapabilityField,
+  fetchSttCloudModels,
   onProviderChange,
   onSearchProviderChange,
   onImageProviderChange,
@@ -578,6 +581,11 @@ const routeParam = computed(() => route.params.section)
 // `/setup` → `/settings/auto` asks for the first not-ready section once
 // readiness is known; it is a routing sentinel, never a real rail section.
 const wantsAutoSection = computed(() => routeParam.value === 'auto')
+// Deep-link from the composer's voice menu: /settings/capabilities?focus=stt
+// lands with the recognition card already expanded.
+const capabilitiesFocusTarget = computed<'stt' | ''>(() => (
+  route.query.focus === 'stt' ? 'stt' : ''
+))
 
 const COMPOSITE_HASH_TARGETS: Record<string, string> = {
   '#connection': 'settings-gateway-connection',

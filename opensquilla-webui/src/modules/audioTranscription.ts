@@ -20,12 +20,25 @@ export interface AudioTranscriptionOwner {
   sessionEpoch?: number
 }
 
+export type SttCloudEngine = 'openai_transcriptions' | 'openai_chat'
+
+export interface SttModelDiscovery {
+  ok: boolean
+  models: string[]
+  failureKind?: string
+}
+
 export interface AudioTranscription {
   transcribe(input: AudioTranscriptionOwner & {
     recording: Blob
     mimeType: string
     signal?: AbortSignal
   }): Promise<string>
+  /** List models served by a configured OpenAI-compatible STT endpoint. */
+  discoverModels?(input: {
+    engine: SttCloudEngine
+    signal?: AbortSignal
+  }): Promise<SttModelDiscovery>
 }
 
 export const AUDIO_TRANSCRIPTION_KEY: InjectionKey<AudioTranscription> = Symbol('AudioTranscription')

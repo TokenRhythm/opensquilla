@@ -1,6 +1,7 @@
 import {
   AudioTranscriptionError,
   type AudioTranscription,
+  type SttModelDiscovery,
 } from '@/modules/audioTranscription'
 import { HttpTransportError } from './privateHttpTransport'
 
@@ -8,6 +9,10 @@ interface AudioHttpTransport {
   requestJson<T>(endpoint: string, options: {
     method: 'POST'
     form: FormData
+    signal?: AbortSignal
+    timeoutMs?: number
+  } | {
+    method: 'GET'
     signal?: AbortSignal
     timeoutMs?: number
   }): Promise<T>
@@ -56,6 +61,24 @@ export function createV4AudioTranscription(http: AudioHttpTransport): AudioTrans
         return String((raw as Record<string, unknown>).text || '').trim()
       } catch (error) {
         throw mapError(error)
+      }
+    },
+    async discoverModels(input): Promise<SttModelDiscovery> {
+      const raw = await http.requestJson<unknown>(
+        `/api/audio/stt/models?engine=${encodeURIComponent(input.engine)}`,
+        { method: 'GET', signal: input.signal, timeoutMs: 20_000 },
+      )
+      if (!raw || typeof raw !== 'object' || Array.isArray(raw)) {
+        return { ok: false, models: [], failureKind: 'invalid_response' }
+      }
+      const payload = raw as Record<string, unknown>
+      const models = Array.isArray(payload.models)
+        ? payload.models.filter((id): id is string => typeof id === 'string' && Boolean(id))
+        : []
+      return {
+        ok: payload.ok === true,
+        models,
+        failureKind: typeof payload.failureKind === 'string' ? payload.failureKind : '',
       }
     },
   }

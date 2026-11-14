@@ -617,6 +617,14 @@
       :voice-ready="voiceReady"
       :voice-devices="voiceDevices"
       :voice-device-id="voiceDeviceId"
+      :voice-default-label="voiceDefaultLabel"
+      :voice-default-device-id="voiceDefaultDeviceId"
+      :voice-engine-id="voiceEngineId"
+      :voice-engine-busy="voiceEngineBusy"
+      :voice-engine-models="voiceEngineModels"
+      :voice-engine-configured="voiceEngineConfigured"
+      :voice-cloud-platforms="voiceCloudPlatforms"
+      :voice-cloud-models="voiceCloudModels"
       :project-workspace="activeWorkspace"
       :project-workspace-status="activeWorkspacePresentationStatus"
       :project-binding-busy="projectBindingBusy || workbenchSessionPreparing || sessionHasActiveWork || goalBusy || planModeBusy || modelRoutingSettingsBusy"
@@ -677,8 +685,11 @@
       @cancel-replan="cancelPlanRevision"
       @voice-input="onVoiceInput"
       @voice-setup="onVoiceSetup"
-      @voice-devices-refresh="void refreshVoiceDevices()"
+      @voice-devices-refresh="void refreshVoiceDevices(); void loadVoiceEngine()"
       @select-voice-device="setVoiceDevice($event); void refreshVoiceDevices()"
+      @select-voice-engine="void setVoiceEngine($event)"
+      @select-cloud-model="void selectCloudModel($event.platformKey, $event.modelId)"
+      @open-voice-settings="openComposerVoiceSettings"
       @export-markdown="exportMarkdown"
       @send="onComposerSend"
       @stop="onComposerStop"
@@ -986,6 +997,7 @@ import { useChatUsageWidget } from '@/composables/chat/useChatUsageWidget'
 import { useChatSessionModel } from '@/composables/chat/useChatSessionModel'
 import { useSessionArtifacts } from '@/composables/chat/useSessionArtifacts'
 import { useVoiceInput } from '@/composables/chat/useVoiceInput'
+import { useVoiceEngine } from '@/composables/chat/useVoiceEngine'
 import { AUDIO_TRANSCRIPTION_KEY } from '@/modules/audioTranscription'
 import { useDocumentEvent } from '@/composables/useDocumentEvent'
 import { hasOpenDialogLayer } from '@/composables/useDialogA11y'
@@ -2902,12 +2914,37 @@ const {
   voiceRecording,
   voiceDevices,
   voiceDeviceId,
+  voiceDefaultLabel,
+  voiceDefaultDeviceId,
   setVoiceDevice,
   refreshVoiceDevices,
   toggleVoiceInput,
   cleanup: cleanupVoiceInput,
 } = voiceInput
 watch([sessionKey, currentEpoch], () => voiceInput.cancel(), { flush: 'sync' })
+
+// Recognition-engine switch for the composer's voice menu: same config.patch
+// dot-path as the settings capabilities card, refreshed on every menu open.
+const {
+  voiceEngineId,
+  voiceEngineBusy,
+  voiceEngineModels,
+  voiceEngineConfigured,
+  voiceCloudPlatforms,
+  voiceCloudModels,
+  loadVoiceEngine,
+  setVoiceEngine,
+  selectCloudModel,
+} = useVoiceEngine({
+  appSettings: injectedAppSettings,
+  connectionAvailable: computed(() => gatewayAccess.isAvailable),
+  discoverModels: injectedAudioTranscription.discoverModels
+    ? input => injectedAudioTranscription.discoverModels!(input)
+    : undefined,
+})
+watch(() => gatewayAccess.isAvailable, (available) => {
+  if (available) void loadVoiceEngine()
+}, { immediate: true })
 
 // Gate the composer mic button on real transcription readiness. onboarding.status
 // resolves whether audio is enabled AND an ElevenLabs key is present server-side
@@ -5577,6 +5614,12 @@ async function refreshComposerModels() {
 
 function openComposerModelSettings() {
   void router.push('/settings/modelStrategy').catch(() => {})
+}
+
+// The voice menu's settings entry mirrors the model-routing one: route to the
+// capabilities page with the recognition card already expanded.
+function openComposerVoiceSettings() {
+  void router.push('/settings/capabilities?focus=stt').catch(() => {})
 }
 
 // A suggestion chip is an explicit task choice. Route it through the same

@@ -15,6 +15,12 @@ export function parseContextWindowInput(value: unknown): number | null {
   return Number.isFinite(parsed) && parsed > 0 ? Math.floor(parsed) : null
 }
 
+// The two OpenAI-compatible cloud engines own their credentials under
+// [audio.stt.<engine>] — separate from the ElevenLabs generation key.
+export function isCloudSttProvider(provider: string): boolean {
+  return provider === 'openai_transcriptions' || provider === 'openai_chat'
+}
+
 interface PromotedConfigData {
   llm_request_timeout_seconds?: number
   llm?: { provider?: string; model?: string; thinking?: string }
@@ -30,6 +36,8 @@ interface PromotedConfigData {
       provider?: string
       language?: string
       sensevoice?: { model_dir?: string }
+      openai_transcriptions?: { base_url?: string; api_key?: string; model?: string }
+      openai_chat?: { base_url?: string; api_key?: string; model?: string }
     }
     presets?: Record<string, { label?: string; voice_id?: string }>
   }
@@ -57,10 +65,20 @@ export function useSettingsPromotedForm() {
   // ElevenLabs provider mutation; the gateway reloads the chain per request.
   const sttProvider = ref('elevenlabs')
   const sttModelDir = ref('')
+  // Cloud-engine credentials (openai_transcriptions / openai_chat). The key
+  // is a one-time paste like audioApiKey: config.get redacts stored secrets,
+  // so presence alone drives the "configured" hint and the field stays blank.
+  const sttCloudApiKey = ref('')
+  const sttCloudBaseUrl = ref('')
+  const sttCloudModel = ref('')
+  const sttCloudKeyConfigured = ref(false)
+  // Last loaded audio config, kept so switching between the two cloud engines
+  // can rehydrate that engine's own saved section without a config round-trip.
+  const sttAudioConfigCache = ref<PromotedConfigData['audio'] | null>(null)
   // Baselines are refs, not plain objects: a dirty computed must be able to
   // track a rebase (acceptSavedStt / initAudioFromConfig) that happens between
   // its reads.
-  const sttBaseline = ref({ provider: 'elevenlabs', modelDir: '' })
+  const sttBaseline = ref({ provider: 'elevenlabs', modelDir: '', cloudBaseUrl: '', cloudModel: '' })
   // Generation-axis preset selection (PRD F3.6): '' = raw [audio.tts] fields;
   // a name switches default TTS output (and, later, pet speech) to that pack.
   const audioPreset = ref('')
@@ -82,6 +100,11 @@ export function useSettingsPromotedForm() {
   const sttDirty = computed(() => (
     sttProvider.value !== sttBaseline.value.provider
     || sttModelDir.value.trim() !== sttBaseline.value.modelDir
+    || (isCloudSttProvider(sttProvider.value) && (
+      sttCloudApiKey.value !== ''
+      || sttCloudBaseUrl.value.trim() !== sttBaseline.value.cloudBaseUrl
+      || sttCloudModel.value.trim() !== sttBaseline.value.cloudModel
+    ))
     || audioPreset.value !== presetBaseline.value
   ))
 
@@ -138,6 +161,20 @@ export function useSettingsPromotedForm() {
     captureBaseline.value = memoryAutoCapture.value
   }
 
+  // Reseed the cloud fields from the cached config section of the given
+  // engine. Each cloud engine owns its credentials, so switching engines
+  // shows that engine's saved state and drops any unsaved paste.
+  function hydrateCloudSttFields(provider: string) {
+    const stt = sttAudioConfigCache.value?.stt
+    const section = (provider === 'openai_transcriptions' ? stt?.openai_transcriptions
+      : provider === 'openai_chat' ? stt?.openai_chat
+        : undefined) || {}
+    sttCloudBaseUrl.value = String(section.base_url || '')
+    sttCloudModel.value = String(section.model || '')
+    sttCloudKeyConfigured.value = Boolean(section.api_key)
+    sttCloudApiKey.value = ''
+  }
+
   function initAudioFromConfig(config: PromotedConfigData) {
     audioEnabled.value = config.audio?.enabled === true
     const audioProvider = config.audio?.providers?.[audioProviderId] || {}
@@ -152,10 +189,14 @@ export function useSettingsPromotedForm() {
     audioApiKey.value = ''
     sttProvider.value = String(config.audio?.stt?.provider || '').trim() || 'elevenlabs'
     sttModelDir.value = String(config.audio?.stt?.sensevoice?.model_dir || '')
+    sttAudioConfigCache.value = config.audio || null
+    hydrateCloudSttFields(sttProvider.value)
     audioPreset.value = String(config.audio?.tts?.preset || '').trim()
     sttBaseline.value = {
       provider: sttProvider.value,
       modelDir: sttModelDir.value.trim(),
+      cloudBaseUrl: sttCloudBaseUrl.value.trim(),
+      cloudModel: sttCloudModel.value.trim(),
     }
     presetBaseline.value = audioPreset.value
 
@@ -164,12 +205,37 @@ export function useSettingsPromotedForm() {
 
   // Reseed the STT switch from freshly loaded config (called after a save
   // reload so the next reload does not preserve a just-persisted draft).
-  function acceptSavedStt(provider: string, modelDir: string) {
+  function acceptSavedStt(
+    provider: string,
+    modelDir: string,
+    cloud?: { baseUrl: string; model: string; keySaved: boolean },
+  ) {
     sttProvider.value = String(provider || '').trim() || 'elevenlabs'
     sttModelDir.value = String(modelDir || '')
+    if (cloud) {
+      sttCloudBaseUrl.value = cloud.baseUrl
+      sttCloudModel.value = cloud.model
+      sttCloudApiKey.value = ''
+      if (cloud.keySaved) sttCloudKeyConfigured.value = true
+      // Keep the engine-switch cache in sync so toggling engines before the
+      // post-save config reload still shows the just-persisted state.
+      if (isCloudSttProvider(sttProvider.value) && sttAudioConfigCache.value) {
+        const stt = { ...(sttAudioConfigCache.value.stt || {}) }
+        const section = {
+          base_url: cloud.baseUrl,
+          model: cloud.model,
+          api_key: sttCloudKeyConfigured.value ? '[redacted]' : '',
+        }
+        if (sttProvider.value === 'openai_transcriptions') stt.openai_transcriptions = section
+        else stt.openai_chat = section
+        sttAudioConfigCache.value = { ...sttAudioConfigCache.value, stt }
+      }
+    }
     sttBaseline.value = {
       provider: sttProvider.value,
       modelDir: sttModelDir.value.trim(),
+      cloudBaseUrl: sttCloudBaseUrl.value.trim(),
+      cloudModel: sttCloudModel.value.trim(),
     }
   }
 
@@ -208,8 +274,21 @@ export function useSettingsPromotedForm() {
     else if (key === 'ttsVoice') audioTtsVoice.value = String(value)
     else if (key === 'ttsModel') audioTtsModel.value = String(value)
     else if (key === 'languageCode') audioLanguageCode.value = String(value)
-    else if (key === 'sttProvider') sttProvider.value = String(value)
+    else if (key === 'sttProvider') {
+      sttProvider.value = String(value)
+      // Each cloud engine has its own saved section; rehydrate on switch and
+      // rebaseline the cloud fields so the switch itself is the only draft.
+      hydrateCloudSttFields(sttProvider.value)
+      sttBaseline.value = {
+        ...sttBaseline.value,
+        cloudBaseUrl: sttCloudBaseUrl.value.trim(),
+        cloudModel: sttCloudModel.value.trim(),
+      }
+    }
     else if (key === 'sttModelDir') sttModelDir.value = String(value)
+    else if (key === 'sttCloudApiKey') sttCloudApiKey.value = String(value)
+    else if (key === 'sttCloudBaseUrl') sttCloudBaseUrl.value = String(value)
+    else if (key === 'sttCloudModel') sttCloudModel.value = String(value)
     else if (key === 'preset') audioPreset.value = String(value)
   }
 
@@ -267,11 +346,34 @@ export function useSettingsPromotedForm() {
   function sttPatches(): Record<string, unknown> {
     if (!sttDirty.value) return {}
     const patches: Record<string, unknown> = {}
-    if (sttProvider.value !== sttBaseline.value.provider
-      || sttModelDir.value.trim() !== sttBaseline.value.modelDir) {
+    const providerChanged = sttProvider.value !== sttBaseline.value.provider
+    const modelDirChanged = sttModelDir.value.trim() !== sttBaseline.value.modelDir
+    const cloud = isCloudSttProvider(sttProvider.value)
+    const cloudBaseUrl = sttCloudBaseUrl.value.trim()
+    const cloudModel = sttCloudModel.value.trim()
+    const cloudChanged = cloud && (
+      sttCloudApiKey.value !== ''
+      || cloudBaseUrl !== sttBaseline.value.cloudBaseUrl
+      || cloudModel !== sttBaseline.value.cloudModel
+    )
+    if (providerChanged || modelDirChanged || cloudChanged) {
       patches['audio.stt.provider'] = sttProvider.value
       if (sttProvider.value === 'sensevoice') {
         patches['audio.stt.sensevoice.model_dir'] = sttModelDir.value.trim()
+      }
+      if (cloud) {
+        // Plain str fields: "" restores the schema default (the provider
+        // falls back to api.openai.com), never null. The key is only sent
+        // when the operator pasted a new one; blank means "keep stored".
+        if (providerChanged || cloudBaseUrl !== sttBaseline.value.cloudBaseUrl) {
+          patches[`audio.stt.${sttProvider.value}.base_url`] = cloudBaseUrl
+        }
+        if (providerChanged || cloudModel !== sttBaseline.value.cloudModel) {
+          patches[`audio.stt.${sttProvider.value}.model`] = cloudModel
+        }
+        if (sttCloudApiKey.value) {
+          patches[`audio.stt.${sttProvider.value}.api_key`] = sttCloudApiKey.value
+        }
       }
     }
     if (audioPreset.value !== presetBaseline.value) {
@@ -310,6 +412,11 @@ export function useSettingsPromotedForm() {
     audioKeyConfigured,
     sttProvider,
     sttModelDir,
+    sttCloudApiKey,
+    sttCloudBaseUrl,
+    sttCloudModel,
+    sttCloudKeyConfigured,
+    sttSavedProvider: computed(() => sttBaseline.value.provider),
     audioPreset,
     timeoutDirty,
     thinkingDirty,

@@ -280,6 +280,18 @@ class HostInputEof:
 
 
 @dataclass(frozen=True)
+class HostInputVoice:
+    """Alt+V push-to-talk signal from the host (PR-4 hotkey).
+
+    ``action`` is ``"press"`` on key down or ``"release"`` on key up (kitty
+    terminals). Python starts capture on press and stops on release; on raw
+    terminals without release events a second press toggles capture off.
+    """
+
+    action: str = "press"
+
+
+@dataclass(frozen=True)
 class HostResize:
     width: int
     height: int
@@ -335,6 +347,7 @@ type HostToPythonMessage = (
     | HostInputSubmit
     | HostInputCancel
     | HostInputEof
+    | HostInputVoice
     | HostResize
     | HostCompletionRequest
     | HostError
@@ -389,6 +402,7 @@ HOST_TO_PYTHON_TYPES: dict[str, type] = {
     "input.submit": HostInputSubmit,
     "input.cancel": HostInputCancel,
     "input.eof": HostInputEof,
+    "input.voice": HostInputVoice,
     "resize": HostResize,
     "completion.request": HostCompletionRequest,
     "error": HostError,
@@ -447,6 +461,11 @@ def host_message_from_json(raw: str) -> HostToPythonMessage:
         return HostInputCancel()
     if message_type == "input.eof":
         return HostInputEof()
+    if message_type == "input.voice":
+        action = _optional_str(payload, "action") or "press"
+        if action not in {"press", "release"}:
+            action = "press"
+        return HostInputVoice(action=action)
     if message_type == "resize":
         return HostResize(
             width=_required_int(payload, "resize.width", "width"),

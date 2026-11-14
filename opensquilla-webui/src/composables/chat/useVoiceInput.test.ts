@@ -456,6 +456,111 @@ describe('useVoiceInput device selection', () => {
     voice.cleanup()
   })
 
+  it('hides the synthetic default/communications routing entries', async () => {
+    vi.stubGlobal('fetch', vi.fn())
+    stubMedia()
+    // The real Windows shape: Chromium lists the OS default routing twice
+    // ("默认 - …"/"通讯 - …") next to the physical endpoints, while the OS
+    // sound settings show only the two physical microphones.
+    Object.defineProperty(globalThis.navigator.mediaDevices, 'enumerateDevices', {
+      configurable: true,
+      value: vi.fn(async () => [
+        { kind: 'audioinput', deviceId: 'default', label: '默认 - 耳机 (HONOR Earbuds A Hands-Free AG Audio)' },
+        { kind: 'audioinput', deviceId: 'communications', label: '通讯 - 耳机 (HONOR Earbuds A Hands-Free AG Audio)' },
+        { kind: 'audioinput', deviceId: 'steam-mic', label: '麦克风 (Steam Streaming Microphone)' },
+        { kind: 'audioinput', deviceId: 'honor-mic', label: '耳机 (HONOR Earbuds A Hands-Free AG Audio)' },
+      ]),
+    })
+    const voice = useVoiceInputComposable({ transcribe: vi.fn(async () => '') } as AudioTranscription)
+    await voice.refreshVoiceDevices()
+    expect(voice.voiceDevices.value).toEqual([
+      { deviceId: 'steam-mic', label: '麦克风 (Steam Streaming Microphone)' },
+      { deviceId: 'honor-mic', label: '耳机 (HONOR Earbuds A Hands-Free AG Audio)' },
+    ])
+    voice.cleanup()
+  })
+
+  it('filters routing entries after the permission probe unlocks labels', async () => {
+    vi.stubGlobal('fetch', vi.fn())
+    const { getUserMedia } = stubMedia()
+    const enumerateDevices = vi.fn()
+      .mockResolvedValueOnce([
+        { kind: 'audioinput', deviceId: '', label: '' },
+      ])
+      .mockResolvedValueOnce([
+        { kind: 'audioinput', deviceId: 'default', label: '默认 - Mic' },
+        { kind: 'audioinput', deviceId: 'communications', label: '通讯 - Mic' },
+        { kind: 'audioinput', deviceId: 'real-mic', label: 'Mic' },
+      ])
+    Object.defineProperty(globalThis.navigator.mediaDevices, 'enumerateDevices', {
+      configurable: true,
+      value: enumerateDevices,
+    })
+    const voice = useVoiceInputComposable({ transcribe: vi.fn(async () => '') } as AudioTranscription)
+    await voice.refreshVoiceDevices()
+    expect(getUserMedia).toHaveBeenCalledTimes(1)
+    expect(enumerateDevices).toHaveBeenCalledTimes(2)
+    expect(voice.voiceDevices.value).toEqual([
+      { deviceId: 'real-mic', label: 'Mic' },
+    ])
+    voice.cleanup()
+  })
+
+  it('resets a stored routing-id selection to the system default', async () => {
+    vi.stubGlobal('fetch', vi.fn())
+    stubMedia()
+    const voice = useVoiceInputComposable({ transcribe: vi.fn(async () => '') } as AudioTranscription)
+    // A selection saved before routing entries were hidden must not strand
+    // the picker on an invisible row.
+    voice.setVoiceDevice('default')
+    Object.defineProperty(globalThis.navigator.mediaDevices, 'enumerateDevices', {
+      configurable: true,
+      value: vi.fn(async () => [
+        { kind: 'audioinput', deviceId: 'default', label: '默认 - Mic' },
+        { kind: 'audioinput', deviceId: 'real-mic', label: 'Mic' },
+      ]),
+    })
+    await voice.refreshVoiceDevices()
+    expect(voice.voiceDeviceId.value).toBe('')
+    expect(localStorage.getItem('opensquilla.voiceDeviceId')).toBeNull()
+    voice.cleanup()
+  })
+
+  it('resolves the real default device name from the synthetic default entry', async () => {
+    vi.stubGlobal('fetch', vi.fn())
+    stubMedia()
+    Object.defineProperty(globalThis.navigator.mediaDevices, 'enumerateDevices', {
+      configurable: true,
+      value: vi.fn(async () => [
+        { kind: 'audioinput', deviceId: 'default', label: '默认 - 麦克风 (Real Mic)' },
+        { kind: 'audioinput', deviceId: 'communications', label: '通讯 - 麦克风 (Real Mic)' },
+        { kind: 'audioinput', deviceId: 'real-mic', label: '麦克风 (Real Mic)' },
+        { kind: 'audioinput', deviceId: 'other-mic', label: '麦克风 (Other Mic)' },
+      ]),
+    })
+    const voice = useVoiceInputComposable({ transcribe: vi.fn(async () => '') } as AudioTranscription)
+    await voice.refreshVoiceDevices()
+    expect(voice.voiceDefaultLabel.value).toBe('麦克风 (Real Mic)')
+    expect(voice.voiceDefaultDeviceId.value).toBe('real-mic')
+    voice.cleanup()
+  })
+
+  it('leaves the default label empty when no routing entry is exposed', async () => {
+    vi.stubGlobal('fetch', vi.fn())
+    stubMedia()
+    Object.defineProperty(globalThis.navigator.mediaDevices, 'enumerateDevices', {
+      configurable: true,
+      value: vi.fn(async () => [
+        { kind: 'audioinput', deviceId: 'real-mic', label: '麦克风 (Real Mic)' },
+      ]),
+    })
+    const voice = useVoiceInputComposable({ transcribe: vi.fn(async () => '') } as AudioTranscription)
+    await voice.refreshVoiceDevices()
+    expect(voice.voiceDefaultLabel.value).toBe('')
+    expect(voice.voiceDefaultDeviceId.value).toBe('')
+    voice.cleanup()
+  })
+
   it('drops a stored device that no longer exists', async () => {
     vi.stubGlobal('fetch', vi.fn())
     stubMedia()

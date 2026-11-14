@@ -144,6 +144,13 @@ interface CapabilitiesPanelContext {
   audioLanguageCode: Ref<string>
   sttProvider: Ref<string>
   sttModelDir: Ref<string>
+  sttCloudApiKey: Ref<string>
+  sttCloudBaseUrl: Ref<string>
+  sttCloudModel: Ref<string>
+  sttCloudKeyPlaceholder: ComputedRef<string>
+  sttCloudModelPlaceholder: ComputedRef<string>
+  sttCloudModels: Ref<string[]>
+  sttCloudModelsStatus: Ref<string>
   audioPreset: Ref<string>
   audioStatusText: ComputedRef<string>
   audioBadgeTone: ComputedRef<string>
@@ -841,6 +848,9 @@ export function useSetupCapabilitiesForm() {
         audioLanguageCode: context.audioLanguageCode.value,
         sttProvider: context.sttProvider.value,
         sttModelDir: context.sttModelDir.value,
+        sttCloudApiKey: context.sttCloudApiKey.value,
+        sttCloudBaseUrl: context.sttCloudBaseUrl.value,
+        sttCloudModel: context.sttCloudModel.value,
         audioPreset: context.audioPreset.value,
       },
       options: {
@@ -894,6 +904,10 @@ export function useSetupCapabilitiesForm() {
         audioKeyPlaceholder: context.audioKeyPlaceholder.value,
         sttProviderOptions: context.sttProviderOptions.value,
         sttStatusText: context.sttStatusText.value,
+        sttCloudKeyPlaceholder: context.sttCloudKeyPlaceholder.value,
+        sttCloudModelPlaceholder: context.sttCloudModelPlaceholder.value,
+        sttCloudModels: context.sttCloudModels.value,
+        sttCloudModelsStatus: context.sttCloudModelsStatus.value,
         audioGenerationConfigured: context.audioGenerationConfigured.value,
         voicePresets: context.voicePresets.value,
         resettable: context.resettable,

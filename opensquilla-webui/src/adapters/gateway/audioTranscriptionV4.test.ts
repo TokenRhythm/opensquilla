@@ -24,7 +24,8 @@ describe('v4 AudioTranscription Adapter', () => {
       timeoutMs: 60_000,
       form: expect.any(FormData),
     }))
-    const form = requestJson.mock.calls[0]![1].form
+    const options = requestJson.mock.calls[0]![1]
+    const form = options.method === 'POST' ? options.form : new FormData()
     expect(form.get('mime')).toBe('audio/webm')
     expect(form.get('file')).toBeInstanceOf(Blob)
   })

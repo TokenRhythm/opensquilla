@@ -223,3 +223,83 @@ def register_audio_transcription_routes(
         return JSONResponse(response)
 
     app.router.routes.append(Route("/api/audio/transcribe", transcribe_handler, methods=["POST"]))
+
+    async def stt_models_handler(request: Request) -> JSONResponse:
+        """List models served by a configured OpenAI-compatible STT endpoint.
+
+        The credential is resolved server-side from ``[audio.stt.<engine>]``
+        (inline key or its env reference) and never echoed back; the browser
+        only receives model ids. Same origin/token guards as transcription.
+        """
+        if not request_origin_allowed(request, config):
+            return forbidden_origin_response()
+        if config.auth.mode == "token":
+            if config.auth.token and not _authorization_token_matches(config, request):
+                return JSONResponse(
+                    {
+                        "error": (
+                            "Authorization header (Bearer ...) required for "
+                            "/api/audio/stt/models"
+                        ),
+                        "code": "UNAUTHORIZED",
+                    },
+                    status_code=401,
+                )
+        engine = str(request.query_params.get("engine") or "").strip()
+        if engine not in ("openai_transcriptions", "openai_chat"):
+            return JSONResponse(
+                {
+                    "error": "engine must be openai_transcriptions or openai_chat",
+                    "code": "INVALID_ENGINE",
+                },
+                status_code=400,
+            )
+        section = getattr(config.audio.stt, engine, None)
+        if section is None:
+            return JSONResponse({"ok": False, "models": [], "failureKind": "unconfigured"})
+        import os
+
+        from opensquilla.audio.stt_registry import resolve_stt_api_key_env
+
+        api_key = str(getattr(section, "api_key", "") or "").strip()
+        if not api_key:
+            env_name = resolve_stt_api_key_env(section)
+            api_key = str(os.environ.get(env_name, "") or "").strip() if env_name else ""
+        if not api_key:
+            return JSONResponse({"ok": False, "models": [], "failureKind": "missing_key"})
+        base_url = (
+            str(getattr(section, "base_url", "") or "").strip()
+            or "https://api.openai.com/v1"
+        )
+        from opensquilla.onboarding.probe import discover_selectable_provider_models
+
+        try:
+            result = await discover_selectable_provider_models(
+                provider_id="custom",
+                api_key=api_key,
+                base_url=base_url,
+                allow_default_api_key_env=False,
+            )
+        except Exception as exc:  # noqa: BLE001 - discovery is best-effort
+            return JSONResponse(
+                {
+                    "ok": False,
+                    "models": [],
+                    "failureKind": "discover_failed",
+                    "detail": str(exc)[:200],
+                }
+            )
+        models = [
+            str(row.get("id"))
+            for row in (result.models or [])
+            if isinstance(row, dict) and row.get("id")
+        ]
+        return JSONResponse(
+            {
+                "ok": bool(result.ok),
+                "models": models,
+                "failureKind": str(getattr(result, "failure_kind", "") or ""),
+            }
+        )
+
+    app.router.routes.append(Route("/api/audio/stt/models", stt_models_handler, methods=["GET"]))

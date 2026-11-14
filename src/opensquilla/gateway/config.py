@@ -2084,6 +2084,16 @@ class AudioVoicePresetConfig(BaseModel):
         return normalized
 
 
+class AudioCaptureConfig(BaseModel):
+    """``[audio.capture]`` — terminal microphone capture for voice input (PR-4)."""
+
+    # Empty device auto-detects the default capture device (Windows dshow).
+    device: str = ""
+    max_seconds: int = Field(default=60, ge=1, le=600)
+    # Submit the transcribed text immediately instead of filling the input box.
+    auto_send: bool = False
+
+
 class AudioConfig(BaseSettings):
     model_config = SettingsConfigDict(
         env_prefix="OPENSQUILLA_AUDIO_",
@@ -2094,6 +2104,7 @@ class AudioConfig(BaseSettings):
     tts: AudioTTSConfig = Field(default_factory=AudioTTSConfig)
     providers: AudioProvidersConfig = Field(default_factory=AudioProvidersConfig)
     stt: AudioSttConfig = Field(default_factory=AudioSttConfig)
+    capture: AudioCaptureConfig = Field(default_factory=AudioCaptureConfig)
     presets: dict[str, AudioVoicePresetConfig] = Field(default_factory=dict)
 
 

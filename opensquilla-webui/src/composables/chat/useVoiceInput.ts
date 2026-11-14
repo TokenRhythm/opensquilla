@@ -37,6 +37,17 @@ export interface VoiceInputDevice {
   label: string
 }
 
+// Chromium lists the OS default routing as extra "default"/"communications"
+// entries next to the real endpoints, so one physical microphone can appear
+// three times. The picker already offers its own system-default option and
+// the OS sound settings list only the physical devices — drop the routing
+// duplicates so the picker matches what the system shows.
+function isPhysicalAudioInput(device: MediaDeviceInfo): boolean {
+  return device.kind === 'audioinput'
+    && device.deviceId !== 'default'
+    && device.deviceId !== 'communications'
+}
+
 function readStoredDeviceId(): string {
   try {
     return localStorage.getItem(DEVICE_STORAGE_KEY) || ''
@@ -136,6 +147,13 @@ export function useVoiceInput(transcription: AudioTranscription, recordingOwner?
   const voiceRecording = ref(false)
   const voiceDevices = ref<VoiceInputDevice[]>([])
   const voiceDeviceId = ref(readStoredDeviceId())
+  // Friendly name of the device the OS currently routes as default, resolved
+  // from Chromium's synthetic "default" entry so the picker's follow-default
+  // option can show the real microphone instead of an abstract label.
+  const voiceDefaultLabel = ref('')
+  // Device id behind that label; the picker hides it from the explicit list
+  // so the default microphone is never shown twice.
+  const voiceDefaultDeviceId = ref('')
   let recorder: MediaRecorder | null = null
   let activeStream: MediaStream | null = null
   let silenceMeter: SilenceMeter | null = null
@@ -156,31 +174,41 @@ export function useVoiceInput(transcription: AudioTranscription, recordingOwner?
   async function refreshVoiceDevices(): Promise<void> {
     if (!navigator.mediaDevices?.enumerateDevices) return
     try {
-      const all = await navigator.mediaDevices.enumerateDevices()
-      const inputs = all.filter(device => device.kind === 'audioinput')
+      let raw = await navigator.mediaDevices.enumerateDevices()
+      let inputs = raw.filter(device => device.kind === 'audioinput')
       // Before the first permission grant, enumerateDevices reports empty
       // labels. One throwaway getUserMedia unlocks the real device names so
       // the picker is usable from the first open, not just after the first
-      // recording.
+      // recording. The probe decision uses the raw list: the pre-permission
+      // placeholder may itself be a routing entry.
       if (inputs.length && inputs.every(device => !device.label)
         && navigator.mediaDevices.getUserMedia) {
         try {
           const probe = await navigator.mediaDevices.getUserMedia({ audio: true })
           probe.getTracks().forEach(track => track.stop())
-          const named = await navigator.mediaDevices.enumerateDevices()
-          inputs.length = 0
-          inputs.push(...named.filter(device => device.kind === 'audioinput'))
+          raw = await navigator.mediaDevices.enumerateDevices()
+          inputs = raw.filter(device => device.kind === 'audioinput')
         } catch {
           // Permission was refused or the device is busy; the id-only list is
           // still functional and labels arrive after the first recording.
         }
       }
-      voiceDevices.value = inputs.map(device => ({
+      const physical = inputs.filter(isPhysicalAudioInput)
+      voiceDevices.value = physical.map(device => ({
         deviceId: device.deviceId,
         label: device.label,
       }))
+      // The synthetic "default" entry carries the OS-localized prefix plus
+      // the default device's own label; suffix matching resolves the real
+      // microphone name without depending on the UI language.
+      const defaultEntry = raw.find(device => device.kind === 'audioinput' && device.deviceId === 'default')
+      const defaultMatch = defaultEntry?.label
+        ? physical.find(device => device.label && defaultEntry.label.endsWith(device.label))
+        : undefined
+      voiceDefaultLabel.value = defaultMatch?.label || ''
+      voiceDefaultDeviceId.value = defaultMatch?.deviceId || ''
       const stored = voiceDeviceId.value
-      if (stored && (!inputs.length || deviceIdsMatch(inputs.map(device => device.deviceId), stored))) {
+      if (stored && (!physical.length || deviceIdsMatch(physical.map(device => device.deviceId), stored))) {
         return
       }
       if (stored) setVoiceDevice('')
@@ -456,6 +484,8 @@ export function useVoiceInput(transcription: AudioTranscription, recordingOwner?
     voiceRecording,
     voiceDevices,
     voiceDeviceId,
+    voiceDefaultLabel,
+    voiceDefaultDeviceId,
     setVoiceDevice,
     refreshVoiceDevices,
     toggleVoiceInput,

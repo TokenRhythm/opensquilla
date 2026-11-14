@@ -41,6 +41,9 @@ interface CapabilitiesPanelContract {
     audioApiKey: string
     sttProvider: string
     sttModelDir: string
+    sttCloudApiKey: string
+    sttCloudBaseUrl: string
+    sttCloudModel: string
     audioPreset: string
   }
   options: {
@@ -86,6 +89,10 @@ interface CapabilitiesPanelContract {
     audioStatusText: string
     audioKeyPlaceholder: string
     sttStatusText: string
+    sttCloudKeyPlaceholder: string
+    sttCloudModelPlaceholder: string
+    sttCloudModels: string[]
+    sttCloudModelsStatus: string
     audioGenerationConfigured: boolean
     voicePresets: VoicePresetOption[]
     capabilityBadgeTone: (name: CapabilityId) => string
@@ -97,6 +104,9 @@ interface CapabilitiesPanelContract {
 
 const props = defineProps<{
   panel: CapabilitiesPanelContract
+  // Deep-link target: the composer's voice menu opens Settings with the
+  // recognition card already expanded instead of the quiet overview.
+  initialExpanded?: CapabilityId | ''
 }>()
 
 const emit = defineEmits<{
@@ -105,12 +115,13 @@ const emit = defineEmits<{
   imageProviderChange: [providerId: string]
   useImageRecommendation: [providerId: string]
   resetCapability: [capabilityId: CapabilityId]
+  fetchSttModels: []
 }>()
 
 // Enter the capability settings at a quiet overview. Operators can expand
 // exactly the capability they intend to edit instead of landing inside the
-// first form by default.
-const expanded = ref<CapabilityId | ''>('')
+// first form by default. A deep-link (initialExpanded) skips the overview.
+const expanded = ref<CapabilityId | ''>(props.initialExpanded ?? '')
 const imageKeyEditorOpen = ref(false)
 const imageCredentialNeedsInput = computed(() => (
   props.panel.form.imageCredentialSource === 'none'
@@ -536,6 +547,113 @@ function resetLabel(capabilityId: CapabilityId): string {
           <p v-else-if="panel.form.sttProvider === 'elevenlabs'" class="capability-card__draft-note">
             {{ t('setup.stt.engineUsesGenerationKey') }}
           </p>
+          <template v-else-if="panel.form.sttProvider === 'openai_transcriptions' || panel.form.sttProvider === 'openai_chat'">
+            <label class="control-row">
+              <div class="control-row__label-block">
+                <span class="control-row__label">{{ t('setup.common.apiKey') }}</span>
+                <span class="control-row__desc">{{ t('setup.stt.cloudKeyHint') }}</span>
+              </div>
+              <div class="control-row__control">
+                <input
+                  class="control-input"
+                  :value="panel.form.sttCloudApiKey"
+                  name="setup_stt_cloud_api_key"
+                  type="password"
+                  autocomplete="off"
+                  data-1p-ignore
+                  data-bwignore
+                  data-form-type="other"
+                  data-lpignore="true"
+                  data-protonpass-ignore="true"
+                  :placeholder="panel.state.sttCloudKeyPlaceholder"
+                  :aria-label="t('setup.common.apiKey')"
+                  @input="emit('updateField', 'audio', 'sttCloudApiKey', ($event.target as HTMLInputElement).value)"
+                >
+              </div>
+            </label>
+            <label class="control-row">
+              <div class="control-row__label-block">
+                <span class="control-row__label">{{ t('setup.common.baseUrl') }}</span>
+              </div>
+              <div class="control-row__control">
+                <input
+                  class="control-input"
+                  :value="panel.form.sttCloudBaseUrl"
+                  name="setup_stt_cloud_base_url"
+                  type="text"
+                  autocomplete="off"
+                  spellcheck="false"
+                  :placeholder="t('setup.stt.cloudBaseUrlPlaceholder')"
+                  :aria-label="t('setup.common.baseUrl')"
+                  @input="emit('updateField', 'audio', 'sttCloudBaseUrl', ($event.target as HTMLInputElement).value)"
+                >
+              </div>
+            </label>
+            <label class="control-row">
+              <div class="control-row__label-block">
+                <span class="control-row__label">{{ t('setup.common.model') }}</span>
+                <span class="control-row__desc">{{ t('setup.stt.cloudModelHint') }}</span>
+              </div>
+              <div class="control-row__control">
+                <input
+                  class="control-input"
+                  :value="panel.form.sttCloudModel"
+                  name="setup_stt_cloud_model"
+                  type="text"
+                  autocomplete="off"
+                  spellcheck="false"
+                  :placeholder="panel.state.sttCloudModelPlaceholder"
+                  :aria-label="t('setup.common.model')"
+                  @input="emit('updateField', 'audio', 'sttCloudModel', ($event.target as HTMLInputElement).value)"
+                >
+              </div>
+            </label>
+            <div class="control-row">
+              <div class="control-row__label-block">
+                <span class="control-row__label">{{ t('setup.stt.fetchModels') }}</span>
+                <span class="control-row__desc">{{ t('setup.stt.fetchModelsHint') }}</span>
+              </div>
+              <div class="control-row__control">
+                <button
+                  type="button"
+                  class="btn"
+                  name="setup_stt_fetch_models"
+                  :disabled="panel.state.sttCloudModelsStatus === 'loading'"
+                  :aria-busy="panel.state.sttCloudModelsStatus === 'loading' ? 'true' : undefined"
+                  @click="emit('fetchSttModels')"
+                >
+                  <Icon name="refresh" :size="14" />
+                  {{ panel.state.sttCloudModelsStatus === 'loading' ? t('setup.stt.fetchingModels') : t('setup.stt.fetchModels') }}
+                </button>
+              </div>
+            </div>
+            <div
+              v-if="panel.state.sttCloudModelsStatus === 'ready' && panel.state.sttCloudModels.length"
+              class="capability-card__models"
+              role="listbox"
+              :aria-label="t('setup.stt.fetchModels')"
+            >
+              <button
+                v-for="modelId in panel.state.sttCloudModels"
+                :key="modelId"
+                type="button"
+                class="capability-card__model-chip"
+                :class="{ 'is-active': panel.form.sttCloudModel === modelId }"
+                role="option"
+                :aria-selected="panel.form.sttCloudModel === modelId ? 'true' : 'false'"
+                @click="emit('updateField', 'audio', 'sttCloudModel', modelId)"
+              >{{ modelId }}</button>
+            </div>
+            <p v-else-if="panel.state.sttCloudModelsStatus === 'ready'" class="capability-card__draft-note">
+              {{ t('setup.stt.fetchModelsEmpty') }}
+            </p>
+            <p v-else-if="panel.state.sttCloudModelsStatus === 'nokey'" class="capability-card__draft-note">
+              {{ t('setup.stt.fetchModelsNoKey') }}
+            </p>
+            <p v-else-if="panel.state.sttCloudModelsStatus === 'error'" class="capability-card__draft-note">
+              {{ t('setup.stt.fetchModelsFailed') }}
+            </p>
+          </template>
         </template>
 
         <template v-else-if="capability.id === 'audio'">
@@ -718,6 +836,36 @@ function resetLabel(capabilityId: CapabilityId): string {
   color: var(--text-muted);
   font-size: 12px;
   line-height: 1.45;
+}
+
+.capability-card__models {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin: 10px 0 0;
+}
+
+.capability-card__model-chip {
+  padding: 4px 10px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-control);
+  background: transparent;
+  color: var(--text-muted);
+  font-size: var(--fs-xs);
+  font-family: inherit;
+  line-height: 1.4;
+  cursor: pointer;
+}
+
+.capability-card__model-chip:hover {
+  background: var(--bg-hover);
+  color: var(--text);
+}
+
+.capability-card__model-chip.is-active {
+  border-color: color-mix(in srgb, var(--accent) 28%, var(--border));
+  background: color-mix(in srgb, var(--accent) 9%, var(--bg-surface));
+  color: color-mix(in srgb, var(--accent) 80%, var(--text));
 }
 
 .capability-card__field-error {

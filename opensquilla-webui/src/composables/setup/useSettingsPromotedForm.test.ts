@@ -266,6 +266,111 @@ describe('useSettingsPromotedForm — STT engine switch', () => {
   })
 })
 
+// Cloud engines (openai_transcriptions / openai_chat) own their credentials
+// under [audio.stt.<engine>]; the capabilities card edits them through the
+// same draft/patch/rebase cycle as the engine switch itself.
+describe('useSettingsPromotedForm — cloud STT credentials', () => {
+  const savedCloudConfig = {
+    audio: {
+      enabled: true,
+      stt: {
+        provider: 'openai_transcriptions',
+        openai_transcriptions: {
+          base_url: 'https://api.siliconflow.cn/v1',
+          api_key: '[redacted]',
+          model: 'whisper-1',
+        },
+        openai_chat: { base_url: 'https://api.xiaomimimo.com/v1', model: 'mimo-v2.5-asr' },
+      },
+    },
+  }
+
+  it('hydrates the selected cloud section and stays pristine', () => {
+    const f = useSettingsPromotedForm()
+    f.initFromConfig(savedCloudConfig)
+    expect(f.sttCloudBaseUrl.value).toBe('https://api.siliconflow.cn/v1')
+    expect(f.sttCloudModel.value).toBe('whisper-1')
+    expect(f.sttCloudKeyConfigured.value).toBe(true)
+    expect(f.sttCloudApiKey.value).toBe('')
+    expect(f.sttDirty.value).toBe(false)
+    expect(f.sttPatches()).toEqual({})
+  })
+
+  it('pasting a key and editing url/model patches the selected engine section', () => {
+    const f = useSettingsPromotedForm()
+    f.initFromConfig(savedCloudConfig)
+    f.updateAudioField('sttCloudApiKey', 'sk-new')
+    f.updateAudioField('sttCloudBaseUrl', 'https://api.openai.com/v1')
+    f.updateAudioField('sttCloudModel', 'gpt-4o-mini-transcribe')
+    expect(f.sttDirty.value).toBe(true)
+    expect(f.sttPatches()).toEqual({
+      'audio.stt.provider': 'openai_transcriptions',
+      'audio.stt.openai_transcriptions.base_url': 'https://api.openai.com/v1',
+      'audio.stt.openai_transcriptions.model': 'gpt-4o-mini-transcribe',
+      'audio.stt.openai_transcriptions.api_key': 'sk-new',
+    })
+  })
+
+  it('a key-only edit leaves url and model untouched', () => {
+    const f = useSettingsPromotedForm()
+    f.initFromConfig(savedCloudConfig)
+    f.updateAudioField('sttCloudApiKey', 'sk-rotate')
+    expect(f.sttPatches()).toEqual({
+      'audio.stt.provider': 'openai_transcriptions',
+      'audio.stt.openai_transcriptions.api_key': 'sk-rotate',
+    })
+  })
+
+  it('switching cloud engines rehydrates that engine section and drops the paste', () => {
+    const f = useSettingsPromotedForm()
+    f.initFromConfig(savedCloudConfig)
+    f.updateAudioField('sttCloudApiKey', 'sk-unsaved')
+    f.updateAudioField('sttProvider', 'openai_chat')
+    expect(f.sttCloudApiKey.value).toBe('')
+    expect(f.sttCloudBaseUrl.value).toBe('https://api.xiaomimimo.com/v1')
+    expect(f.sttCloudModel.value).toBe('mimo-v2.5-asr')
+    expect(f.sttCloudKeyConfigured.value).toBe(false)
+    // The switch itself is the draft; the hydrated fields are not.
+    expect(f.sttPatches()).toEqual({
+      'audio.stt.provider': 'openai_chat',
+      'audio.stt.openai_chat.base_url': 'https://api.xiaomimimo.com/v1',
+      'audio.stt.openai_chat.model': 'mimo-v2.5-asr',
+    })
+  })
+
+  it('switching away from a cloud engine never leaks cloud patches', () => {
+    const f = useSettingsPromotedForm()
+    f.initFromConfig(savedCloudConfig)
+    f.updateAudioField('sttCloudApiKey', 'sk-unsaved')
+    f.updateAudioField('sttProvider', 'sensevoice')
+    // sensevoice always carries its model_dir default; no cloud keys leak.
+    expect(f.sttPatches()).toEqual({
+      'audio.stt.provider': 'sensevoice',
+      'audio.stt.sensevoice.model_dir': '',
+    })
+  })
+
+  it('acceptSavedStt rebaselines cloud fields and keeps the cache in sync', () => {
+    const f = useSettingsPromotedForm()
+    f.initFromConfig({ audio: { stt: { provider: 'elevenlabs' } } })
+    f.updateAudioField('sttProvider', 'openai_chat')
+    f.updateAudioField('sttCloudApiKey', 'sk-chat')
+    f.updateAudioField('sttCloudModel', 'mimo-v2.5-asr')
+    expect(f.sttDirty.value).toBe(true)
+    f.acceptSavedStt('openai_chat', '', {
+      baseUrl: '', model: 'mimo-v2.5-asr', keySaved: true,
+    })
+    expect(f.sttCloudApiKey.value).toBe('')
+    expect(f.sttCloudKeyConfigured.value).toBe(true)
+    expect(f.sttDirty.value).toBe(false)
+    // Toggling engines before the post-save reload still shows the saved state.
+    f.updateAudioField('sttProvider', 'openai_transcriptions')
+    f.updateAudioField('sttProvider', 'openai_chat')
+    expect(f.sttCloudKeyConfigured.value).toBe(true)
+    expect(f.sttCloudModel.value).toBe('mimo-v2.5-asr')
+  })
+})
+
 // The global thinking level persists through the provider-save dot-path
 // snapshot; clearing the select writes null so the llm.thinking key is
 // removed (same clear semantics as the context-window override).

@@ -48,7 +48,9 @@ import {
   type ModelStrategy,
 } from '@/composables/setup/useSetupModelStrategyForm'
 import { invalidateReadiness } from '@/composables/setup/readinessInvalidation'
-import { useSettingsPromotedForm, DEFAULT_LLM_TIMEOUT_SECONDS } from '@/composables/setup/useSettingsPromotedForm'
+import { useSettingsPromotedForm, DEFAULT_LLM_TIMEOUT_SECONDS, isCloudSttProvider } from '@/composables/setup/useSettingsPromotedForm'
+import { filterAsrModels } from '@/composables/chat/useVoiceEngine'
+import { AUDIO_TRANSCRIPTION_KEY } from '@/modules/audioTranscription'
 import { useSettingsSection } from '@/composables/setup/useSettingsSection'
 import { SETTINGS_SECTIONS, type SettingsSectionId } from '@/composables/setup/settingsSections'
 import { GATEWAY_ACCESS_KEY } from '@/modules/gatewayAccess'
@@ -1701,10 +1703,64 @@ const sttStatusText = computed(() => {
       ? t('setup.stt.statusReady')
       : t('setup.stt.statusNeedsGenerationKey')
   }
+  if (isCloudSttProvider(promotedForm.sttProvider.value)) {
+    // Cloud engines own their credential under [audio.stt.<engine>]; never
+    // borrow the ElevenLabs generation key's readiness for them. A saved env
+    // reference only counts while the draft still names the saved engine.
+    const keyPresent = promotedForm.sttCloudKeyConfigured.value
+      || Boolean(promotedForm.sttCloudApiKey.value.trim())
+      || (status.value.audioSource === 'env'
+        && promotedForm.sttProvider.value === promotedForm.sttSavedProvider.value)
+    if (!keyPresent) return t('setup.stt.statusCloudNeedsKey')
+    if (!promotedForm.sttCloudModel.value.trim()) return t('setup.stt.statusCloudNeedsModel')
+    return t('setup.stt.statusReady')
+  }
   return status.value.audioConfigured === true
     ? t('setup.stt.statusReady')
     : t('setup.stt.statusCloudNeedsKey')
 })
+// Cloud credential field hints: the key placeholder mirrors the generation
+// card's write-only pattern; the model placeholder names each wire protocol's
+// typical model so the required field is never a guessing game.
+const sttCloudKeyPlaceholder = computed(() => (
+  promotedForm.sttCloudKeyConfigured.value ? t('setup.common.leaveBlankKeep') : t('setup.audio.pasteKey')
+))
+const sttCloudModelPlaceholder = computed(() => (
+  promotedForm.sttProvider.value === 'openai_chat'
+    ? t('setup.stt.cloudModelPlaceholderChat')
+    : t('setup.stt.cloudModelPlaceholderTranscriptions')
+))
+// Model discovery for the recognition card: fetches the saved endpoint's
+// catalog server-side and keeps only speech-to-text models (a platform's
+// /models also lists LLM and TTS entries, which belong to other surfaces).
+const injectedAudioTranscription = inject(AUDIO_TRANSCRIPTION_KEY, undefined)
+const sttCloudModels = ref<string[]>([])
+const sttCloudModelsStatus = ref<'' | 'loading' | 'ready' | 'error' | 'nokey'>('')
+let sttModelsRequest = 0
+async function fetchSttCloudModels(): Promise<void> {
+  const engine = promotedForm.sttProvider.value
+  if (engine !== 'openai_transcriptions' && engine !== 'openai_chat') return
+  const discover = injectedAudioTranscription?.discoverModels
+  if (!discover) {
+    sttCloudModelsStatus.value = 'error'
+    return
+  }
+  const request = ++sttModelsRequest
+  sttCloudModelsStatus.value = 'loading'
+  sttCloudModels.value = []
+  try {
+    const result = await discover({ engine })
+    if (request !== sttModelsRequest) return
+    if (result.ok) {
+      sttCloudModels.value = filterAsrModels(result.models)
+      sttCloudModelsStatus.value = 'ready'
+    } else {
+      sttCloudModelsStatus.value = result.failureKind === 'missing_key' ? 'nokey' : 'error'
+    }
+  } catch {
+    if (request === sttModelsRequest) sttCloudModelsStatus.value = 'error'
+  }
+}
 const sttBadgeTone = computed(() => (
   sttStatusText.value === t('setup.stt.statusReady')
   || sttStatusText.value === t('setup.audio.statusLocalReady')
@@ -2352,6 +2408,13 @@ const capabilitiesPanel = capabilitiesForm.createPanel({
   audioLanguageCode: promotedForm.audioLanguageCode,
   sttProvider: promotedForm.sttProvider,
   sttModelDir: promotedForm.sttModelDir,
+  sttCloudApiKey: promotedForm.sttCloudApiKey,
+  sttCloudBaseUrl: promotedForm.sttCloudBaseUrl,
+  sttCloudModel: promotedForm.sttCloudModel,
+  sttCloudKeyPlaceholder,
+  sttCloudModelPlaceholder,
+  sttCloudModels,
+  sttCloudModelsStatus,
   audioPreset: promotedForm.audioPreset,
   audioStatusText,
   audioBadgeTone,
@@ -3904,6 +3967,12 @@ function updateCapabilityField(
   value: string | number | boolean,
 ) {
   if (group === 'audio') {
+    if (key === 'sttProvider') {
+      // A fetched model list belongs to the previous engine's endpoint.
+      sttModelsRequest += 1
+      sttCloudModels.value = []
+      sttCloudModelsStatus.value = ''
+    }
     promotedForm.updateAudioField(key, value as string | boolean)
     return
   }
@@ -5067,6 +5136,14 @@ async function saveAudio(options: SaveOptions = {}): Promise<boolean> {
         'audio.stt.sensevoice.model_dir' in sttPatches
           ? String(sttPatches['audio.stt.sensevoice.model_dir'] || '')
           : promotedForm.sttModelDir.value.trim(),
+        isCloudSttProvider(promotedForm.sttProvider.value)
+          ? {
+              baseUrl: promotedForm.sttCloudBaseUrl.value.trim(),
+              model: promotedForm.sttCloudModel.value.trim(),
+              keySaved: Boolean(promotedForm.sttCloudApiKey.value)
+                || promotedForm.sttCloudKeyConfigured.value,
+            }
+          : undefined,
       )
       // The preset rides the same patch; re-seed its baseline too so a
       // preset-only change converges without a stale dirty flag.
@@ -5226,6 +5303,7 @@ async function copyConfigPath() {
     removeProviderCredential,
     updateTierField,
     updateCapabilityField,
+    fetchSttCloudModels,
     onProviderChange,
     onSearchProviderChange,
     onMemoryProviderChange,

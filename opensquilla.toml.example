@@ -603,6 +603,14 @@ default_mode = "bypass"                 # off | on | bypass | full
 # use_itn = true                 # inverse text normalization (数字/标点)
 # num_threads = 4
 
+# [audio.capture]
+# Terminal microphone capture for the TUI /voice command (PR-4). Records via
+# ffmpeg (no extra dependency) and transcribes through [audio.stt] above.
+# In the chat TUI: /voice → Enter to start → Enter to stop → text is sent.
+# device = ""                    # empty auto-detects the default mic (Windows dshow)
+# max_seconds = 60               # hard stop per recording (1–600)
+# auto_send = false              # reserved: submit immediately vs fill the composer
+
 # [pet]
 # In-process desktop-pet (AgentRMC) reminder + directed-dispatch service.
 # Disabled by default: no pet, no behavior, no port probes. When enabled, the
