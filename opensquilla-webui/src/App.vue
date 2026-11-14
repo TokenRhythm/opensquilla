@@ -455,7 +455,7 @@
 </template>
 
 <script setup lang="ts">
-import { computed, inject, nextTick, onMounted, onUnmounted, ref, watch } from 'vue'
+import { computed, inject, nextTick, onMounted, onUnmounted, reactive, ref, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { SettingsBackgroundRoute, useSettingsRouteOverlay } from './router/settingsRouteOverlay'
 import SidebarAccountMenu from './components/SidebarAccountMenu.vue'
@@ -1148,7 +1148,7 @@ const sidebarSessionItems = computed((): SessionItem[] => {
     ))
   }
   const current = currentSessionKey.value
-  if (current && !seen.has(current)) {
+  if (current && !seen.has(current) && !deletedSessionKeys.has(current)) {
     const currentAgentId = normalizeAgentId(current.split(':')[1] || 'main')
     const project = optimisticProjectForSession(current) || undefined
     items.push(syntheticChatSession(
@@ -1192,9 +1192,23 @@ watch(
   ],
   ([key], oldValues) => {
     if (!key || allSessions.value.some(item => item.key === key)) return
-    const existing = localChatSessions.value[key]
+    // A session the app deleted must never re-enter the optimistic ledger,
+    // no matter which reactive path re-announces its key.
+    if (deletedSessionKeys.has(key)) return
     const previousKey = oldValues?.[0] || ''
     const previousHeaderKey = oldValues?.[1] || ''
+    // The chat surface can move on to a newer session while the route still
+    // points at the previous key: deleting the current conversation hands
+    // the header to the fresh draft before the route leaves the deleted key
+    // behind. The abandoned key must not be (re)seeded here, and an existing
+    // row must keep its resolved title instead of falling back.
+    if (
+      previousKey === key
+      && previousHeaderKey === key
+      && chatRouteHeaderSessionKey.value
+      && chatRouteHeaderSessionKey.value !== key
+    ) return
+    const existing = localChatSessions.value[key]
     const sessionChanged = Boolean(
       (previousKey && key && previousKey !== key)
       || (previousHeaderKey
@@ -1630,6 +1644,7 @@ async function onProjectDeleteHistory(workspaceId: string) {
       deletedSessionKeys: result.deletedSessionKeys,
     })
     const deleted = new Set(result.deletedSessionKeys)
+    rememberDeletedSessions(deleted)
     removeLocalSessions(deleted)
     sessionTaskAttention.removeMany(deleted)
     appStore.removePendingApprovalsForSessions(deleted)
@@ -1784,10 +1799,30 @@ function removeLocalSessions(keys: Set<string>) {
   if (changed) localChatSessions.value = next
 }
 
+// Session keys the app explicitly deleted. Reactive paths that re-announce a
+// missing session key (the optimistic ledger watch below, or the current-chat
+// fallback in sidebarSessionItems) must never resurrect one of these as a
+// placeholder "current task" row in the sidebar Recents list.
+const DELETED_SESSION_KEY_MEMORY_LIMIT = 500
+const deletedSessionKeys = reactive(new Set<string>())
+
+function rememberDeletedSessions(keys: Set<string>) {
+  if (keys.size === 0) return
+  for (const key of keys) deletedSessionKeys.add(key)
+  let overflow = deletedSessionKeys.size - DELETED_SESSION_KEY_MEMORY_LIMIT
+  if (overflow <= 0) return
+  for (const oldest of deletedSessionKeys) {
+    deletedSessionKeys.delete(oldest)
+    overflow -= 1
+    if (overflow <= 0) break
+  }
+}
+
 function handleLocalSessionsDeleted(event: Event) {
   const detail = localSessionsDeletedDetail(event)
   if (!detail || detail.source === APP_SESSION_SYNC_SOURCE) return
   const deleted = new Set(detail.keys)
+  rememberDeletedSessions(deleted)
   removeLocalSessions(deleted)
   sessionTaskAttention.removeMany(deleted)
   appStore.removePendingApprovalsForSessions(deleted)
@@ -1819,6 +1854,7 @@ async function onBulkDeleteSessions(keys: string[]) {
     pushToast(t('shared.sidebar.bulkDeleteFailed'), { tone: 'danger' })
     return
   }
+  rememberDeletedSessions(deleted)
   removeLocalSessions(deleted)
   sessionTaskAttention.removeMany(deleted)
   appStore.removePendingApprovalsForSessions(deleted)
@@ -1844,6 +1880,7 @@ async function onDeleteSession(key: string) {
     return
   }
   const deleted = new Set([key])
+  rememberDeletedSessions(deleted)
   removeLocalSessions(deleted)
   sessionTaskAttention.removeMany(deleted)
   appStore.removePendingApprovalsForSessions(deleted)
@@ -1929,7 +1966,10 @@ function handleAppForeground() {
 }
 
 const sessionDirectoryChangesSubscription = sessionDirectoryChanges.subscribe(change => {
-  if (change.reason === 'deleted') removeLocalSessions(new Set([change.key]))
+  if (change.reason === 'deleted') {
+    rememberDeletedSessions(new Set([change.key]))
+    removeLocalSessions(new Set([change.key]))
+  }
   scheduleSessionRefresh()
   sessionTaskAttention.handleSessionDirectoryChange(change, {
     currentSessionKey: currentSessionKey.value,
