@@ -1,11 +1,12 @@
 <script setup lang="ts">
 import ControlSelect from '@/components/ControlSelect.vue'
-import { computed, ref, watch } from 'vue'
+import { computed, onMounted, ref, watch } from 'vue'
 import { useI18n } from 'vue-i18n'
 import ControlSwitch from '@/components/ControlSwitch.vue'
 import SetupModelCombobox from '@/components/setup/SetupModelCombobox.vue'
 import SetupCapabilityCredential from '@/components/setup/SetupCapabilityCredential.vue'
 import type { ImageCredentialSource } from '@/composables/setup/useSetupCapabilitiesForm'
+import type { SenseVoicePrepareStatus } from '@/modules/audioTranscription'
 import type { DiscoveredModel } from '@/composables/setup/useSetupProviderForm'
 
 const { t } = useI18n()
@@ -93,6 +94,8 @@ interface CapabilitiesPanelContract {
     sttCloudModelPlaceholder: string
     sttCloudModels: string[]
     sttCloudModelsStatus: string
+    senseVoicePrepareStatus: SenseVoicePrepareStatus
+    senseVoicePrepareSupported: boolean
     audioGenerationConfigured: boolean
     voicePresets: VoicePresetOption[]
     capabilityBadgeTone: (name: CapabilityId) => string
@@ -116,12 +119,42 @@ const emit = defineEmits<{
   useImageRecommendation: [providerId: string]
   resetCapability: [capabilityId: CapabilityId]
   fetchSttModels: []
+  startSenseVoiceDownload: []
+  cancelSenseVoiceDownload: []
+  refreshSenseVoiceDownload: []
 }>()
+
+onMounted(() => emit('refreshSenseVoiceDownload'))
 
 // Enter the capability settings at a quiet overview. Operators can expand
 // exactly the capability they intend to edit instead of landing inside the
 // first form by default. A deep-link (initialExpanded) skips the overview.
 const expanded = ref<CapabilityId | ''>(props.initialExpanded ?? '')
+
+// Local SenseVoice download presentation: the gateway publishes byte progress;
+// the card renders a bar plus a human-readable size line.
+const senseVoiceDownloading = computed(() => (
+  props.panel.state.senseVoicePrepareStatus.phase === 'checking'
+  || props.panel.state.senseVoicePrepareStatus.phase === 'downloading'
+))
+const senseVoicePercent = computed(() => {
+  const status = props.panel.state.senseVoicePrepareStatus
+  const total = status.totalBytes || 0
+  if (!total) return 0
+  return Math.min(100, Math.round(((status.completedBytes || 0) / total) * 100))
+})
+function formatBytes(value: number): string {
+  if (value >= 1024 * 1024) return `${(value / (1024 * 1024)).toFixed(1)} MB`
+  if (value >= 1024) return `${(value / 1024).toFixed(0)} KB`
+  return `${value} B`
+}
+const senseVoiceProgressText = computed(() => {
+  const status = props.panel.state.senseVoicePrepareStatus
+  if (status.phase === 'checking') return t('setup.stt.downloadChecking')
+  const done = formatBytes(status.completedBytes || 0)
+  const total = formatBytes(status.totalBytes || 0)
+  return `${done} / ${total}`
+})
 const imageKeyEditorOpen = ref(false)
 const imageCredentialNeedsInput = computed(() => (
   props.panel.form.imageCredentialSource === 'none'
@@ -654,6 +687,56 @@ function resetLabel(capabilityId: CapabilityId): string {
               {{ t('setup.stt.fetchModelsFailed') }}
             </p>
           </template>
+          <div v-if="panel.form.sttProvider === 'sensevoice' && panel.state.senseVoicePrepareSupported" class="capability-card__download">
+            <div class="control-row">
+              <div class="control-row__label-block">
+                <span class="control-row__label">{{ t('setup.stt.downloadModel') }}</span>
+                <span class="control-row__desc">{{ t('setup.stt.downloadModelHint') }}</span>
+              </div>
+              <div class="control-row__control capability-card__download-actions">
+                <button
+                  v-if="!senseVoiceDownloading"
+                  type="button"
+                  class="btn"
+                  name="setup_stt_download_model"
+                  @click="emit('startSenseVoiceDownload')"
+                >
+                  <Icon name="download" :size="14" />
+                  {{ t('setup.stt.downloadModel') }}
+                </button>
+                <button
+                  v-else
+                  type="button"
+                  class="btn"
+                  name="setup_stt_cancel_download"
+                  @click="emit('cancelSenseVoiceDownload')"
+                >
+                  {{ t('setup.stt.downloadCancel') }}
+                </button>
+              </div>
+            </div>
+            <div v-if="senseVoiceDownloading" class="capability-card__progress">
+              <div
+                class="capability-card__progress-track"
+                role="progressbar"
+                :aria-valuemin="0"
+                :aria-valuemax="100"
+                :aria-valuenow="senseVoicePercent"
+              >
+                <div class="capability-card__progress-fill" :style="{ width: `${senseVoicePercent}%` }" />
+              </div>
+              <span class="capability-card__progress-text">{{ senseVoiceProgressText }}</span>
+            </div>
+            <p v-else-if="panel.state.senseVoicePrepareStatus.phase === 'ready'" class="capability-card__draft-note">
+              {{ t('setup.stt.downloadReady') }}
+            </p>
+            <p v-else-if="panel.state.senseVoicePrepareStatus.phase === 'failed'" class="capability-card__draft-note">
+              {{ t('setup.stt.downloadFailed') }}
+            </p>
+            <p v-else-if="panel.state.senseVoicePrepareStatus.phase === 'cancelled'" class="capability-card__draft-note">
+              {{ t('setup.stt.downloadCancelled') }}
+            </p>
+          </div>
         </template>
 
         <template v-else-if="capability.id === 'audio'">
@@ -866,6 +949,44 @@ function resetLabel(capabilityId: CapabilityId): string {
   border-color: color-mix(in srgb, var(--accent) 28%, var(--border));
   background: color-mix(in srgb, var(--accent) 9%, var(--bg-surface));
   color: color-mix(in srgb, var(--accent) 80%, var(--text));
+}
+
+.capability-card__download {
+  margin-top: 4px;
+}
+
+.capability-card__download-actions {
+  display: flex;
+  gap: 8px;
+}
+
+.capability-card__progress {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin: 8px 0 0;
+}
+
+.capability-card__progress-track {
+  flex: 1;
+  height: 6px;
+  border-radius: var(--radius-sm);
+  background: var(--bg-elevated);
+  overflow: hidden;
+}
+
+.capability-card__progress-fill {
+  height: 100%;
+  border-radius: var(--radius-sm);
+  background: var(--accent);
+  transition: width var(--dur-fast) var(--ease-out);
+}
+
+.capability-card__progress-text {
+  flex-shrink: 0;
+  color: var(--text-muted);
+  font-size: var(--fs-xs);
+  font-variant-numeric: tabular-nums;
 }
 
 .capability-card__field-error {

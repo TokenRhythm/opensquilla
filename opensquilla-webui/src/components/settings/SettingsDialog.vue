@@ -213,6 +213,9 @@
               @use-image-recommendation="useImageRecommendation"
               @reset-capability="resetCapability"
               @fetch-stt-models="fetchSttCloudModels"
+              @start-sense-voice-download="startSenseVoiceDownload"
+              @cancel-sense-voice-download="cancelSenseVoiceDownload"
+              @refresh-sense-voice-download="refreshSenseVoiceDownload"
             />
           </template>
           <VideoGenerationSettings
@@ -379,6 +382,9 @@ const {
   updateTierField,
   updateCapabilityField,
   fetchSttCloudModels,
+  startSenseVoiceDownload,
+  cancelSenseVoiceDownload,
+  refreshSenseVoiceDownload,
   onProviderChange,
   onSearchProviderChange,
   onImageProviderChange,

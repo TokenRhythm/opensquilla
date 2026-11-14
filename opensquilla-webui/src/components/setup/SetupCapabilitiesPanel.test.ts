@@ -3,6 +3,7 @@ import { afterEach, describe, expect, it, vi } from 'vitest'
 import { createApp, nextTick, type App } from 'vue'
 import i18n from '@/i18n'
 import type { ImageCredentialSource } from '@/composables/setup/useSetupCapabilitiesForm'
+import type { SenseVoicePrepareStatus } from '@/modules/audioTranscription'
 import SetupCapabilitiesPanel from './SetupCapabilitiesPanel.vue'
 
 const mounted: App[] = []
@@ -110,6 +111,8 @@ function panel() {
       sttCloudModelPlaceholder: 'e.g. whisper-1',
       sttCloudModels: [] as string[],
       sttCloudModelsStatus: '',
+      senseVoicePrepareStatus: { phase: 'idle' } as SenseVoicePrepareStatus,
+      senseVoicePrepareSupported: false,
       audioGenerationConfigured: false,
       voicePresets: [] as Array<{
         name: string
@@ -132,6 +135,8 @@ async function mountPanel(panelValue = panel(), extraProps: Record<string, unkno
   const updateField = vi.fn()
   const imageProviderChange = vi.fn()
   const fetchSttModels = vi.fn()
+  const startSenseVoiceDownload = vi.fn()
+  const cancelSenseVoiceDownload = vi.fn()
   const el = document.createElement('div')
   document.body.appendChild(el)
   const app = createApp(SetupCapabilitiesPanel, {
@@ -140,13 +145,15 @@ async function mountPanel(panelValue = panel(), extraProps: Record<string, unkno
     onUpdateField: updateField,
     onImageProviderChange: imageProviderChange,
     onFetchSttModels: fetchSttModels,
+    onStartSenseVoiceDownload: startSenseVoiceDownload,
+    onCancelSenseVoiceDownload: cancelSenseVoiceDownload,
     ...extraProps,
   })
   app.use(i18n)
   app.mount(el)
   mounted.push(app)
   await nextTick()
-  return { el, resetCapability, updateField, imageProviderChange, fetchSttModels }
+  return { el, resetCapability, updateField, imageProviderChange, fetchSttModels, startSenseVoiceDownload, cancelSenseVoiceDownload }
 }
 
 afterEach(() => {
@@ -591,6 +598,44 @@ describe('SetupCapabilitiesPanel', () => {
     expect(chips.map(chip => chip.textContent)).toEqual(['mimo-v2.5-asr'])
     chips[0]!.click()
     expect(updateField).toHaveBeenCalledWith('audio', 'sttCloudModel', 'mimo-v2.5-asr')
+  })
+
+  it('offers the pinned SenseVoice download and reports progress', async () => {
+    i18n.global.locale.value = 'en'
+    const local = panel()
+    local.form.sttProvider = 'sensevoice'
+    local.state.senseVoicePrepareSupported = true
+    const { el, startSenseVoiceDownload } = await mountPanel(local)
+
+    const download = el.querySelector<HTMLButtonElement>('[name="setup_stt_download_model"]')
+    expect(download).not.toBeNull()
+    download!.click()
+    expect(startSenseVoiceDownload).toHaveBeenCalledTimes(1)
+
+    // A downloading snapshot renders a progress bar plus cancel.
+    const downloading = panel()
+    downloading.form.sttProvider = 'sensevoice'
+    downloading.state.senseVoicePrepareSupported = true
+    downloading.state.senseVoicePrepareStatus = {
+      phase: 'downloading', resource: 'model.int8.onnx', completedBytes: 50, totalBytes: 100,
+    }
+    const active = await mountPanel(downloading)
+    const progress = active.el.querySelector('[role="progressbar"]')
+    expect(progress).not.toBeNull()
+    expect(progress!.getAttribute('aria-valuenow')).toBe('50')
+    const cancel = active.el.querySelector<HTMLButtonElement>('[name="setup_stt_cancel_download"]')
+    expect(cancel).not.toBeNull()
+    cancel!.click()
+    expect(active.cancelSenseVoiceDownload).toHaveBeenCalledTimes(1)
+  })
+
+  it('hides the SenseVoice download when the gateway does not support it', async () => {
+    i18n.global.locale.value = 'en'
+    const local = panel()
+    local.form.sttProvider = 'sensevoice'
+    local.state.senseVoicePrepareSupported = false
+    const { el } = await mountPanel(local)
+    expect(el.querySelector('[name="setup_stt_download_model"]')).toBeNull()
   })
 
   it('opens with the deep-linked capability card already expanded', async () => {

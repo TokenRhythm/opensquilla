@@ -2228,7 +2228,14 @@
       "fetchingModels": "Fetching…",
       "fetchModelsNoKey": "Save the API key first, then fetch.",
       "fetchModelsFailed": "Could not fetch the model list.",
-      "fetchModelsEmpty": "No speech-to-text models found."
+      "fetchModelsEmpty": "No speech-to-text models found.",
+      "downloadModel": "Download model",
+      "downloadModelHint": "Fetches the pinned SenseVoiceSmall (INT8) weights and token table from Hugging Face or its mirror, verifies SHA-256, and fills the model directory.",
+      "downloadCancel": "Cancel",
+      "downloadChecking": "Checking cache…",
+      "downloadReady": "Model downloaded and verified. Save to use it.",
+      "downloadFailed": "Model download failed. Check the network and retry.",
+      "downloadCancelled": "Download cancelled. Completed files are kept for the next retry."
     },
     "connection": {
       "title": "Gateway connection",

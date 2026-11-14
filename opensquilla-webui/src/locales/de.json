@@ -2228,7 +2228,14 @@
       "fetchingModels": "Wird abgerufen…",
       "fetchModelsNoKey": "Zuerst den API-Schlüssel speichern, dann abrufen.",
       "fetchModelsFailed": "Modellliste konnte nicht abgerufen werden.",
-      "fetchModelsEmpty": "Keine Spracherkennungsmodelle gefunden."
+      "fetchModelsEmpty": "Keine Spracherkennungsmodelle gefunden.",
+      "downloadModel": "Modell herunterladen",
+      "downloadModelHint": "Lädt die SenseVoiceSmall-(INT8)-Gewichte und Tokentabelle mit fester Revision von Hugging Face oder einem Mirror, prüft SHA-256 und trägt das Modellverzeichnis ein.",
+      "downloadCancel": "Abbrechen",
+      "downloadChecking": "Cache wird geprüft…",
+      "downloadReady": "Modell heruntergeladen und verifiziert. Zum Verwenden speichern.",
+      "downloadFailed": "Modell-Download fehlgeschlagen. Netzwerk prüfen und erneut versuchen.",
+      "downloadCancelled": "Download abgebrochen. Fertige Dateien bleiben für den nächsten Versuch erhalten."
     },
     "connection": {
       "title": "Gateway-Verbindung",

@@ -2228,7 +2228,14 @@
       "fetchingModels": "正在拉取…",
       "fetchModelsNoKey": "请先保存 API 密钥，再拉取模型。",
       "fetchModelsFailed": "模型列表拉取失败。",
-      "fetchModelsEmpty": "未发现语音识别模型。"
+      "fetchModelsEmpty": "未发现语音识别模型。",
+      "downloadModel": "下载模型",
+      "downloadModelHint": "从 Hugging Face 或其镜像拉取固定修订的 SenseVoiceSmall（INT8）权重与词表，校验 SHA-256 后自动填入模型目录。",
+      "downloadCancel": "取消",
+      "downloadChecking": "正在检查缓存…",
+      "downloadReady": "模型已下载并校验通过，保存后即可使用。",
+      "downloadFailed": "模型下载失败，请检查网络后重试。",
+      "downloadCancelled": "下载已取消，已完成的文件会保留供下次重试。"
     },
     "connection": {
       "title": "网关连接",

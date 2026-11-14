@@ -151,6 +151,8 @@ interface CapabilitiesPanelContext {
   sttCloudModelPlaceholder: ComputedRef<string>
   sttCloudModels: Ref<string[]>
   sttCloudModelsStatus: Ref<string>
+  senseVoicePrepareStatus: Ref<import('@/modules/audioTranscription').SenseVoicePrepareStatus>
+  senseVoicePrepareSupported: ComputedRef<boolean>
   audioPreset: Ref<string>
   audioStatusText: ComputedRef<string>
   audioBadgeTone: ComputedRef<string>
@@ -908,6 +910,8 @@ export function useSetupCapabilitiesForm() {
         sttCloudModelPlaceholder: context.sttCloudModelPlaceholder.value,
         sttCloudModels: context.sttCloudModels.value,
         sttCloudModelsStatus: context.sttCloudModelsStatus.value,
+        senseVoicePrepareStatus: context.senseVoicePrepareStatus.value,
+        senseVoicePrepareSupported: context.senseVoicePrepareSupported.value,
         audioGenerationConfigured: context.audioGenerationConfigured.value,
         voicePresets: context.voicePresets.value,
         resettable: context.resettable,

@@ -51,6 +51,7 @@ import { invalidateReadiness } from '@/composables/setup/readinessInvalidation'
 import { useSettingsPromotedForm, DEFAULT_LLM_TIMEOUT_SECONDS, isCloudSttProvider } from '@/composables/setup/useSettingsPromotedForm'
 import { filterAsrModels } from '@/composables/chat/useVoiceEngine'
 import { AUDIO_TRANSCRIPTION_KEY } from '@/modules/audioTranscription'
+import { useSenseVoicePrepare } from '@/composables/setup/useSenseVoicePrepare'
 import { useSettingsSection } from '@/composables/setup/useSettingsSection'
 import { SETTINGS_SECTIONS, type SettingsSectionId } from '@/composables/setup/settingsSections'
 import { GATEWAY_ACCESS_KEY } from '@/modules/gatewayAccess'
@@ -1761,6 +1762,11 @@ async function fetchSttCloudModels(): Promise<void> {
     if (request === sttModelsRequest) sttCloudModelsStatus.value = 'error'
   }
 }
+// Pinned local SenseVoice download: the verified directory fills the model_dir
+// draft field so the operator still owns the explicit Save.
+const senseVoicePrepare = useSenseVoicePrepare(injectedAudioTranscription, (modelDir) => {
+  promotedForm.updateAudioField('sttModelDir', modelDir)
+})
 const sttBadgeTone = computed(() => (
   sttStatusText.value === t('setup.stt.statusReady')
   || sttStatusText.value === t('setup.audio.statusLocalReady')
@@ -2415,6 +2421,8 @@ const capabilitiesPanel = capabilitiesForm.createPanel({
   sttCloudModelPlaceholder,
   sttCloudModels,
   sttCloudModelsStatus,
+  senseVoicePrepareStatus: senseVoicePrepare.status,
+  senseVoicePrepareSupported: computed(() => senseVoicePrepare.supported),
   audioPreset: promotedForm.audioPreset,
   audioStatusText,
   audioBadgeTone,
@@ -5304,6 +5312,9 @@ async function copyConfigPath() {
     updateTierField,
     updateCapabilityField,
     fetchSttCloudModels,
+    startSenseVoiceDownload: senseVoicePrepare.start,
+    cancelSenseVoiceDownload: senseVoicePrepare.cancel,
+    refreshSenseVoiceDownload: senseVoicePrepare.refresh,
     onProviderChange,
     onSearchProviderChange,
     onMemoryProviderChange,

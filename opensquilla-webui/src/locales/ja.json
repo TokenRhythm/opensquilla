@@ -2228,7 +2228,14 @@
       "fetchingModels": "取得中…",
       "fetchModelsNoKey": "先に API キーを保存してから取得してください。",
       "fetchModelsFailed": "モデル一覧を取得できませんでした。",
-      "fetchModelsEmpty": "音声認識モデルが見つかりません。"
+      "fetchModelsEmpty": "音声認識モデルが見つかりません。",
+      "downloadModel": "モデルをダウンロード",
+      "downloadModelHint": "Hugging Face またはミラーから固定リビジョンの SenseVoiceSmall（INT8）重みとトークン表を取得し、SHA-256 検証後にモデルディレクトリを設定します。",
+      "downloadCancel": "キャンセル",
+      "downloadChecking": "キャッシュを確認中…",
+      "downloadReady": "モデルをダウンロードし検証しました。保存して使用してください。",
+      "downloadFailed": "モデルのダウンロードに失敗しました。ネットワークを確認して再試行してください。",
+      "downloadCancelled": "ダウンロードをキャンセルしました。完了済みファイルは次回の再試行用に保持されます。"
     },
     "connection": {
       "title": "Gateway 接続",

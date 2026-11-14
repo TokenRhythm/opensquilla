@@ -1,21 +1,38 @@
 import {
   AudioTranscriptionError,
   type AudioTranscription,
+  type SenseVoicePrepareStatus,
   type SttModelDiscovery,
 } from '@/modules/audioTranscription'
 import { HttpTransportError } from './privateHttpTransport'
 
+// Structural subset of the private transport's request options: bodyless
+// GET/POST/DELETE plus the multipart POST used for transcription. Kept local
+// so the exported adapter signature never names a private transport symbol.
+type AudioRequestOptions =
+  | { method?: 'GET'; signal?: AbortSignal; timeoutMs?: number }
+  | { method: 'POST'; form: FormData; signal?: AbortSignal; timeoutMs?: number }
+  | { method: 'POST' | 'DELETE'; signal?: AbortSignal; timeoutMs?: number }
+
 interface AudioHttpTransport {
-  requestJson<T>(endpoint: string, options: {
-    method: 'POST'
-    form: FormData
-    signal?: AbortSignal
-    timeoutMs?: number
-  } | {
-    method: 'GET'
-    signal?: AbortSignal
-    timeoutMs?: number
-  }): Promise<T>
+  requestJson<T>(endpoint: string, options?: AudioRequestOptions): Promise<T>
+}
+
+function prepareStatus(raw: unknown): SenseVoicePrepareStatus {
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return { phase: 'idle' }
+  const payload = raw as Record<string, unknown>
+  const phase = typeof payload.phase === 'string' ? payload.phase : 'idle'
+  const error = payload.error && typeof payload.error === 'object' && !Array.isArray(payload.error)
+    ? payload.error as SenseVoicePrepareStatus['error']
+    : undefined
+  return {
+    phase: phase as SenseVoicePrepareStatus['phase'],
+    resource: typeof payload.resource === 'string' ? payload.resource : undefined,
+    completedBytes: typeof payload.completedBytes === 'number' ? payload.completedBytes : undefined,
+    totalBytes: typeof payload.totalBytes === 'number' ? payload.totalBytes : undefined,
+    modelDir: typeof payload.modelDir === 'string' ? payload.modelDir : undefined,
+    error,
+  }
 }
 
 function unavailable(error: HttpTransportError): boolean {
@@ -80,6 +97,24 @@ export function createV4AudioTranscription(http: AudioHttpTransport): AudioTrans
         models,
         failureKind: typeof payload.failureKind === 'string' ? payload.failureKind : '',
       }
+    },
+    async startSenseVoicePrepare(): Promise<SenseVoicePrepareStatus> {
+      return prepareStatus(await http.requestJson<unknown>(
+        '/api/audio/stt/sensevoice/prepare',
+        { method: 'POST', timeoutMs: 20_000 },
+      ))
+    },
+    async senseVoicePrepareStatus(): Promise<SenseVoicePrepareStatus> {
+      return prepareStatus(await http.requestJson<unknown>(
+        '/api/audio/stt/sensevoice/prepare',
+        { method: 'GET', timeoutMs: 10_000 },
+      ))
+    },
+    async cancelSenseVoicePrepare(): Promise<SenseVoicePrepareStatus> {
+      return prepareStatus(await http.requestJson<unknown>(
+        '/api/audio/stt/sensevoice/prepare',
+        { method: 'DELETE', timeoutMs: 10_000 },
+      ))
     },
   }
 }

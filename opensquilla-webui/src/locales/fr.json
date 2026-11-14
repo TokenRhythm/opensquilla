@@ -2228,7 +2228,14 @@
       "fetchingModels": "Récupération…",
       "fetchModelsNoKey": "Enregistrez d'abord la clé API, puis récupérez.",
       "fetchModelsFailed": "Impossible de récupérer la liste des modèles.",
-      "fetchModelsEmpty": "Aucun modèle de reconnaissance vocale trouvé."
+      "fetchModelsEmpty": "Aucun modèle de reconnaissance vocale trouvé.",
+      "downloadModel": "Télécharger le modèle",
+      "downloadModelHint": "Récupère les poids SenseVoiceSmall (INT8) et la table de tokens à révision fixe depuis Hugging Face ou son miroir, vérifie le SHA-256 et remplit le répertoire du modèle.",
+      "downloadCancel": "Annuler",
+      "downloadChecking": "Vérification du cache…",
+      "downloadReady": "Modèle téléchargé et vérifié. Enregistrez pour l’utiliser.",
+      "downloadFailed": "Échec du téléchargement du modèle. Vérifiez le réseau et réessayez.",
+      "downloadCancelled": "Téléchargement annulé. Les fichiers terminés sont conservés pour le prochain essai."
     },
     "connection": {
       "title": "Connexion au Gateway",

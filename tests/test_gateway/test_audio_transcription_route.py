@@ -261,3 +261,59 @@ def test_audio_transcription_disabled_flag_returns_unavailable() -> None:
 
     assert response.status_code == 503
     assert response.json()["code"] == "UNAVAILABLE"
+
+
+def test_sensevoice_prepare_short_circuits_when_model_ready(monkeypatch) -> None:
+    from opensquilla.audio import sensevoice_assets
+
+    monkeypatch.setattr(sensevoice_assets, "model_ready", lambda _dir: True)
+    client = _route_with(lambda _cfg: [_FakeProvider()])
+
+    response = client.post("/api/audio/stt/sensevoice/prepare")
+    assert response.status_code == 200
+    body = response.json()
+    assert body["phase"] == "ready"
+    assert body["modelDir"]
+
+    status = client.get("/api/audio/stt/sensevoice/prepare")
+    assert status.json()["phase"] == "ready"
+
+
+def test_sensevoice_prepare_runs_background_download(monkeypatch, tmp_path) -> None:
+    from opensquilla.audio import sensevoice_assets
+
+    monkeypatch.setattr(sensevoice_assets, "model_ready", lambda _dir: False)
+    monkeypatch.setattr(sensevoice_assets, "default_model_dir", lambda _cfg: tmp_path)
+
+    async def fake_prepare(model_dir, *, progress=None, cancelled=None):
+        if progress:
+            progress("model.int8.onnx", 10, 100)
+        return model_dir
+
+    monkeypatch.setattr(sensevoice_assets, "prepare_sensevoice_model", fake_prepare)
+    client = _route_with(lambda _cfg: [_FakeProvider()])
+
+    started = client.post("/api/audio/stt/sensevoice/prepare")
+    assert started.status_code == 200
+    # The first response must already report an active preparation so the
+    # client begins polling instead of treating it as idle.
+    assert started.json()["phase"] == "checking"
+
+    # The background task settles to ready; poll the published state.
+    for _ in range(50):
+        body = client.get("/api/audio/stt/sensevoice/prepare").json()
+        if body["phase"] == "ready":
+            break
+    assert body["phase"] == "ready"
+    assert body["modelDir"] == str(tmp_path)
+
+
+def test_sensevoice_prepare_requires_token_when_configured() -> None:
+    config = _make_config()
+    config.auth.mode = "token"
+    config.auth.token = "token-123"
+    client = _route_with(lambda _cfg: [_FakeProvider()], config=config)
+
+    assert client.get("/api/audio/stt/sensevoice/prepare").status_code == 401
+    assert client.post("/api/audio/stt/sensevoice/prepare").status_code == 401
+    assert client.delete("/api/audio/stt/sensevoice/prepare").status_code == 401

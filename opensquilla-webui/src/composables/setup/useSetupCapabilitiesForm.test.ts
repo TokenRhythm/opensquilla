@@ -489,6 +489,8 @@ function stubPanelContext() {
     sttCloudModelPlaceholder: text,
     sttCloudModels: ref<string[]>([]),
     sttCloudModelsStatus: ref(''),
+    senseVoicePrepareStatus: ref<import('@/modules/audioTranscription').SenseVoicePrepareStatus>({ phase: 'idle' }),
+    senseVoicePrepareSupported: computed(() => false),
     audioStatusText: text,
     audioBadgeTone: text,
     audioBadgeLabel: text,

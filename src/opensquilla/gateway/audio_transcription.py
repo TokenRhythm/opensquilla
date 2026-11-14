@@ -303,3 +303,89 @@ def register_audio_transcription_routes(
         )
 
     app.router.routes.append(Route("/api/audio/stt/models", stt_models_handler, methods=["GET"]))
+
+    # --- Local SenseVoice model preparation (pinned download, DSH-style) ---
+    import asyncio
+
+    from opensquilla.audio import sensevoice_assets
+
+    prepare_state: dict[str, Any] = {"phase": "idle"}
+    prepare_task: asyncio.Task | None = None
+    prepare_cancel = asyncio.Event()
+
+    def _prepare_guard(request: Request) -> JSONResponse | None:
+        if not request_origin_allowed(request, config):
+            return forbidden_origin_response()
+        if config.auth.mode == "token":
+            if config.auth.token and not _authorization_token_matches(config, request):
+                return JSONResponse(
+                    {"error": "Authorization header (Bearer ...) required", "code": "UNAUTHORIZED"},
+                    status_code=401,
+                )
+        return None
+
+    async def _run_prepare(model_dir: Any) -> None:
+        nonlocal prepare_state
+        prepare_cancel.clear()
+
+        def report(resource: str, done: int, total: int) -> None:
+            prepare_state = {
+                "phase": "downloading",
+                "resource": resource,
+                "completedBytes": done,
+                "totalBytes": total,
+                "modelDir": str(model_dir),
+            }
+
+        try:
+            prepare_state = {"phase": "checking", "modelDir": str(model_dir)}
+            await sensevoice_assets.prepare_sensevoice_model(
+                model_dir,
+                progress=report,
+                cancelled=prepare_cancel.is_set,
+            )
+            prepare_state = {"phase": "ready", "modelDir": str(model_dir)}
+        except sensevoice_assets.SenseVoiceDownloadError as exc:
+            prepare_state = {
+                "phase": "cancelled" if exc.reason == "cancelled" else "failed",
+                "modelDir": str(model_dir),
+                "error": {"resource": exc.resource, "reason": exc.reason, "status": exc.status},
+            }
+        except Exception as exc:  # noqa: BLE001 - surface a bounded public reason
+            prepare_state = {
+                "phase": "failed",
+                "modelDir": str(model_dir),
+                "error": {"resource": "sensevoice", "reason": "unknown", "detail": str(exc)[:200]},
+            }
+
+    async def sensevoice_prepare_handler(request: Request) -> JSONResponse:
+        nonlocal prepare_task, prepare_state
+        guard = _prepare_guard(request)
+        if guard is not None:
+            return guard
+        if request.method == "GET":
+            return JSONResponse(prepare_state)
+        if request.method == "DELETE":
+            if prepare_task is not None and not prepare_task.done():
+                prepare_cancel.set()
+            return JSONResponse(prepare_state)
+        # POST: start (idempotent while a preparation is already running).
+        if prepare_task is not None and not prepare_task.done():
+            return JSONResponse(prepare_state)
+        model_dir = sensevoice_assets.default_model_dir(config.config_path)
+        if sensevoice_assets.model_ready(model_dir):
+            prepare_state = {"phase": "ready", "modelDir": str(model_dir)}
+            return JSONResponse(prepare_state)
+        # Publish "checking" synchronously so the caller's first response already
+        # reflects an active preparation and begins polling progress.
+        prepare_state = {"phase": "checking", "modelDir": str(model_dir)}
+        prepare_task = asyncio.create_task(_run_prepare(model_dir))
+        return JSONResponse(prepare_state)
+
+    app.router.routes.append(
+        Route(
+            "/api/audio/stt/sensevoice/prepare",
+            sensevoice_prepare_handler,
+            methods=["GET", "POST", "DELETE"],
+        )
+    )
