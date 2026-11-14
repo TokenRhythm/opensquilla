@@ -18,7 +18,10 @@ function extract(start: string, end: string) {
   }).outputText
 }
 // Run App's real projection, watches and deletion handler with Vue and useSessions.
+// The deleted-key ledger declaration must be extracted too: App.vue declares it
+// before the optimistic ledger watch (which runs with `immediate: true`).
 const source = [
+  extract('const DELETED_SESSION_KEY_MEMORY_LIMIT', '// Pending optimistic renames'),
   extract('function removeLocalSessions(', 'async function deleteSessions('),
   extract('function syntheticChatSession(', 'const SIDEBAR_SESSION_ORDER_KEY'),
   extract('async function onProjectDeleteHistory(', 'async function onProjectRemove('),

@@ -899,6 +899,13 @@ const { agents, loadAgents } = useAgentOptions(agentCatalog, optionalSessionRead
 const mobileKeyboardOpen = ref(false)
 const commandPaletteOpen = ref(false)
 const localChatSessions = ref<Record<string, { effectiveAgentId: string; title: string; updatedAt: number }>>({})
+// Session keys the app explicitly deleted. Reactive paths that re-announce a
+// missing session key (the optimistic ledger watch below, or the current-chat
+// fallback in sidebarSessionItems) must never resurrect one of these as a
+// placeholder "current task" row in the sidebar Recents list. Declared before
+// the watch that reads it with `immediate: true`.
+const DELETED_SESSION_KEY_MEMORY_LIMIT = 500
+const deletedSessionKeys = reactive(new Set<string>())
 // Pending optimistic renames, keyed by session key; confirmed names enter the
 // existing list before the temporary override is removed.
 const renameOverrides = ref<Record<string, string>>({})
@@ -1798,13 +1805,6 @@ function removeLocalSessions(keys: Set<string>) {
   }
   if (changed) localChatSessions.value = next
 }
-
-// Session keys the app explicitly deleted. Reactive paths that re-announce a
-// missing session key (the optimistic ledger watch below, or the current-chat
-// fallback in sidebarSessionItems) must never resurrect one of these as a
-// placeholder "current task" row in the sidebar Recents list.
-const DELETED_SESSION_KEY_MEMORY_LIMIT = 500
-const deletedSessionKeys = reactive(new Set<string>())
 
 function rememberDeletedSessions(keys: Set<string>) {
   if (keys.size === 0) return
