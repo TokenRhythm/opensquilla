@@ -35,3 +35,43 @@ def test_dynamic_stream_replaces_unencodable_text_for_legacy_gbk_stream(
     stream.flush()
 
     assert raw.getvalue().decode("cp936") == "中文 ?"
+
+
+class _ClosedPipeStream:
+    """A stdout whose reader already went away, as with `| head`."""
+
+    def write(self, data: str) -> int:
+        raise BrokenPipeError(32, "Broken pipe")
+
+    def flush(self) -> None:
+        raise BrokenPipeError(32, "Broken pipe")
+
+
+def test_dynamic_stream_treats_a_closed_pipe_as_end_of_output(monkeypatch) -> None:
+    monkeypatch.setattr(sys, "stdout", _ClosedPipeStream())
+
+    stream = _DynamicStream("stdout")
+
+    assert stream.write("sample payload") == len("sample payload")
+    stream.flush()
+
+
+class _InvalidArgumentStream:
+    """Windows colorama raises OSError(EINVAL) instead of BrokenPipeError."""
+
+    def write(self, data: str) -> int:
+        raise OSError(22, "Invalid argument")
+
+    def flush(self) -> None:
+        raise OSError(22, "Invalid argument")
+
+
+def test_dynamic_stream_treats_an_invalid_argument_write_as_end_of_output(
+    monkeypatch,
+) -> None:
+    monkeypatch.setattr(sys, "stdout", _InvalidArgumentStream())
+
+    stream = _DynamicStream("stdout")
+
+    assert stream.write("sample payload") == len("sample payload")
+    stream.flush()
