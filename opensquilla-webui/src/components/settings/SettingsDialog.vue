@@ -590,7 +590,7 @@ const wantsAutoSection = computed(() => routeParam.value === 'auto')
 // Deep-link from the composer's voice menu: /settings/capabilities?focus=stt
 // lands with the recognition card already expanded.
 const capabilitiesFocusTarget = computed<'stt' | ''>(() => (
-  route.query.focus === 'stt' ? 'stt' : ''
+  route.query?.focus === 'stt' ? 'stt' : ''
 ))
 
 const COMPOSITE_HASH_TARGETS: Record<string, string> = {

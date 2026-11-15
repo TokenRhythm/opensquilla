@@ -508,6 +508,8 @@ describe('catalog parity', () => {
     const intentionalEnglishTerms = new Set([
       'chat.routerFx.ensembleTokens',
       'account.manualKey', // TokenRhythm · API Key is a product/credential label.
+      // An example endpoint URL: translating it would break the hint.
+      'setup.stt.cloudBaseUrlPlaceholder',
     ])
     const leaked = Object.keys(enFlat).filter(
       (k) =>
