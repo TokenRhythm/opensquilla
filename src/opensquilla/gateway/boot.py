@@ -5602,7 +5602,10 @@ async def start_gateway_server(
                 from opensquilla.gateway.session_services import get_session_storage
 
                 try:
-                    session = await svc.session_manager.get_session(session_key)
+                    session_manager = svc.session_manager
+                    if session_manager is None:
+                        return ("", "")
+                    session = await session_manager.get_session(session_key)
                     if session is None:
                         return ("", "")
                     title = str(
@@ -5611,7 +5614,7 @@ async def start_gateway_server(
                         or ""
                     )
                     project = ""
-                    storage = get_session_storage(svc.session_manager)
+                    storage = get_session_storage(session_manager)
                     if storage is not None:
                         workspace = await resolve_session_project_workspace(
                             storage, session

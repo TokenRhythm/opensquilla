@@ -571,7 +571,7 @@ def test_session_label_prefers_title_then_project_dir() -> None:
     assert events.session_label("WebChat", "D:\\repo\\Opensquilla") == "Opensquilla"
     assert events.session_label("", "D:\\repo\\Agentrmc") == "Agentrmc"
     assert events.session_label("", "") == "这个会话"
-    assert events.session_label("webchat", "/home/user/proj/") == "proj"
+    assert events.session_label("webchat", "/opt/user/proj/") == "proj"
 
 
 @pytest.mark.asyncio

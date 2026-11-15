@@ -194,13 +194,17 @@ async def _download_from(
         partial.unlink(missing_ok=True)
 
 
+def _noop_progress(done: int, total: int) -> None:
+    return None
+
+
 async def download_asset(
     asset: SenseVoiceAsset,
     model_dir: Path,
     *,
     origins: Sequence[str] = DEFAULT_ORIGINS,
     client: httpx.AsyncClient | None = None,
-    progress: Callable[[int, int], None] = lambda done, total: None,
+    progress: Callable[[int, int], None] = _noop_progress,
     cancelled: Callable[[], bool] = lambda: False,
 ) -> Path:
     """Ensure one pinned asset exists under ``model_dir``, reusing a good cache."""
@@ -238,18 +242,23 @@ async def prepare_sensevoice_model(
     model_dir: Path,
     *,
     origins: Sequence[str] = DEFAULT_ORIGINS,
-    progress: Callable[[str, int, int], None] = lambda resource, done, total: None,
+    progress: Callable[[str, int, int], None] | None = None,
     cancelled: Callable[[], bool] = lambda: False,
 ) -> Path:
     """Download every missing asset and return the verified model directory."""
+    report = progress or (lambda resource, done, total: None)
     async with httpx.AsyncClient(trust_env=False) as client:
         for asset in ASSETS:
+
+            def _report(done: int, total: int, name: str = asset.name) -> None:
+                report(name, done, total)
+
             await download_asset(
                 asset,
                 model_dir,
                 origins=origins,
                 client=client,
-                progress=lambda done, total, name=asset.name: progress(name, done, total),
+                progress=_report,
                 cancelled=cancelled,
             )
     if not model_ready(model_dir):

@@ -153,7 +153,7 @@ def resolve_voice(config: GatewayConfig, preset_name: str = "") -> ResolvedVoice
                 if value is not None:
                     merged[field] = value
             if getattr(preset, "speed", None) is not None:
-                merged["speed"] = float(preset.speed)
+                merged["speed"] = float(preset.speed)  # type: ignore[arg-type]
             merged["provider"] = str(getattr(preset, "provider", "") or "elevenlabs")
     if not str(merged.get("voice_id") or "").strip():
         raise VoicePresetError(

@@ -596,7 +596,7 @@ default_mode = "bypass"                 # off | on | bypass | full
 # microphone testing without spending ElevenLabs credits.
 # Install the extra first: uv sync --extra voice
 # model_dir must contain model.int8.onnx (or model.onnx) and tokens.txt,
-# e.g. a SenseVoice sherpa-onnx bundle: D:\models\sensevoice
+# e.g. a SenseVoice sherpa-onnx bundle under a local models directory
 # Browser recordings are audio/webm and need ffmpeg on PATH.
 # model_dir = ""
 # language = ""                  # empty follows [audio.stt].language; else auto|zh|en|ja|ko|yue

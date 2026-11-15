@@ -111,6 +111,9 @@ def _stringify_content(content: object) -> str:
 
 
 class _OpenAISttBase:
+    # Every concrete provider overrides this; the base needs the declaration so
+    # shared error messages can name the `[audio.stt.<provider>]` section.
+    provider_id: str = ""
     accepts_request_model = False
 
     def __init__(
@@ -159,7 +162,7 @@ class _OpenAISttBase:
             transport=self._transport,
             trust_env=_trust_env(),
         ) as client:
-            response = await accounted_request(
+            response: httpx.Response = await accounted_request(
                 client,
                 "POST",
                 url,

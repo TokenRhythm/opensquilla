@@ -100,7 +100,7 @@ class SenseVoiceSttProvider:
     @staticmethod
     def _import_sherpa():
         try:
-            import sherpa_onnx
+            import sherpa_onnx  # type: ignore[import-untyped]
         except ImportError as exc:
             raise SttProviderError(
                 "local speech-to-text requires the sherpa-onnx package"
@@ -276,8 +276,10 @@ class SenseVoiceSttProvider:
             stream.accept_waveform(_TARGET_SAMPLE_RATE, samples)
             recognizer.decode_stream(stream)
             text = str(getattr(stream.result, "text", "") or "").strip()
-            lang = str(getattr(stream.result, "lang", "") or "")
-            lang = lang.strip("<|").split("|>")[0] if lang else None
+            raw_lang = str(getattr(stream.result, "lang", "") or "")
+            lang: str | None = (
+                raw_lang.strip("<|").split("|>")[0] if raw_lang else None
+            )
             return text, (lang if lang and lang != "auto" else None)
 
         text, detected = await asyncio.to_thread(_run)

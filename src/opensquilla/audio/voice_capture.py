@@ -166,10 +166,14 @@ class MicrophoneRecorder:
         await asyncio.sleep(0.15)
         if self._proc.returncode is not None:
             detail = ""
-            try:
-                detail = (await self._proc.stderr.read()).decode("utf-8", "replace").strip()[:300]
-            except (OSError, ValueError):
-                pass
+            stderr = self._proc.stderr
+            if stderr is not None:
+                try:
+                    detail = (
+                        (await stderr.read()).decode("utf-8", "replace").strip()[:300]
+                    )
+                except (OSError, ValueError):
+                    pass
             self._cleanup_file()
             self._proc = None
             self._path = None
@@ -187,11 +191,13 @@ class MicrophoneRecorder:
         try:
             if proc.returncode is None:
                 # 'q' asks ffmpeg to stop cleanly and write the WAV trailer.
-                try:
-                    proc.stdin.write(b"q")
-                    await proc.stdin.drain()
-                except (BrokenPipeError, ConnectionResetError, OSError):
-                    pass
+                stdin = proc.stdin
+                if stdin is not None:
+                    try:
+                        stdin.write(b"q")
+                        await stdin.drain()
+                    except (BrokenPipeError, ConnectionResetError, OSError):
+                        pass
                 try:
                     await asyncio.wait_for(proc.wait(), timeout=5.0)
                 except TimeoutError:

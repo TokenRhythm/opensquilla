@@ -3293,6 +3293,8 @@ async def tts(
         # explicit call-site voice parameter still overrides it.
         from opensquilla.audio.voice_presets import VoicePresetError, resolve_voice
 
+        if tts_config is None:
+            raise ToolError("text-to-speech is not configured")
         try:
             resolved_preset = resolve_voice(config, str(tts_config.preset).strip())
         except VoicePresetError as exc:

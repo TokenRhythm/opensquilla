@@ -120,7 +120,10 @@ async def _elevenlabs_speech(
     if preset_name:
         try:
             # resolve_voice expects the full config surface (config.audio.*).
-            resolved_preset = resolve_voice(SimpleNamespace(audio=audio_config), preset_name)
+            resolved_preset = resolve_voice(
+                SimpleNamespace(audio=audio_config),  # type: ignore[arg-type]
+                preset_name,
+            )
         except VoicePresetError as exc:
             return JSONResponse({"error": str(exc)}, status_code=400)
     model_id = model or (resolved_preset.model_id if resolved_preset else "") or str(

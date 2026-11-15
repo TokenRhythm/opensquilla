@@ -157,6 +157,7 @@ class PetReminderService:
     async def _handle_event(
         self, session_key: str, event_name: str, payload: dict[str, Any]
     ) -> None:
+        kind: str | None
         if event_name == events.TOOL_RESULT_EVENT:
             # A pending clarify/choice card → speak a question prompt and raise
             # the window, deduped by the form's request id.
