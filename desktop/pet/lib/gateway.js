@@ -269,8 +269,10 @@ class GatewayClient extends EventEmitter {
     return this.call("chat.clarify_submit", { sessionKey, requestId, fields });
   }
 
-  sendToSession(key, text) {
-    const cmid = "pet-" + crypto.randomUUID().replace(/-/g, "");
+  sendToSession(key, text, clientMessageId) {
+    // 调用方可以对同一气泡里的同一段内容复用 id：重试因此是同一条消息，
+    // 而不是网关眼里的新的一轮。
+    const cmid = clientMessageId || "pet-" + crypto.randomUUID().replace(/-/g, "");
     return this.call("sessions.send", {
       key,
       message: text,

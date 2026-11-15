@@ -126,6 +126,10 @@ html, body {
 .btn.danger { background: #fff; border-color: #e6b3ad; color: #d23b2e; }
 .btn.danger:hover { background: #fdeceb; }
 .btn.mini, .mini { padding: 3px 8px; font-size: 11px; border: 1px solid var(--line); background: #fff; border-radius: 7px; cursor: pointer; color: var(--orange); }
+.btn:disabled, .b-opt:disabled { opacity: .55; cursor: default; }
+.btn.primary:disabled { filter: none; }
+.btn.done { background: #eaf7ec; border-color: #8bc34a; color: #2e7d32; }
+.b-opt.chosen { border-color: var(--orange); background: var(--orange-soft); font-weight: 600; }
 .b-field { margin: 6px 0; }
 .b-field label { display: block; font-size: 12px; margin-bottom: 3px; color: #7a5a3a; }
 .b-input, .b-select, .b-textarea { width: 100%; border: 1px solid var(--line); border-radius: 8px; padding: 6px 8px; font-size: 12px; font-family: inherit; background: #fffdf9; }

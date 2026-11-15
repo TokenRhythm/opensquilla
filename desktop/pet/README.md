@@ -9,6 +9,9 @@ OpenSquilla 自己的桌面小伙伴 **蛋仔（Eggy）**：一只引用默认�
 - **权限确认气泡**：`approval_required` → 显示工具 / 命令 / 风险，一键 **允许 / 拒绝**（直接调网关 `exec.approval.resolve`）。
 - **方案选择 / 澄清气泡**：`plan_presentation` 与交互式 `user_input` 选择卡 → 渲染选项 / 表单，提交走 `chat.clarify_submit`。
 - **直接回复会话**：单击蛋仔弹出回复框，选会话、输入内容，走网关 `sessions.send`（离线时回退到 companion 派发队列）。
+  发送时按钮立即置忙并显示「发送中…／已发送（或已排队）」，同一气泡只允许一次在途发送——网关偏慢时反复点击
+  不会重复发送（网关会把每次新输入当成 steer，重复发送会打断进行中的回合）；失败会显示错误并可重试，
+  同一气泡里重试同一段内容复用同一个 `client_message_id`，对网关是同一条消息。
 - **音色 / 模型拉取**：设置里填 TTS Base URL / API Key，一键拉取 `/models` 与音色列表，试听。
 
 ## 运行
@@ -92,7 +95,12 @@ desktop/pet/
 ## 验证
 
 ```bat
+:: 网关协议只读探针
 node desktop\pet\scripts\probe-gateway.mjs
+
+:: 发送反馈冒烟（隐藏窗口，不需要网关）：连点三次只发一次 / 忙碌与完成态 / 完成态后收起 /
+:: 失败可重试 / 重试复用同一个 client_message_id
+desktop\electron\node_modules\electron\dist\electron.exe desktop\pet\scripts\smoke-send-feedback.cjs
 ```
 
-确认握手 / `sessions.list` / `exec.approvals.get` / 订阅成功。
+`probe-gateway.mjs` 确认握手 / `sessions.list` / `exec.approvals.get` / 订阅成功。

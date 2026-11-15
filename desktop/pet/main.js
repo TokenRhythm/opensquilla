@@ -596,48 +596,61 @@ function registerIpc() {
     }
   });
 
-  ipcMain.handle("reply:send", async (_e, { key, text, bubbleId }) => {
+  // 同一个气泡同时只允许一个在途动作。网关稍慢时重复点击会真的重复发送，
+  // 而后端把每次新输入都当成 steer：进行中的回合会被打断，用户看到的就是
+  // 「点了没反应、再点一次」，最后收到多份重复消息。
+  const inflightBubbleActions = new Set();
+  const withBubbleAction = async (bubbleId, action) => {
+    const slot = String(bubbleId || "");
+    if (slot && inflightBubbleActions.has(slot)) return { error: "正在发送中，请稍候…" };
+    if (slot) inflightBubbleActions.add(slot);
+    try {
+      return await action();
+    } finally {
+      if (slot) inflightBubbleActions.delete(slot);
+    }
+  };
+
+  ipcMain.handle("reply:send", async (_e, { key, text, bubbleId, clientMessageId }) => withBubbleAction(bubbleId, async () => {
     const target = key || lastActiveSession;
     if (!target) return { error: "没有可回复的会话" };
     if (!String(text || "").trim()) return { error: "内容为空" };
     try {
       if (gateway.connected) {
-        await gateway.sendToSession(target, String(text));
+        await gateway.sendToSession(target, String(text), clientMessageId);
       } else {
         dispatch.enqueue({ session_id: target, text: String(text), exe: cfg().companion.exe });
       }
-      if (bubbleId) dismissBubble(bubbleId);
+      // 气泡由渲染进程展示完「已发送」后自己收起，这里不再抢着关。
       setMood("happy");
       setTimeout(() => setMood("idle"), 1500);
       return { ok: true, queued: !gateway.connected };
     } catch (err) {
       return { error: String(err.message || err) };
     }
-  });
+  }));
 
-  ipcMain.handle("approval:resolve", async (_e, { id, approved, namespace, choice, bubbleId }) => {
+  ipcMain.handle("approval:resolve", async (_e, { id, approved, namespace, choice, bubbleId }) => withBubbleAction(bubbleId, async () => {
     try {
       await gateway.resolveApproval({ id, approved, namespace, choice });
-      if (bubbleId) dismissBubble(bubbleId);
       setMood(approved ? "happy" : "idle");
       setTimeout(() => setMood("idle"), 1500);
       return { ok: true };
     } catch (err) {
       return { error: String(err.message || err) };
     }
-  });
+  }));
 
-  ipcMain.handle("clarify:submit", async (_e, { sessionKey, requestId, fields, bubbleId }) => {
+  ipcMain.handle("clarify:submit", async (_e, { sessionKey, requestId, fields, bubbleId }) => withBubbleAction(bubbleId, async () => {
     try {
       await gateway.submitClarify({ sessionKey, requestId, fields });
-      if (bubbleId) dismissBubble(bubbleId);
       setMood("happy");
       setTimeout(() => setMood("idle"), 1500);
       return { ok: true };
     } catch (err) {
       return { error: String(err.message || err) };
     }
-  });
+  }));
 
   ipcMain.handle("bubble:dismiss", (_e, { id }) => { dismissBubble(id); return { ok: true }; });
   ipcMain.handle("pet:open-session", (_e, { key }) => {

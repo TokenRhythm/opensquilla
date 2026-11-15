@@ -43,6 +43,66 @@ function toast(text) {
   toastTimer = setTimeout(() => toastEl.classList.add("hidden"), 3500);
 }
 
+// ── 发送反馈 ──────────────────────────────────────────────────────
+// 同一个气泡只允许一个在途请求：按钮立即置忙并显示进度，成功或排队后留下
+// 完成态，再由调用方决定何时收起气泡。没有这层保护时，网关稍慢就会让人以为
+// 没发出去而反复点，同一句话会被发送多次（每次都会打断进行中的回合）。
+const inflightSends = new Set();
+const sendAttemptIds = new Map();
+
+// 同一气泡里的同一段内容复用同一个 id：重试对网关是同一条消息，而不是新的一轮。
+function sendAttemptId(bubbleId, text) {
+  const key = String(bubbleId || "") + "\u0000" + String(text || "");
+  let id = sendAttemptIds.get(key);
+  if (!id) {
+    id = "pet-" + (typeof crypto !== "undefined" && crypto.randomUUID
+      ? crypto.randomUUID()
+      : Date.now().toString(16) + Math.random().toString(16).slice(2));
+    sendAttemptIds.set(key, id);
+    if (sendAttemptIds.size > 50) sendAttemptIds.delete(sendAttemptIds.keys().next().value);
+  }
+  return id;
+}
+
+async function submitSend(channel, payload, options = {}) {
+  const { button, err, busyText = "发送中…", doneText = "已发送", onDone } = options;
+  const slot = String((payload && payload.bubbleId) || channel);
+  if (inflightSends.has(slot)) return false;
+  inflightSends.add(slot);
+  const original = button ? button.textContent : "";
+  if (button) { button.disabled = true; button.textContent = busyText; }
+  if (err) err.textContent = "";
+  let result;
+  try {
+    result = await api.invoke(channel, payload);
+  } catch (error) {
+    result = { error: String((error && error.message) || error) };
+  } finally {
+    inflightSends.delete(slot);
+  }
+  if (!result || result.error) {
+    if (button) { button.disabled = false; button.textContent = original; }
+    const message = (result && result.error) || "发送失败";
+    if (err) err.textContent = message;
+    toast("发送失败：" + message);
+    return false;
+  }
+  if (button) { button.textContent = doneText; button.classList.add("done"); }
+  toast(result.queued ? "网关离线，已加入派发队列" : "已发送");
+  if (typeof onDone === "function") onDone(result);
+  return true;
+}
+
+// 完成态停留一下再收起，让「已发送」真的被看见。本地先收（主进程只为它自己
+// 创建过的气泡转发关闭事件），再顺手同步主进程的气泡表。
+function dismissAfterFeedback(bubbleId, delay = 1100) {
+  if (!bubbleId) return;
+  setTimeout(() => {
+    closeBubble(bubbleId);
+    api.invoke("bubble:dismiss", { id: bubbleId });
+  }, delay);
+}
+
 // ── 角色状态 ──────────────────────────────────────────────────────
 let moodTimer = null;
 function setMood(mood) {
@@ -117,13 +177,28 @@ function renderBubble(b) {
     if (b.warning) body.push(el("div", { class: "b-warn", text: "⚠ " + b.warning }));
     if (b.destructive) body.push(el("div", { class: "b-warn", text: "⚠ 该操作可能不可逆，请谨慎确认。" }));
     const err = el("div", { class: "b-err" });
-    const act = async (approved) => {
-      const r = await api.invoke("approval:resolve", { id: b.approval.id, approved, namespace: b.approval.namespace, bubbleId: b.id });
-      if (r && r.error) err.textContent = r.error;
+    const allowBtn = el("button", { class: "btn primary" }, "允许");
+    const denyBtn = el("button", { class: "btn danger" }, "拒绝");
+    const act = (approved, button) => {
+      submitSend("approval:resolve", {
+        id: b.approval.id, approved, namespace: b.approval.namespace, bubbleId: b.id,
+      }, {
+        button,
+        err,
+        busyText: approved ? "允许中…" : "拒绝中…",
+        doneText: approved ? "已允许" : "已拒绝",
+        onDone: () => {
+          allowBtn.disabled = true;
+          denyBtn.disabled = true;
+          dismissAfterFeedback(b.id, 900);
+        },
+      });
     };
+    allowBtn.addEventListener("click", () => act(true, allowBtn));
+    denyBtn.addEventListener("click", () => act(false, denyBtn));
     body.push(el("div", { class: "b-actions" }, [
-      el("button", { class: "btn primary", onclick: () => act(true) }, "允许"),
-      el("button", { class: "btn danger", onclick: () => act(false) }, "拒绝"),
+      allowBtn,
+      denyBtn,
       el("button", { class: "btn", onclick: () => api.invoke("pet:open-session", { key: b.sessionKey }) }, "去会话"),
     ]));
     body.push(err);
@@ -208,16 +283,22 @@ function renderBubble(b) {
       body.push(el("div", { class: "b-field" }, [el("label", { text: label + (f.required ? " *" : "") }), input]));
     }
     const err = el("div", { class: "b-err" });
+    const submitBtn = el("button", { class: "btn primary" }, "提交");
+    submitBtn.addEventListener("click", () => {
+      const fields = {};
+      for (const [k, get] of Object.entries(inputs)) fields[k] = get();
+      submitSend("clarify:submit", {
+        sessionKey: b.sessionKey, requestId: b.requestId, fields, bubbleId: b.id,
+      }, {
+        button: submitBtn,
+        err,
+        busyText: "提交中…",
+        doneText: "已提交",
+        onDone: () => dismissAfterFeedback(b.id, 900),
+      });
+    });
     body.push(el("div", { class: "b-actions" }, [
-      el("button", {
-        class: "btn primary",
-        onclick: async () => {
-          const fields = {};
-          for (const [k, get] of Object.entries(inputs)) fields[k] = get();
-          const r = await api.invoke("clarify:submit", { sessionKey: b.sessionKey, requestId: b.requestId, fields, bubbleId: b.id });
-          if (r && r.error) err.textContent = r.error;
-        },
-      }, "提交"),
+      submitBtn,
       el("button", { class: "btn", onclick: () => api.invoke("pet:open-session", { key: b.sessionKey }) }, "去会话"),
     ]));
     body.push(err);
@@ -225,31 +306,55 @@ function renderBubble(b) {
   } else if (b.kind === "plan") {
     if (b.message) body.push(el("div", { class: "b-msg", text: b.message }));
     const err = el("div", { class: "b-err" });
+    let lockOptions = () => {};
     if (Array.isArray(b.options) && b.options.length) {
       const opts = el("div", { class: "b-opts" });
+      lockOptions = () => {
+        for (const node of opts.querySelectorAll("button")) node.disabled = true;
+      };
       for (const o of b.options) {
         const val = typeof o === "string" ? o : (o.value ?? o.label ?? o.title);
         const lab = typeof o === "string" ? o : (o.label ?? o.title ?? String(val));
-        opts.appendChild(el("button", {
-          class: "b-opt",
-          onclick: async () => {
-            const r = await api.invoke("reply:send", { key: b.sessionKey, text: String(val), bubbleId: b.id });
-            if (r && r.error) err.textContent = r.error;
-          },
-        }, String(lab)));
+        const optionBtn = el("button", { class: "b-opt" }, String(lab));
+        optionBtn.addEventListener("click", () => {
+          const text = String(val);
+          submitSend("reply:send", {
+            key: b.sessionKey, text, bubbleId: b.id, clientMessageId: sendAttemptId(b.id, text),
+          }, {
+            button: optionBtn,
+            err,
+            busyText: "发送中…",
+            doneText: String(lab) + " ✓",
+            onDone: () => {
+              optionBtn.classList.add("chosen");
+              lockOptions();
+              dismissAfterFeedback(b.id);
+            },
+          });
+        });
+        opts.appendChild(optionBtn);
       }
       body.push(opts);
     }
     const ta = el("textarea", { class: "b-textarea", placeholder: "自己输入其他回复…" });
     body.push(el("div", { class: "b-field" }, [ta]));
-    body.push(el("div", { class: "b-actions" }, [
-      el("button", {
-        class: "btn primary",
-        onclick: async () => {
-          const r = await api.invoke("reply:send", { key: b.sessionKey, text: ta.value, bubbleId: b.id });
-          if (r && r.error) err.textContent = r.error;
+    const planSendBtn = el("button", { class: "btn primary" }, "发送");
+    planSendBtn.addEventListener("click", () => {
+      const text = String(ta.value || "");
+      submitSend("reply:send", {
+        key: b.sessionKey, text, bubbleId: b.id, clientMessageId: sendAttemptId(b.id, text),
+      }, {
+        button: planSendBtn,
+        err,
+        onDone: () => {
+          ta.disabled = true;
+          lockOptions();
+          dismissAfterFeedback(b.id);
         },
-      }, "发送"),
+      });
+    });
+    body.push(el("div", { class: "b-actions" }, [
+      planSendBtn,
       el("button", { class: "btn", onclick: () => api.invoke("pet:open-session", { key: b.sessionKey }) }, "去会话"),
     ]));
     body.push(err);
@@ -258,17 +363,34 @@ function renderBubble(b) {
     const sel = sessionSelect(b.sessionKey || lastActiveKey);
     const ta = el("textarea", { class: "b-textarea", placeholder: "输入要发送到会话的内容…", rows: 3 });
     const err = el("div", { class: "b-err" });
-    const send = async () => {
-      const r = await api.invoke("reply:send", { key: sel.value, text: ta.value, bubbleId: b.id });
-      if (r && r.error) err.textContent = r.error;
-      else if (r && r.queued) toast("已加入派发队列（网关离线）");
+    const sendBtn = el("button", { class: "btn primary" }, "发送 (Ctrl+Enter)");
+    const send = () => {
+      const text = String(ta.value || "");
+      if (!text.trim()) {
+        err.textContent = "内容为空";
+        ta.focus();
+        return;
+      }
+      submitSend("reply:send", {
+        key: sel.value,
+        text,
+        bubbleId: b.id,
+        clientMessageId: sendAttemptId(b.id, text),
+      }, {
+        button: sendBtn,
+        err,
+        onDone: () => {
+          ta.disabled = true;
+          sel.disabled = true;
+          dismissAfterFeedback(b.id);
+        },
+      });
     };
-    ta.addEventListener("keydown", (e) => { if (e.key === "Enter" && (e.ctrlKey || e.metaKey)) send(); });
+    sendBtn.addEventListener("click", send);
+    ta.addEventListener("keydown", (e) => { if (e.key === "Enter" && (e.ctrlKey || e.metaKey)) { e.preventDefault(); send(); } });
     body.push(el("div", { class: "b-field" }, [el("label", { text: "目标会话" }), sel]));
     body.push(el("div", { class: "b-field" }, [ta]));
-    body.push(el("div", { class: "b-actions" }, [
-      el("button", { class: "btn primary", onclick: send }, "发送 (Ctrl+Enter)"),
-    ]));
+    body.push(el("div", { class: "b-actions" }, [sendBtn]));
     body.push(err);
     node = bubbleShell(b, body);
     setTimeout(() => ta.focus(), 50);
