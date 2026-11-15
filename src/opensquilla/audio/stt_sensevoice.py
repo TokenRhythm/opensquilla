@@ -100,7 +100,10 @@ class SenseVoiceSttProvider:
     @staticmethod
     def _import_sherpa():
         try:
-            import sherpa_onnx  # type: ignore[import-untyped]
+            # Optional extra: absent in CI's core environment (import-not-found)
+            # and shipped without a py.typed marker when installed
+            # (import-untyped), so both codes are silenced here.
+            import sherpa_onnx  # type: ignore[import-not-found,import-untyped]
         except ImportError as exc:
             raise SttProviderError(
                 "local speech-to-text requires the sherpa-onnx package"
