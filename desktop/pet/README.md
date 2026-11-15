@@ -39,7 +39,9 @@ OpenSquilla 桌面 app（[desktop/electron](../electron)）内置了蛋仔开关
 - 桌面 app 启动时若已启用，会自动把蛋仔作为子进程拉起，并通过 `EGGY_GATEWAY_URL`
   传入桌面 app 自己的网关地址，保证两者共用同一网关/会话；桌面 app 退出时自动带走蛋仔。
 - 实现见 [desktop/electron/src/desktop-pet.ts](../electron/src/desktop-pet.ts)（自包含：独立偏好文件 + 子进程生命周期），
-  在 `main.ts` 的托盘菜单 / `whenReady` / `will-quit` 三处挂钩。打包版若未 bundled 蛋仔目录则该开关自动置灰。
+  在 `main.ts` 的托盘菜单 / `whenReady` / `will-quit` 三处挂钩。打包版已内置蛋仔：安装目录下的
+  `desktop\pet\`（electron-builder `extraFiles`，随包发布时排除 `dev/` 截图）与 `assets\opensquilla-mark.png` logo，
+  开关默认可用；目录缺失（例如被裁剪过的开发检出）时该开关自动置灰。
 
 ## 与网关的关系
 

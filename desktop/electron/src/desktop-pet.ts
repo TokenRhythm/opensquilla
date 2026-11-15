@@ -3,8 +3,11 @@
 // The pet lives in `desktop/pet` as a standalone zero-dependency Electron app.
 // This module lets the Desktop shell start/stop it as a child process, exposes a
 // tray toggle, and persists the user's choice in its own preference file so the
-// main preferences schema is untouched. When the pet directory is absent (e.g.
-// packaged builds that do not bundle it) the feature gracefully no-ops.
+// main preferences schema is untouched. Packaged builds ship the same relative
+// layout (electron-builder `extraFiles` puts the pet at `<app root>/desktop/pet`
+// and its logo at `<app root>/assets/opensquilla-mark.png`), so one lookup
+// serves both a checkout and an installation. When the directory is absent the
+// feature gracefully no-ops.
 import { app } from 'electron'
 import { spawn, type ChildProcess } from 'node:child_process'
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs'
