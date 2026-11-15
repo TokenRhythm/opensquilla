@@ -164,11 +164,40 @@ async function listVoices(cfg) {
   return { voices: OPENAI_PRESET_VOICES, source: "preset" };
 }
 
-// 统一入口。windows 直接出声；openai 返回音频由渲染进程播放。
-async function speak(text, cfg) {
+// 复用桌面 app 的语音配置：网关 /api/audio/speech 服务端合成（URL/Key/音色都在网关侧）。
+async function speakGateway(text, { gatewayBase, voice, model } = {}) {
+  const base = String(gatewayBase || "").trim().replace(/\/+$/, "");
+  if (!base) throw new Error("未连接网关，无法复用桌面语音");
+  const payload = { text };
+  if (voice) payload.voice = voice;
+  if (model) payload.model = model;
+  const res = await fetchWithTimeout(
+    base + "/api/audio/speech",
+    { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(payload) },
+    60000
+  );
+  if (!res.ok) {
+    const detail = await res.text().catch(() => "");
+    throw new Error("gateway speech HTTP " + res.status + ": " + detail.slice(0, 160));
+  }
+  const buf = Buffer.from(await res.arrayBuffer());
+  const mime = res.headers.get("content-type") || "audio/mpeg";
+  return { provider: "gateway", audio: { mime, base64: buf.toString("base64") } };
+}
+
+// 统一入口。gateway=复用桌面配置（失败回退本地）；windows 直接出声；openai 返回音频由渲染进程播放。
+async function speak(text, cfg, gatewayBase) {
   const clean = String(text || "").trim();
   if (!clean) return { skipped: true };
   if (cfg.enabled === false) return { skipped: true, reason: "disabled" };
+  if (cfg.provider === "gateway") {
+    try {
+      return await speakGateway(clean, { gatewayBase, voice: cfg.voice, model: cfg.model });
+    } catch {
+      // 网关语音不可用（未配置/离线）时回退本地 SAPI，保证蛋仔仍能出声。
+      return speakWindows(clean, cfg);
+    }
+  }
   if (cfg.provider === "openai") return speakOpenAI(clean, cfg);
   return speakWindows(clean, cfg);
 }
@@ -177,6 +206,7 @@ module.exports = {
   speak,
   speakWindows,
   speakOpenAI,
+  speakGateway,
   listWindowsVoices,
   listModels,
   listVoices,

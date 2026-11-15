@@ -245,7 +245,15 @@ def register_audio_transcription_routes(
                     },
                     status_code=401,
                 )
-        engine = str(request.query_params.get("engine") or "").strip()
+        draft: dict = {}
+        if request.method == "POST":
+            try:
+                parsed = await request.json()
+            except Exception:
+                parsed = {}
+            if isinstance(parsed, dict):
+                draft = parsed
+        engine = str(draft.get("engine") or request.query_params.get("engine") or "").strip()
         if engine not in ("openai_transcriptions", "openai_chat"):
             return JSONResponse(
                 {
@@ -261,14 +269,20 @@ def register_audio_transcription_routes(
 
         from opensquilla.audio.stt_registry import resolve_stt_api_key_env
 
-        api_key = str(getattr(section, "api_key", "") or "").strip()
+        # Draft credentials (typed in the setup form, not yet saved) win so the
+        # operator can fetch models before pressing Save; otherwise fall back to
+        # the stored section. Sent via POST body to keep keys out of URLs/logs.
+        api_key = str(draft.get("api_key") or "").strip() or str(
+            getattr(section, "api_key", "") or ""
+        ).strip()
         if not api_key:
             env_name = resolve_stt_api_key_env(section)
             api_key = str(os.environ.get(env_name, "") or "").strip() if env_name else ""
         if not api_key:
             return JSONResponse({"ok": False, "models": [], "failureKind": "missing_key"})
         base_url = (
-            str(getattr(section, "base_url", "") or "").strip()
+            str(draft.get("base_url") or "").strip()
+            or str(getattr(section, "base_url", "") or "").strip()
             or "https://api.openai.com/v1"
         )
         from opensquilla.onboarding.probe import discover_selectable_provider_models
@@ -302,7 +316,7 @@ def register_audio_transcription_routes(
             }
         )
 
-    app.router.routes.append(Route("/api/audio/stt/models", stt_models_handler, methods=["GET"]))
+    app.router.routes.append(Route("/api/audio/stt/models", stt_models_handler, methods=["GET", "POST"]))
 
     # --- Local SenseVoice model preparation (pinned download, DSH-style) ---
     import asyncio

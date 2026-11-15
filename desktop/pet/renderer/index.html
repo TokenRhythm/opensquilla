@@ -105,10 +105,12 @@
         <div class="set-sec">语音</div>
         <label>引擎
           <select id="tts-provider">
+            <option value="gateway">复用桌面语音配置（网关）</option>
             <option value="windows">Windows 本地（免 KEY）</option>
             <option value="openai">OpenAI 兼容云端</option>
           </select>
         </label>
+        <div id="tts-gateway" class="hint">复用桌面 app「语音」设置里的提供商 / URL / Key / 音色，无需重复填写；网关语音不可用时自动回退本地语音。</div>
         <div id="tts-windows">
           <label>音色
             <span class="row">

@@ -12,6 +12,7 @@ import { HttpTransportError } from './privateHttpTransport'
 type AudioRequestOptions =
   | { method?: 'GET'; signal?: AbortSignal; timeoutMs?: number }
   | { method: 'POST'; form: FormData; signal?: AbortSignal; timeoutMs?: number }
+  | { method: 'POST'; json: unknown; signal?: AbortSignal; timeoutMs?: number }
   | { method: 'POST' | 'DELETE'; signal?: AbortSignal; timeoutMs?: number }
 
 interface AudioHttpTransport {
@@ -81,9 +82,12 @@ export function createV4AudioTranscription(http: AudioHttpTransport): AudioTrans
       }
     },
     async discoverModels(input): Promise<SttModelDiscovery> {
+      const body: Record<string, string> = { engine: input.engine }
+      if (input.baseUrl && input.baseUrl.trim()) body.base_url = input.baseUrl.trim()
+      if (input.apiKey && input.apiKey.trim()) body.api_key = input.apiKey.trim()
       const raw = await http.requestJson<unknown>(
-        `/api/audio/stt/models?engine=${encodeURIComponent(input.engine)}`,
-        { method: 'GET', signal: input.signal, timeoutMs: 20_000 },
+        '/api/audio/stt/models',
+        { method: 'POST', json: body, signal: input.signal, timeoutMs: 20_000 },
       )
       if (!raw || typeof raw !== 'object' || Array.isArray(raw)) {
         return { ok: false, models: [], failureKind: 'invalid_response' }

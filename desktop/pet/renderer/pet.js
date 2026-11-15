@@ -328,6 +328,7 @@ function toggleProvider() {
   const p = $("#tts-provider").value;
   $("#tts-windows").classList.toggle("hidden", p !== "windows");
   $("#tts-openai").classList.toggle("hidden", p !== "openai");
+  $("#tts-gateway").classList.toggle("hidden", p !== "gateway");
 }
 
 async function loadWindowsVoices(selected) {

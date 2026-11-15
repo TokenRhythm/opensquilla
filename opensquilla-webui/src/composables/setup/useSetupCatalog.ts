@@ -1750,7 +1750,11 @@ async function fetchSttCloudModels(): Promise<void> {
   sttCloudModelsStatus.value = 'loading'
   sttCloudModels.value = []
   try {
-    const result = await discover({ engine })
+    const result = await discover({
+      engine,
+      baseUrl: promotedForm.sttCloudBaseUrl.value,
+      apiKey: promotedForm.sttCloudApiKey.value,
+    })
     if (request !== sttModelsRequest) return
     if (result.ok) {
       sttCloudModels.value = filterAsrModels(result.models)

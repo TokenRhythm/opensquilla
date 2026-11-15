@@ -46,6 +46,9 @@ export interface AudioTranscription {
   /** List models served by a configured OpenAI-compatible STT endpoint. */
   discoverModels?(input: {
     engine: SttCloudEngine
+    /** Draft endpoint/key from the form (used before Save); omitted = stored. */
+    baseUrl?: string
+    apiKey?: string
     signal?: AbortSignal
   }): Promise<SttModelDiscovery>
   /** Start (or join) the pinned local SenseVoice model download. */

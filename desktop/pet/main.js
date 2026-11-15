@@ -106,7 +106,7 @@ async function processSpeakQueue() {
   speaking = true;
   setMood("talk", { talking: true });
   try {
-    const result = await tts.speak(text, cfg().tts);
+    const result = await tts.speak(text, cfg().tts, gateway ? gateway.httpBase : "");
     if (result && result.audio) {
       send("tts:play", { ...result.audio, volume: cfg().tts.volume });
       await waitForAudioEnd(30000);
@@ -649,7 +649,7 @@ function registerIpc() {
 
   ipcMain.handle("tts:test", async (_e, { text } = {}) => {
     try {
-      const result = await tts.speak(text || "你好，我是蛋仔。", cfg().tts);
+      const result = await tts.speak(text || "你好，我是蛋仔。", cfg().tts, gateway ? gateway.httpBase : "");
       if (result && result.audio) send("tts:play", { ...result.audio, volume: cfg().tts.volume });
       return { ok: true, provider: result.provider || (result.skipped ? "skipped" : "windows") };
     } catch (err) {

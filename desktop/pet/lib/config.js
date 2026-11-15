@@ -14,7 +14,7 @@ const DEFAULTS = {
     exe: "OpenSquilla.exe",
   },
   tts: {
-    provider: "windows", // windows | openai
+    provider: "gateway", // gateway(复用桌面配置) | windows | openai
     baseUrl: "", // OpenAI 兼容 base，例如 https://api.openai.com/v1
     apiKey: "",
     model: "", // 例如 tts-1 / gpt-4o-mini-tts
