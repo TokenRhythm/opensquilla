@@ -42,7 +42,9 @@ def _openai_audio_endpoint(config: Any) -> tuple[str, str] | None:
         base_url = str(getattr(provider, "base_url", "") or "").strip()
         api_key = str(getattr(provider, "api_key", "") or "").strip()
         if not api_key:
-            api_key = str(os.environ.get(str(getattr(provider, "api_key_env", "") or ""), "")).strip()
+            api_key = str(
+                os.environ.get(str(getattr(provider, "api_key_env", "") or ""), "")
+            ).strip()
         if base_url and api_key:
             return base_url.rstrip("/"), api_key
     return None
@@ -57,7 +59,10 @@ def register_audio_speech_routes(app: Any, *, config: GatewayConfig) -> None:
         if config.auth.mode == "token":
             if config.auth.token and not _authorization_token_matches(config, request):
                 return JSONResponse(
-                    {"error": "Authorization required for /api/audio/speech", "code": "UNAUTHORIZED"},
+                    {
+                        "error": "Authorization required for /api/audio/speech",
+                        "code": "UNAUTHORIZED",
+                    },
                     status_code=401,
                 )
         try:
@@ -165,7 +170,10 @@ async def _openai_speech(
                 json=payload,
             )
     except httpx.HTTPError as exc:
-        return JSONResponse({"error": f"speech request failed: {exc}", "code": "UNAVAILABLE"}, status_code=503)
+        return JSONResponse(
+            {"error": f"speech request failed: {exc}", "code": "UNAVAILABLE"},
+            status_code=503,
+        )
     if response.status_code != 200:
         return JSONResponse(
             {"error": f"speech provider HTTP {response.status_code}", "code": "UNAVAILABLE"},

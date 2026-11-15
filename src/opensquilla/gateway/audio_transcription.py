@@ -316,7 +316,9 @@ def register_audio_transcription_routes(
             }
         )
 
-    app.router.routes.append(Route("/api/audio/stt/models", stt_models_handler, methods=["GET", "POST"]))
+    app.router.routes.append(
+        Route("/api/audio/stt/models", stt_models_handler, methods=["GET", "POST"])
+    )
 
     # --- Local SenseVoice model preparation (pinned download, DSH-style) ---
     import asyncio
@@ -343,6 +345,7 @@ def register_audio_transcription_routes(
         prepare_cancel.clear()
 
         def report(resource: str, done: int, total: int) -> None:
+            nonlocal prepare_state
             prepare_state = {
                 "phase": "downloading",
                 "resource": resource,

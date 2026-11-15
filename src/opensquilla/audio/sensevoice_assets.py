@@ -16,9 +16,8 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import os
-import tempfile
 import uuid
-from collections.abc import Awaitable, Callable, Sequence
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -157,7 +156,9 @@ async def _download_from(
     partial = destination.with_name(f"{destination.name}.{uuid.uuid4().hex}.part")
     source = url
     try:
-        async with client.stream("GET", url, timeout=_DOWNLOAD_TIMEOUT_SECONDS, follow_redirects=True) as response:
+        async with client.stream(
+            "GET", url, timeout=_DOWNLOAD_TIMEOUT_SECONDS, follow_redirects=True
+        ) as response:
             source = str(response.url)
             if response.status_code >= 400:
                 raise SenseVoiceDownloadError(asset.name, source, "http", response.status_code)
