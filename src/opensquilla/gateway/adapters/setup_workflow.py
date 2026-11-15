@@ -126,7 +126,7 @@ def _setup_status(config: Any, *, is_owner: bool) -> SetupStatus:
             "audioSource": status.audio_source,
             "audioProvider": status.audio_provider,
             "audioEnvKey": status.audio_env_key,
-            "sttPresets": list_presets(config),
+            "voicePresets": list_presets(config),
             "searchConfigured": status.search_configured,
             "searchProvider": status.search_provider,
             "searchSource": status.search_source,

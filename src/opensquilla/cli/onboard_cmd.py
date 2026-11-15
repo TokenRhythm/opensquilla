@@ -11,6 +11,7 @@ import typer
 from pydantic import ValidationError
 from rich.table import Table
 
+from opensquilla.audio.voice_presets import list_presets
 from opensquilla.cli.output import print_json
 from opensquilla.cli.ui import (
     ACCENT,
@@ -798,6 +799,7 @@ def _status_payload(status: OnboardingStatus, *, config: GatewayConfig) -> dict:
         "audioSource": status.audio_source,
         "audioProvider": status.audio_provider,
         "audioEnvKey": status.audio_env_key,
+        "voicePresets": list_presets(config),
         "memoryEmbeddingConfigured": status.memory_embedding_configured,
         "memoryEmbeddingProvider": status.memory_embedding_provider,
         "memoryEmbeddingSource": status.memory_embedding_source,

@@ -183,7 +183,7 @@ def test_desktop_activation_and_second_instance_share_safe_reveal_helper() -> No
     assert "void openOrResumeDesktopApp()" in _section(
         main_ts,
         "void app.whenReady().then",
-        "})\n}",
+        "    })\n  }\n}",
     )
 
 
@@ -274,7 +274,7 @@ def test_desktop_window_close_has_a_visible_background_recovery_surface() -> Non
     )
     tray = _section(main_ts, "function createWindowsTray", "function hideMainWindow")
     hide = _section(main_ts, "function hideMainWindow", "function revealDesktopApp")
-    ready = _section(main_ts, "void app.whenReady().then", "})\n}")
+    ready = _section(main_ts, "void app.whenReady().then", "    })\n  }\n}")
 
     assert "window.on('close', (event) => handleMainWindowClose(window, event))" in main_ts
     session_end = _section(
@@ -2225,7 +2225,7 @@ def test_desktop_mock_update_is_dev_only_and_uses_native_update_surface() -> Non
         "function nativeAutoUpdateEnabled",
         "// macOS Squirrel",
     )
-    startup = _section(main_ts, "void app.whenReady().then", "})\n}")
+    startup = _section(main_ts, "void app.whenReady().then", "    })\n  }\n}")
 
     assert "const MOCK_UPDATE_VERSION_ENV = 'OPENSQUILLA_DESKTOP_MOCK_UPDATE_VERSION'" in main_ts
     assert "if (app.isPackaged) return null" in mock_version
@@ -2691,7 +2691,7 @@ def test_desktop_network_observability_disable_gates_native_update_and_gateway_e
         "function desktopUpdateManaged(): boolean",
         "function autoUpdateSupported",
     )
-    startup = _section(main_ts, "void app.whenReady().then", "})\n}")
+    startup = _section(main_ts, "void app.whenReady().then", "    })\n  }\n}")
     start = _section(
         main_ts,
         "async function startGateway",
@@ -2749,7 +2749,7 @@ def test_desktop_network_observability_disable_gates_native_update_and_gateway_e
 
 def test_desktop_native_update_scheduler_is_wired_to_startup_and_quit() -> None:
     main_ts = _read("desktop/electron/src/main.ts")
-    startup = _section(main_ts, "void app.whenReady().then", "})\n}")
+    startup = _section(main_ts, "void app.whenReady().then", "    })\n  }\n}")
     before_quit = _section(main_ts, "app.on('before-quit'", "function shutdownFromSignal")
 
     assert "const UPDATE_CHECK_INITIAL_DELAY_MS = 12_000" in main_ts

@@ -276,7 +276,7 @@ interface OnboardingStatus {
   audioEnabled?: boolean
   audioSource?: string
   audioEnvKey?: string
-  sttPresets?: unknown[]
+  voicePresets?: unknown[]
   capabilityConfiguration?: Partial<Record<CapabilityId, { resettable?: boolean }>>
   llmCredentialStatus?: {
     provider?: string
@@ -1675,7 +1675,7 @@ const audioProviders = computed(() => (catalog.value.audioProviders || [])
 // ElevenLabs credential and TTS fields; this flag drives its badge.
 const audioGenerationConfigured = computed(() => status.value.audioConfigured === true)
 const voicePresets = computed(() => {
-  const raw = status.value.sttPresets
+  const raw = status.value.voicePresets
   if (!Array.isArray(raw)) return []
   return raw.flatMap(item => (
     item && typeof item === 'object'
