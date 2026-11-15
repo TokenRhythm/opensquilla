@@ -2942,9 +2942,11 @@ const {
     ? input => injectedAudioTranscription.discoverModels!(input)
     : undefined,
 })
-watch(() => gatewayAccess.isAvailable, (available) => {
-  if (available) void loadVoiceEngine()
-}, { immediate: true })
+// The recognition-engine snapshot is read on demand (opening the composer's
+// voice menu, or an explicit refresh) rather than on connection availability.
+// Reconnect-driven reads would add a second config.get to the recovery path,
+// and that path is pinned to exactly one ordered config read.
+
 
 // Gate the composer mic button on real transcription readiness. onboarding.status
 // resolves whether audio is enabled AND an ElevenLabs key is present server-side
