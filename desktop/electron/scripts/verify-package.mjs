@@ -329,6 +329,9 @@ function verifyMainProcess(source, label) {
     'isCurrentWindowAtDesktopRenderer',
     'desktopGatewayConnectionSnapshot',
     'readinessCheck',
+    // A packaged Electron binary ignores a directory argument, so the bundled
+    // pet is reached through this switch rather than through argv.
+    'OPENSQUILLA_PET_APP',
   ]) {
     if (!source.includes(expected)) fail(`${label} main process is missing ${expected}`)
   }

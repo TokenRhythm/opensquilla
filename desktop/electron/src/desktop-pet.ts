@@ -11,7 +11,17 @@
 import { app } from 'electron'
 import { spawn, type ChildProcess } from 'node:child_process'
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs'
+import { createRequire } from 'node:module'
 import { dirname, join } from 'node:path'
+
+/**
+ * A packaged Electron binary ignores a directory argument (`process.defaultApp`
+ * is false), so re-running the shell executable on the pet directory boots the
+ * shell again: it forwards to the running instance and exits without ever
+ * showing the pet. The directory therefore travels in this environment
+ * variable and the re-run process boots the pet app instead of the shell.
+ */
+const PET_APP_ENV = 'OPENSQUILLA_PET_APP'
 
 type Logger = (event: string, detail?: Record<string, unknown>) => void
 
@@ -49,12 +59,34 @@ function resolvePetDir(repoRoot: string): string | null {
   return existsSync(join(candidate, 'main.js')) ? candidate : null
 }
 
+/**
+ * The pet directory this process must boot as the pet app, or null for an
+ * ordinary shell launch. `main.ts` consults this before any shell startup work.
+ */
+export function resolveBundledPetAppDir(): string | null {
+  const candidate = process.env[PET_APP_ENV]?.trim()
+  if (!candidate) return null
+  return existsSync(join(candidate, 'main.js')) ? candidate : null
+}
+
+/**
+ * Take this process over for the bundled pet: the pet keeps its own profile
+ * directory (never the shell's Chromium caches), and the switch is cleared so
+ * nothing the pet spawns inherits it.
+ */
+export function launchBundledPetApp(petAppDir: string): void {
+  delete process.env[PET_APP_ENV]
+  app.setPath('userData', join(app.getPath('appData'), 'opensquilla-pet'))
+  createRequire(import.meta.url)(join(petAppDir, 'main.js'))
+}
+
 function startPet(): void {
   if (petChild || !petDir) return
   const env: NodeJS.ProcessEnv = { ...process.env }
   // The shell may be launched from a harness that sets ELECTRON_RUN_AS_NODE;
   // the pet must run as a real Electron app, not plain Node.
   delete env.ELECTRON_RUN_AS_NODE
+  env[PET_APP_ENV] = petDir
   const wsUrl = getGatewayWsUrl()
   if (wsUrl) env.EGGY_GATEWAY_URL = wsUrl
   try {

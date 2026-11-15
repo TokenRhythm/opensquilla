@@ -38,6 +38,7 @@ import { configuredDesktopDataDirectory, inspectDesktopStartupMetadata } from '.
 import { DesktopWriterAdmission } from './desktop-writer-admission.js'
 import {
   initDesktopPet, toggleDesktopPet, isDesktopPetEnabled, isDesktopPetAvailable, stopDesktopPet,
+  resolveBundledPetAppDir, launchBundledPetApp,
 } from './desktop-pet.js'
 import {
   DESKTOP_QUIT_TERMINATION_MS,
@@ -17357,108 +17358,117 @@ app.on('open-url', (event, rawUrl) => {
   handleDeepLink(rawUrl, 'open-url')
 })
 
-desktopLog('launch', {
-  elapsedMs: Math.max(0, Date.now() - desktopProcessStartedAt),
-  platform: process.platform,
-  argv: process.argv.length,
-})
-const gotSingleInstanceLock = acquireSingleInstanceLockWithRetry()
-
-if (!gotSingleInstanceLock) {
-  // Another instance genuinely holds the lock past the retry window. Signal it
-  // to surface its window (the second-instance handler calls
-  // openOrResumeDesktopApp), show an explicit dialog so the launch is never a
-  // silent no-op, then quit.
-  desktopLog(existingDesktopActivationAccepted ? 'launch_forwarded_to_existing_instance' : 'launch_aborted_lock_held', {
-    deepLinkHandoff: initialDesktopDeepLinkArguments.length > 0,
-  })
-  if (initialDesktopDeepLinkArguments.length === 0 && !existingDesktopActivationAccepted) {
-    try {
-      // This runs before app.whenReady, so app.getLocale() is unreliable; fall back
-      // to the persisted onboarding locale (a plain file read) for this dialog.
-      desktopLocale = loadPersistedDesktopLocale() ?? desktopLocale
-      dialog.showErrorBox(
-        desktopT('launch.alreadyRunningTitle'),
-        desktopT('launch.alreadyRunningMessage'),
-      )
-    } catch {
-      // Dialog is best-effort; the diagnostic log is the durable record.
-    }
-  }
-  app.quit()
+// A packaged Electron binary ignores a directory argument, so a bundled pet
+// cannot be started by re-running this executable on the pet directory.
+// desktop-pet.ts passes that directory in OPENSQUILLA_PET_APP, and this
+// process then boots the pet app instead of the shell.
+const bundledPetAppDir = resolveBundledPetAppDir()
+if (bundledPetAppDir) {
+  launchBundledPetApp(bundledPetAppDir)
 } else {
-  process.on('uncaughtExceptionMonitor', (error) => {
-    desktopReliabilityTelemetry.recordCrash({
-      component: 'desktop_main',
-      errorCode: 'uncaught_exception',
-      reason: 'uncaught_exception',
-      signature: normalizedCrashFingerprintSignature(error),
-    })
+  desktopLog('launch', {
+    elapsedMs: Math.max(0, Date.now() - desktopProcessStartedAt),
+    platform: process.platform,
+    argv: process.argv.length,
   })
-  app.on('child-process-gone', (_event, details) => {
-    if (isQuitting || appExitPhase === 'committed' || details.reason === 'clean-exit') return
-    const childType = String(details.type || '').toLowerCase()
-    const component = childType === 'gpu'
-      ? 'gpu'
-      : childType === 'utility'
-        ? 'utility'
-        : 'unknown'
-    desktopReliabilityTelemetry.recordCrash({
-      component,
-      errorCode: 'child_process_crashed',
-      reason: normalizedCrashFingerprintReason(details.reason),
-    })
-  })
-  handleDeepLinksFromCommandLine(initialDesktopDeepLinkArguments, 'initial-argv')
+  const gotSingleInstanceLock = acquireSingleInstanceLockWithRetry()
 
-  app.once('will-quit', clearDesktopActivationAcknowledgements)
-  app.on('second-instance', (_event, commandLine, _workingDirectory, additionalData) => {
-    const hadDeepLink = handleDeepLinksFromCommandLine(commandLine, 'second-instance')
-    desktopLog('second_instance', { hadDeepLink })
-    if (hadDeepLink) return
-    revealDesktopApp()
-    if (!canRevealDesktopApp(appExitPhase) || isQuitting) return
-    const revealed = currentOnboardingWindow() ?? currentMainWindow()
-    if (revealed && !revealed.isDestroyed() && revealed.isVisible()
-      && !revealed.isMinimized() && revealed.isFocused()) {
-      acknowledgeDesktopActivation(app.getPath('userData'), additionalData)
-    }
-  })
-
-  void app.whenReady().then(async () => {
-    desktopStartupLog('app_ready')
-    // An OS wake is an observation, not permission to restart or reload.
-    const notifySystemResume = () => {
-      for (const window of BrowserWindow.getAllWindows()) {
-        if (!window.isDestroyed() && !window.webContents.isDestroyed()) {
-          window.webContents.send('desktop:system:resume', { source: 'desktop-resume' })
-        }
+  if (!gotSingleInstanceLock) {
+    // Another instance genuinely holds the lock past the retry window. Signal it
+    // to surface its window (the second-instance handler calls
+    // openOrResumeDesktopApp), show an explicit dialog so the launch is never a
+    // silent no-op, then quit.
+    desktopLog(existingDesktopActivationAccepted ? 'launch_forwarded_to_existing_instance' : 'launch_aborted_lock_held', {
+      deepLinkHandoff: initialDesktopDeepLinkArguments.length > 0,
+    })
+    if (initialDesktopDeepLinkArguments.length === 0 && !existingDesktopActivationAccepted) {
+      try {
+        // This runs before app.whenReady, so app.getLocale() is unreliable; fall back
+        // to the persisted onboarding locale (a plain file read) for this dialog.
+        desktopLocale = loadPersistedDesktopLocale() ?? desktopLocale
+        dialog.showErrorBox(
+          desktopT('launch.alreadyRunningTitle'),
+          desktopT('launch.alreadyRunningMessage'),
+        )
+      } catch {
+        // Dialog is best-effort; the diagnostic log is the durable record.
       }
     }
-    powerMonitor.on('resume', notifySystemResume)
-    app.once('will-quit', () => powerMonitor.removeListener('resume', notifySystemResume))
-    app.name = 'OpenSquilla'
-    installDesktopRendererProtocol()
-    desktopLocale = loadPersistedDesktopLocale() ?? resolveDesktopLocale()
-    createApplicationMenu()
-    createWindowsTray()
-    initDesktopPet({
-      repoRoot,
-      gatewayWsUrl: () => (gatewayState.url ? gatewayState.url.replace(/^http/i, 'ws') + '/ws' : ''),
-      onChange: () => rebuildWindowsTrayMenu(),
-      log: desktopLog,
+    app.quit()
+  } else {
+    process.on('uncaughtExceptionMonitor', (error) => {
+      desktopReliabilityTelemetry.recordCrash({
+        component: 'desktop_main',
+        errorCode: 'uncaught_exception',
+        reason: 'uncaught_exception',
+        signature: normalizedCrashFingerprintSignature(error),
+      })
     })
-    registerDesktopDeepLinkProtocolClient()
-    desktopDeepLinkActivationReady = true
-    powerMonitor.on('suspend', () => desktopReliabilityTelemetry.setForeground(false))
-    powerMonitor.on('resume', refreshDesktopReliabilityForegroundState)
-    if (!activatePendingDesktopDeepLink()) void openOrResumeDesktopApp()
-    initAutoUpdater()
-    if (mockUpdateVersion() !== null) {
-      desktopUpdateCheckScheduler.start(MOCK_UPDATE_CHECK_INITIAL_DELAY_MS)
-    } else if (desktopUpdateManaged()) {
-      // Delay the silent startup check so it doesn't compete with gateway boot.
-      desktopUpdateCheckScheduler.start(UPDATE_CHECK_INITIAL_DELAY_MS)
-    }
-  })
+    app.on('child-process-gone', (_event, details) => {
+      if (isQuitting || appExitPhase === 'committed' || details.reason === 'clean-exit') return
+      const childType = String(details.type || '').toLowerCase()
+      const component = childType === 'gpu'
+        ? 'gpu'
+        : childType === 'utility'
+          ? 'utility'
+          : 'unknown'
+      desktopReliabilityTelemetry.recordCrash({
+        component,
+        errorCode: 'child_process_crashed',
+        reason: normalizedCrashFingerprintReason(details.reason),
+      })
+    })
+    handleDeepLinksFromCommandLine(initialDesktopDeepLinkArguments, 'initial-argv')
+
+    app.once('will-quit', clearDesktopActivationAcknowledgements)
+    app.on('second-instance', (_event, commandLine, _workingDirectory, additionalData) => {
+      const hadDeepLink = handleDeepLinksFromCommandLine(commandLine, 'second-instance')
+      desktopLog('second_instance', { hadDeepLink })
+      if (hadDeepLink) return
+      revealDesktopApp()
+      if (!canRevealDesktopApp(appExitPhase) || isQuitting) return
+      const revealed = currentOnboardingWindow() ?? currentMainWindow()
+      if (revealed && !revealed.isDestroyed() && revealed.isVisible()
+        && !revealed.isMinimized() && revealed.isFocused()) {
+        acknowledgeDesktopActivation(app.getPath('userData'), additionalData)
+      }
+    })
+
+    void app.whenReady().then(async () => {
+      desktopStartupLog('app_ready')
+      // An OS wake is an observation, not permission to restart or reload.
+      const notifySystemResume = () => {
+        for (const window of BrowserWindow.getAllWindows()) {
+          if (!window.isDestroyed() && !window.webContents.isDestroyed()) {
+            window.webContents.send('desktop:system:resume', { source: 'desktop-resume' })
+          }
+        }
+      }
+      powerMonitor.on('resume', notifySystemResume)
+      app.once('will-quit', () => powerMonitor.removeListener('resume', notifySystemResume))
+      app.name = 'OpenSquilla'
+      installDesktopRendererProtocol()
+      desktopLocale = loadPersistedDesktopLocale() ?? resolveDesktopLocale()
+      createApplicationMenu()
+      createWindowsTray()
+      initDesktopPet({
+        repoRoot,
+        gatewayWsUrl: () => (gatewayState.url ? gatewayState.url.replace(/^http/i, 'ws') + '/ws' : ''),
+        onChange: () => rebuildWindowsTrayMenu(),
+        log: desktopLog,
+      })
+      registerDesktopDeepLinkProtocolClient()
+      desktopDeepLinkActivationReady = true
+      powerMonitor.on('suspend', () => desktopReliabilityTelemetry.setForeground(false))
+      powerMonitor.on('resume', refreshDesktopReliabilityForegroundState)
+      if (!activatePendingDesktopDeepLink()) void openOrResumeDesktopApp()
+      initAutoUpdater()
+      if (mockUpdateVersion() !== null) {
+        desktopUpdateCheckScheduler.start(MOCK_UPDATE_CHECK_INITIAL_DELAY_MS)
+      } else if (desktopUpdateManaged()) {
+        // Delay the silent startup check so it doesn't compete with gateway boot.
+        desktopUpdateCheckScheduler.start(UPDATE_CHECK_INITIAL_DELAY_MS)
+      }
+    })
+  }
 }
