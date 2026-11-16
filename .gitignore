@@ -122,3 +122,12 @@ opensquilla-webui/public/music
 
 # Isolated local implementation worktrees.
 /.worktrees/
+
+# TUI host companion artifacts: scripts/build_tui_host_companion.py emits these
+# into the package tree (and the OpenTUI bundle) for local validation. They are
+# platform-specific 100 MB+ binaries, the release workflow does not publish
+# them, and a checkout without them falls back to the `plain` renderer, so they
+# stay untracked. Run the builder to regenerate.
+packages/opensquilla-tui-host/src/opensquilla_tui_host/bin/
+packages/opensquilla-tui-host/src/opensquilla_tui_host/_host_metadata.json
+src/opensquilla/cli/tui/opentui/package/opensquilla-tui-host*
