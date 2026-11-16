@@ -78,6 +78,7 @@ async function fixture(options = {}) {
   const signature = { error: null, hold: null, entered: null }
   const download = { hold: null, entered: null }
   const globals = {
+    desktopBuildIdentity: { updatesEnabled: true },
     desktopReliabilityTelemetry: {
       recordUpdateResult: (event) => { (calls.telemetry ??= []).push(event) },
       markUpdateHandoff: (version) => { (calls.handoffs ??= []).push(version); return true },

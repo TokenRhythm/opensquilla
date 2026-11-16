@@ -17,10 +17,11 @@ function deferred() {
   return { promise, resolve, reject }
 }
 
-function harness({ installFails = false, gatewayFails = false, timeoutMs = 1000 } = {}) {
+function harness({ installFails = false, gatewayFails = false, timeoutMs = 1000, updatesEnabled = true } = {}) {
   const disk = deferred()
   const calls = { paused: 0, resumed: 0, installs: 0, gateways: 0, restarts: 0, dialogs: [] }
   const env = {
+    desktopBuildIdentity: { updatesEnabled },
     AccountError, pauseAccountsForMaintenance,
     AbortSignal: { timeout: () => AbortSignal.timeout(timeoutMs) },
     desktopAccounts: new Map([['profile', { account: {
@@ -59,6 +60,15 @@ function harness({ installFails = false, gatewayFails = false, timeoutMs = 1000 
   }`)(env)
   return { calls, env, disk, apply }
 }
+
+test('Preview never pauses account writes or starts a production update handoff', async () => {
+  const h = harness({ updatesEnabled: false })
+  await h.apply()
+  assert.equal(h.calls.paused, 0)
+  assert.equal(h.calls.gateways, 0)
+  assert.equal(h.calls.installs, 0)
+  assert.equal(h.env.desktopWriters.closed, false)
+})
 
 test('native updater waits for account writes before stopping Gateway or handing off', async () => {
   const h = harness()

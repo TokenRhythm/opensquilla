@@ -8,6 +8,7 @@ import { join } from 'node:path'
 import { pathToFileURL } from 'node:url'
 
 const config = JSON.parse(readFileSync(process.env.OPENSQUILLA_TEST_FIXTURE_CONFIG, 'utf8'))
+const desktopBuildIdentity = { updatesEnabled: true }
 const moduleAt = name => import(pathToFileURL(join(config.packageRoot, 'dist', name)).href)
 const { DesktopWriterAdmission } = await moduleAt('desktop-writer-admission.js')
 const { DesktopQuitBudget, DesktopQuitConfirmation } = await moduleAt('desktop-quit.js')

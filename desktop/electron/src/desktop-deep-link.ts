@@ -14,7 +14,10 @@ const DESKTOP_DEEP_LINK_ACTIONS = new Set<DesktopDeepLinkAction>(['open'])
  * the renderer.  Session targets are deliberately one path segment so an
  * incoming link cannot smuggle a route, query, or filesystem path.
  */
-export function parseDesktopDeepLinkTarget(rawUrl: unknown): DesktopDeepLinkTarget | null {
+export function parseDesktopDeepLinkTarget(
+  rawUrl: unknown,
+  scheme = DESKTOP_DEEP_LINK_SCHEME,
+): DesktopDeepLinkTarget | null {
   if (
     typeof rawUrl !== 'string'
     || !rawUrl
@@ -34,7 +37,7 @@ export function parseDesktopDeepLinkTarget(rawUrl: unknown): DesktopDeepLinkTarg
     return null
   }
 
-  if (parsed.protocol.toLowerCase() !== `${DESKTOP_DEEP_LINK_SCHEME}:`) return null
+  if (parsed.protocol.toLowerCase() !== `${scheme.toLowerCase()}:`) return null
   if (parsed.username || parsed.password || parsed.port || parsed.search || parsed.hash) return null
 
   const action = parsed.hostname.toLowerCase() as DesktopDeepLinkAction
@@ -62,12 +65,18 @@ export function parseDesktopDeepLinkTarget(rawUrl: unknown): DesktopDeepLinkTarg
   return { action, sessionKey }
 }
 
-export function parseDesktopDeepLink(rawUrl: unknown): DesktopDeepLinkAction | null {
-  return parseDesktopDeepLinkTarget(rawUrl)?.action ?? null
+export function parseDesktopDeepLink(
+  rawUrl: unknown,
+  scheme = DESKTOP_DEEP_LINK_SCHEME,
+): DesktopDeepLinkAction | null {
+  return parseDesktopDeepLinkTarget(rawUrl, scheme)?.action ?? null
 }
 
-export function desktopDeepLinkArguments(argv: readonly string[]): string[] {
-  const prefix = `${DESKTOP_DEEP_LINK_SCHEME}:`
+export function desktopDeepLinkArguments(
+  argv: readonly string[],
+  scheme = DESKTOP_DEEP_LINK_SCHEME,
+): string[] {
+  const prefix = `${scheme.toLowerCase()}:`
   return argv.filter((value) => (
     typeof value === 'string'
     && value.trim().toLowerCase().startsWith(prefix)

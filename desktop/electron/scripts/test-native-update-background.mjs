@@ -54,6 +54,7 @@ function fixture(options = {}) {
     quitAndInstall: () => { calls.installs += 1 },
   })
   const globals = {
+    desktopBuildIdentity: { updatesEnabled: true },
     process: { platform: 'darwin', arch: 'arm64', env: {} },
     app: { getVersion: () => '0.5.4' },
     BrowserWindow: { getAllWindows: () => [{ isDestroyed: () => false, webContents: {

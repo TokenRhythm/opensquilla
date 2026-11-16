@@ -93,6 +93,7 @@ function fixture(options = {}) {
   const network = { offline: Boolean(options.offline) }
   const signature = { error: options.signatureError ?? null }
   const globals = {
+    desktopBuildIdentity: { updatesEnabled: true },
     desktopReliabilityTelemetry: {
       recordUpdateResult: (event) => { (calls.telemetry ??= []).push(event) },
       finishSession() {},

@@ -25,6 +25,7 @@
     "dist:local:test:prepared": "node scripts/build-local.mjs dist --test --prepared",
     "pack:local:prepared": "node scripts/build-local.mjs pack --prepared",
     "test:local-build": "node --test scripts/test-local-build.mjs scripts/test-mac-keychain-preferences.mjs scripts/test-build-download-proxy.mjs",
+    "test:build-identity": "npm run build && node --test scripts/test-desktop-build-identity.mjs && node scripts/test-desktop-deep-link.mjs",
     "verify:prepared": "node scripts/verify-prepared-gateway.mjs",
     "verify:icons": "node scripts/verify-icon-config.mjs",
     "verify:package": "npm run verify:icons && node scripts/verify-package.mjs",

@@ -569,6 +569,9 @@ async function verifyAsarPackageVersion(asarPath, label) {
   for (const [key, expected] of [
     ['version', process.env.OPENSQUILLA_EXPECT_PACKAGE_VERSION],
     ['opensquillaTokenRhythmOrigin', process.env.OPENSQUILLA_EXPECT_ACCOUNT_ORIGIN],
+    ['name', process.env.OPENSQUILLA_EXPECT_PACKAGE_NAME],
+    ['productName', process.env.OPENSQUILLA_EXPECT_PRODUCT_NAME],
+    ['opensquillaDistribution', process.env.OPENSQUILLA_EXPECT_DISTRIBUTION],
   ]) {
     if (expected && packageJson[key] !== expected) fail(`${label} packaged ${key} does not match the requested test build`)
   }
@@ -599,6 +602,14 @@ async function verifyGeneratedBundle({ label, resourcesDir, platform }) {
   try {
     await verifyAsarPackageVersion(asarPath, label)
     verifyMainProcess(await readAsarText(asarPath, 'dist/main.js'), label)
+    if (process.env.OPENSQUILLA_EXPECT_DISTRIBUTION === 'preview') {
+      const packagedIdentity = await readAsarText(asarPath, 'dist/desktop-build-identity.js')
+      const builtIdentity = await readFile(join(packageRoot, 'dist', 'desktop-build-identity.js'), 'utf8')
+      if (packagedIdentity !== builtIdentity) fail(`${label} preview identity module differs from the verified build`)
+      if (platform === 'win32' && !existsSync(join(dirname(resourcesDir), 'OpenSquilla Preview.exe'))) {
+        fail(`${label} preview Windows executable must have its independent name`)
+      }
+    }
   } catch (error) {
     fail(`${label} app.asar could not be inspected: ${error instanceof Error ? error.message : String(error)}`)
   }

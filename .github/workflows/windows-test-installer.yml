@@ -14,6 +14,14 @@ on:
         options:
           - uat
           - production
+      side_by_side:
+        description: Build OpenSquilla Preview with an independent installation and profile
+        type: boolean
+        default: false
+      mirror_to_oss:
+        description: Mirror ordinary test installers to public OSS (never applies to Preview)
+        type: boolean
+        default: true
 
 permissions:
   contents: read
@@ -33,24 +41,44 @@ jobs:
       PYTHONUNBUFFERED: '1'
       CSC_IDENTITY_AUTO_DISCOVERY: 'false'
       OPENSQUILLA_TEST_ENVIRONMENT: ${{ (inputs.account_environment == 'production' || startsWith(github.ref_name, 'test-windows-production-')) && 'production' || 'uat' }}
+      OPENSQUILLA_SIDE_BY_SIDE: ${{ inputs.side_by_side && 'true' || 'false' }}
     steps:
       - name: Select test account environment
         id: target
         run: |
+          $preview = $env:OPENSQUILLA_SIDE_BY_SIDE -eq 'true'
           if ($env:OPENSQUILLA_TEST_ENVIRONMENT -eq 'production') {
-            'package_root=dist/desktop-electron/test/production' >> $env:GITHUB_OUTPUT
             'account_origin=https://tokenrhythm.studio' >> $env:GITHUB_OUTPUT
-            'artifact_name=windows-production-test-installer' >> $env:GITHUB_OUTPUT
+            $channel = 'production'
           } else {
-            'package_root=dist/desktop-electron/test' >> $env:GITHUB_OUTPUT
             'account_origin=https://gpt.tokenrhythm.studio' >> $env:GITHUB_OUTPUT
-            'artifact_name=windows-uat-test-installer' >> $env:GITHUB_OUTPUT
+            $channel = 'uat'
           }
+          if ($preview) {
+            $packageRoot = 'dist/desktop-electron/preview'
+            "artifact_name=windows-$channel-preview-installer" >> $env:GITHUB_OUTPUT
+            'installer_pattern=OpenSquilla-Preview-*-test-*-win-x64.exe' >> $env:GITHUB_OUTPUT
+          } else {
+            $packageRoot = 'dist/desktop-electron/test'
+            "artifact_name=windows-$channel-test-installer" >> $env:GITHUB_OUTPUT
+            'installer_pattern=OpenSquilla-*-test-*-win-x64.exe' >> $env:GITHUB_OUTPUT
+          }
+          if ($channel -eq 'production') { $packageRoot += '/production' }
+          "package_root=$packageRoot" >> $env:GITHUB_OUTPUT
       - uses: actions/checkout@v4
         with:
           ref: ${{ github.sha }}
           lfs: true
           persist-credentials: false
+      - name: Validate Preview acceptance script
+        if: inputs.side_by_side
+        run: |
+          $tokens = $null
+          $parseErrors = $null
+          $null = [System.Management.Automation.Language.Parser]::ParseFile(
+            (Join-Path $pwd 'desktop/electron/scripts/test-preview-install-windows.ps1'),
+            [ref]$tokens, [ref]$parseErrors)
+          if ($parseErrors.Count -gt 0) { throw ($parseErrors | Out-String) }
       - uses: actions/setup-node@v4
         with:
           node-version-file: opensquilla-webui/.node-version
@@ -73,25 +101,43 @@ jobs:
         run: |
           npm ci
           if ($LASTEXITCODE -ne 0) { throw 'Electron dependency installation failed' }
+          npm run test:build-identity
+          if ($LASTEXITCODE -ne 0) { throw 'Desktop identity and protocol verification failed' }
           $buildArgs = @('run', 'dist:local:test')
-          if ($env:OPENSQUILLA_TEST_ENVIRONMENT -eq 'production') { $buildArgs += @('--', '--production') }
+          $buildFlags = @()
+          if ($env:OPENSQUILLA_TEST_ENVIRONMENT -eq 'production') { $buildFlags += '--production' }
+          if ($env:OPENSQUILLA_SIDE_BY_SIDE -eq 'true') { $buildFlags += '--preview' }
+          if ($buildFlags.Count -gt 0) { $buildArgs += @('--') + $buildFlags }
           npm @buildArgs
           if ($LASTEXITCODE -ne 0) { throw 'Windows test packaging or verification failed' }
       - name: Verify installer size and record checksum
         run: |
           python .github/scripts/verify_desktop_slim_size.py --root '${{ steps.target.outputs.package_root }}' --platform windows
           if ($LASTEXITCODE -ne 0) { throw 'Windows installer exceeds the existing size budget' }
-          $installers = @(Get-ChildItem '${{ steps.target.outputs.package_root }}' -Filter 'OpenSquilla-*-test-*-win-x64.exe' -File)
+          $installers = @(Get-ChildItem '${{ steps.target.outputs.package_root }}' -Filter '${{ steps.target.outputs.installer_pattern }}' -File)
           if ($installers.Count -ne 1) { throw 'Expected exactly one Windows test installer' }
           $installer = $installers[0]
           $digest = (Get-FileHash -LiteralPath $installer.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
           "$digest  $($installer.Name)" | Set-Content -LiteralPath "$($installer.FullName).sha256" -Encoding utf8
           "Windows $env:OPENSQUILLA_TEST_ENVIRONMENT test installer: $($installer.Name); source: $env:GITHUB_SHA; account/API origin: ${{ steps.target.outputs.account_origin }}; unsigned." >> $env:GITHUB_STEP_SUMMARY
+      - name: Verify Preview installation remains independent from stable
+        if: inputs.side_by_side
+        run: |
+          & ./desktop/electron/scripts/test-preview-install-windows.ps1 -PackageRoot '${{ steps.target.outputs.package_root }}'
+          if ($LASTEXITCODE -ne 0) { throw 'Preview side-by-side installation verification failed' }
+      - name: Upload Preview installation evidence
+        uses: actions/upload-artifact@v4
+        if: ${{ always() && inputs.side_by_side }}
+        with:
+          name: windows-preview-install-evidence
+          path: ${{ runner.temp }}/opensquilla-preview-install-evidence.json
+          if-no-files-found: error
+          retention-days: 14
       - uses: actions/upload-artifact@v4
         with:
           name: ${{ steps.target.outputs.artifact_name }}
           path: |
-            ${{ steps.target.outputs.package_root }}/OpenSquilla-*-test-*-win-x64.exe
+            ${{ steps.target.outputs.package_root }}/${{ steps.target.outputs.installer_pattern }}
             ${{ steps.target.outputs.package_root }}/*.sha256
           if-no-files-found: error
           compression-level: 0
@@ -100,7 +146,7 @@ jobs:
   mirror-to-oss:
     name: Mirror Windows test installer to domestic OSS
     needs: build
-    if: github.repository == 'TokenRhythm/opensquilla'
+    if: ${{ github.repository == 'TokenRhythm/opensquilla' && !inputs.side_by_side && (github.event_name != 'workflow_dispatch' || inputs.mirror_to_oss) }}
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:

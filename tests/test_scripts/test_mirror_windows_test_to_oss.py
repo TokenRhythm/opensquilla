@@ -161,7 +161,10 @@ def test_workflow_only_mirrors_successful_build_and_keeps_credentials_in_upload_
     )
     job = workflow["jobs"]["mirror-to-oss"]
     assert job["needs"] == "build"
-    assert job["if"] == "github.repository == 'TokenRhythm/opensquilla'"
+    assert job["if"] == (
+        "${{ github.repository == 'TokenRhythm/opensquilla' && !inputs.side_by_side "
+        "&& (github.event_name != 'workflow_dispatch' || inputs.mirror_to_oss) }}"
+    )
     assert "env" not in job
     download = next(
         step
@@ -175,9 +178,60 @@ def test_workflow_only_mirrors_successful_build_and_keeps_credentials_in_upload_
         step
         for step in build["steps"]
         if step.get("uses", "").startswith("actions/upload-artifact@")
+        and step.get("with", {}).get("name") == "${{ steps.target.outputs.artifact_name }}"
     )
     assert artifact_upload["with"]["name"] == "${{ steps.target.outputs.artifact_name }}"
     assert "test-windows-production-" in build["env"]["OPENSQUILLA_TEST_ENVIRONMENT"]
     upload = job["steps"][-1]
     assert "mirror-windows-test-to-oss.py" in upload["run"]
     assert "secrets.ALIYUN_OSS_ACCESS_KEY_SECRET" in upload["env"]["OSS_ACCESS_KEY_SECRET"]
+
+
+def test_workflow_preview_is_opt_in_and_uses_separate_artifact_selection():
+    workflow = yaml.safe_load(
+        Path(".github/workflows/windows-test-installer.yml").read_text(encoding="utf-8")
+    )
+    triggers = workflow.get("on", workflow.get(True))
+    inputs = triggers["workflow_dispatch"]["inputs"]
+    assert inputs["side_by_side"]["type"] == "boolean"
+    assert inputs["side_by_side"]["default"] is False
+    assert inputs["mirror_to_oss"]["type"] == "boolean"
+    assert inputs["mirror_to_oss"]["default"] is True
+    assert triggers["push"]["tags"] == ["test-windows-*"]
+    build = workflow["jobs"]["build"]
+    target = next(step for step in build["steps"] if step.get("id") == "target")
+    assert "dist/desktop-electron/preview" in target["run"]
+    assert "windows-$channel-preview-installer" in target["run"]
+    assert "OpenSquilla-Preview-*-test-*-win-x64.exe" in target["run"]
+    package = next(
+        step for step in build["steps"]
+        if step.get("name") == "Build and verify full Windows test package"
+    )
+    assert "$env:OPENSQUILLA_SIDE_BY_SIDE -eq 'true'" in package["run"]
+    assert "$buildFlags += '--preview'" in package["run"]
+    checksum = next(
+        step for step in build["steps"]
+        if step.get("name") == "Verify installer size and record checksum"
+    )
+    assert "${{ steps.target.outputs.installer_pattern }}" in checksum["run"]
+    upload = next(
+        step for step in build["steps"]
+        if step.get("with", {}).get("name") == "${{ steps.target.outputs.artifact_name }}"
+    )
+    assert upload["with"]["path"].splitlines()[0] == (
+        "${{ steps.target.outputs.package_root }}/${{ steps.target.outputs.installer_pattern }}"
+    )
+    probe = next(
+        step for step in build["steps"]
+        if step.get("name") == "Verify Preview installation remains independent from stable"
+    )
+    assert probe["if"] == "inputs.side_by_side"
+    assert "test-preview-install-windows.ps1 -PackageRoot" in probe["run"]
+    evidence = next(
+        step for step in build["steps"]
+        if step.get("with", {}).get("name") == "windows-preview-install-evidence"
+    )
+    assert evidence["if"] == "${{ always() && inputs.side_by_side }}"
+    assert evidence["with"]["path"] == (
+        "${{ runner.temp }}/opensquilla-preview-install-evidence.json"
+    )

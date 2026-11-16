@@ -211,6 +211,7 @@ function fixture(options = {}) {
   const events = []
   const state = { status: 'downloaded' }
   const globals = {
+    desktopBuildIdentity: { updatesEnabled: true },
     desktopReliabilityTelemetry: {
       recordUpdateResult: (event) => { (calls.telemetry ??= []).push(event) },
       markUpdateHandoff: (version) => { (calls.handoffs ??= []).push(version); return options.telemetryEnabled !== false },
@@ -435,6 +436,18 @@ for (const value of [undefined, '1']) {
   await f.subject.applyWindowsInstaller()
   assert.equal(f.calls.verify, 0)
   assert.equal(f.calls.stops, 0)
+  assert.equal(f.calls.launches, 0)
+}
+
+{
+  const f = fixture()
+  f.context.desktopBuildIdentity.updatesEnabled = false
+  f.context.desktopUpdateSnapshot = () => ({ ...f.state })
+  const result = await f.subject.downloadDesktopUpdate()
+  assert.equal(result.status, 'downloaded')
+  assert.equal(f.calls.loads, 0, 'Preview must not inspect a production update cache')
+  assert.equal(f.calls.verify, 0)
+  assert.equal(f.calls.saves, 0)
   assert.equal(f.calls.launches, 0)
 }
 

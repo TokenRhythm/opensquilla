@@ -76,4 +76,38 @@ assert.deepEqual(
   [],
 )
 
+const previewScheme = 'opensquilla-preview'
+for (const scheme of ['opensquilla', previewScheme]) {
+  const otherScheme = scheme === previewScheme ? 'opensquilla' : previewScheme
+  const sessionPath = '/session/agent%3Amain%3Awebchat%3Aabc'
+  assert.equal(parseDesktopDeepLink(`${scheme}://open`, scheme), 'open')
+  assert.equal(parseDesktopDeepLink(`${scheme.toUpperCase()}://OPEN`, scheme), 'open')
+  assert.deepEqual(parseDesktopDeepLinkTarget(`${scheme}://open${sessionPath}`, scheme), {
+    action: 'open', sessionKey: 'agent:main:webchat:abc',
+  })
+  assert.equal(parseDesktopDeepLink(`${otherScheme}://open`, scheme), null)
+  assert.equal(parseDesktopDeepLinkTarget(`${otherScheme}://open${sessionPath}`, scheme), null)
+  assert.deepEqual(desktopDeepLinkArguments([
+    'OpenSquilla.exe', `${otherScheme}://open`, `${scheme}://open`,
+    `${scheme.toUpperCase()}://OPEN`, `${scheme}-other://open`,
+  ], scheme), [`${scheme}://open`, `${scheme.toUpperCase()}://OPEN`])
+}
+assert.equal(parseDesktopDeepLink(`${previewScheme}://open`), null)
+assert.equal(parseDesktopDeepLinkTarget(`${previewScheme}://open/session/a`), null)
+assert.deepEqual(desktopDeepLinkArguments([`${previewScheme}://open`]), [])
+for (const suffix of [
+  '/session/a/b', '/session/a%2Fb', '/session/%2e%2e', '/session/.%2e',
+  '/session/a%5Cb', '/session/%00', '/session/a\nb', '/session/a\tb',
+  '/session/', '/session/a?', '/session/a#', '?command=anything', '#anything',
+  `/session/${'a'.repeat(513)}`, `/session/${'%41'.repeat(2049)}`,
+]) {
+  assert.equal(parseDesktopDeepLinkTarget(`${previewScheme}://open${suffix}`, previewScheme), null)
+}
+for (const url of [
+  `${previewScheme}://user:password@open`, `${previewScheme}://open:1234`,
+  `${previewScheme}://unknown`, `${previewScheme}:open`,
+]) {
+  assert.equal(parseDesktopDeepLinkTarget(url, previewScheme), null)
+}
+
 console.log('desktop deep-link checks passed')

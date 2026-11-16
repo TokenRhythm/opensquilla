@@ -37,6 +37,7 @@ function launch(platform, argv, lockResults = [true], options = {}) {
     process: { platform, argv, on() {} },
     desktopDeepLinkArguments,
     parseDesktopDeepLinkTarget,
+    desktopBuildIdentity: { scheme: options.scheme ?? 'opensquilla' },
     desktopLog() {},
     desktopProcessStartedAt: 0,
     Date: { now: () => now },
@@ -82,6 +83,15 @@ function launch(platform, argv, lockResults = [true], options = {}) {
     ready: () => runInContext('desktopDeepLinkActivationReady = true; activatePendingDesktopDeepLink()', context),
   }
 }
+
+const previewLink = `opensquilla-preview://open/session/${encodeURIComponent(sessionKey)}`
+const previewLaunch = launch('win32', ['OpenSquilla Preview', previewLink], [true], { scheme: 'opensquilla-preview' })
+assert.equal(previewLaunch.pending(), sessionKey)
+assert.equal(previewLaunch.ready(), true)
+await Promise.resolve()
+assert.deepEqual(previewLaunch.calls.delivered, [sessionKey])
+assert.equal(launch('win32', ['OpenSquilla Preview', link], [true], { scheme: 'opensquilla-preview' }).pending(), null)
+assert.equal(launch('win32', ['OpenSquilla', previewLink]).pending(), null)
 
 for (const platform of ['linux', 'win32']) {
   const cold = launch(platform, ['OpenSquilla', '--flag', link])

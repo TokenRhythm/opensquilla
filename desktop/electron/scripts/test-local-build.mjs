@@ -5,18 +5,21 @@ import test from 'node:test'
 import { readFileSync } from 'node:fs'
 
 import {
-  createLocalMacBuildConfig, createLocalTestBuildConfig, parseLocalBuildArgs, runLocalBuild,
-  withLocalMacBuildEnvironment,
+  createLocalMacBuildConfig, createLocalTestBuildConfig, createLocalWindowsTestBuildConfig,
+  parseLocalBuildArgs, runLocalBuild, withLocalMacBuildEnvironment,
 } from './build-local.mjs'
 
 const packageVersion = JSON.parse(readFileSync(new URL('../package.json', import.meta.url), 'utf8')).version
 
 test('local CLI accepts only a packaging target and optional prepared mode', () => {
-  assert.deepEqual(parseLocalBuildArgs(['pack']), { mode: 'pack', prepared: false, test: false, production: false })
-  assert.deepEqual(parseLocalBuildArgs(['dist', '--prepared']), { mode: 'dist', prepared: true, test: false, production: false })
-  assert.deepEqual(parseLocalBuildArgs(['dist', '--test', '--prepared']), { mode: 'dist', prepared: true, test: true, production: false })
-  assert.deepEqual(parseLocalBuildArgs(['dist', '--test', '--production']), { mode: 'dist', prepared: false, test: true, production: true })
-  for (const args of [[], ['release'], ['pack', '--unsigned'], ['dist', '--prepared', '--prepared'], ['dist', '--production']]) {
+  assert.deepEqual(parseLocalBuildArgs(['pack']), { mode: 'pack', prepared: false, test: false, production: false, preview: false })
+  assert.deepEqual(parseLocalBuildArgs(['dist', '--prepared']), { mode: 'dist', prepared: true, test: false, production: false, preview: false })
+  assert.deepEqual(parseLocalBuildArgs(['dist', '--test', '--prepared']), { mode: 'dist', prepared: true, test: true, production: false, preview: false })
+  assert.deepEqual(parseLocalBuildArgs(['dist', '--test', '--production']), { mode: 'dist', prepared: false, test: true, production: true, preview: false })
+  assert.deepEqual(parseLocalBuildArgs(['dist', '--test', '--production', '--preview']), {
+    mode: 'dist', prepared: false, test: true, production: true, preview: true,
+  })
+  for (const args of [[], ['release'], ['pack', '--unsigned'], ['dist', '--prepared', '--prepared'], ['dist', '--production'], ['dist', '--preview'], ['dist', '--test', '--preview', '--preview']]) {
     assert.throws(() => parseLocalBuildArgs(args), /Usage:/)
   }
 })
@@ -59,6 +62,74 @@ test('test packages keep app identity and version, stamping only the installer f
   assert.equal(config.productName, undefined)
   assert.equal(config.appId, undefined)
   assert.ok(config.directories.output.replaceAll('\\', '/').endsWith('/dist/desktop-electron/test'))
+})
+
+test('Preview builds keep an independent identity across account environments and build dates', () => {
+  for (const production of [false, true]) {
+    for (const now of [new Date('2026-10-26T07:02:03Z'), new Date('2026-10-27T07:02:03Z')]) {
+      const config = createLocalTestBuildConfig(now, { preview: true, production })
+      assert.equal(config.appId, 'ai.opensquilla.desktop.preview')
+      assert.equal(config.productName, 'OpenSquilla Preview')
+      assert.equal(config.win.executableName, 'OpenSquilla Preview')
+      assert.equal(config.nsis.shortcutName, 'OpenSquilla Preview')
+      assert.equal(config.nsis.allowToChangeInstallationDirectory, false)
+      assert.equal(config.nsis.guid, '277ac0ed-967c-587e-920a-ccf5ab1172f6')
+      assert.deepEqual(config.protocols, [{ name: 'OpenSquilla Preview', schemes: ['opensquilla-preview'] }])
+      assert.equal(config.extraMetadata.name, 'opensquilla-preview')
+      assert.equal(config.extraMetadata.productName, 'OpenSquilla Preview')
+      assert.equal(config.extraMetadata.opensquillaDistribution, 'preview')
+      assert.equal(config.extraMetadata.version, packageVersion)
+      assert.equal(config.extraMetadata.opensquillaTokenRhythmOrigin,
+        production ? 'https://tokenrhythm.studio' : 'https://gpt.tokenrhythm.studio')
+      const suffix = production ? '/preview/production' : '/preview'
+      assert.ok(config.directories.output.replaceAll('\\', '/').endsWith(suffix))
+      assert.match(config.artifactName, /^OpenSquilla-Preview-\$\{version\}-test-/)
+    }
+  }
+})
+
+test('Windows test signing options preserve the Preview executable name', () => {
+  const preview = createLocalTestBuildConfig(new Date('2026-10-26T07:02:03Z'), { preview: true })
+  const config = createLocalWindowsTestBuildConfig(preview)
+  assert.equal(config.win.executableName, 'OpenSquilla Preview')
+  assert.equal(config.win.signExecutable, false)
+  assert.equal(config.forceCodeSigning, false)
+  assert.equal(config.nsis.guid, preview.nsis.guid)
+  assert.deepEqual(createLocalWindowsTestBuildConfig(), {
+    forceCodeSigning: false, win: { signExecutable: false },
+  })
+})
+
+for (const platform of ['darwin', 'win32']) {
+  test(`${platform} Preview packaging passes the independent identity to verification`, async () => {
+    const calls = []
+    const build = async (mode, config) => {
+      assert.equal(mode, 'dist')
+      assert.equal(config.appId, 'ai.opensquilla.desktop.preview')
+      assert.equal(config.win.executableName, 'OpenSquilla Preview')
+      calls.push('package')
+    }
+    await runLocalBuild({ mode: 'dist', prepared: true, test: true, preview: true, production: true }, {
+      platform, buildMac: build, buildWindowsTest: build,
+      runScript: async (script, env) => {
+        calls.push(script)
+        if (script === 'verify:package') {
+          assert.equal(env.OPENSQUILLA_EXPECT_DISTRIBUTION, 'preview')
+          assert.equal(env.OPENSQUILLA_EXPECT_PACKAGE_NAME, 'opensquilla-preview')
+          assert.equal(env.OPENSQUILLA_EXPECT_PRODUCT_NAME, 'OpenSquilla Preview')
+          assert.equal(env.OPENSQUILLA_EXPECT_ACCOUNT_ORIGIN, 'https://tokenrhythm.studio')
+          assert.ok(env.OPEN_SQUILLA_PACKAGE_OUTPUT.replaceAll('\\', '/').endsWith('/preview/production'))
+        }
+      },
+    })
+    assert.deepEqual(calls, ['build', 'verify:prepared', 'package', 'verify:package'])
+  })
+}
+
+test('Preview packaging cannot silently use a stable packaging entry', async () => {
+  await assert.rejects(runLocalBuild({ mode: 'dist', preview: true }, {
+    platform: 'win32', runScript: async () => assert.fail('must stop before building'),
+  }), /Preview packaging requires --test/)
 })
 
 test('test packaging forwards embedded configuration and verifies only its output', async () => {

@@ -29,7 +29,6 @@ import {
 } from './desktop-locale.js'
 import {
   allProfileContexts as enumerateLegacyDesktopProfiles,
-  channelUserDataPath,
   isRecoveryProfileId,
   primaryProfilePaths,
   type DesktopProfilePaths,
@@ -192,10 +191,10 @@ import {
   type DesktopWorkbenchPreviewMode,
 } from './desktop-window-lifecycle.js'
 import {
-  DESKTOP_DEEP_LINK_SCHEME,
   desktopDeepLinkArguments,
   parseDesktopDeepLinkTarget,
 } from './desktop-deep-link.js'
+import { desktopBuildUserDataPath, resolveDesktopBuildIdentity } from './desktop-build-identity.js'
 import { projectDirectoryDialogOptions } from './project-directory-picker.js'
 import {
   NATIVE_WORKBENCH_CAPABILITIES,
@@ -629,17 +628,27 @@ interface MacInstallContext {
 }
 
 const __dirname = dirname(fileURLToPath(import.meta.url))
+const packageRoot = resolve(__dirname, '..')
+const desktopPackageMetadata = JSON.parse(readFileSync(join(packageRoot, 'package.json'), 'utf8'))
+const desktopBuildIdentity = resolveDesktopBuildIdentity(desktopPackageMetadata)
 // Test installers retain the stable app's Chromium, credential and Gateway state.
-// Other prerelease channels select their own state before any writer starts.
+// Explicit isolated builds select separate Chromium, credential and Gateway state.
 // Changing the update feed never changes this process's active profile.
-const channelUserData = channelUserDataPath(app.getPath('userData'), app.getVersion())
+const channelUserData = desktopBuildUserDataPath(
+  desktopBuildIdentity, app.getPath('appData'), app.getPath('userData'), app.getVersion(),
+)
 if (channelUserData !== resolve(app.getPath('userData'))) {
   mkdirSync(channelUserData, { recursive: true })
   app.setPath('userData', channelUserData)
 }
-const packageRoot = resolve(__dirname, '..')
+if (desktopBuildIdentity.isolated) {
+  mkdirSync(channelUserData, { recursive: true })
+  app.setName(desktopBuildIdentity.name)
+  app.setPath('sessionData', channelUserData)
+  if (process.platform === 'win32') app.setAppUserModelId(desktopBuildIdentity.appId)
+}
 const tokenrhythmAccountOrigin = resolveAccountOrigin(
-  JSON.parse(readFileSync(join(packageRoot, 'package.json'), 'utf8')).opensquillaTokenRhythmOrigin,
+  desktopPackageMetadata.opensquillaTokenRhythmOrigin,
   process.env.OPENSQUILLA_TOKENRHYTHM_ORIGIN,
 )
 const defaultRepoRoot = resolve(packageRoot, '..', '..')
@@ -3538,7 +3547,7 @@ function desktopAccount() {
     decrypt: value => secrets.decrypt(value),
     recoverStorage: value => secrets.recover(value),
     openExternal: url => shell.openExternal(url),
-    openAppViaProtocol: app.isPackaged,
+    openAppViaProtocol: app.isPackaged && !desktopBuildIdentity.isolated,
     onOpenDesktop: async () => {
       if (activeDesktopProfile().home !== profile.home) throw new AccountError('ACCOUNT_CLOSING')
       await activateMainWindow('tokenrhythm-login')
@@ -5601,7 +5610,7 @@ function sendPendingDesktopSessionTarget(): void {
 }
 
 function handleDeepLink(rawUrl: unknown, source = 'unknown'): boolean {
-  const target = parseDesktopDeepLinkTarget(rawUrl)
+  const target = parseDesktopDeepLinkTarget(rawUrl, desktopBuildIdentity.scheme)
   if (!target || target.action !== 'open') {
     // Never persist an untrusted URL: query strings may contain credentials or
     // other private browser state even though this parser rejects them.
@@ -5634,7 +5643,7 @@ function handleDeepLinksFromCommandLine(
   commandLine: readonly string[],
   source: string,
 ): boolean {
-  const candidates = desktopDeepLinkArguments(commandLine)
+  const candidates = desktopDeepLinkArguments(commandLine, desktopBuildIdentity.scheme)
   for (const candidate of candidates) handleDeepLink(candidate, source)
   return candidates.length > 0
 }
@@ -5654,7 +5663,7 @@ function registerDesktopDeepLinkProtocolClient(): void {
     return
   }
   try {
-    const registered = app.setAsDefaultProtocolClient(DESKTOP_DEEP_LINK_SCHEME)
+    const registered = app.setAsDefaultProtocolClient(desktopBuildIdentity.scheme)
     desktopLog('deep_link_protocol_registered', { registered })
   } catch (error) {
     desktopLog('deep_link_protocol_registration_failed', {
@@ -11600,6 +11609,7 @@ function desktopUpdateMenuEnabled(): boolean {
 }
 
 function desktopUpdateManaged(): boolean {
+  if (!desktopBuildIdentity.updatesEnabled) return false
   if (!app.isPackaged) return false
   if (desktopNetworkObservabilityDisabled()) return false
   if (process.env.OPENSQUILLA_DESKTOP_DISABLE_AUTO_UPDATE === '1') return false
@@ -12034,6 +12044,7 @@ function downloadDesktopUpdate(origin: 'automatic' | 'user' = 'user'): Promise<D
 }
 
 async function runDesktopUpdateDownload(origin: 'automatic' | 'user'): Promise<DesktopUpdateState> {
+  if (!desktopBuildIdentity.updatesEnabled) return desktopUpdateSnapshot()
   try {
     await restoreWindowsUpdateCache(true)
   } catch (error) {
@@ -12891,6 +12902,7 @@ async function downloadNativeDesktopUpdateWithFallback(): Promise<void> {
 }
 
 function desktopUpdateCheckAllowed(): boolean {
+  if (!desktopBuildIdentity.updatesEnabled) return false
   if (isQuitting || desktopWriters.closed) return false
   return isUpdateCheckAllowed({
     downloading: updateDownloadInProgress || windowsUpdateCacheRestore !== null || (manualInstallerActionInProgress && desktopUpdateCandidate !== null),
@@ -13368,6 +13380,7 @@ async function applyWindowsInstaller(): Promise<void> {
 // open file handles under resources/runtime that the installer must overwrite —
 // orphaning it breaks the next launch. Mirrors the uninstall quiesce path.
 async function applyDownloadedUpdate(): Promise<void> {
+  if (!desktopBuildIdentity.updatesEnabled) return
   if (windowsInstallerActionsSupported()) return await applyWindowsInstaller()
   if (updateApplying) return
   if (isQuitting || desktopWriters.closed) return
@@ -17280,7 +17293,7 @@ app.on('will-quit', () => {
 configureChromiumKeychainPolicy()
 
 const initialDesktopDeepLinkArguments = process.platform === 'win32' || process.platform === 'linux'
-  ? desktopDeepLinkArguments(process.argv)
+  ? desktopDeepLinkArguments(process.argv, desktopBuildIdentity.scheme)
   : []
 
 // Bounded retry for the single-instance lock. A relaunch immediately after
@@ -17425,7 +17438,7 @@ if (!gotSingleInstanceLock) {
     }
     powerMonitor.on('resume', notifySystemResume)
     app.once('will-quit', () => powerMonitor.removeListener('resume', notifySystemResume))
-    app.name = 'OpenSquilla'
+    app.name = desktopBuildIdentity.name
     installDesktopRendererProtocol()
     desktopLocale = loadPersistedDesktopLocale() ?? resolveDesktopLocale()
     createApplicationMenu()
