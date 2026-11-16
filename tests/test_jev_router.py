@@ -947,7 +947,7 @@ async def test_implicit_input_uses_configured_task_roles_in_one_native_choice(se
     )
     payload = provider.calls[0]
     choices = payload["questions"]["target"]["criteria"]
-    assert choices["small"].startswith("Configured task role c0: Routine, mechanical work")
+    assert choices["small"].startswith("Configured task role c0: ")
     assert choices["current"].startswith("Configured task role c3: Difficult reasoning")
     assert "not benchmark guarantees" in payload["questions"]["target"]["instructions"]
     assert "No request to switch models is needed" in payload["questions"]["target"]["instructions"]

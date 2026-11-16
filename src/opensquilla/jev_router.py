@@ -555,7 +555,8 @@ _TASK_ROLES = {
         "Routine work and execution of an already established plan do not justify this cost."
     ),
     "c0": (
-        "Routine, mechanical work: format, sort, classify, extract, or rewrite short supplied "
+        "Simple conversation, greetings, acknowledgements, and routine mechanical work: "
+        "format, sort, classify, extract, or rewrite short supplied "
         "text with clear instructions; basic facts and small transformations. No open-ended "
         "analysis is required."
     ),
@@ -647,12 +648,15 @@ def _native_payload(request: JevRequest, signals: tuple[str, ...]) -> dict[str, 
                     "authorized scope. "
                     "Consecutive tool failures warrant reassessment, not an automatic upgrade: "
                     "a missing file, denied permission, unavailable dependency or network outage "
-                    "may need an environmental fix rather than a stronger model. Choose a "
-                    "different model only if the evidence supports a reasoning or tool-use gap. "
+                    "may need an environmental fix rather than a stronger model. "
                     "Honor declared context, tool and modality requirements. Do not infer "
-                    "unknown prices or capabilities. An unranked current model may remain selected "
-                    "when evidence is insufficient. Private input requires an explicitly local "
-                    "candidate or the current model. Do not bypass safety."
+                    "unknown prices or capabilities. Private input requires an explicitly local "
+                    "candidate or the current model. Do not bypass safety. "
+                    "Tasks limited to greetings, acknowledgements or casual social exchanges "
+                    "require only the routine role. Reassess from the current task without "
+                    "preferring the model already selected. Choosing an adequate lower-cost "
+                    "deployment does not require any failure or capability gap in the current "
+                    "model."
                 ),
                 "criteria": candidates,
             },
