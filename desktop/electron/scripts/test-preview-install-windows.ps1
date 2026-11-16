@@ -338,3 +338,4 @@ try {
 }
 if (-not $evidence.passed) { throw "Preview installation verification failed: $failure. Evidence: $evidencePath" }
 Write-Output "Preview installation verification passed. Evidence: $evidencePath"
+exit 0

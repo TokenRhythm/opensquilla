@@ -227,6 +227,7 @@ def test_workflow_preview_is_opt_in_and_uses_separate_artifact_selection():
     )
     assert probe["if"] == "inputs.side_by_side"
     assert "test-preview-install-windows.ps1 -PackageRoot" in probe["run"]
+    assert "$LASTEXITCODE" not in probe["run"]
     evidence = next(
         step for step in build["steps"]
         if step.get("with", {}).get("name") == "windows-preview-install-evidence"

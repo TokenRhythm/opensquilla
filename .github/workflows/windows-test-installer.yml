@@ -111,6 +111,7 @@ jobs:
           npm @buildArgs
           if ($LASTEXITCODE -ne 0) { throw 'Windows test packaging or verification failed' }
       - name: Verify installer size and record checksum
+        id: checksum
         run: |
           python .github/scripts/verify_desktop_slim_size.py --root '${{ steps.target.outputs.package_root }}' --platform windows
           if ($LASTEXITCODE -ne 0) { throw 'Windows installer exceeds the existing size budget' }
@@ -124,7 +125,6 @@ jobs:
         if: inputs.side_by_side
         run: |
           & ./desktop/electron/scripts/test-preview-install-windows.ps1 -PackageRoot '${{ steps.target.outputs.package_root }}'
-          if ($LASTEXITCODE -ne 0) { throw 'Preview side-by-side installation verification failed' }
       - name: Upload Preview installation evidence
         uses: actions/upload-artifact@v4
         if: ${{ always() && inputs.side_by_side }}
@@ -134,6 +134,7 @@ jobs:
           if-no-files-found: error
           retention-days: 14
       - uses: actions/upload-artifact@v4
+        if: ${{ always() && steps.checksum.conclusion == 'success' }}
         with:
           name: ${{ steps.target.outputs.artifact_name }}
           path: |
