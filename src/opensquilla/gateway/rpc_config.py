@@ -17,8 +17,12 @@ def _public_gateway_config_schema() -> dict[str, Any]:
     from opensquilla.gateway.config import GatewayConfig
 
     schema = GatewayConfig.model_json_schema()
+    properties = schema.get("properties")
+    if isinstance(properties, dict):
+        properties.pop("jev_router", None)
     definitions = schema.get("$defs")
     if isinstance(definitions, dict):
+        definitions.pop("JevRouterConfig", None)
         llm_schema = definitions.get("LlmProviderConfig")
         if isinstance(llm_schema, dict):
             properties = llm_schema.get("properties")

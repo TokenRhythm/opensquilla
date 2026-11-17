@@ -176,6 +176,38 @@ async def test_public_schema_and_lookup_hide_extra_body() -> None:
         )
 
 
+async def test_legacy_jev_router_is_hidden_readonly_and_preserved_on_public_apply(tmp_path) -> None:
+    path = tmp_path / "config.toml"
+    config = GatewayConfig(
+        config_path=str(path),
+        jev_router={"enabled": True},
+    )
+
+    assert "jev_router" not in config.to_public_dict()
+    response = await _handle_config_schema({}, _ctx(config))
+    assert "jev_router" not in response["schema"]["properties"]
+    assert "JevRouterConfig" not in response["schema"]["$defs"]
+    with pytest.raises(KeyError, match="Schema path not found"):
+        await _handle_config_schema_lookup({"path": "jev_router.enabled"}, _ctx(config))
+    with pytest.raises(ValueError, match="read-only"):
+        await _handle_config_set(
+            {"path": "jev_router.enabled", "value": False},
+            _ctx(config),
+        )
+    await _handle_config_patch(
+        {"patch": {"jev_router": {"enabled": False}}},
+        _ctx(config),
+    )
+    assert config.jev_router.enabled is True
+
+    public_apply = config.to_public_dict()
+    public_apply["naming"]["enabled"] = not config.naming.enabled
+    await _handle_config_apply({"config": public_apply}, _ctx(config))
+
+    assert config.jev_router.enabled is True
+    assert GatewayConfig.load(path).jev_router.enabled is True
+
+
 async def test_rpc_rejects_extra_body_writes_and_public_apply_preserves_it(tmp_path) -> None:
     path = tmp_path / "config.toml"
     config = _custom_config(config_path=str(path))
