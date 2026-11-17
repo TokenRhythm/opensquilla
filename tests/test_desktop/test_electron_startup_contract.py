@@ -652,7 +652,6 @@ def test_keychain_startup_recovery_is_actionable_without_plaintext_fallback() ->
 
     assert "type BootErrorCode = 'keychain_unavailable'" in main_ts
     assert "code?: BootErrorCode" in main_ts
-    assert "throw new DesktopStartupError(" in main_ts
     assert "'keychain_unavailable'" in main_ts
     assert "...(error instanceof DesktopStartupError ? { code: error.code } : {})" in main_ts
     assert "function invalidateSecretStorageBackendCache(): void" in main_ts
@@ -681,6 +680,27 @@ def test_keychain_startup_recovery_is_actionable_without_plaintext_fallback() ->
 
     encryption = _section(main_ts, "function encryptSecret", "function decryptSecret")
     assert "catch {\n      return plainSecret(secret)" not in encryption
+    assert "if (policyBackend === 'safeStorage')" in encryption
+    assert "if (availableBackend !== 'safeStorage')" in encryption
+    assert (
+        "The OS keychain is unavailable. Unlock it and try saving credentials again." in encryption
+    )
+    assert "The OS keychain could not encrypt the credential:" in encryption
+
+    startup_secret = _section(
+        main_ts, "function readDesktopStartupSecret", "function desktopCredentialNeedsRecovery",
+    )
+    assert "failures[slot] = record[slot]" in startup_secret
+    assert "return ''" in startup_secret
+    assert "writeFile" not in startup_secret
+    recovery = _section(
+        main_ts, "async function offerDesktopCredentialRecovery", "function isConnectionReady",
+    )
+    assert "dialog.showMessageBox" in recovery
+    assert "credential?.configAuthority === 'profile'" in recovery
+    assert "new URL('/settings', DESKTOP_RENDERER_URL)" in recovery
+    assert "await runOnboarding()" in recovery
+    assert main_ts.count("'credentialRecovery.message':") == 6
 
 
 def test_boot_error_and_recovery_states_freeze_determinate_progress() -> None:
@@ -4138,17 +4158,18 @@ def test_settings_import_reconciles_or_prompts_for_imported_provider() -> None:
     assert "onboardingHtml(" in onboarding
     assert "pendingProviderSetup," in onboarding
     assert "onboardingMigrationCandidates" not in onboarding
-    assert "desktopSecretStoragePolicyBackend() === 'safeStorage'" in prepare
+    # Configuration authority precedes process-local key availability. Imports
+    # still prompt, and the generated-config path must never seed an import.
+    assert "return pendingProviderSetup ? null : existing" in prepare
+    assert "pendingProviderSetup || forceOnboardingOnNextStartup" in prepare
+    assert "onboardingPromptProfileKey = desktopProfileKey()" in prepare
     reuse = prepare.index(
-        "if (!pendingProviderSetup && existing && credentialReadable "
-        "&& isConnectionReady(existing))"
+        "if (!pendingProviderSetup && existing && existing.configAuthority !== 'profile'"
     )
-    assert "existing?.encryption !== 'safeStorage'" in prepare
-    assert prepare.index("const credentialReadable =") < reuse
-    assert prepare.index("desktopSecretStoragePolicyBackend() === 'safeStorage'") < prepare.index(
-        "'keychain_unavailable'"
-    )
-    assert prepare.index("'keychain_unavailable'") < reuse
+    assert prepare.index("if (configExists)") < reuse
+    assert prepare.index("return pendingProviderSetup ? null : existing") < reuse
+    assert "decryptApiKey(" not in prepare
+    assert "isConnectionReady(" not in prepare
 
     reconcile = _section(
         main_ts,

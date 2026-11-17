@@ -946,6 +946,10 @@ const onboardingFlows = new OnboardingFlowCoordinator<
 >()
 let secretStorageBackendCache: SecretEncryption | null = null
 const decryptedSecretCache = new SecretDecryptionCache()
+type DesktopCredentialSlot = 'encryptedApiKey' | 'encryptedSearchApiKey'
+const unreadableDesktopCredentials = new Map<string, Partial<Record<DesktopCredentialSlot, string>>>()
+const credentialRecoveryNotices = new Set<string>()
+let desktopStartupConnectionPromise: Promise<DesktopConnection | null> | null = null
 let macCodeSignatureDiagnosticCache: string | null = null
 let bootStatus: BootStatus = {
   phaseId: 'profile',
@@ -2640,6 +2644,50 @@ function decryptSearchApiKey(record: DesktopConnection): string {
   return decryptSecret(record.encryptedSearchApiKey, record.encryption)
 }
 
+function readDesktopStartupSecret(record: DesktopConnection, slot: DesktopCredentialSlot): string {
+  const home = activeDesktopProfile().home
+  const failures = unreadableDesktopCredentials.get(home) ?? {}
+  try {
+    const value = slot === 'encryptedApiKey' ? decryptApiKey(record) : decryptSearchApiKey(record)
+    delete failures[slot]
+    unreadableDesktopCredentials.set(home, failures)
+    return value
+  } catch (error) {
+    failures[slot] = record[slot]
+    unreadableDesktopCredentials.set(home, failures)
+    desktopLog('desktop_credential_unreadable', {
+      credential: slot === 'encryptedApiKey' ? 'model' : 'search',
+      error: error instanceof Error ? error.message : String(error),
+    })
+    // Only the failed process-local injection is omitted. Keep the original
+    // credential and the authoritative config intact so the client can open.
+    return ''
+  }
+}
+
+function desktopCredentialNeedsRecovery(profile = activeDesktopProfile()): boolean {
+  return Object.keys(unreadableDesktopCredentials.get(profile.home) ?? {}).length > 0
+}
+
+async function offerDesktopCredentialRecovery(): Promise<void> {
+  const profile = activeDesktopProfile()
+  if (!desktopCredentialNeedsRecovery(profile) || credentialRecoveryNotices.has(profile.home)) return
+  credentialRecoveryNotices.add(profile.home)
+  const result = await dialog.showMessageBox({
+    type: 'warning', title: desktopT('credentialRecovery.title'),
+    message: desktopT('credentialRecovery.message'),
+    buttons: [desktopT('credentialRecovery.open'), desktopT('common.cancel')],
+    defaultId: 0, cancelId: 1, noLink: true,
+  })
+  if (result.response !== 0 || isQuitting || activeDesktopProfile().home !== profile.home) return
+  const credential = await loadDesktopCredential()
+  if (credential?.configAuthority === 'profile') {
+    await currentMainWindow()?.loadURL(new URL('/settings', DESKTOP_RENDERER_URL).toString())
+  } else if (!onboardingFlows.active) {
+    await runOnboarding()
+  }
+}
+
 function isConnectionReady(record: DesktopConnection): boolean {
   return !providerDefaults(record.provider).requiresApiKey || Boolean(decryptApiKey(record))
 }
@@ -3403,6 +3451,15 @@ async function applyDesktopSettingsPair(
     if (currentCredential !== expectedCredential) {
       throw new Error('Desktop credential changed while settings were being prepared; retry.')
     }
+    if (expectedCredential !== null && candidateCredential !== expectedCredential
+      && desktopCredentialNeedsRecovery(profile)) {
+      // An explicit replacement must retain the unreadable original even after
+      // the settings transaction cleans up its temporary rollback files.
+      await writeFile(
+        join(dirname(profile.credentialPath), `desktop-credential.unreadable-${randomUUID()}.json`),
+        expectedCredential, { flag: 'wx', mode: 0o600, flush: true },
+      )
+    }
     const candidateConfig = renderDesktopConfigAfterPreflight(
       profile,
       credential,
@@ -3437,7 +3494,10 @@ async function applyDesktopSettingsPair(
     if (!restartSafe) {
       throw new Error(`Desktop settings were not applied (${result.stable_code}).`)
     }
-    if (candidateCredential !== expectedCredential) decryptedSecretCache.clear()
+    if (candidateCredential !== expectedCredential) {
+      decryptedSecretCache.clear()
+      unreadableDesktopCredentials.delete(profile.home)
+    }
     return result
   } finally {
     if (ownedGatewayWasRunning && desktopProfileKey() === targetProfileKey) {
@@ -3490,7 +3550,8 @@ function settingsSnapshot(connection: DesktopConnection | null): DesktopSettings
     provider,
     model: connection?.model || routerDefaultModel(routerTiers, routerDefaultTier) || defaults.model,
     baseUrl: connection?.baseUrl || defaults.baseUrl,
-    apiKeyConfigured: Boolean(connection?.encryptedApiKey),
+    apiKeyConfigured: Boolean(connection?.encryptedApiKey)
+      && unreadableDesktopCredentials.get(activeDesktopProfile().home)?.encryptedApiKey !== connection?.encryptedApiKey,
     modelRoutingMode,
     routerMode,
     routerDefaultTier,
@@ -3499,7 +3560,8 @@ function settingsSnapshot(connection: DesktopConnection | null): DesktopSettings
       ? { routerPresetBinding: normalizeRouterPresetBinding(connection?.routerPresetBinding) } : {}),
     searchProvider,
     searchApiKeyEnv: connection?.searchApiKeyEnv || searchDefaults.envKey,
-    searchApiKeyConfigured: Boolean(connection?.encryptedSearchApiKey),
+    searchApiKeyConfigured: Boolean(connection?.encryptedSearchApiKey)
+      && unreadableDesktopCredentials.get(activeDesktopProfile().home)?.encryptedSearchApiKey !== connection?.encryptedSearchApiKey,
     disableNetworkObservability: connection?.disableNetworkObservability ?? false,
     configManagedByProfile: connection?.configAuthority === 'profile',
     searchProviders: SEARCH_PROVIDER_CATALOG,
@@ -3576,14 +3638,22 @@ async function confirmAccountRecovery(event: Electron.IpcMainInvokeEvent, accoun
   return result.response === 1
 }
 
-ipcMain.handle('desktop:account:get', async event => {
+async function prepareAccountProfile(event: Electron.IpcMainInvokeEvent): Promise<void> {
   requireAccountSender(event)
+  if (!(await pathExists(desktopConfigPath()))) {
+    await prepareDesktopStartupConnection()
+    requireAccountSender(event)
+  }
+}
+
+ipcMain.handle('desktop:account:get', async event => {
+  await prepareAccountProfile(event)
   const { account } = desktopAccount()
   await account.initialize()
   return account.snapshot()
 })
 ipcMain.handle('desktop:account:action', async (event, action: AccountAction) => {
-  requireAccountSender(event)
+  await prepareAccountProfile(event)
   const { account } = desktopAccount()
   await account.initialize()
   switch (action) {
@@ -3598,7 +3668,7 @@ ipcMain.handle('desktop:account:action', async (event, action: AccountAction) =>
   }
 })
 ipcMain.handle('desktop:account:source', async (event, source: ModelCredentialSource, expected?: unknown) => {
-  requireAccountSender(event)
+  await prepareAccountProfile(event)
   return desktopAccount().account.selectSource(source, expected === undefined ? undefined : accountPrimaryActivation(expected))
 })
 ipcMain.handle('desktop:account:cancel-primary', async (event, id?: unknown) => {
@@ -3607,7 +3677,7 @@ ipcMain.handle('desktop:account:cancel-primary', async (event, id?: unknown) => 
   return desktopAccount().account.cancelPrimaryActivation(id)
 })
 ipcMain.handle('desktop:account:media-source', async (event, kind: 'image' | 'video', source: AccountMediaSource) => {
-  requireAccountSender(event)
+  await prepareAccountProfile(event)
   return desktopAccount().account.selectMediaSource(kind, source)
 })
 ipcMain.handle('desktop:account:link', async (event, link: AccountLink) => {
@@ -3948,6 +4018,9 @@ function applyDesktopLocaleChoice(raw: unknown): void {
 
 const DESKTOP_MESSAGES: Record<DesktopLocale, Record<string, string>> = {
   en: {
+    'credentialRecovery.title': 'Saved credentials need attention',
+    'credentialRecovery.message': 'A saved model or search API key could not be decrypted. Your original credentials, conversations and workspace are preserved. Unlock OS credential storage and restart, or open setup to enter keys again or sign in. Imported profiles use Settings.',
+    'credentialRecovery.open': 'Open credential settings',
     'common.cancel': 'Cancel',
     "account.recoveryTitle": "Reset local sign-in?",
     "account.recoveryMessage": "Local sign-in information cannot be restored.",
@@ -4129,6 +4202,9 @@ const DESKTOP_MESSAGES: Record<DesktopLocale, Record<string, string>> = {
   },
   'zh-Hans': {
     'common.cancel': '取消',
+    'credentialRecovery.title': '已保存的凭据需要恢复',
+    'credentialRecovery.message': '已保存的模型或搜索 API Key 无法解密。原凭据、对话和工作区已保留。可以解锁系统凭据存储后重启，或打开设置重新录入密钥、登录账号。导入的配置请在设置中修改。',
+    'credentialRecovery.open': '打开凭据设置',
     "account.recoveryTitle": "重置本机登录？",
     "account.recoveryMessage": "本地登录信息无法恢复。",
     "account.recoveryDetail": "将先备份当前凭据，再重置本机登录并打开浏览器重新授权。你的对话、模型配置和网站账号余额都会保留。",
@@ -4309,6 +4385,9 @@ const DESKTOP_MESSAGES: Record<DesktopLocale, Record<string, string>> = {
   },
   ja: {
     'common.cancel': 'キャンセル',
+    'credentialRecovery.title': '保存済み認証情報の復旧が必要です',
+    'credentialRecovery.message': 'モデルまたは検索 API キーを復号できません。元の認証情報、会話、ワークスペースは保持されています。OS の認証ストレージを解除して再起動するか、設定でキーを再入力またはサインインしてください。インポート済みプロファイルは設定画面を使用します。',
+    'credentialRecovery.open': '認証設定を開く',
     "account.recoveryTitle": "ローカルのログインをリセットしますか？",
     "account.recoveryMessage": "ローカルのログイン情報を復元できません。",
     "account.recoveryDetail": "現在の認証情報をバックアップしてからログインをリセットし、ブラウザーで再認証します。会話、モデル設定、ウェブサイトのアカウント残高は保持されます。",
@@ -4473,6 +4552,9 @@ const DESKTOP_MESSAGES: Record<DesktopLocale, Record<string, string>> = {
   },
   fr: {
     'common.cancel': 'Annuler',
+    'credentialRecovery.title': 'Identifiants enregistrés à restaurer',
+    'credentialRecovery.message': 'Une clé API de modèle ou de recherche ne peut pas être déchiffrée. Les identifiants originaux, conversations et espaces de travail sont conservés. Déverrouillez le stockage du système et redémarrez, ou ouvrez les réglages pour saisir les clés ou vous connecter. Les profils importés utilisent les réglages.',
+    'credentialRecovery.open': 'Ouvrir les réglages des identifiants',
     "account.recoveryTitle": "Réinitialiser la connexion locale ?",
     "account.recoveryMessage": "Impossible de restaurer la connexion locale.",
     "account.recoveryDetail": "Les identifiants actuels seront sauvegardés avant la réinitialisation et l’ouverture du navigateur pour autorisation. Vos conversations, paramètres de modèles et solde du compte sur le site seront conservés.",
@@ -4637,6 +4719,9 @@ const DESKTOP_MESSAGES: Record<DesktopLocale, Record<string, string>> = {
   },
   de: {
     'common.cancel': 'Abbrechen',
+    'credentialRecovery.title': 'Gespeicherte Zugangsdaten wiederherstellen',
+    'credentialRecovery.message': 'Ein Modell- oder Such-API-Schlüssel kann nicht entschlüsselt werden. Originale Zugangsdaten, Gespräche und Arbeitsbereich bleiben erhalten. Entsperren Sie den Systemspeicher und starten Sie neu, oder öffnen Sie die Einstellungen zur erneuten Eingabe oder Anmeldung. Importierte Profile verwenden die Einstellungen.',
+    'credentialRecovery.open': 'Zugangsdaten-Einstellungen öffnen',
     "account.recoveryTitle": "Lokale Anmeldung zurücksetzen?",
     "account.recoveryMessage": "Die lokalen Anmeldedaten können nicht wiederhergestellt werden.",
     "account.recoveryDetail": "Die aktuellen Zugangsdaten werden gesichert, bevor die Anmeldung zurückgesetzt und der Browser zur Autorisierung geöffnet wird. Gespräche, Modelleinstellungen und das Kontoguthaben auf der Website bleiben erhalten.",
@@ -4801,6 +4886,9 @@ const DESKTOP_MESSAGES: Record<DesktopLocale, Record<string, string>> = {
   },
   es: {
     'common.cancel': 'Cancelar',
+    'credentialRecovery.title': 'Las credenciales guardadas necesitan atención',
+    'credentialRecovery.message': 'No se puede descifrar una clave API de modelo o búsqueda. Se conservan las credenciales originales, conversaciones y espacio de trabajo. Desbloquea el almacén del sistema y reinicia, o abre la configuración para volver a introducir las claves o iniciar sesión. Los perfiles importados usan Ajustes.',
+    'credentialRecovery.open': 'Abrir ajustes de credenciales',
     "account.recoveryTitle": "¿Restablecer el inicio de sesión local?",
     "account.recoveryMessage": "No se puede restaurar el inicio de sesión local.",
     "account.recoveryDetail": "Se respaldarán las credenciales actuales antes de restablecer el inicio de sesión y abrir el navegador para autorizar. Se conservarán las conversaciones, la configuración de modelos y el saldo de la cuenta en el sitio web.",
@@ -7624,29 +7712,28 @@ function abandonOnboardingFlow(
 }
 
 async function prepareDesktopStartupConnection(): Promise<DesktopConnection | null> {
+  if (desktopStartupConnectionPromise) return desktopStartupConnectionPromise
+  const promise = prepareDesktopStartupConnectionOnce()
+  desktopStartupConnectionPromise = promise
+  try { return await promise } finally {
+    if (desktopStartupConnectionPromise === promise) desktopStartupConnectionPromise = null
+  }
+}
+
+async function prepareDesktopStartupConnectionOnce(): Promise<DesktopConnection | null> {
   const pendingProviderSetup = await loadPendingMigrationProviderSetup()
   const existing = await loadDesktopCredential()
-  // A saved credential encrypted with the OS keychain that this session cannot
-  // read (keychain locked or unavailable) must not be treated as "no credential":
-  // silently re-onboarding would re-save the key as plaintext. Surface an
-  // actionable error so the user can unlock and retry, or Reset setup.
-  if (
-    desktopSecretStoragePolicyBackend() === 'safeStorage'
-    && desktopSecretStorageBackend() !== 'safeStorage'
-    && (
-      pendingProviderSetup !== null
-      || Boolean(existing?.encryptedApiKey && existing.encryption === 'safeStorage')
-    )
-  ) {
-    throw new DesktopStartupError(
-      'keychain_unavailable',
-      'OpenSquilla needs the OS keychain to read or safely adopt this credential, '
-      + 'but the keychain is currently unavailable. Unlock it and reopen '
-      + 'OpenSquilla, or use "Reset setup" to start over.'
-    )
+  // Existing config belongs to the profile. OS credential availability must
+  // not gate opening the local client; each injection is checked at spawn.
+  const configExists = await pathExists(desktopConfigPath())
+  if (configExists) {
+    if (pendingProviderSetup || forceOnboardingOnNextStartup) {
+      onboardingPromptProfileKey = desktopProfileKey()
+    }
+    return pendingProviderSetup ? null : existing
   }
-  const credentialReadable = existing?.encryption !== 'safeStorage' || desktopSecretStoragePolicyBackend() === 'safeStorage'
-  if (!pendingProviderSetup && existing && credentialReadable && isConnectionReady(existing)) {
+  if (!pendingProviderSetup && existing && existing.configAuthority !== 'profile'
+    && (!providerDefaults(existing.provider).requiresApiKey || Boolean(existing.encryptedApiKey))) {
     // Seed the gateway config from the saved credential only when it does not
     // exist yet. Once it exists the Control UI owns it via RPC, so regenerating
     // it from the credential template here would clobber provider/router/channel
@@ -7667,7 +7754,6 @@ async function prepareDesktopStartupConnection(): Promise<DesktopConnection | nu
   // An explicit empty primary prevents provider defaults or inherited API keys
   // from silently configuring a fresh profile. The config also records that the
   // first-run invitation has been offered; later launches use Settings instead.
-  const configExists = await pathExists(desktopConfigPath())
   if (!configExists) {
     const finishWriter = beginDesktopWriterOperation('initialize unconfigured desktop profile')
     const profile = activeDesktopProfile()
@@ -9903,14 +9989,8 @@ async function startGateway(): Promise<GatewayState> {
     }
   }
   forceOnboardingOnNextStartup = false
-  const apiKey = startupConnection ? decryptApiKey(startupConnection) : ''
-  // Keyless providers (e.g. Ollama) ship requiresApiKey=false and are accepted
-  // by onboarding without a key, so only treat a missing key as fatal when the
-  // provider actually needs one — otherwise every keyless credential wedges boot.
-  if (startupConnection && providerDefaults(startupConnection.provider).requiresApiKey && !apiKey) {
-    throw new Error('Saved desktop API key could not be read.')
-  }
-  const searchApiKey = startupConnection ? decryptSearchApiKey(startupConnection) : ''
+  const apiKey = startupConnection ? readDesktopStartupSecret(startupConnection, 'encryptedApiKey') : ''
+  const searchApiKey = startupConnection ? readDesktopStartupSecret(startupConnection, 'encryptedSearchApiKey') : ''
   // Config is seeded (when missing) inside runOnboarding / the onboarding save,
   // and is otherwise the RPC-owned source of truth — so it is intentionally NOT
   // regenerated here on every boot.
@@ -10172,13 +10252,16 @@ async function startGateway(): Promise<GatewayState> {
     // Release the append fd; without this every (re)start leaks one open handle
     // to gateway.log for the lifetime of the main process.
     closeLogStream()
+    // A settings save can stop a still-starting child and clear its ownership.
+    // Settle that child's private readiness wait after draining its output even
+    // when a newer operation owns the global Gateway state.
+    childExitMessage = classifiedMessage
     if (!isCurrentGateway) return
     if (isQuitting) {
       gatewayState.status = 'stopped'
       publishGatewayConnection()
       return
     }
-    childExitMessage = classifiedMessage
     advanceGatewayStartTelemetry('spawn', 'spawn_failed')
     if (!childWasReady && portConflictExit && !hasExplicitGatewayPort()) {
       gatewayState.status = 'stopped'
@@ -11107,6 +11190,9 @@ async function openOrResumeDesktopApp(): Promise<void> {
               sendBootStatus('ready')
               finishAppStartSuccess()
               finishDesktopStartupStageAttempt(startupStageAttempt, 'success')
+              void offerDesktopCredentialRecovery().catch(() => {
+                desktopLog('credential_recovery_notice_unavailable')
+              })
               if (onboardingPromptProfileKey === desktopProfileKey() && !onboardingFlows.active) {
                 onboardingPromptProfileKey = null
                 // The client and Gateway are already ready. This optional,
@@ -15953,7 +16039,11 @@ async function performOnboardingSave(
       && !isQuitting && !desktopWriters.closed && appExitPhase === 'running') {
       clearReusableGatewayState()
       bootError = null
-      void openOrResumeDesktopApp()
+      const restart = openOrResumeDesktopApp()
+      // A failed save leaves the wizard open. Finish restoring the stopped
+      // runtime before releasing this save request for another attempt, or an
+      // immediate correction can stop the replacement while it is starting.
+      if (flow.state === 'editing') await restart
     }
   }
 }

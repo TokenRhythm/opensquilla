@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import json
+import os
+import subprocess
 import threading
 from pathlib import Path
 
@@ -126,6 +128,104 @@ def test_existing_credentials_are_never_replaced_or_used(home: Path) -> None:
     assert raised.value.stable_code == "profile_not_fresh"
     assert not home.exists()
     assert credential.read_bytes() == b'{"provider":"openai","encryptedApiKey":"synthetic"}'
+
+
+@pytest.mark.parametrize("completed_login", [False, True])
+def test_preboot_account_artifacts_are_retained(home: Path, completed_login: bool) -> None:
+    account = home / "desktop-account" / "0123456789abcdef"
+    account.mkdir(parents=True)
+    (home / "workspace").mkdir()
+    (home / "state").mkdir()
+    originals = {"installation-id": b"11234567-89ab-4cde-8fab-0123456789ab"}
+    if completed_login:
+        originals.update({"account.local.key": b"x" * 32,
+                          "account.local.enc": b"local-v1:synthetic-encrypted-account"})
+    for name, data in originals.items():
+        (account / name).write_bytes(data)
+    for _ in range(3):
+        assert initialize(home).outcome == "ready"
+        for name, data in originals.items():
+            assert (account / name).read_bytes() == data
+    assert (home / "config.toml").read_bytes() == SEED.encode()
+
+
+@pytest.mark.parametrize("relative", [
+    "desktop-account/not-an-origin/installation-id",
+    "desktop-account/0123456789abcdef/unknown.txt",
+    "desktop-account/0123456789abcdef/workspace/chat.txt",
+    "workspace/existing-chat.txt",
+])
+def test_account_exception_does_not_admit_unknown_data(home: Path, relative: str) -> None:
+    artifact = home / relative
+    artifact.parent.mkdir(parents=True)
+    artifact.write_bytes(b"preserve me")
+    with pytest.raises(RecoveryError):
+        initialize(home)
+    assert artifact.read_bytes() == b"preserve me"
+    assert not (home / "config.toml").exists()
+
+
+def test_account_only_profile_can_initialize_without_touching_account(home: Path) -> None:
+    account = home / "desktop-account" / "0123456789abcdef"
+    account.mkdir(parents=True)
+    original = b"11234567-89ab-4cde-8fab-0123456789ab"
+    (account / "installation-id").write_bytes(original)
+    assert initialize(home).outcome == "ready"
+    assert (account / "installation-id").read_bytes() == original
+
+
+def test_preboot_reconcile_artifacts_do_not_wedge_existing_account(home: Path) -> None:
+    from opensquilla.recovery import reconcile_profile
+
+    (home / "workspace").mkdir(parents=True)
+    (home / "state").mkdir()
+    account = home / "desktop-account" / "0123456789abcdef"
+    account.mkdir(parents=True)
+    (account / "installation-id").write_bytes(b"11234567-89ab-4cde-8fab-0123456789ab")
+    reconcile_profile(home)
+    marker = (home / "desktop-layout-v2.json").read_bytes()
+    assert initialize(home).outcome == "ready"
+    assert (home / "desktop-layout-v2.json").read_bytes() == marker
+
+
+def test_nonempty_layout_receipt_does_not_admit_existing_data(home: Path) -> None:
+    (home / "workspace").mkdir(parents=True)
+    (home / "state").mkdir()
+    (home / "desktop-layout-v2.json").write_text(json.dumps({
+        "schema_version": 2, "protectedBy": "rc4", "migratedAt": "2026-11-17T00:00:00+00:00",
+        "moved": ["sessions"],
+    }))
+    with pytest.raises(RecoveryError):
+        initialize(home)
+    assert not (home / "config.toml").exists()
+
+
+def test_preboot_account_rejects_hardlinked_artifact(home: Path, tmp_path: Path) -> None:
+    account = home / "desktop-account" / "0123456789abcdef"
+    account.mkdir(parents=True)
+    outside = tmp_path / "outside-key"
+    outside.write_bytes(b"x" * 32)
+    os.link(outside, account / "account.local.key")
+    with pytest.raises(RecoveryError):
+        initialize(home)
+    assert outside.read_bytes() == b"x" * 32
+    assert not (home / "config.toml").exists()
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows junction boundary")
+def test_preboot_account_rejects_windows_junction(home: Path, tmp_path: Path) -> None:
+    home.mkdir()
+    outside = tmp_path / "outside-account"
+    outside.mkdir()
+    result = subprocess.run(
+        ["cmd", "/c", "mklink", "/J", str(home / "desktop-account"), str(outside)],
+        capture_output=True, text=True, check=True,
+    )
+    assert result.returncode == 0
+    with pytest.raises(RecoveryError):
+        initialize(home)
+    assert not list(outside.iterdir())
+    assert not (home / "config.toml").exists()
 
 
 @pytest.mark.parametrize("phase", ["prepared", "published"])

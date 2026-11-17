@@ -216,6 +216,7 @@ for (const superseded of [false, true]) {
     finishAppStartFailure: () => { events.push('failure') },
     clearReusableGatewayState: () => { events.push('cleanup') },
     sendBootStatus() {}, finishAppStartSuccess: () => { events.push('ready') },
+    offerDesktopCredentialRecovery: async () => {},
   })
   vm.runInContext(resumeCode, startup)
   await startup.openOrResumeDesktopApp()

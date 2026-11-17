@@ -133,7 +133,10 @@ async function runRealProcessExitBeforeStdioCloseCase() {
     // needed, and the same handshake works on Windows, macOS, and Linux.
     const holderSource = `
       const socket = require('node:net').connect({ host: '127.0.0.1', port: Number(process.argv[1]) });
-      socket.once('connect', () => socket.write('ready'));
+      // Exercise both inherited streams before allowing the launcher to exit;
+      // the TCP handshake alone does not validate the pipe-holder fixture.
+      socket.once('connect', () => process.stdout.write('holder-ready', () =>
+        process.stderr.write('holder-ready', () => socket.write('ready'))));
       socket.once('end', () => process.exit(0));
       socket.once('close', () => process.exit(0));
       socket.once('error', () => process.exit(1));
@@ -344,6 +347,7 @@ function mainStartupHarness() {
     forceOnboardingOnNextStartup: false,
     onboardingPromptProfileKey: null,
     onboardingFlows: { active: null },
+    offerDesktopCredentialRecovery: async () => {},
     runOnboarding: () => {
       calls.invitations += 1
       return new Promise(() => {})
@@ -682,6 +686,7 @@ function lateReadyHarness() {
     gatewayProcessOwnershipContexts: new Map([[child, launch]]),
     forceOnboardingOnNextStartup: false, onboardingPromptProfileKey: null,
     onboardingFlows: { active: null }, bootError: null,
+    offerDesktopCredentialRecovery: async () => {},
     gatewayStartPromise: null, gatewayStartTelemetryAttempt: null,
     invalidateSecretStorageBackendCache() {},
     createGatewayStartTelemetryAttempt: () => ({}), finishGatewayStartTelemetry() {},
