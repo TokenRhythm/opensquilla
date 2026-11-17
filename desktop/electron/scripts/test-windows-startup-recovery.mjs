@@ -5,14 +5,17 @@
 // asserts the known failures. Evidence is retained under --output=<new folder>.
 import assert from 'node:assert/strict'
 import { spawnSync } from 'node:child_process'
+import { createHash } from 'node:crypto'
+import { createServer as createHttpServer } from 'node:http'
 import { mkdir, mkdtemp, readFile, readdir, writeFile } from 'node:fs/promises'
 import { createServer } from 'node:net'
 import { tmpdir } from 'node:os'
 import { dirname, join, resolve } from 'node:path'
-import { fileURLToPath } from 'node:url'
+import { fileURLToPath, pathToFileURL } from 'node:url'
 import electronBinary from 'electron'
 import { _electron } from 'playwright'
 import { closeElectronWithDeadline, requestElectronQuitWithConfirmation } from './e2e-shutdown-helpers.mjs'
+import { LocalAccountSecrets, LOCAL_ACCOUNT_FILE } from '../dist/local-account-secrets.js'
 
 assert.equal(process.platform, 'win32', 'This acceptance test requires native Windows')
 const option = name => process.argv.find(value => value.startsWith(`--${name}=`))?.slice(name.length + 3)
@@ -21,8 +24,8 @@ const repo = resolve(option('repo') || join(packageRoot, '../..'))
 const baseline = process.argv.includes('--baseline')
 const cases = (option('cases') || (baseline
   ? 'fresh,early,account,model,search,interrupted'
-  : 'fresh,early,account,model,search,both,interrupted,repair')).split(',')
-assert.ok(cases.every(name => ['fresh', 'early', 'account', 'model', 'search', 'both', 'interrupted', 'repair'].includes(name)))
+  : 'fresh,early,account,account-rejected,model,search,both,interrupted,repair,account-repair')).split(',')
+assert.ok(cases.every(name => ['fresh', 'early', 'account', 'account-rejected', 'model', 'search', 'both', 'interrupted', 'repair', 'account-repair'].includes(name)))
 const root = option('output') ? resolve(option('output')) : await mkdtemp(join(tmpdir(), 'opensquilla-startup-recovery-'))
 await mkdir(root, { recursive: true })
 const environment = process.env.UV_PROJECT_ENVIRONMENT
@@ -128,6 +131,12 @@ asyncio.run(main())
     await page.getByText('synthetic retained answer', { exact: true }).first().waitFor({ timeout: 30_000 })
   }
   let app
+  let fixture
+  let fixtureUrl
+  let accountDirectory
+  let accountTokens
+  let modelRequests = 0
+  const accountReply = 'SYNTHETIC_ACCOUNT_RECOVERY_CHAT_OK'
   try {
     const bootstrap = join(directory, 'safe-storage.cjs')
     await writeFile(bootstrap, "const {app}=require('electron'); app.whenReady();\n")
@@ -150,7 +159,7 @@ asyncio.run(main())
     await app.close()
     app = null
 
-    if (['model', 'search', 'both', 'repair'].includes(name)) {
+    if (['model', 'search', 'both', 'repair', 'account-repair'].includes(name)) {
       await mkdir(join(home, 'workspace'), { recursive: true })
       await mkdir(join(home, 'state'))
       const provider = 'openai'
@@ -161,17 +170,64 @@ asyncio.run(main())
       await preserve(join(userData, 'desktop-credential.json'), JSON.stringify({
         provider, model: 'synthetic-model', baseUrl: 'http://127.0.0.1:1', apiKeyEnv: 'OPENAI_API_KEY',
         encryption: 'safeStorage', encryptedApiKey: name === 'search' ? native.validCiphertext : native.ciphertext,
-        encryptedSearchApiKey: name === 'model' ? native.validCiphertext : native.ciphertext,
+        encryptedSearchApiKey: ['model', 'account-repair'].includes(name) ? native.validCiphertext : native.ciphertext,
         searchProvider: 'brave', searchApiKeyEnv: 'BRAVE_API_KEY',
         routerMode: 'disabled', configAuthority: 'generated',
       }))
     }
-    if (name === 'account') {
+    if (['account', 'account-rejected'].includes(name)) {
       const account = join(home, 'desktop-account', '0123456789abcdef')
       await mkdir(account, { recursive: true })
       await mkdir(join(home, 'workspace'))
       await mkdir(join(home, 'state'))
       await preserve(join(account, 'installation-id'), '11234567-89ab-4cde-8fab-0123456789ab')
+      if (name === 'account-rejected') await preserve(join(account, 'model-key-rejected'), '1')
+    }
+    if (name === 'account-repair') {
+      const origin = 'https://tokenrhythm.studio'
+      accountDirectory = join(home, 'desktop-account', createHash('sha256').update(origin).digest('hex').slice(0, 16))
+      accountTokens = { accessToken: 'synthetic-access', refreshToken: 'synthetic-refresh',
+        expiresAt: Date.now() + 3600_000, accountId: 'synthetic-account', sessionId: 'synthetic-session' }
+      const secrets = new LocalAccountSecrets(accountDirectory)
+      await writeFile(join(accountDirectory, LOCAL_ACCOUNT_FILE), secrets.encrypt(JSON.stringify({
+        version: 1, tokens: accountTokens, source: 'account', selectedAccountId: 'synthetic-account', pending: [],
+        key: { secret: 'synthetic-account-key', keyId: 'synthetic-key', generation: 1, accountId: 'synthetic-account' },
+      })))
+      const accountKey = await readFile(join(accountDirectory, 'account.local.key'))
+      originals.set(join(accountDirectory, 'account.local.key'), accountKey)
+      fixture = createHttpServer(async (request, response) => {
+        const chunks = []
+        for await (const chunk of request) chunks.push(chunk)
+        const path = new URL(request.url, 'http://localhost').pathname
+        const json = data => { response.setHeader('content-type', 'application/json'); response.end(JSON.stringify(data)) }
+        if (path.endsWith('/account')) return json({ code: 0, data: {
+          account_id: 'synthetic-account', session_id: 'synthetic-session', display_name: 'Synthetic account',
+          masked_phone: 'synthetic', links: {},
+        } })
+        if (path.endsWith('/wallet')) return json({ code: 0, data: { account_id: 'synthetic-account', currency: 'CNY',
+          balances: { available: '1', recharge: '1', bonus: '0', debt: '0', frozen: '0' }, as_of: '2026-11-17T00:00:00Z' } })
+        if (path.includes('/managed-key')) return json({ code: 0, data: { account_id: 'synthetic-account',
+          app_id: 'opensquilla', status: 'active', key_id: 'synthetic-key', generation: 1, secret: 'synthetic-account-key' } })
+        if (path.endsWith('/models')) return json({ data: [{ id: 'qwen3.7-max', object: 'model' }] })
+        if (path === '/v1/chat/completions' && request.headers.authorization === 'Bearer synthetic-account-key') {
+          modelRequests++
+          const body = JSON.parse(Buffer.concat(chunks).toString())
+          const base = { id: 'synthetic-chat', created: 0, model: body.model }
+          if (!body.stream) return json({ ...base, object: 'chat.completion', choices: [
+            { index: 0, message: { role: 'assistant', content: accountReply }, finish_reason: 'stop' } ] })
+          response.setHeader('content-type', 'text/event-stream')
+          response.end([ { ...base, object: 'chat.completion.chunk', choices: [
+            { index: 0, delta: { role: 'assistant', content: accountReply }, finish_reason: null } ] },
+          { ...base, object: 'chat.completion.chunk', choices: [
+            { index: 0, delta: {}, finish_reason: 'stop' } ] },
+          ].map(frame => `data: ${JSON.stringify(frame)}\n\n`).join('') + 'data: [DONE]\n\n')
+          return
+        }
+        response.statusCode = 400
+        json({ error: 'Unexpected synthetic request' })
+      })
+      await new Promise(resolve => fixture.listen(0, '127.0.0.1', resolve))
+      fixtureUrl = `http://127.0.0.1:${fixture.address().port}`
     }
     if (name === 'interrupted') {
       const code = `import sys
@@ -205,13 +261,39 @@ print(inspect_profile(home).stable_code)
       await preserve(join(home, 'workspace', 'preserve.txt'), 'synthetic workspace')
       await preserve(join(home, 'state', 'preserve.json'), 'synthetic history')
     }
-    const hasHistory = ['model', 'search', 'both', 'repair', 'interrupted'].includes(name)
+    const hasHistory = ['model', 'search', 'both', 'repair', 'interrupted', 'account-repair'].includes(name)
     if (hasHistory) history('seed')
 
     const start = async () => {
       const instance = await _electron.launch({
         executablePath: electronBinary, args: [`--user-data-dir=${userData}`, join(repo, 'desktop/electron')], env,
       })
+      app = instance // Keep lifecycle ownership even if a test transport hook fails.
+      if (fixtureUrl) await instance.evaluate(async (_electron, { modules, fixtureUrl }) => {
+        // Substitute only external auth/model transports; retain real account
+        // verification, storage, leases, proxy, Gateway, handler and renderer.
+        const require = process.getBuiltinModule('module').createRequire(modules + 'main.js')
+        const { TokenRhythmAccount } = require('./tokenrhythm-account.js')
+        const { TokenRhythmModelProxy } = require('./tokenrhythm-model-proxy.js')
+        const { request } = process.getBuiltinModule('http')
+        const initialize = TokenRhythmAccount.prototype.initialize
+        TokenRhythmAccount.prototype.initialize = function () {
+          this.request = (url, options) => {
+            const target = new URL(url)
+            if (target.origin !== 'https://tokenrhythm.studio') throw new Error('Unexpected authentication origin')
+            return fetch(fixtureUrl + target.pathname + target.search, options)
+          }
+          return initialize.call(this)
+        }
+        const handle = TokenRhythmModelProxy.prototype.handle
+        TokenRhythmModelProxy.prototype.handle = function (...args) {
+          this.upstreamRequest = (url, options, callback) => {
+            if (url.origin !== 'https://tokenrhythm.studio') throw new Error('Unexpected model origin')
+            return request(fixtureUrl + url.pathname, options, callback)
+          }
+          return handle.apply(this, args)
+        }
+      }, { modules: pathToFileURL(join(repo, 'desktop/electron/dist/')).href, fixtureUrl })
       await instance.evaluate(({ shell, dialog }, repair) => {
         // Authentication remains local: verify the actual login IPC generated
         // the authorization URL, without opening a real browser/account.
@@ -224,7 +306,7 @@ print(inspect_profile(home).stable_code)
           globalThis.credentialRecoveryNotices.push(options)
           return { response: repair ? 0 : 1, checkboxChecked: false }
         }
-      }, name === 'repair')
+      }, ['repair', 'account-repair'].includes(name))
       return instance
     }
     app = await start()
@@ -238,7 +320,7 @@ print(inspect_profile(home).stable_code)
     const failedBaseline = baseline && name !== 'fresh'
     const terminal = async index => waitFor(async () => {
       for (const page of app.windows()) {
-        if (!page.isClosed() && page.url().startsWith('data:text/html') && name !== 'repair') {
+        if (!page.isClosed() && page.url().startsWith('data:text/html') && !['repair', 'account-repair'].includes(name)) {
           try {
             await page.evaluate(() => window.opensquillaDesktop?.skipOnboarding())
           } catch (error) {
@@ -264,7 +346,31 @@ print(inspect_profile(home).stable_code)
       } else {
         assert.equal(event.outcome, 'success', JSON.stringify(event))
       }
-      if (index === 0 && name === 'repair') {
+      if (index === 0 && name === 'account-repair') {
+        const wizard = await waitFor(() => app.windows().find(page => page.url().startsWith('data:text/html')), 'account recovery setup')
+        await wizard.locator('#accountContinue').waitFor({ state: 'visible', timeout: 30_000 })
+        await wizard.locator('#accountContinue').click()
+        await waitFor(() => wizard.isClosed(), 'confirmed account settings publication')
+        const saved = JSON.parse(await readFile(join(userData, 'desktop-credential.json'), 'utf8'))
+        assert.equal(saved.provider, 'tokenrhythm')
+        assert.equal(saved.credentialSource, 'account')
+        assert.equal(saved.encryptedApiKey, '')
+        assert.equal(saved.encryption, 'safeStorage')
+        assert.equal(saved.encryptedSearchApiKey, native.validCiphertext)
+        const config = await readFile(join(home, 'config.toml'), 'utf8')
+        assert.match(config, /provider = "tokenrhythm"/)
+        assert.match(config, /credential_source = "account"/)
+        for (const [directory, prefix, original] of [
+          [userData, 'desktop-credential.unreadable-', join(userData, 'desktop-credential.json')],
+          [home, 'config.toml.before-account-', join(home, 'config.toml')],
+        ]) {
+          const backups = (await readdir(directory)).filter(file => file.startsWith(prefix))
+          assert.ok((await Promise.all(backups.map(file => readFile(join(directory, file)))))
+            .some(bytes => bytes.equals(originals.get(original))))
+          originals.delete(original)
+        }
+        report.accountPrimarySaved = true
+      } else if (index === 0 && name === 'repair') {
         const wizard = await waitFor(() => app.windows().find(page => page.url().startsWith('data:text/html')), 'credential recovery setup')
         // A partial replacement must fail without discarding either original.
         await assert.rejects(wizard.evaluate(() => window.opensquillaDesktop.saveOnboarding({
@@ -304,7 +410,16 @@ print(inspect_profile(home).stable_code)
       }
     }
     report.notices = await app.evaluate(() => globalThis.credentialRecoveryNotices)
-    if (!baseline && ['model', 'search', 'both', 'repair'].includes(name)) assert.equal(report.notices.length, 1)
+    if (!baseline && ['model', 'search', 'both', 'repair', 'account-repair'].includes(name)) assert.equal(report.notices.length, 1)
+    if (name === 'account-repair') {
+      const desktop = app.windows().find(page => page.url().startsWith('opensquilla-app://desktop/'))
+      await desktop.goto(new URL('/chat', desktop.url()).toString(), { waitUntil: 'domcontentloaded' })
+      const composer = desktop.locator('.chat-textarea')
+      await composer.fill('Return the synthetic account recovery confirmation. Do not use tools.')
+      await composer.press('Enter')
+      await waitFor(async () => modelRequests > 0 && (await desktop.locator('.chat-thread').innerText()).includes(accountReply), 'recovered account chat response')
+      report.accountChatReplied = true
+    }
     for (const [path, bytes] of originals) assert.deepEqual(await readFile(path), bytes, path)
     if (name === 'early') {
       assert.equal(await app.evaluate(() => Boolean(globalThis.syntheticAuthorizationUrl)), true)
@@ -329,6 +444,12 @@ print(inspect_profile(home).stable_code)
     throw error
   } finally {
     if (app) report.finalShutdown = await close(app, name)
+    if (fixture) { fixture.closeAllConnections(); await new Promise(resolve => fixture.close(resolve)) }
+    if (accountDirectory) {
+      const saved = JSON.parse(new LocalAccountSecrets(accountDirectory).decrypt(await readFile(join(accountDirectory, LOCAL_ACCOUNT_FILE), 'utf8')))
+      assert.deepEqual(saved.tokens, accountTokens)
+      report.accountTokensPreserved = true
+    }
     if (!report.error && report.historyPreserved) { history('verify'); report.coldHistoryPreserved = true }
     await writeFile(join(directory, 'result.json'), JSON.stringify(report, null, 2))
     reports.push(report)

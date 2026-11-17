@@ -156,7 +156,7 @@ def _initial_desktop_accounts(root: Path) -> bool:
     """
     limits = {"installation-id": 36, "account.local.key": 32,
               "account.local.enc": 1024 * 1024, "account.enc": 1024 * 1024,
-              "logged-out": 1}
+              "logged-out": 1, "model-key-rejected": 1}
     for origin in root.iterdir():
         if not re.fullmatch(r"[0-9a-f]{16}", origin.name):
             return False
@@ -174,7 +174,7 @@ def _initial_desktop_accounts(root: Path) -> bool:
                 return False
             if artifact.name == "account.local.key" and len(snapshot.data) != 32:
                 return False
-            if artifact.name == "logged-out" and snapshot.data != b"1":
+            if artifact.name in {"logged-out", "model-key-rejected"} and snapshot.data != b"1":
                 return False
     return True
 

@@ -345,6 +345,7 @@ interface DesktopConnection {
   model: string
   baseUrl: string
   apiKeyEnv: string
+  credentialSource?: 'account'
   encryptedApiKey?: string
   modelRoutingMode: ModelRoutingMode
   routerMode: RouterMode
@@ -2723,7 +2724,10 @@ function normalizeDesktopCredential(parsed: Partial<DesktopConnection>): Desktop
     provider,
     model: parsed.model || routerDefaultModel(routerTiers, routerDefaultTier) || defaults.model,
     baseUrl: parsed.baseUrl || defaults.baseUrl,
-    apiKeyEnv: parsed.apiKeyEnv || defaults.apiKeyEnv,
+    apiKeyEnv: parsed.credentialSource === 'account' && provider === 'tokenrhythm'
+      ? '' : parsed.apiKeyEnv || defaults.apiKeyEnv,
+    ...(parsed.credentialSource === 'account' && provider === 'tokenrhythm'
+      ? { credentialSource: 'account' as const } : {}),
     encryptedApiKey: parsed.encryptedApiKey || '',
     modelRoutingMode,
     routerMode,
@@ -2749,6 +2753,7 @@ const DESKTOP_CREDENTIAL_CONFIGURATION_FIELDS = [
   'model',
   'baseUrl',
   'apiKeyEnv',
+  'credentialSource',
   'encryptedApiKey',
   'modelRoutingMode',
   'routerMode',
@@ -2966,6 +2971,7 @@ async function saveDesktopCredential(
   payload: OnboardingPayload,
   writerReserved = false,
   completingOnboarding = false,
+  accountPrimary = false,
 ): Promise<DesktopConnection> {
   const targetProfile = activeDesktopProfile()
   const expectedCredential = await readOptionalDesktopText(targetProfile.credentialPath)
@@ -2977,6 +2983,7 @@ async function saveDesktopCredential(
     )
   }
   const provider = normalizeProvider(payload.provider ?? existing?.provider)
+  if (accountPrimary && provider !== 'tokenrhythm') throw new AccountError('INVALID_ACCOUNT_SOURCE')
   const defaults = providerDefaults(provider)
   const hasModelRoutingMode = Object.prototype.hasOwnProperty.call(payload, 'modelRoutingMode')
   const hasRouterMode = Object.prototype.hasOwnProperty.call(payload, 'routerMode')
@@ -3035,15 +3042,20 @@ async function saveDesktopCredential(
     : routerModel || directModel
   const baseUrl = String(payload.baseUrl || (!providerChanged && existing?.baseUrl) || defaults.baseUrl).trim() || defaults.baseUrl
   const searchApiKey = String(payload.searchApiKey || '').trim()
-  const resolvedApiKey = apiKey || (existing && provider === existing.provider ? decryptApiKey(existing) : '')
-  const resolvedSearchApiKey = searchDefaults.requiresApiKey
+  // Account tokens stay in the private bridge. The trusted account action must
+  // neither decrypt the old model key nor discard/re-encrypt a search key.
+  const resolvedApiKey = accountPrimary ? ''
+    : apiKey || (existing && provider === existing.provider ? decryptApiKey(existing) : '')
+  const resolvedSearchApiKey = !accountPrimary && searchDefaults.requiresApiKey
     ? searchApiKey || (existing && searchProvider === existing.searchProvider ? decryptSearchApiKey(existing) : '')
     : ''
   const apiKeySecret = resolvedApiKey ? encryptSecret(resolvedApiKey) : null
   const searchApiKeySecret = resolvedSearchApiKey ? encryptSecret(resolvedSearchApiKey) : null
   const encryptedApiKey = apiKeySecret?.value || ''
-  const encryptedSearchApiKey = searchApiKeySecret?.value || ''
-  const encryption = apiKeySecret?.encryption || searchApiKeySecret?.encryption || 'plain'
+  const encryptedSearchApiKey = accountPrimary ? existing?.encryptedSearchApiKey || ''
+    : searchApiKeySecret?.value || ''
+  const encryption = accountPrimary ? existing?.encryption || 'safeStorage'
+    : apiKeySecret?.encryption || searchApiKeySecret?.encryption || 'plain'
   const configDisableNetworkObservability = readDesktopConfigNetworkObservabilitySetting()
   const disableNetworkObservability = Object.prototype.hasOwnProperty.call(payload, 'disableNetworkObservability')
     ? normalizeBooleanSetting(payload.disableNetworkObservability, existing?.disableNetworkObservability ?? false)
@@ -3061,14 +3073,14 @@ async function saveDesktopCredential(
       ? emptyDesktopTelemetryConsent()
       : null
 
-  if (defaults.requiresApiKey && !encryptedApiKey) throw new Error('API key is required.')
+  if (!accountPrimary && defaults.requiresApiKey && !encryptedApiKey) throw new Error('API key is required.')
   if (modelRoutingMode === 'llm_ensemble' && !modelRoutingModeAllowed(modelRoutingMode, provider)
     && !(primaryChange && !hasModelRoutingMode && !hasRouterMode)) {
     throw new Error('LLM Ensemble requires OpenRouter or TokenRhythm in desktop onboarding.')
   }
   if (!routerModel && routerMode !== 'disabled') throw new Error('Router tiers require a default model.')
   if (!model) throw new Error('Model is required.')
-  if (searchDefaults.requiresApiKey && !encryptedSearchApiKey) {
+  if (!accountPrimary && searchDefaults.requiresApiKey && !encryptedSearchApiKey) {
     throw new Error(`${searchDefaults.label} search API key is required.`)
   }
 
@@ -3087,7 +3099,8 @@ async function saveDesktopCredential(
     provider,
     model,
     baseUrl,
-    apiKeyEnv: defaults.apiKeyEnv,
+    apiKeyEnv: accountPrimary ? '' : defaults.apiKeyEnv,
+    ...(accountPrimary ? { credentialSource: 'account' as const } : {}),
     encryptedApiKey,
     modelRoutingMode,
     routerMode,
@@ -3396,6 +3409,7 @@ function renderDesktopConfigAfterPreflight(
     '[llm]',
     `provider = ${tomlString(credential.provider)}`,
     `model = ${tomlString(credential.model)}`,
+    ...(credential.credentialSource === 'account' ? ['credential_source = "account"'] : []),
     ...(credential.apiKeyEnv ? [`api_key_env = ${tomlString(credential.apiKeyEnv)}`] : []),
     `base_url = ${tomlString(credential.baseUrl)}`,
     '',
@@ -3452,12 +3466,20 @@ async function applyDesktopSettingsPair(
       throw new Error('Desktop credential changed while settings were being prepared; retry.')
     }
     if (expectedCredential !== null && candidateCredential !== expectedCredential
-      && desktopCredentialNeedsRecovery(profile)) {
+      && (desktopCredentialNeedsRecovery(profile) || credential.credentialSource === 'account')) {
       // An explicit replacement must retain the unreadable original even after
       // the settings transaction cleans up its temporary rollback files.
       await writeFile(
         join(dirname(profile.credentialPath), `desktop-credential.unreadable-${randomUUID()}.json`),
         expectedCredential, { flag: 'wx', mode: 0o600, flush: true },
+      )
+    }
+    if (credential.credentialSource === 'account' && expectedConfig !== null) {
+      // Provider selection may replace an inline manual key as well as the
+      // credential mirror. Preserve both originals before the explicit switch.
+      await writeFile(
+        join(profile.home, `config.toml.before-account-${randomUUID()}`),
+        expectedConfig, { flag: 'wx', mode: 0o600, flush: true },
       )
     }
     const candidateConfig = renderDesktopConfigAfterPreflight(
@@ -7201,8 +7223,16 @@ function onboardingHtml(
     });
     accountCancel.addEventListener('click', () => window.opensquillaDesktop.accountAction('cancel').then(renderAccount));
     accountContinue.addEventListener('click', async () => {
+      if (submitting || leaving) return;
       accountContinue.disabled = true;
-      try { await window.opensquillaDesktop.completeAccountOnboarding(); } catch { accountContinue.disabled = false; }
+      try {
+        const result = await window.opensquillaDesktop.completeAccountOnboarding();
+        if (!result || !result.ok) throw new Error('Account setup could not be saved.');
+      } catch {
+        accountContinue.disabled = false;
+        errorBox.textContent = t.localSaveFailed;
+        errorBox.focus({ preventScroll: false });
+      }
     });
     const apiKey = document.getElementById('apiKey');
     const apiKeyError = document.getElementById('apiKeyError');
@@ -15906,6 +15936,7 @@ function completeOnboardingFlow(flow: OnboardingFlow, credential: DesktopConnect
 async function performOnboardingSave(
   flow: OnboardingFlow,
   payload: OnboardingPayload,
+  accountPrimary = false,
 ): Promise<OnboardingSaveResult> {
   const telemetry = new OnboardingSaveTelemetry(
     ++onboardingSaveTelemetryAttempt,
@@ -15973,6 +16004,12 @@ async function performOnboardingSave(
         // remained open. Re-check it on every save attempt instead of carrying
         // a transient locked-keychain result across a user unlock.
         invalidateSecretStorageBackendCache()
+        if (accountPrimary) {
+          if (pendingMigration) throw new Error('Complete imported profile setup before changing providers.')
+          // This flag is host-owned, never read from an IPC payload. Verification
+          // and binding must succeed before account-only settings can be saved.
+          await desktopAccount().account.selectSource('account')
+        }
         if (pendingMigration?.phase === 'needs-setup' && pendingMigration.provider) {
           return await saveImportedDesktopCredential(
             pendingMigration,
@@ -15982,7 +16019,7 @@ async function performOnboardingSave(
             payload,
           )
         }
-        return await saveDesktopCredential(payload, true, true)
+        return await saveDesktopCredential(payload, true, true, accountPrimary)
       })
       telemetry.markSettingsPersistedConfirmed()
       await telemetry.stage('local_finalize', async () => {
@@ -16523,9 +16560,15 @@ ipcMain.handle('desktop:onboarding:save', async (event, payload: OnboardingPaylo
 ipcMain.handle('desktop:onboarding:account', async (event) => {
   const flow = onboardingFlows.active
   if (!flow || !trustedOnboardingIpc(event, flow)) throw new AccountError('ACCOUNT_IPC_FORBIDDEN')
-  await desktopAccount().account.selectSource('account')
-  dismissOnboardingFlow(flow)
-  return { ok: true }
+  const payload = { provider: 'tokenrhythm', credentialSource: 'account' }
+  const request = onboardingFlows.requestSave(flow, payload, () => performOnboardingSave(flow, payload, true))
+  if (request.kind === 'conflict') {
+    return onboardingSaveFailure('save_in_progress', 'OpenSquilla is already saving a different setup request.')
+  }
+  if (request.kind === 'inactive') {
+    return onboardingSaveFailure('onboarding_inactive', 'OpenSquilla setup is no longer active.')
+  }
+  return await request.promise
 })
 ipcMain.handle('desktop:onboarding:skip', (event) => {
   const flow = onboardingFlows.active

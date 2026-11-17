@@ -50,8 +50,8 @@ const context = vm.createContext({
     throw Object.assign(new Error('missing synthetic credential'), { code: 'ENOENT' })
   },
   normalizeTextTier: value => value || 'c1',
-  normalizeSearchProvider: () => 'duckduckgo',
-  searchProviderDefaults: () => ({ requiresApiKey: false, envKey: '' }),
+  normalizeSearchProvider: value => value || 'duckduckgo',
+  searchProviderDefaults: value => ({ requiresApiKey: value === 'brave', envKey: value === 'brave' ? 'BRAVE_API_KEY' : '' }),
   normalizeBooleanSetting: (value, fallback) => typeof value === 'boolean' ? value : fallback,
   encryptSecret: () => ({ value: 'synthetic-encrypted-key', encryption: 'safeStorage' }),
   readDesktopConfigNetworkObservabilitySetting: () => false,
@@ -165,6 +165,26 @@ credentialText = JSON.stringify({
 await assert.rejects(context.loadDesktopCredential(), /Reset setup/)
 credentialText = '{invalid'
 await assert.rejects(context.loadDesktopCredential(), /invalid or unreadable/)
+
+// The verified account path changes the primary without decrypting the failed
+// model key or losing an unrelated search ciphertext. IPC payload fields alone
+// cannot grant that trusted path or bypass the manual API-key requirement.
+credentialText = JSON.stringify({ provider: 'openai', model: 'original-model',
+  encryptedApiKey: 'unreadable-model', encryptedSearchApiKey: 'unreadable-search',
+  searchProvider: 'brave', encryption: 'safeStorage', routerMode: 'disabled' })
+configText = '[llm]\nprovider = "openai"\nmodel = "original-model"\n[squilla_router]\nenabled = false\n'
+context.decryptApiKey = context.decryptSearchApiKey = () => { throw new Error('must not decrypt old keys') }
+const accountCredential = await context.saveDesktopCredential({ provider: 'tokenrhythm' }, true, true, true)
+assert.equal(accountCredential.provider, 'tokenrhythm')
+assert.equal(accountCredential.credentialSource, 'account')
+assert.equal(accountCredential.encryptedApiKey, '')
+assert.equal(accountCredential.apiKeyEnv, '')
+assert.equal(accountCredential.encryptedSearchApiKey, 'unreadable-search')
+assert.equal(accountCredential.encryption, 'safeStorage')
+assert.equal(context.normalizeDesktopCredential(accountCredential).credentialSource, 'account')
+assert.equal(context.normalizeDesktopCredential(accountCredential).apiKeyEnv, '')
+await assert.rejects(context.saveDesktopCredential({ provider: 'tokenrhythm',
+  credentialSource: 'account', searchProvider: 'duckduckgo' }, true, true), /API key is required/)
 
 // Exercise the real startup catch, including a profile change during its await.
 // It must reveal the existing reset UI, and must still clean up a superseded run.

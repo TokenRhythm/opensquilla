@@ -174,6 +174,36 @@ def test_account_only_profile_can_initialize_without_touching_account(home: Path
     assert (account / "installation-id").read_bytes() == original
 
 
+@pytest.mark.parametrize("marker", ["logged-out", "model-key-rejected"])
+@pytest.mark.parametrize("data", [b"1", b"", b"0", b"11", b"1\n"])
+def test_preboot_account_markers_require_exact_bytes(home: Path, marker: str, data: bytes) -> None:
+    account = home / "desktop-account" / "0123456789abcdef"
+    account.mkdir(parents=True)
+    path = account / marker
+    path.write_bytes(data)
+    if data == b"1":
+        for _ in range(3):
+            assert initialize(home).outcome == "ready"
+    else:
+        with pytest.raises(RecoveryError):
+            initialize(home)
+        assert not (home / "config.toml").exists()
+    assert path.read_bytes() == data
+
+
+@pytest.mark.parametrize("marker", ["logged-out", "model-key-rejected"])
+def test_preboot_account_markers_reject_hardlinks(home: Path, tmp_path: Path, marker: str) -> None:
+    account = home / "desktop-account" / "0123456789abcdef"
+    account.mkdir(parents=True)
+    outside = tmp_path / "outside-marker"
+    outside.write_bytes(b"1")
+    os.link(outside, account / marker)
+    with pytest.raises(RecoveryError):
+        initialize(home)
+    assert outside.read_bytes() == b"1"
+    assert not (home / "config.toml").exists()
+
+
 def test_preboot_reconcile_artifacts_do_not_wedge_existing_account(home: Path) -> None:
     from opensquilla.recovery import reconcile_profile
 
