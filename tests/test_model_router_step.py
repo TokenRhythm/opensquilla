@@ -505,3 +505,34 @@ def test_explicit_thinking_requires_reasoning_even_when_policy_suggests_t0():
     ctx.metadata.update(routing_applied=True, routed_tier="c0", thinking_mode="T0")
     with pytest.raises(ModelRouteError, match="does not support reasoning"):
         validate_model_route_capacity(ctx)
+
+
+def test_undeclared_capacity_is_reported_as_a_configuration_gap():
+    ctx = context(auto_thinking=False)
+    ctx.config.squilla_router.tiers["c0"]["model"] = "undeclared-route-model"
+    ctx.metadata.update(routing_applied=True, routed_tier="c0", thinking_mode="T0")
+    with pytest.raises(ModelRouteError, match="no verified context capacity") as denied:
+        validate_model_route_capacity(ctx)
+    message = str(denied.value)
+    assert denied.value.capacity_status == "capacity_unknown"
+    # The size claim this denial cannot prove must not reach the transcript.
+    assert "cannot fit the complete request" not in message
+    assert "context_window_tokens" in message
+
+
+def test_known_oversize_keeps_the_size_wording_and_adds_the_reduction_hint():
+    ctx = context()
+    ctx.config.llm.context_window_tokens = 10000
+    ctx.metadata.update(
+        routing_applied=True,
+        routed_tier="c0",
+        thinking_mode="T0",
+        routing_history_capacity_estimated_tokens=20000,
+        routing_history_capacity_message_count=20,
+        routing_history_capacity_estimate_complete=True,
+    )
+    with pytest.raises(ModelRouteError, match="cannot fit the complete request") as denied:
+        validate_model_route_capacity(ctx)
+    message = str(denied.value)
+    assert denied.value.capacity_status == "known_capacity_request_too_large"
+    assert "/compact" in message
