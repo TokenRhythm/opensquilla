@@ -5,13 +5,16 @@ from __future__ import annotations
 import contextlib
 import json
 import os
+import re
+import stat
 import tomllib
 import uuid
 from collections.abc import Callable
 from dataclasses import replace
+from datetime import datetime
 from pathlib import Path
 
-from opensquilla.recovery.atomic import _native_io_path
+from opensquilla.recovery.atomic import _native_io_path, is_path_redirecting_stat
 from opensquilla.recovery.config_patch import ConfigSnapshot
 from opensquilla.recovery.errors import DestinationExistsError, RecoveryError
 from opensquilla.recovery.locking import LegacyGatewayLock, ProfileOperationLock, resolve_home_link
@@ -84,16 +87,34 @@ def _initial_consent_mirror(path: Path) -> bool:
 
 
 def _initial_canonical_roots(home: Path) -> bool:
-    """Accept empty roots plus the known pre-Gateway, fail-closed consent mirror."""
+    """Accept only empty data roots and known pre-Gateway control artifacts."""
     if not _lexists(home):
         return True
     _plain_directory(home)
     entries = tuple(home.iterdir())
-    if any(entry.name not in {"workspace", "state"} for entry in entries):
+    allowed = {"workspace", "state", "desktop-account", "desktop-layout-v2.json"}
+    if any(entry.name not in allowed for entry in entries):
         return False
     for entry in entries:
+        if entry.name == "desktop-layout-v2.json":
+            if not _initial_layout_marker(entry):
+                return False
+            continue
         _plain_directory(entry)
+        if entry.name == "desktop-account":
+            if not _initial_desktop_accounts(entry):
+                return False
+            continue
         for child in entry.iterdir():
+            if entry.name == "state" and child.name == "gateway.pid.lock":
+                # LegacyGatewayLock already holds this exact compatibility
+                # lock. Windows locks one byte, so reading it with another fd
+                # would fail. Accept only the empty/one-byte regular lock file.
+                info = child.lstat()
+                if (is_path_redirecting_stat(info) or not stat.S_ISREG(info.st_mode)
+                        or info.st_nlink != 1 or info.st_size > 1):
+                    return False
+                continue
             if entry.name != "state" or child.name != "telemetry":
                 return False
             _plain_directory(child)
@@ -103,6 +124,58 @@ def _initial_canonical_roots(home: Path) -> bool:
                     or not _initial_consent_mirror(artifact)
                 ):
                     return False
+    return True
+
+
+def _initial_layout_marker(path: Path) -> bool:
+    if path.lstat().st_size > 4096:
+        return False
+    snapshot = ConfigSnapshot.capture(path)
+    if snapshot.identity is None:
+        return False
+    try:
+        marker = json.loads(snapshot.data)
+        if not isinstance(marker, dict) or set(marker) != {
+            "schema_version", "migratedAt", "moved", "protectedBy",
+        }:
+            return False
+        return (type(marker["schema_version"]) is int and marker["schema_version"] == 2
+                and marker["moved"] == []
+                and marker["protectedBy"] == "rc4"
+                and isinstance(marker["migratedAt"], str)
+                and datetime.fromisoformat(marker["migratedAt"]).tzinfo is not None)
+    except (UnicodeError, ValueError):
+        return False
+
+
+def _initial_desktop_accounts(root: Path) -> bool:
+    """Recognize Desktop's preboot account store without decrypting or rewriting it.
+
+    Older clients could write this store before config initialization. Keep it
+    in place, but do not admit arbitrary data, links, nested trees or hardlinks.
+    """
+    limits = {"installation-id": 36, "account.local.key": 32,
+              "account.local.enc": 1024 * 1024, "account.enc": 1024 * 1024,
+              "logged-out": 1, "model-key-rejected": 1}
+    for origin in root.iterdir():
+        if not re.fullmatch(r"[0-9a-f]{16}", origin.name):
+            return False
+        _plain_directory(origin)
+        for artifact in origin.iterdir():
+            maximum = limits.get(artifact.name)
+            if maximum is None or artifact.lstat().st_size > maximum:
+                return False
+            snapshot = ConfigSnapshot.capture(artifact)
+            if snapshot.identity is None:
+                return False
+            if artifact.name == "installation-id" and not re.fullmatch(
+                rb"[0-9a-fA-F]{8}(?:-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12}", snapshot.data,
+            ):
+                return False
+            if artifact.name == "account.local.key" and len(snapshot.data) != 32:
+                return False
+            if artifact.name in {"logged-out", "model-key-rejected"} and snapshot.data != b"1":
+                return False
     return True
 
 
@@ -144,6 +217,7 @@ def initialize_unconfigured_profile(
             before.stable_code not in {
                 "fresh_profile", "fresh_recovery_profile", "canonical_workspace",
                 "effective_workspace_missing", "effective_state_missing",
+                "unknown_layout",
             }
             or before.effective_workspace != home_path / "workspace"
             or not any(
