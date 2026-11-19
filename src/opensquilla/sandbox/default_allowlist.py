@@ -26,6 +26,7 @@ DEFAULT_ALLOWLIST: dict[str, tuple[str, ...]] = {
         "api.exa.ai",
         "api.tavily.com",
         "cloud-iqs.aliyuncs.com",
+        "api.keenable.ai",
         "www.google.com",
         "www.bing.com",
     ),

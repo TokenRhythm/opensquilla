@@ -205,6 +205,9 @@ class SearchProviderSpec:
     requires_api_key: bool = False
     env_key: str = ""
     capabilities: frozenset[str] = field(default_factory=lambda: frozenset({"web"}))
+    # Keyless providers that stay unavailable until selected as the search
+    # provider or given an API key, so needing no key never enables them.
+    opt_in: bool = False
 
 
 @dataclass

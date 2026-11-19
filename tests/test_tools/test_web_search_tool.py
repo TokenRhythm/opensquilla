@@ -218,6 +218,39 @@ async def test_web_search_tool_accepts_iqs_provider_override(
 
 
 @pytest.mark.asyncio
+async def test_web_search_tool_accepts_keenable_provider_override(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    seen_options: list[SearchOptions] = []
+
+    async def fake_run_canonical_web_search(
+        options: SearchOptions,
+        **kwargs: object,
+    ) -> dict[str, object]:
+        seen_options.append(options)
+        return {"ok": True, "query": options.query, "results": []}
+
+    monkeypatch.setattr(
+        web_module,
+        "run_canonical_web_search",
+        fake_run_canonical_web_search,
+    )
+
+    bare_web_search = inspect.unwrap(web_module.web_search)
+    payload = json.loads(await bare_web_search("python release", provider="keenable"))
+
+    assert payload["ok"] is True
+    assert seen_options == [
+        SearchOptions(
+            query="python release",
+            mode="auto",
+            max_results=DEFAULT_SEARCH_MAX_RESULTS,
+            provider="keenable",
+        )
+    ]
+
+
+@pytest.mark.asyncio
 async def test_web_search_tool_rejects_sensitive_query_without_calling_core(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -276,7 +309,8 @@ async def test_web_search_benchmark_blocklist_blocks_query_without_calling_core(
         ({"query": 123}, "query must be a non-empty string."),
         (
             {"query": "python release", "provider": "serpapi"},
-            "Invalid provider. Expected one of: auto, bocha, brave, duckduckgo, exa, iqs, tavily.",
+            "Invalid provider. Expected one of: "
+            "auto, bocha, brave, duckduckgo, exa, iqs, keenable, tavily.",
         ),
         (
             {"query": "python release", "mode": "invalid"},

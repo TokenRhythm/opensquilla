@@ -49,6 +49,17 @@ def test_iqs_search_spec_requires_api_key():
     assert "domain_filter" in spec.capabilities
 
 
+def test_keenable_search_spec_is_keyless_with_optional_key():
+    spec = get_search_provider_setup_spec("keenable")
+    assert spec.requires_api_key is False
+    assert spec.env_key == "KEENABLE_API_KEY"
+    assert spec.label == "Keenable"
+    assert spec.deployment == "cloud"
+    assert spec.what_you_need == ("No API key required; KEENABLE_API_KEY raises rate limits.",)
+    api_field = next(field for field in spec.fields if field.name == "api_key")
+    assert api_field.required is False
+
+
 def test_tavily_search_spec_requires_api_key():
     spec = get_search_provider_setup_spec("tavily")
     assert spec.requires_api_key is True

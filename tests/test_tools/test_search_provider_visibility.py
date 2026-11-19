@@ -15,7 +15,11 @@ from opensquilla.search.types import SearchProviderSpec
 from opensquilla.tools.registry import ToolRegistry, get_default_registry
 from opensquilla.tools.types import CallerKind, ToolContext, ToolSpec, current_tool_context
 
-_PUBLIC_PROVIDER_IDS = ["auto", "bocha", "tavily", "brave", "duckduckgo", "exa", "iqs"]
+_PUBLIC_PROVIDER_IDS = ["auto", "bocha", "tavily", "brave", "duckduckgo", "exa", "iqs", "keenable"]
+# Keyless opt-in providers stay hidden when only keyed providers are configured.
+_ALL_KEYED_PROVIDER_IDS = [
+    provider_id for provider_id in _PUBLIC_PROVIDER_IDS if provider_id != "keenable"
+]
 _KEYED_PROVIDERS = {
     "bocha": "BOCHA_SEARCH_API_KEY",
     "tavily": "TAVILY_API_KEY",
@@ -61,7 +65,7 @@ def _context() -> ToolContext:
     [
         ((), ["auto", "duckduckgo"]),
         (("brave", "exa"), ["auto", "brave", "duckduckgo", "exa"]),
-        (tuple(_KEYED_PROVIDERS), _PUBLIC_PROVIDER_IDS),
+        (tuple(_KEYED_PROVIDERS), _ALL_KEYED_PROVIDER_IDS),
     ],
 )
 def test_model_surface_only_advertises_available_search_providers(
@@ -108,6 +112,31 @@ def test_model_provider_visibility_uses_all_runtime_credential_sources(
     definitions = registry.to_model_tool_definitions(registry.to_tool_definitions(ctx), ctx)
 
     assert _provider_ids(definitions) == ["auto", "duckduckgo", "exa"]
+    assert "synthetic-" not in json.dumps(
+        [definition.model_dump(mode="json") for definition in definitions]
+    )
+
+
+@pytest.mark.parametrize("opt_in", ["selected", "spec_env"])
+def test_model_surface_advertises_keyless_opt_in_provider_only_after_opt_in(
+    monkeypatch: pytest.MonkeyPatch,
+    opt_in: str,
+) -> None:
+    registry = _registry()
+    ctx = _context()
+    authorized = registry.to_tool_definitions(ctx)
+    assert _provider_ids(registry.to_model_tool_definitions(authorized, ctx)) == [
+        "auto",
+        "duckduckgo",
+    ]
+
+    if opt_in == "selected":
+        configure_search_runtime("keenable")
+    else:
+        monkeypatch.setenv("KEENABLE_API_KEY", "synthetic-keenable-key")
+    definitions = registry.to_model_tool_definitions(authorized, ctx)
+
+    assert _provider_ids(definitions) == ["auto", "duckduckgo", "keenable"]
     assert "synthetic-" not in json.dumps(
         [definition.model_dump(mode="json") for definition in definitions]
     )

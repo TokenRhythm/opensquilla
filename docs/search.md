@@ -20,6 +20,7 @@ Runtime-supported providers in this build include:
 - DuckDuckGo
 - Tavily
 - Exa
+- Keenable
 
 The catalog may include metadata for providers that are not runtime-supported
 in the current build. Check JSON output when integrating.
@@ -73,7 +74,17 @@ export IQS_SEARCH_API_KEY="..."
 opensquilla configure search --search-provider iqs --api-key-env IQS_SEARCH_API_KEY
 ```
 
-In configuration files, `search_provider` can be `"duckduckgo", "bocha", "brave", "iqs", "tavily", or "exa"`.
+Keenable (no API key required; opt-in):
+
+```sh
+opensquilla configure search --search-provider keenable
+```
+
+Keenable is used only after you select it as the search provider or set
+`KEENABLE_API_KEY`. The key is optional and raises the keyless rate limits
+(10 requests per second and 1,000 per hour per IP).
+
+In configuration files, `search_provider` can be `"duckduckgo", "bocha", "brave", "iqs", "tavily", "exa", or "keenable"`.
 It identifies the provider tied to `search_api_key` and
 `search_api_key_env`; automatic searches without `--provider` still rank all
 available providers by mode, recency needs, and provider capabilities. Use
@@ -88,9 +99,11 @@ switches after a network failure. `search_diagnostics = true` includes
 provider-attempt details in tool results.
 
 The agent's provider choices include only currently available providers. Providers
-that require an API key are hidden from the model until credentials are configured;
-explicit calls from an older tool definition are also rejected before constructing
-or calling the provider. Missing credentials are reported separately from rejected
+that require an API key are hidden from the model until credentials are configured.
+Keenable needs no key but is opt-in: it stays hidden and out of automatic ranking
+until it is the selected `search_provider` or `KEENABLE_API_KEY` is set. Explicit
+calls from an older tool definition are also rejected before constructing or
+calling the provider. Missing credentials are reported separately from rejected
 credentials.
 
 If DuckDuckGo returns an anti-bot challenge, it is not called again during that
