@@ -681,6 +681,13 @@ def _safe_validation_message(value: object) -> str:
     return redact_secret_text(compact)[:500]
 
 
+def _tokenrhythm_message_limit_error_fields(payload: dict[str, Any]) -> dict[str, Any]:
+    if "code" in payload:
+        return payload
+    error = payload.get("error")
+    return error if isinstance(error, dict) else {}
+
+
 def _format_tokenrhythm_message_limit_error(
     display_name: str,
     status_code: int,
@@ -693,12 +700,12 @@ def _format_tokenrhythm_message_limit_error(
         payload = json.loads(text)
     except (json.JSONDecodeError, TypeError):
         payload = {}
-    top_message = (
-        _safe_validation_message(payload.get("message"))
+    error_message = (
+        _safe_validation_message(_tokenrhythm_message_limit_error_fields(payload).get("message"))
         if isinstance(payload, dict)
         else ""
     )
-    detail = f"BAD_REQUEST: {top_message}" if top_message else "BAD_REQUEST"
+    detail = f"BAD_REQUEST: {error_message}" if error_message else "BAD_REQUEST"
     if validation_message:
         detail = f"{detail}; {validation_message}"
     return f"{display_name} chat request failed (HTTP {status_code}): {detail}"
@@ -732,7 +739,9 @@ def _tokenrhythm_message_limit_evidence(
         payload = json.loads(text)
     except (json.JSONDecodeError, TypeError):
         return None
-    if not isinstance(payload, dict) or payload.get("code") != "BAD_REQUEST":
+    if not isinstance(payload, dict):
+        return None
+    if _tokenrhythm_message_limit_error_fields(payload).get("code") != "BAD_REQUEST":
         return None
     rows = payload.get("data")
     if not isinstance(rows, list):
