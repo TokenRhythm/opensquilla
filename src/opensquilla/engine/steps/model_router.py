@@ -18,6 +18,15 @@ from opensquilla.router_tiers import TEXT_TIERS
 class ModelRouteError(RuntimeError):
     """The selected model-policy route cannot execute faithfully."""
 
+    def __init__(self, message: str, *, capacity_status: str | None = None) -> None:
+        super().__init__(message)
+        # Admission outcome behind a capacity denial, when the caller knows it:
+        # ``known_capacity_request_too_large`` or ``capacity_unknown``. ``None``
+        # for every non-capacity rejection. The message distinguishes the two
+        # for operators; this attribute keeps the same distinction readable by
+        # diagnostics that must not parse prose.
+        self.capacity_status = capacity_status
+
 
 async def apply_model_router(ctx: TurnContext) -> TurnContext:
     from opensquilla.engine.routing.model_policy import (
@@ -400,6 +409,36 @@ def resolve_model_image_route(
     return ctx
 
 
+def _capacity_denial_message(selected: str, assessment: object | None) -> str:
+    """State the admission outcome that denied the request, with its remedy.
+
+    ``capacity_unknown`` proves nothing about request size: the deployment has
+    no verified limit at all, and the remedy is to declare one. Reporting it as
+    "cannot fit the complete request" sent operators of an undeclared tier to
+    compaction for what is a configuration gap. The two statuses therefore read
+    differently, while the fail-closed outcome itself stays identical.
+
+    An assessment without a ``status`` keeps the historical sentence unchanged.
+    """
+
+    status = getattr(assessment, "status", None)
+    if status == "capacity_unknown":
+        from opensquilla.engine.capacity_admission import CAPACITY_CONFIGURATION_HINT
+
+        return (
+            f"Selected tier {selected} has no verified context capacity for the "
+            f"complete request. {CAPACITY_CONFIGURATION_HINT}"
+        )
+    if status == "known_capacity_request_too_large":
+        from opensquilla.engine.capacity_admission import CAPACITY_REDUCTION_HINT
+
+        return (
+            f"Selected tier {selected} cannot fit the complete request. "
+            f"{CAPACITY_REDUCTION_HINT}"
+        )
+    return f"Selected tier {selected} cannot fit the complete request"
+
+
 def validate_model_route_capacity(
     ctx: TurnContext,
     *,
@@ -465,4 +504,7 @@ def validate_model_route_capacity(
         if reduced and reduced.fits:
             ctx.metadata["router_model_capacity_retry_pending"] = True
             return ctx
-    raise ModelRouteError(f"Selected tier {selected} cannot fit the complete request")
+    raise ModelRouteError(
+        _capacity_denial_message(selected, assessment),
+        capacity_status=getattr(assessment, "status", None),
+    )
