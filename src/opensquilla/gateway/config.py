@@ -1360,6 +1360,14 @@ class RouterBudgetConfig(BaseModel):
     include_next_turn_estimate: bool = False
 
 
+class JevRouterConfig(BaseModel):
+    """Preserve the legacy JEV router toggle without enabling legacy behavior."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    enabled: bool = False
+
+
 class SquillaRouterConfig(BaseSettings):
     model_config = SettingsConfigDict(
         env_prefix="OPENSQUILLA_SQUILLA_ROUTER_",
@@ -2667,6 +2675,10 @@ class GatewayConfig(BaseSettings):
     prompt: PromptConfig = Field(default_factory=PromptConfig)
     memory: MemoryConfig = Field(default_factory=MemoryConfig)
     squilla_router: SquillaRouterConfig = Field(default_factory=SquillaRouterConfig)
+    # Older desktop profiles may contain [jev_router]. Keep its one known
+    # field round-trippable while retaining strict validation of all other
+    # legacy section fields; this setting does not activate a JEV runtime.
+    jev_router: JevRouterConfig = Field(default_factory=JevRouterConfig)
     agent_token_saving: AgentTokenSavingConfig = Field(default_factory=AgentTokenSavingConfig)
     compaction: CompactionLlmConfig = Field(default_factory=CompactionLlmConfig)
     naming: SessionNamingConfig = Field(default_factory=SessionNamingConfig)
@@ -3442,6 +3454,9 @@ class GatewayConfig(BaseSettings):
     def to_public_dict(self) -> dict[str, Any]:
         """Return a redacted config view safe for public control surfaces."""
         data = cast(dict[str, Any], redact_public_config(self.model_dump()))
+        # Legacy compatibility metadata is retained in local config writes,
+        # but is not an active setting and must not be exposed as one.
+        data.pop("jev_router", None)
         video = data.get("video_generation")
         video_providers = video.get("providers") if isinstance(video, dict) else None
         if isinstance(video_providers, dict):

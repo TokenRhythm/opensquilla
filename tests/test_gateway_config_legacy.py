@@ -581,6 +581,36 @@ def test_example_toml_parses_clean() -> None:
     GatewayConfig(**data)
 
 
+def test_legacy_jev_router_flag_loads_and_is_preserved(tmp_path: Path) -> None:
+    """Known legacy JEV config survives load and an unrelated config save."""
+    from opensquilla.onboarding.config_store import persist_config
+
+    config_path = tmp_path / "config.toml"
+    config_path.write_text("[jev_router]\nenabled = true\n", encoding="utf-8")
+
+    cfg = GatewayConfig.load(config_path)
+
+    assert cfg.jev_router.enabled is True
+    assert cfg.to_toml_dict()["jev_router"] == {"enabled": True}
+
+    cfg.debug = True
+    persist_config(cfg, path=config_path, backup=False)
+
+    assert GatewayConfig.load(config_path).jev_router.enabled is True
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        {"unknown_top_level": True},
+        {"jev_router": {"enabled": True, "unknown_option": True}},
+    ],
+)
+def test_legacy_jev_router_compatibility_keeps_config_validation_strict(payload) -> None:
+    with pytest.raises(ValidationError):
+        GatewayConfig.model_validate(payload)
+
+
 @pytest.mark.parametrize("profile", [
     "repo_coding_source_edit",
     "repo_coding_source_edit_strict",
