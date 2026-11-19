@@ -12,6 +12,7 @@ from opensquilla.gateway.config import (
 )
 from opensquilla.onboarding.section_status import (
     SectionStatus,
+    audio_section_status,
     channels_section_status,
     ensemble_section_status,
     image_generation_section_status,
@@ -950,3 +951,108 @@ def test_both_call_sites_resolve_the_same_providers(cfg, monkeypatch):
     assert s.image_generation_provider == "openrouter"
     assert image_generation_section_status(cfg) is SectionStatus.OK
     assert s.image_generation_configured is True
+
+
+# ── audio (speech-to-text providers) ────────────────────────────────────────
+
+
+def test_audio_stt_defaults_to_elevenlabs(cfg):
+    """Adding [audio.stt] must not move the default provider."""
+    assert GatewayConfig().audio.stt.provider == "elevenlabs"
+    assert audio_section_status(cfg) is SectionStatus.OPTIONAL
+
+
+def test_audio_elevenlabs_still_uses_the_legacy_provider_block(cfg, monkeypatch):
+    monkeypatch.delenv("ELEVENLABS_API_KEY", raising=False)
+    cfg.audio.enabled = True
+    assert audio_section_status(cfg) is SectionStatus.DEGRADED
+    monkeypatch.setenv("ELEVENLABS_API_KEY", "from-env")
+    assert audio_section_status(cfg) is SectionStatus.OK
+
+
+def test_audio_stt_selected_provider_with_explicit_key_is_ok(cfg):
+    from opensquilla.onboarding.section_status import stt_provider_annotation
+
+    cfg.audio.enabled = True
+    cfg.audio.stt.provider = "openai_transcriptions"
+    cfg.audio.stt.openai_transcriptions.api_key = "local"
+    cfg.audio.stt.openai_transcriptions.model = "sensevoice-local"
+
+    assert stt_provider_annotation(cfg) == ("explicit", "openai_transcriptions", "")
+    assert audio_section_status(cfg) is SectionStatus.OK
+
+
+def test_audio_stt_selected_provider_with_env_key_is_ok(cfg, monkeypatch):
+    monkeypatch.setenv("OPENAI_API_KEY", "from-env")
+    cfg.audio.enabled = True
+    cfg.audio.stt.provider = "openai_chat"
+    cfg.audio.stt.openai_chat.model = "mimo-v2.5-asr"
+
+    assert audio_section_status(cfg) is SectionStatus.OK
+
+
+def test_audio_stt_missing_env_key_degrades_and_is_not_masked_by_elevenlabs(
+    cfg, monkeypatch
+):
+    """A selected provider must not borrow ElevenLabs readiness.
+
+    The transcription route only ever calls the selected provider, so an
+    ElevenLabs key cannot make it work; reporting OK here would light up the
+    WebUI microphone and then fail at request time.
+    """
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    monkeypatch.setenv("ELEVENLABS_API_KEY", "healthy-elevenlabs")
+    cfg.audio.enabled = True
+    cfg.audio.stt.provider = "openai_transcriptions"
+    cfg.audio.stt.openai_transcriptions.model = "whisper-1"
+
+    assert audio_section_status(cfg) is SectionStatus.DEGRADED
+
+
+def test_audio_stt_custom_origin_does_not_reuse_the_default_env_key(
+    cfg, monkeypatch
+):
+    """Readiness must match the per-origin credential rule the provider uses.
+
+    ``OPENAI_API_KEY`` belongs to the registry origin; a third-party
+    ``base_url`` may not consume it implicitly, so the section reports MISSING
+    rather than promising a key the request will refuse to send.
+    """
+    from opensquilla.onboarding.section_status import stt_provider_annotation
+
+    monkeypatch.setenv("OPENAI_API_KEY", "from-env")
+    cfg.audio.enabled = True
+    cfg.audio.stt.provider = "openai_transcriptions"
+    cfg.audio.stt.openai_transcriptions.model = "sensevoice-local"
+    cfg.audio.stt.openai_transcriptions.base_url = "http://127.0.0.1:8787/v1"
+
+    assert stt_provider_annotation(cfg) == ("none", "openai_transcriptions", "")
+    assert audio_section_status(cfg) is SectionStatus.MISSING
+
+
+def test_audio_stt_unknown_provider_reference_is_unknown(cfg):
+    cfg.audio.enabled = True
+    cfg.audio.stt.provider = "no-such-stt-provider"
+
+    assert audio_section_status(cfg) is SectionStatus.UNKNOWN
+
+
+def test_audio_status_annotations_name_the_selected_stt_provider(cfg):
+    """The WebUI microphone gate reads these fields, not the raw config."""
+    cfg.audio.enabled = True
+    cfg.audio.stt.provider = "openai_transcriptions"
+    cfg.audio.stt.openai_transcriptions.api_key = "local"
+    cfg.audio.stt.openai_transcriptions.model = "sensevoice-local"
+
+    s = get_onboarding_status(cfg)
+
+    assert s.audio_configured is True
+    assert s.audio_provider == "openai_transcriptions"
+    assert s.audio_source == "explicit"
+
+
+def test_audio_stt_annotation_has_a_single_implementation():
+    """status.py must reuse the verifier's provider resolution verbatim."""
+    from opensquilla.onboarding import section_status, status
+
+    assert status.stt_provider_annotation is section_status.stt_provider_annotation

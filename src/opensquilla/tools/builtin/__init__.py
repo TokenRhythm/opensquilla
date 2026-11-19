@@ -20,6 +20,7 @@ _NAMES = [
     "messaging",
     "nodes",
     "patch",
+    "pet",
     "plan_control",
     "router_control",
     "sessions",

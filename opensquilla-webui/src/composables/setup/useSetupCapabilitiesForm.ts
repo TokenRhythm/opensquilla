@@ -72,7 +72,10 @@ export interface ImageCredentialOption {
   reason?: string
 }
 
-type CapabilityId = 'search' | 'memory_embedding' | 'image_generation' | 'audio'
+// 'stt' and 'audio' are the two capability-axis cards (recognition vs
+// generation); the backend capability key remains 'audio' — the axis cards
+// share its one resettable/save action (PRD §5.0).
+type CapabilityId = 'search' | 'memory_embedding' | 'image_generation' | 'audio' | 'stt'
 
 interface CapabilitiesPanelContext {
   searchProviders: ComputedRef<Array<{
@@ -139,10 +142,42 @@ interface CapabilitiesPanelContext {
   audioTtsVoice: Ref<string>
   audioTtsModel: Ref<string>
   audioLanguageCode: Ref<string>
+  sttProvider: Ref<string>
+  sttModelDir: Ref<string>
+  sttCloudApiKey: Ref<string>
+  sttCloudBaseUrl: Ref<string>
+  sttCloudModel: Ref<string>
+  sttCloudKeyPlaceholder: ComputedRef<string>
+  sttCloudModelPlaceholder: ComputedRef<string>
+  sttCloudModels: Ref<string[]>
+  sttCloudModelsStatus: Ref<string>
+  senseVoicePrepareStatus: Ref<import('@/modules/audioTranscription').SenseVoicePrepareStatus>
+  senseVoicePrepareSupported: ComputedRef<boolean>
+  audioPreset: Ref<string>
   audioStatusText: ComputedRef<string>
   audioBadgeTone: ComputedRef<string>
   audioBadgeLabel: ComputedRef<string>
   audioKeyPlaceholder: ComputedRef<string>
+  sttStatusText: ComputedRef<string>
+  sttProviderOptions: ComputedRef<{ value: string; label: string }[]>
+  audioProviders: ComputedRef<Array<{
+    providerId: string
+    label: string
+    envKey: string
+    defaultBaseUrl: string
+    defaultTtsVoice: string
+    defaultTtsModel: string
+    requiresApiKey: boolean
+  }>>
+  audioGenerationConfigured: ComputedRef<boolean>
+  voicePresets: ComputedRef<Array<{
+    name: string
+    label: string
+    provider: string
+    voiceId: string
+    modelId: string
+    source: string
+  }>>
   resettable: (name: CapabilityId) => boolean
   resetPending: Ref<CapabilityId | ''>
 }
@@ -813,6 +848,12 @@ export function useSetupCapabilitiesForm() {
         audioTtsVoice: context.audioTtsVoice.value,
         audioTtsModel: context.audioTtsModel.value,
         audioLanguageCode: context.audioLanguageCode.value,
+        sttProvider: context.sttProvider.value,
+        sttModelDir: context.sttModelDir.value,
+        sttCloudApiKey: context.sttCloudApiKey.value,
+        sttCloudBaseUrl: context.sttCloudBaseUrl.value,
+        sttCloudModel: context.sttCloudModel.value,
+        audioPreset: context.audioPreset.value,
       },
       options: {
         searchProviders: context.searchProviders.value,
@@ -822,6 +863,8 @@ export function useSetupCapabilitiesForm() {
         imageRecommendation: context.imageRecommendation.value,
         imageCredentialOptions: context.imageCredentialOptions.value,
         imageModels: context.imageModels.value,
+        sttProviderOptions: context.sttProviderOptions.value,
+        audioProviders: context.audioProviders.value,
       },
       state: {
         searchRequiresKey: context.searchRequiresKey.value,
@@ -861,6 +904,16 @@ export function useSetupCapabilitiesForm() {
         audioBadgeTone: context.audioBadgeTone.value,
         audioBadgeLabel: context.audioBadgeLabel.value,
         audioKeyPlaceholder: context.audioKeyPlaceholder.value,
+        sttProviderOptions: context.sttProviderOptions.value,
+        sttStatusText: context.sttStatusText.value,
+        sttCloudKeyPlaceholder: context.sttCloudKeyPlaceholder.value,
+        sttCloudModelPlaceholder: context.sttCloudModelPlaceholder.value,
+        sttCloudModels: context.sttCloudModels.value,
+        sttCloudModelsStatus: context.sttCloudModelsStatus.value,
+        senseVoicePrepareStatus: context.senseVoicePrepareStatus.value,
+        senseVoicePrepareSupported: context.senseVoicePrepareSupported.value,
+        audioGenerationConfigured: context.audioGenerationConfigured.value,
+        voicePresets: context.voicePresets.value,
         resettable: context.resettable,
         resetPending: context.resetPending.value,
       },

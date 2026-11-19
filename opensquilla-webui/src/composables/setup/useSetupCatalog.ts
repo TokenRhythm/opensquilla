@@ -48,7 +48,10 @@ import {
   type ModelStrategy,
 } from '@/composables/setup/useSetupModelStrategyForm'
 import { invalidateReadiness } from '@/composables/setup/readinessInvalidation'
-import { useSettingsPromotedForm, DEFAULT_LLM_TIMEOUT_SECONDS } from '@/composables/setup/useSettingsPromotedForm'
+import { useSettingsPromotedForm, DEFAULT_LLM_TIMEOUT_SECONDS, isCloudSttProvider } from '@/composables/setup/useSettingsPromotedForm'
+import { filterAsrModels } from '@/composables/chat/useVoiceEngine'
+import { AUDIO_TRANSCRIPTION_KEY } from '@/modules/audioTranscription'
+import { useSenseVoicePrepare } from '@/composables/setup/useSenseVoicePrepare'
 import { useSettingsSection } from '@/composables/setup/useSettingsSection'
 import { SETTINGS_SECTIONS, type SettingsSectionId } from '@/composables/setup/settingsSections'
 import { GATEWAY_ACCESS_KEY } from '@/modules/gatewayAccess'
@@ -273,6 +276,7 @@ interface OnboardingStatus {
   audioEnabled?: boolean
   audioSource?: string
   audioEnvKey?: string
+  voicePresets?: unknown[]
   capabilityConfiguration?: Partial<Record<CapabilityId, { resettable?: boolean }>>
   llmCredentialStatus?: {
     provider?: string
@@ -350,6 +354,7 @@ interface OnboardingCatalog {
   searchProviders?: ProviderSpec[]
   imageGenerationProviders?: ProviderSpec[]
   memoryEmbeddingProviders?: ProviderSpec[]
+  audioProviders?: Array<Record<string, unknown>>
 }
 
 interface StoredLlmProfileConfig {
@@ -467,7 +472,9 @@ interface EffectiveConfigData {
   fields?: Record<string, { value?: unknown; source?: string }>
 }
 
-type CapabilityId = 'search' | 'image_generation' | 'audio' | 'memory_embedding'
+// 'stt' is the recognition-axis card (PRD §5.0): a UI-only id that shares the
+// backend "audio" capability for resettable/save; the other ids map 1:1.
+type CapabilityId = 'search' | 'image_generation' | 'audio' | 'memory_embedding' | 'stt'
 
 export interface SettingsActionItem {
   label: string
@@ -924,7 +931,7 @@ async function loadData(options: {
           search: capabilitiesForm.searchDirty.value,
           memory: capabilitiesForm.memoryDirty.value,
           image: capabilitiesForm.imageDirty.value,
-          audio: promotedForm.audioDirty.value,
+          audio: promotedForm.audioDirty.value || promotedForm.sttDirty.value,
         }
       : null
     if (preserve && options.rebaseSections) {
@@ -1624,25 +1631,155 @@ const imageNeeds = computed(() => {
 })
 const imageStatusText = computed(() => _imageGenerationStatusText())
 
+// Generation-axis card (PRD §5.0): readiness is the ElevenLabs credential
+// itself, independent of which recognition engine the STT card selects.
+// audioKeyConfigured is seeded from config.get's redacted-key presence.
 const audioStatusText = computed(() => {
   if (status.value.audioEnabled !== true) return t('setup.audio.statusDisabled')
-  if (status.value.audioConfigured === true) return t('setup.audio.statusReady')
-  if (status.value.audioSource === 'missing_env') {
-    return _missingEnvStatusText(t('setup.audio.title'), status.value.audioEnvKey, t('setup.audio.statusNeedsKey'))
-  }
+  if (promotedForm.audioKeyConfigured.value) return t('setup.audio.statusReady')
   return t('setup.audio.statusNeedsKey')
 })
 const audioBadgeTone = computed(() => {
   if (status.value.audioEnabled !== true) return 'is-muted'
-  return status.value.audioConfigured === true ? 'is-ok' : 'is-warn'
+  return promotedForm.audioKeyConfigured.value ? 'is-ok' : 'is-warn'
 })
 const audioBadgeLabel = computed(() => {
   if (status.value.audioEnabled !== true) return t('setup.capabilities.statusPending')
-  return status.value.audioConfigured === true
+  return promotedForm.audioKeyConfigured.value
     ? t('setup.capabilities.statusAvailable')
     : t('setup.capabilities.statusNeedsAction')
 })
 const audioKeyPlaceholder = computed(() => promotedForm.audioKeyConfigured.value ? t('setup.common.leaveBlankKeep') : t('setup.audio.pasteKey'))
+// Ordered by test-friendliness first: local runs offline and costs nothing,
+// ElevenLabs is the historical default, OpenAI-compatible covers the rest.
+const sttProviderOptions = computed(() => [
+  { value: 'sensevoice', label: t('setup.audio.sttSenseVoice') },
+  { value: 'elevenlabs', label: t('setup.audio.sttElevenLabs') },
+  { value: 'openai_transcriptions', label: t('setup.audio.sttOpenaiTranscriptions') },
+  { value: 'openai_chat', label: t('setup.audio.sttOpenaiChat') },
+])
+// ElevenLabs credentials live once, in the generation axis (PRD §5.0 single
+// source): the generation card's provider picker and readiness read this list.
+const audioProviders = computed(() => (catalog.value.audioProviders || [])
+  .filter(spec => spec.runtimeSupported !== false)
+  .map(spec => ({
+    providerId: String(spec.providerId ?? ''),
+    label: String(spec.label ?? spec.providerId ?? ''),
+    envKey: String(spec.envKey ?? ''),
+    defaultBaseUrl: String(spec.defaultBaseUrl ?? ''),
+    defaultTtsVoice: String(spec.defaultTtsVoice ?? ''),
+    defaultTtsModel: String(spec.defaultTtsModel ?? ''),
+    requiresApiKey: spec.requiresApiKey !== false,
+  })))
+// The two-axis cards share one save (F4): the generation card owns the
+// ElevenLabs credential and TTS fields; this flag drives its badge.
+const audioGenerationConfigured = computed(() => status.value.audioConfigured === true)
+const voicePresets = computed(() => {
+  const raw = status.value.voicePresets
+  if (!Array.isArray(raw)) return []
+  return raw.flatMap(item => (
+    item && typeof item === 'object'
+      ? [{
+        name: String((item as Record<string, unknown>).name ?? ''),
+        label: String((item as Record<string, unknown>).label ?? ''),
+        provider: String((item as Record<string, unknown>).provider ?? 'elevenlabs'),
+        voiceId: String((item as Record<string, unknown>).voice_id ?? ''),
+        modelId: String((item as Record<string, unknown>).model_id ?? ''),
+        source: String((item as Record<string, unknown>).source ?? 'user'),
+      }]
+      : []
+  ))
+})
+// Recognition-axis card readiness (PRD §5.0): the engine choice lives on the
+// draft while unsaved, so a pending switch is visible immediately; once saved
+// the gateway's [audio.stt] annotation (local / missing_local) is authoritative.
+const sttStatusText = computed(() => {
+  if (promotedForm.sttProvider.value === 'sensevoice') {
+    return status.value.audioSource === 'local'
+      ? t('setup.audio.statusLocalReady')
+      : t('setup.audio.statusLocalMissingModel')
+  }
+  if (promotedForm.sttProvider.value === 'elevenlabs') {
+    return status.value.audioConfigured === true
+      ? t('setup.stt.statusReady')
+      : t('setup.stt.statusNeedsGenerationKey')
+  }
+  if (isCloudSttProvider(promotedForm.sttProvider.value)) {
+    // Cloud engines own their credential under [audio.stt.<engine>]; never
+    // borrow the ElevenLabs generation key's readiness for them. A saved env
+    // reference only counts while the draft still names the saved engine.
+    const keyPresent = promotedForm.sttCloudKeyConfigured.value
+      || Boolean(promotedForm.sttCloudApiKey.value.trim())
+      || (status.value.audioSource === 'env'
+        && promotedForm.sttProvider.value === promotedForm.sttSavedProvider.value)
+    if (!keyPresent) return t('setup.stt.statusCloudNeedsKey')
+    if (!promotedForm.sttCloudModel.value.trim()) return t('setup.stt.statusCloudNeedsModel')
+    return t('setup.stt.statusReady')
+  }
+  return status.value.audioConfigured === true
+    ? t('setup.stt.statusReady')
+    : t('setup.stt.statusCloudNeedsKey')
+})
+// Cloud credential field hints: the key placeholder mirrors the generation
+// card's write-only pattern; the model placeholder names each wire protocol's
+// typical model so the required field is never a guessing game.
+const sttCloudKeyPlaceholder = computed(() => (
+  promotedForm.sttCloudKeyConfigured.value ? t('setup.common.leaveBlankKeep') : t('setup.audio.pasteKey')
+))
+const sttCloudModelPlaceholder = computed(() => (
+  promotedForm.sttProvider.value === 'openai_chat'
+    ? t('setup.stt.cloudModelPlaceholderChat')
+    : t('setup.stt.cloudModelPlaceholderTranscriptions')
+))
+// Model discovery for the recognition card: fetches the saved endpoint's
+// catalog server-side and keeps only speech-to-text models (a platform's
+// /models also lists LLM and TTS entries, which belong to other surfaces).
+const injectedAudioTranscription = inject(AUDIO_TRANSCRIPTION_KEY, undefined)
+const sttCloudModels = ref<string[]>([])
+const sttCloudModelsStatus = ref<'' | 'loading' | 'ready' | 'error' | 'nokey'>('')
+let sttModelsRequest = 0
+async function fetchSttCloudModels(): Promise<void> {
+  const engine = promotedForm.sttProvider.value
+  if (engine !== 'openai_transcriptions' && engine !== 'openai_chat') return
+  const discover = injectedAudioTranscription?.discoverModels
+  if (!discover) {
+    sttCloudModelsStatus.value = 'error'
+    return
+  }
+  const request = ++sttModelsRequest
+  sttCloudModelsStatus.value = 'loading'
+  sttCloudModels.value = []
+  try {
+    const result = await discover({
+      engine,
+      baseUrl: promotedForm.sttCloudBaseUrl.value,
+      apiKey: promotedForm.sttCloudApiKey.value,
+    })
+    if (request !== sttModelsRequest) return
+    if (result.ok) {
+      sttCloudModels.value = filterAsrModels(result.models)
+      sttCloudModelsStatus.value = 'ready'
+    } else {
+      sttCloudModelsStatus.value = result.failureKind === 'missing_key' ? 'nokey' : 'error'
+    }
+  } catch {
+    if (request === sttModelsRequest) sttCloudModelsStatus.value = 'error'
+  }
+}
+// Pinned local SenseVoice download: the verified directory fills the model_dir
+// draft field so the operator still owns the explicit Save.
+const senseVoicePrepare = useSenseVoicePrepare(injectedAudioTranscription, (modelDir) => {
+  promotedForm.updateAudioField('sttModelDir', modelDir)
+})
+const sttBadgeTone = computed(() => (
+  sttStatusText.value === t('setup.stt.statusReady')
+  || sttStatusText.value === t('setup.audio.statusLocalReady')
+    ? 'is-ok'
+    : 'is-warn'
+))
+const sttBadgeLabelKey = computed(() => (
+  sttBadgeTone.value === 'is-ok' ? 'setup.capabilities.statusAvailable' : 'setup.capabilities.statusNeedsAction'
+))
 
 const providerProbeModel = computed(() => {
   const provider = normalizeProviderId(providerForm.selectedProvider.value)
@@ -2279,10 +2416,27 @@ const capabilitiesPanel = capabilitiesForm.createPanel({
   audioTtsVoice: promotedForm.audioTtsVoice,
   audioTtsModel: promotedForm.audioTtsModel,
   audioLanguageCode: promotedForm.audioLanguageCode,
+  sttProvider: promotedForm.sttProvider,
+  sttModelDir: promotedForm.sttModelDir,
+  sttCloudApiKey: promotedForm.sttCloudApiKey,
+  sttCloudBaseUrl: promotedForm.sttCloudBaseUrl,
+  sttCloudModel: promotedForm.sttCloudModel,
+  sttCloudKeyPlaceholder,
+  sttCloudModelPlaceholder,
+  sttCloudModels,
+  sttCloudModelsStatus,
+  senseVoicePrepareStatus: senseVoicePrepare.status,
+  senseVoicePrepareSupported: computed(() => senseVoicePrepare.supported),
+  audioPreset: promotedForm.audioPreset,
   audioStatusText,
   audioBadgeTone,
   audioBadgeLabel,
   audioKeyPlaceholder,
+  sttStatusText,
+  sttProviderOptions,
+  audioProviders,
+  audioGenerationConfigured,
+  voicePresets,
   resettable: capabilityResettable,
   resetPending: capabilityResetPending,
 })
@@ -2485,6 +2639,7 @@ const capabilitiesDirty = computed(() => (
   || capabilitiesForm.memoryDirty.value
   || capabilitiesForm.imageDirty.value
   || promotedForm.audioDirty.value
+  || promotedForm.sttDirty.value
 ))
 
 function sectionDirty(sectionId: string): boolean {
@@ -2519,7 +2674,7 @@ async function saveDirtySections() {
       search: capabilitiesForm.searchDirty.value,
       memory: capabilitiesForm.memoryDirty.value,
       image: capabilitiesForm.imageDirty.value,
-      audio: promotedForm.audioDirty.value,
+      audio: promotedForm.audioDirty.value || promotedForm.sttDirty.value,
     }
     const behaviorPatches = behaviorForm.patches()
     if (!Object.values(work).some(Boolean)) return
@@ -3824,6 +3979,12 @@ function updateCapabilityField(
   value: string | number | boolean,
 ) {
   if (group === 'audio') {
+    if (key === 'sttProvider') {
+      // A fetched model list belongs to the previous engine's endpoint.
+      sttModelsRequest += 1
+      sttCloudModels.value = []
+      sttCloudModelsStatus.value = ''
+    }
     promotedForm.updateAudioField(key, value as string | boolean)
     return
   }
@@ -3944,6 +4105,7 @@ function capabilityBadgeTone(name: CapabilityId): string {
     return status.value.imageGenerationConfigured === true ? 'is-ok' : 'is-warn'
   }
   if (name === 'audio') return audioBadgeTone.value
+  if (name === 'stt') return sttBadgeTone.value
   return 'is-muted'
 }
 
@@ -3977,17 +4139,20 @@ function capabilityBadgeLabel(name: CapabilityId): string {
       : t('setup.capabilities.statusNeedsAction')
   }
   if (name === 'audio') return audioBadgeLabel.value
+  if (name === 'stt') return t(sttBadgeLabelKey.value)
   return t('setup.capabilities.statusPending')
 }
 
 function capabilityResettable(name: CapabilityId): boolean {
-  return status.value.capabilityConfiguration?.[name]?.resettable === true
+  // Both axis cards reset through the single backend "audio" capability.
+  return status.value.capabilityConfiguration?.[name === 'stt' ? 'audio' : name]?.resettable === true
 }
 
 function capabilityHasDraft(name: CapabilityId): boolean {
   if (name === 'search') return capabilitiesForm.searchDirty.value
   if (name === 'memory_embedding') return capabilitiesForm.memoryDirty.value
   if (name === 'image_generation') return capabilitiesForm.imageDirty.value
+  if (name === 'stt') return promotedForm.sttDirty.value
   return promotedForm.audioDirty.value
 }
 
@@ -3995,6 +4160,7 @@ function capabilityTitle(name: CapabilityId): string {
   if (name === 'search') return t('setup.search.title')
   if (name === 'memory_embedding') return t('setup.memory.title')
   if (name === 'image_generation') return t('setup.image.title')
+  if (name === 'stt') return t('setup.stt.title')
   return t('setup.audio.title')
 }
 
@@ -4017,7 +4183,10 @@ async function resetCapability(name: CapabilityId) {
 
   capabilityResetPending.value = name
   try {
-    const response = await setupWorkflow.capability.resetCapability(name)
+    // 'stt' is a UI axis card; the backend capability key stays 'audio'.
+    const response = await setupWorkflow.capability.resetCapability(
+      name === 'stt' ? 'audio' : name,
+    )
     // Refresh server-owned status while preserving unrelated drafts, then
     // reseed only the capability that the user explicitly reset.
     await loadData({ preserveFormDrafts: true, throwOnError: true })
@@ -4961,17 +5130,52 @@ async function saveImage(options: SaveOptions = {}): Promise<boolean> {
 }
 
 async function saveAudio(options: SaveOptions = {}): Promise<boolean> {
-  if (!promotedForm.audioDirty.value) {
+  const sttPatches = promotedForm.sttPatches()
+  if (!promotedForm.audioDirty.value && !Object.keys(sttPatches).length) {
     return true
   }
   try {
-    const res = await setupWorkflow.capability.configureAudio(promotedForm.audioPayload()) as {
-      entry?: { api_key_env?: string; api_key_source?: string; api_key?: string }
-      restartRequired?: boolean
+    let restartRequired = false
+    if (Object.keys(sttPatches).length) {
+      restartRequired = (await patchConfig(sttPatches)) || restartRequired
+      // config.patch is confirmed by its response and the transcription route
+      // rebuilds the provider chain per request, so the switch needs no
+      // restart. Re-seed the STT draft from the just-persisted values so a
+      // later reload with preserveDirtySectionDrafts can never resurrect a
+      // saved change as a dirty draft.
+      promotedForm.acceptSavedStt(
+        String(sttPatches['audio.stt.provider'] || '') || promotedForm.sttProvider.value,
+        'audio.stt.sensevoice.model_dir' in sttPatches
+          ? String(sttPatches['audio.stt.sensevoice.model_dir'] || '')
+          : promotedForm.sttModelDir.value.trim(),
+        isCloudSttProvider(promotedForm.sttProvider.value)
+          ? {
+              baseUrl: promotedForm.sttCloudBaseUrl.value.trim(),
+              model: promotedForm.sttCloudModel.value.trim(),
+              keySaved: Boolean(promotedForm.sttCloudApiKey.value)
+                || promotedForm.sttCloudKeyConfigured.value,
+            }
+          : undefined,
+      )
+      // The preset rides the same patch; re-seed its baseline too so a
+      // preset-only change converges without a stale dirty flag.
+      promotedForm.acceptSavedPreset(
+        'audio.tts.preset' in sttPatches
+          ? String(sttPatches['audio.tts.preset'] || '')
+          : promotedForm.audioPreset.value,
+      )
     }
-    const entry = res?.entry || {}
-    const message = envReferenceSaveMessage(t('setup.audio.title'), entry.api_key_env, entry.api_key_source, entry.api_key, res?.restartRequired)
-    return await finishSave(options, 'audio', message || (res?.restartRequired ? t('setup.toast.audioSavedRestart') : ''), res?.restartRequired === true)
+    if (promotedForm.audioDirty.value) {
+      const res = await setupWorkflow.capability.configureAudio(promotedForm.audioPayload()) as {
+        entry?: { api_key_env?: string; api_key_source?: string; api_key?: string }
+        restartRequired?: boolean
+      }
+      const entry = res?.entry || {}
+      const message = envReferenceSaveMessage(t('setup.audio.title'), entry.api_key_env, entry.api_key_source, entry.api_key, res?.restartRequired)
+      if (message) saveToast(options, message, undefined, res?.restartRequired === true)
+      restartRequired = (res?.restartRequired === true) || restartRequired
+    }
+    return await finishSave(options, 'audio', restartRequired ? t('setup.toast.audioSavedRestart') : '', restartRequired)
   } catch (err) {
     return await reportSaveFailure(err, options)
   }
@@ -5111,6 +5315,10 @@ async function copyConfigPath() {
     removeProviderCredential,
     updateTierField,
     updateCapabilityField,
+    fetchSttCloudModels,
+    startSenseVoiceDownload: senseVoicePrepare.start,
+    cancelSenseVoiceDownload: senseVoicePrepare.cancel,
+    refreshSenseVoiceDownload: senseVoicePrepare.refresh,
     onProviderChange,
     onSearchProviderChange,
     onMemoryProviderChange,

@@ -162,6 +162,7 @@ beforeEach(() => {
   leaveGuard = null
   routeState = reactive({
     params: { section: 'general' },
+    query: {},
     hash: '',
     path: '/settings/general',
   })

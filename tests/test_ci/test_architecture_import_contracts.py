@@ -298,10 +298,30 @@ APPROVED_PACKAGE_IMPORTS: frozenset[tuple[str, str]] = frozenset({
     ("tools", "session"),
     ("tools", "skills"),
     ("uninstall", "gateway"),
+    # Speech-to-text and text-to-speech. `audio` is a leaf capability layer: it
+    # reads its own configuration model (`gateway.config`), the shared provider
+    # HTTP/metering boundary, and `onboarding.config_store` only to locate the
+    # pinned model directory. The reverse edges are the gateway/CLI/onboarding
+    # surfaces consuming the providers, so the pair participates in the same
+    # configuration cycle every other capability package already does.
+    ("audio", "gateway"),
+    ("audio", "onboarding"),
+    ("audio", "provider"),
+    ("cli", "audio"),
+    ("gateway", "audio"),
+    ("onboarding", "audio"),
+    ("tools", "audio"),
+    # The desktop-pet service reads its configuration model from `gateway` and
+    # the gateway boots it as a lifecycle child; the CLI reaches it through a
+    # thin bridge client. Same configuration cycle as `audio`.
+    ("cli", "pet"),
+    ("gateway", "pet"),
+    ("pet", "gateway"),
 })
 
 APPROVED_CYCLIC_PACKAGES: frozenset[str] = frozenset({
     "agents",
+    "audio",
     "channels",
     "engine",
     "gateway",
@@ -310,6 +330,7 @@ APPROVED_CYCLIC_PACKAGES: frozenset[str] = frozenset({
     "memory",
     "onboarding",
     "persistence",
+    "pet",
     "provider",
     "sandbox",
     "scheduler",

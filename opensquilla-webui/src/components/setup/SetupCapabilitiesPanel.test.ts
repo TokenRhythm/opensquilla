@@ -3,6 +3,7 @@ import { afterEach, describe, expect, it, vi } from 'vitest'
 import { createApp, nextTick, type App } from 'vue'
 import i18n from '@/i18n'
 import type { ImageCredentialSource } from '@/composables/setup/useSetupCapabilitiesForm'
+import type { SenseVoicePrepareStatus } from '@/modules/audioTranscription'
 import SetupCapabilitiesPanel from './SetupCapabilitiesPanel.vue'
 
 const mounted: App[] = []
@@ -19,6 +20,12 @@ function panel() {
       imageKeyConfigured: false,
       imageCredentialSource: 'none' as ImageCredentialSource,
       audioApiKey: '',
+      sttProvider: 'elevenlabs',
+      sttModelDir: '',
+      sttCloudApiKey: '',
+      sttCloudBaseUrl: '',
+      sttCloudModel: '',
+      audioPreset: '',
     },
     options: {
       searchProviders: [
@@ -67,6 +74,22 @@ function panel() {
           capabilitySource: '',
         },
       ],
+      sttProviderOptions: [
+        { value: 'sensevoice', label: 'Local SenseVoice' },
+        { value: 'elevenlabs', label: 'ElevenLabs Scribe' },
+        { value: 'openai_transcriptions', label: 'OpenAI transcriptions' },
+        { value: 'openai_chat', label: 'OpenAI chat ASR' },
+      ],
+      audioProviders: [
+        {
+          providerId: 'elevenlabs',
+          label: 'ElevenLabs Audio',
+          envKey: 'ELEVENLABS_API_KEY',
+          defaultTtsVoice: '21m00Tcm4TlvDq8ikWAM',
+          defaultTtsModel: 'eleven_multilingual_v2',
+          requiresApiKey: true,
+        },
+      ],
     },
     state: {
       searchRequiresKey: false,
@@ -83,6 +106,22 @@ function panel() {
       imageModelSource: 'catalog',
       audioStatusText: 'Add an ElevenLabs key.',
       audioKeyPlaceholder: 'Paste key',
+      sttStatusText: 'Speech recognition is ready.',
+      sttCloudKeyPlaceholder: 'Paste key',
+      sttCloudModelPlaceholder: 'e.g. whisper-1',
+      sttCloudModels: [] as string[],
+      sttCloudModelsStatus: '',
+      senseVoicePrepareStatus: { phase: 'idle' } as SenseVoicePrepareStatus,
+      senseVoicePrepareSupported: false,
+      audioGenerationConfigured: false,
+      voicePresets: [] as Array<{
+        name: string
+        label: string
+        provider: string
+        voiceId: string
+        modelId: string
+        source: string
+      }>,
       capabilityBadgeTone: (name: string): string => name === 'search' ? 'is-ok' : 'is-muted',
       capabilityBadgeLabel: (name: string): string => name === 'search' ? 'Available' : 'Set up',
       resettable: (name: string): boolean => name === 'image_generation',
@@ -91,10 +130,13 @@ function panel() {
   }
 }
 
-async function mountPanel(panelValue = panel()) {
+async function mountPanel(panelValue = panel(), extraProps: Record<string, unknown> = {}) {
   const resetCapability = vi.fn()
   const updateField = vi.fn()
   const imageProviderChange = vi.fn()
+  const fetchSttModels = vi.fn()
+  const startSenseVoiceDownload = vi.fn()
+  const cancelSenseVoiceDownload = vi.fn()
   const el = document.createElement('div')
   document.body.appendChild(el)
   const app = createApp(SetupCapabilitiesPanel, {
@@ -102,12 +144,16 @@ async function mountPanel(panelValue = panel()) {
     onResetCapability: resetCapability,
     onUpdateField: updateField,
     onImageProviderChange: imageProviderChange,
+    onFetchSttModels: fetchSttModels,
+    onStartSenseVoiceDownload: startSenseVoiceDownload,
+    onCancelSenseVoiceDownload: cancelSenseVoiceDownload,
+    ...extraProps,
   })
   app.use(i18n)
   app.mount(el)
   mounted.push(app)
   await nextTick()
-  return { el, resetCapability, updateField, imageProviderChange }
+  return { el, resetCapability, updateField, imageProviderChange, fetchSttModels, startSenseVoiceDownload, cancelSenseVoiceDownload }
 }
 
 afterEach(() => {
@@ -122,15 +168,17 @@ describe('SetupCapabilitiesPanel', () => {
     const triggers = el.querySelectorAll<HTMLButtonElement>('.capability-card__trigger')
     const chevrons = el.querySelectorAll<SVGElement>('svg.capability-card__chevron')
 
-    expect(triggers).toHaveLength(3)
-    expect(chevrons).toHaveLength(3)
+    expect(triggers).toHaveLength(4)
+    expect(chevrons).toHaveLength(4)
     expect(chevrons[0]?.querySelector('path')?.getAttribute('d')).toBe('m6 8 4 4 4-4')
     expect(el.textContent).not.toContain('⌄')
     expect(triggers[0]?.getAttribute('aria-expanded')).toBe('false')
     expect(triggers[1]?.getAttribute('aria-expanded')).toBe('false')
     expect(triggers[2]?.getAttribute('aria-expanded')).toBe('false')
+    expect(triggers[3]?.getAttribute('aria-expanded')).toBe('false')
     expect(el.querySelector('#capability-search-panel')?.getAttribute('style')).toContain('display: none')
     expect(el.querySelector('#capability-image_generation-panel')?.getAttribute('style')).toContain('display: none')
+    expect(el.querySelector('#capability-stt-panel')?.getAttribute('style')).toContain('display: none')
     expect(el.querySelector('#capability-audio-panel')?.getAttribute('style')).toContain('display: none')
     expect(el.querySelector('[name="setup_image_enabled"]')).not.toBeNull()
     expect(el.querySelector('[name="setup_audio_enabled"]')).toBeNull()
@@ -454,5 +502,171 @@ describe('SetupCapabilitiesPanel', () => {
     expect(resetButtons[0]?.textContent).toContain('Remove configuration')
     resetButtons[0]!.click()
     expect(resetCapability).toHaveBeenCalledWith('image_generation')
+  })
+
+  it('shows the local model directory on the recognition card for sensevoice', async () => {
+    i18n.global.locale.value = 'en'
+    const local = panel()
+    local.form.sttProvider = 'sensevoice'
+    local.form.sttModelDir = 'D:\\models\\sensevoice'
+    const { el, updateField } = await mountPanel(local)
+
+    // The model directory lives on the recognition (stt) card…
+    expect(el.querySelector('[name="setup_stt_model_dir"]')).not.toBeNull()
+    expect(el.querySelector<HTMLInputElement>('[name="setup_stt_model_dir"]')?.value)
+      .toBe('D:\\models\\sensevoice')
+    // …while the ElevenLabs key stays on the generation (audio) card.
+    expect(el.querySelector('[name="setup_audio_api_key"]')).not.toBeNull()
+
+    const dir = el.querySelector<HTMLInputElement>('[name="setup_stt_model_dir"]')!
+    dir.value = 'D:\\other'
+    dir.dispatchEvent(new Event('input'))
+    expect(updateField).toHaveBeenCalledWith('audio', 'sttModelDir', 'D:\\other')
+  })
+
+  it('routes the STT engine select through updateField', async () => {
+    i18n.global.locale.value = 'en'
+    const { el, updateField } = await mountPanel()
+    const select = el.querySelector<HTMLSelectElement>('[name="setup_stt_provider"]')
+
+    expect(select).not.toBeNull()
+    expect(select!.value).toBe('elevenlabs')
+    // The engine list matches the gateway chain; the key lives on the
+    // generation card regardless of the selected recognition engine.
+    expect(el.querySelector('[name="setup_audio_api_key"]')).not.toBeNull()
+    expect(Array.from(select!.options).map(option => option.value)).toEqual([
+      'sensevoice', 'elevenlabs', 'openai_transcriptions', 'openai_chat',
+    ])
+
+    select!.value = 'sensevoice'
+    select!.dispatchEvent(new Event('change'))
+    expect(updateField).toHaveBeenCalledWith('audio', 'sttProvider', 'sensevoice')
+  })
+
+  it('shows key, base URL and model fields for the cloud engines', async () => {
+    i18n.global.locale.value = 'en'
+    const local = panel()
+    local.form.sttProvider = 'openai_transcriptions'
+    local.form.sttCloudBaseUrl = 'https://api.siliconflow.cn/v1'
+    local.form.sttCloudModel = 'whisper-1'
+    const { el, updateField } = await mountPanel(local)
+
+    const key = el.querySelector<HTMLInputElement>('[name="setup_stt_cloud_api_key"]')
+    const baseUrl = el.querySelector<HTMLInputElement>('[name="setup_stt_cloud_base_url"]')
+    const model = el.querySelector<HTMLInputElement>('[name="setup_stt_cloud_model"]')
+    expect(key).not.toBeNull()
+    expect(key!.type).toBe('password')
+    expect(baseUrl!.value).toBe('https://api.siliconflow.cn/v1')
+    expect(model!.value).toBe('whisper-1')
+    // The local model directory belongs to sensevoice only.
+    expect(el.querySelector('[name="setup_stt_model_dir"]')).toBeNull()
+
+    key!.value = 'sk-cloud'
+    key!.dispatchEvent(new Event('input'))
+    expect(updateField).toHaveBeenCalledWith('audio', 'sttCloudApiKey', 'sk-cloud')
+    baseUrl!.value = 'https://api.openai.com/v1'
+    baseUrl!.dispatchEvent(new Event('input'))
+    expect(updateField).toHaveBeenCalledWith('audio', 'sttCloudBaseUrl', 'https://api.openai.com/v1')
+    model!.value = 'gpt-4o-mini-transcribe'
+    model!.dispatchEvent(new Event('input'))
+    expect(updateField).toHaveBeenCalledWith('audio', 'sttCloudModel', 'gpt-4o-mini-transcribe')
+  })
+
+  it('hides the cloud fields for non-cloud engines', async () => {
+    i18n.global.locale.value = 'en'
+    const { el } = await mountPanel()
+    expect(el.querySelector('[name="setup_stt_cloud_api_key"]')).toBeNull()
+    expect(el.querySelector('[name="setup_stt_cloud_base_url"]')).toBeNull()
+    expect(el.querySelector('[name="setup_stt_cloud_model"]')).toBeNull()
+  })
+
+  it('fetches ASR models from the settings card and fills the model field from a chip', async () => {
+    i18n.global.locale.value = 'en'
+    const local = panel()
+    local.form.sttProvider = 'openai_chat'
+    local.state.sttCloudModels = ['mimo-v2.5-asr']
+    local.state.sttCloudModelsStatus = 'ready'
+    const { el, updateField, fetchSttModels } = await mountPanel(local)
+
+    const fetchButton = el.querySelector<HTMLButtonElement>('[name="setup_stt_fetch_models"]')
+    expect(fetchButton).not.toBeNull()
+    fetchButton!.click()
+    expect(fetchSttModels).toHaveBeenCalledTimes(1)
+
+    // Only the ASR model is offered; clicking it fills the model field.
+    const chips = Array.from(el.querySelectorAll<HTMLButtonElement>('.capability-card__model-chip'))
+    expect(chips.map(chip => chip.textContent)).toEqual(['mimo-v2.5-asr'])
+    chips[0]!.click()
+    expect(updateField).toHaveBeenCalledWith('audio', 'sttCloudModel', 'mimo-v2.5-asr')
+  })
+
+  it('offers the pinned SenseVoice download and reports progress', async () => {
+    i18n.global.locale.value = 'en'
+    const local = panel()
+    local.form.sttProvider = 'sensevoice'
+    local.state.senseVoicePrepareSupported = true
+    const { el, startSenseVoiceDownload } = await mountPanel(local)
+
+    const download = el.querySelector<HTMLButtonElement>('[name="setup_stt_download_model"]')
+    expect(download).not.toBeNull()
+    download!.click()
+    expect(startSenseVoiceDownload).toHaveBeenCalledTimes(1)
+
+    // A downloading snapshot renders a progress bar plus cancel.
+    const downloading = panel()
+    downloading.form.sttProvider = 'sensevoice'
+    downloading.state.senseVoicePrepareSupported = true
+    downloading.state.senseVoicePrepareStatus = {
+      phase: 'downloading', resource: 'model.int8.onnx', completedBytes: 50, totalBytes: 100,
+    }
+    const active = await mountPanel(downloading)
+    const progress = active.el.querySelector('[role="progressbar"]')
+    expect(progress).not.toBeNull()
+    expect(progress!.getAttribute('aria-valuenow')).toBe('50')
+    const cancel = active.el.querySelector<HTMLButtonElement>('[name="setup_stt_cancel_download"]')
+    expect(cancel).not.toBeNull()
+    cancel!.click()
+    expect(active.cancelSenseVoiceDownload).toHaveBeenCalledTimes(1)
+  })
+
+  it('hides the SenseVoice download when the gateway does not support it', async () => {
+    i18n.global.locale.value = 'en'
+    const local = panel()
+    local.form.sttProvider = 'sensevoice'
+    local.state.senseVoicePrepareSupported = false
+    const { el } = await mountPanel(local)
+    expect(el.querySelector('[name="setup_stt_download_model"]')).toBeNull()
+  })
+
+  it('opens with the deep-linked capability card already expanded', async () => {
+    i18n.global.locale.value = 'en'
+    const { el } = await mountPanel(panel(), { initialExpanded: 'stt' })
+    // The recognition card is the expanded one; its engine select is visible.
+    expect(el.querySelector('[name="setup_stt_provider"]')).not.toBeNull()
+    const expanded = Array.from(el.querySelectorAll<HTMLButtonElement>('.capability-card__trigger'))
+      .filter(button => button.getAttribute('aria-expanded') === 'true')
+    expect(expanded).toHaveLength(1)
+    expect(expanded[0]?.textContent).toContain('Speech recognition')
+  })
+
+  it('lists voice presets on the generation card and routes selection', async () => {
+    i18n.global.locale.value = 'en'
+    const withPresets = panel()
+    withPresets.state.voicePresets = [
+      { name: 'quiet-male', label: 'Calm male', provider: 'elevenlabs', voiceId: 'v1', modelId: 'm1', source: 'builtin' },
+      { name: 'mine', label: 'My voice', provider: 'elevenlabs', voiceId: 'v2', modelId: 'm2', source: 'user' },
+    ]
+    const { el, updateField } = await mountPanel(withPresets)
+    const select = el.querySelector<HTMLSelectElement>('[name="setup_audio_preset"]')
+
+    expect(select).not.toBeNull()
+    const values = Array.from(select!.options).map(option => option.value)
+    expect(values).toEqual(['', 'quiet-male', 'mine'])
+    // Built-in presets are labelled as such.
+    expect(select!.options[1]?.textContent).toContain('built-in')
+
+    select!.value = 'mine'
+    select!.dispatchEvent(new Event('change'))
+    expect(updateField).toHaveBeenCalledWith('audio', 'preset', 'mine')
   })
 })

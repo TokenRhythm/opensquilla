@@ -228,6 +228,7 @@
                 :plan-mode-available="policy.plan && planModeAvailable === true"
                 :plan-mode-busy="planModeBusy === true || planModeDisabled === true"
                 :show-utility-actions="true"
+                :show-voice-action="false"
                 :voice-busy="voiceBusy"
                 :voice-ready="voiceReady"
                 :voice-recording="voiceRecording"
@@ -395,6 +396,213 @@
               />
             </div>
 
+            <div ref="voiceMenuAnchorEl" class="chat-settings-anchor chat-voice-anchor">
+              <button
+                type="button"
+                class="btn btn--icon chat-mic-btn"
+                :class="{
+                  'btn--ghost': !voiceRecording,
+                  'btn--danger': voiceRecording,
+                  'is-active': voiceRecording,
+                  'chat-mic-btn--needs-setup': !voiceReady,
+                }"
+                :title="voiceReady ? t('chat.recordVoice') : t('chat.voiceUnavailableHint')"
+                :aria-label="voiceReady ? t('chat.recordVoice') : t('chat.voiceUnavailableHint')"
+                :aria-pressed="voiceRecording ? 'true' : 'false'"
+                :disabled="voiceBusy && !voiceRecording"
+                @click="voiceReady ? emit('voiceInput') : emit('voiceSetup')"
+              >
+                <Icon name="microphone" :size="18" />
+              </button>
+              <button
+                type="button"
+                class="btn btn--icon btn--ghost chat-voice-devices-btn"
+                :class="{ 'is-active': voiceMenuOpen }"
+                :title="t('chat.voiceDevices')"
+                :aria-label="t('chat.voiceDevices')"
+                aria-haspopup="menu"
+                :aria-expanded="voiceMenuOpen ? 'true' : 'false'"
+                :disabled="voiceRecording || voiceBusy"
+                @click="toggleVoiceMenu"
+              >
+                <Icon name="chevronDown" :size="14" />
+              </button>
+              <div
+                v-if="voiceMenuOpen"
+                ref="voiceMenuEl"
+                class="chat-voice-menu"
+                role="dialog"
+                :aria-label="t('chat.voiceMenuTitle')"
+                :style="voiceMenuShift ? { transform: `translateX(${voiceMenuShift}px)` } : undefined"
+              >
+                <header class="chat-voice-menu__heading">
+                  <strong>{{ t('chat.voiceMenuTitle') }}</strong>
+                  <button
+                    class="chat-voice-menu__close"
+                    type="button"
+                    :aria-label="t('chat.closeComposerSettings')"
+                    @click="voiceMenuOpen = false"
+                  >
+                    <Icon name="x" :size="16" />
+                  </button>
+                </header>
+                <div class="chat-voice-menu__body">
+                  <template v-if="!voiceDrillPlatform">
+                    <div class="chat-voice-menu__section-label">{{ t('chat.voiceEngineSection') }}</div>
+                    <div
+                      class="chat-voice-menu__group"
+                      role="menu"
+                      :aria-label="t('chat.voiceEngineSection')"
+                    >
+                      <button
+                        v-for="engine in voiceEngineOptions"
+                        :key="engine.value"
+                        type="button"
+                        class="chat-voice-menu__mode chat-voice-menu__mode--engine"
+                        :class="{ 'is-selected': voiceEngineId === engine.value }"
+                        role="menuitemradio"
+                        :aria-checked="voiceEngineId === engine.value ? 'true' : 'false'"
+                        :aria-disabled="voiceEngineBusy ? 'true' : undefined"
+                        @click="emit('selectVoiceEngine', engine.value); voiceMenuOpen = false"
+                      >
+                        <span class="chat-voice-menu__mode-top">
+                          <span class="chat-voice-menu__mode-label">{{ engine.label }}</span>
+                          <span class="chat-voice-menu__badge">{{ engine.local ? t('chat.voiceEngineLocal') : t('chat.voiceEngineCloud') }}</span>
+                          <Icon v-if="voiceEngineId === engine.value" name="check" :size="14" />
+                        </span>
+                        <span class="chat-voice-menu__model">
+                          <span class="chat-voice-menu__model-dot" aria-hidden="true" />
+                          <span class="chat-voice-menu__model-name">{{ engine.model }}</span>
+                        </span>
+                      </button>
+                      <button
+                        v-for="platform in voiceCloudPlatforms"
+                        :key="platform.key"
+                        type="button"
+                        class="chat-voice-menu__mode chat-voice-menu__mode--engine"
+                        :class="{ 'is-selected': voicePlatformActive(platform) }"
+                        role="menuitem"
+                        aria-haspopup="menu"
+                        :aria-disabled="voiceEngineBusy ? 'true' : undefined"
+                        @click="openVoicePlatformDrill(platform)"
+                      >
+                        <span class="chat-voice-menu__mode-top">
+                          <span class="chat-voice-menu__mode-label">{{ platform.label }}</span>
+                          <span class="chat-voice-menu__badge">{{ t('chat.voiceEngineCloud') }}</span>
+                          <Icon v-if="voicePlatformActive(platform)" name="check" :size="14" />
+                          <Icon name="chevronRight" :size="14" class="chat-voice-menu__chevron" />
+                        </span>
+                        <span class="chat-voice-menu__model">
+                          <span class="chat-voice-menu__model-dot" aria-hidden="true" />
+                          <span class="chat-voice-menu__model-name">{{ voicePlatformSubline(platform) }}</span>
+                        </span>
+                      </button>
+                      <div
+                        v-if="!voiceEngineOptions.length && !voiceCloudPlatforms.length"
+                        class="chat-voice-menu__empty"
+                      >
+                        {{ t('chat.voiceEnginesEmpty') }}
+                      </div>
+                    </div>
+                  </template>
+                  <template v-else>
+                    <div class="chat-voice-menu__drill-head">
+                      <button
+                        type="button"
+                        class="chat-voice-menu__back"
+                        :aria-label="t('chat.voiceModelsBack')"
+                        @click="voiceDrillPlatform = ''"
+                      >
+                        <Icon name="chevronLeft" :size="15" />
+                      </button>
+                      <span class="chat-voice-menu__drill-title">{{ voiceDrillTarget ? voiceDrillTarget.label : '' }}</span>
+                    </div>
+                    <div
+                      class="chat-voice-menu__group"
+                      role="menu"
+                      :aria-label="voiceDrillTarget ? voiceDrillTarget.label : ''"
+                    >
+                      <template v-if="voiceDrillModels && voiceDrillModels.status === 'ready' && voiceDrillModels.models.length">
+                        <button
+                          v-for="modelId in voiceDrillModels.models"
+                          :key="modelId"
+                          type="button"
+                          class="chat-voice-menu__mode"
+                          :class="{ 'is-selected': voiceDrillTarget && voicePlatformModelActive(voiceDrillTarget, modelId) }"
+                          role="menuitemradio"
+                          :aria-checked="voiceDrillTarget && voicePlatformModelActive(voiceDrillTarget, modelId) ? 'true' : 'false'"
+                          :aria-disabled="voiceEngineBusy ? 'true' : undefined"
+                          @click="voiceDrillTarget && emit('selectCloudModel', { platformKey: voiceDrillTarget.key, modelId }); voiceMenuOpen = false"
+                        >
+                          <span class="chat-voice-menu__mode-label">{{ modelId }}</span>
+                          <Icon v-if="voiceDrillTarget && voicePlatformModelActive(voiceDrillTarget, modelId)" name="check" :size="14" />
+                        </button>
+                      </template>
+                      <div v-else class="chat-voice-menu__empty">{{ voiceDrillStatusText() }}</div>
+                    </div>
+                  </template>
+                  <div class="chat-voice-menu__section-label">{{ t('chat.voiceDevices') }}</div>
+                  <div
+                    class="chat-voice-menu__group"
+                    role="menu"
+                    :aria-label="t('chat.voiceDevices')"
+                  >
+                    <button
+                      type="button"
+                      class="chat-voice-menu__mode"
+                      :class="{ 'is-selected': voiceDefaultSelected }"
+                      role="menuitemradio"
+                      :aria-checked="voiceDefaultSelected ? 'true' : 'false'"
+                      @click="emit('selectVoiceDevice', ''); voiceMenuOpen = false"
+                    >
+                      <span class="chat-voice-menu__mode-label">{{ voiceDefaultLabel || t('chat.voiceDeviceDefault') }}</span>
+                      <span class="chat-voice-menu__badge chat-voice-menu__badge--dim">{{ t('chat.voiceDeviceDefaultBadge') }}</span>
+                      <Icon v-if="voiceDefaultSelected" name="check" :size="14" />
+                    </button>
+                    <button
+                      v-for="device in voiceMenuDevices"
+                      :key="device.deviceId"
+                      type="button"
+                      class="chat-voice-menu__mode"
+                      :class="{ 'is-selected': voiceDeviceId === device.deviceId }"
+                      role="menuitemradio"
+                      :aria-checked="voiceDeviceId === device.deviceId ? 'true' : 'false'"
+                      @click="emit('selectVoiceDevice', device.deviceId); voiceMenuOpen = false"
+                    >
+                      <span class="chat-voice-menu__mode-label">{{ device.label || t('chat.voiceDeviceUnnamed') }}</span>
+                      <Icon v-if="voiceDeviceId === device.deviceId" name="check" :size="14" />
+                    </button>
+                    <div
+                      v-if="!voiceDevices.length"
+                      class="chat-voice-menu__empty"
+                    >
+                      {{ t('chat.voiceDevicesEmpty') }}
+                    </div>
+                  </div>
+                </div>
+                <button
+                  type="button"
+                  class="chat-voice-menu__item chat-voice-menu__rescan"
+                  role="menuitem"
+                  @pointerdown.stop
+                  @click="void emit('voiceDevicesRefresh')"
+                >
+                  <span>{{ t('chat.voiceDevicesRefresh') }}</span>
+                  <Icon name="refresh" :size="14" />
+                </button>
+                <button
+                  type="button"
+                  class="chat-voice-menu__settings"
+                  role="menuitem"
+                  @click="openVoiceSettings"
+                >
+                  <Icon name="settings" :size="16" />
+                  <span>{{ t('chat.voiceDeviceSettings') }}</span>
+                  <Icon name="chevronRight" :size="14" />
+                </button>
+              </div>
+            </div>
+
             <button
               v-if="showSkillQueueSend"
               type="button"
@@ -486,6 +694,7 @@ import ChatComposerAddMenu from '@/components/chat/ChatComposerAddMenu.vue'
 import ChatComposerGoalMode from '@/components/chat/ChatComposerGoalMode.vue'
 import ChatInlineEditor from '@/components/chat/ChatInlineEditor.vue'
 import type { ChatSlashCommand } from '@/composables/chat/useChatSlashCommands'
+import type { VoiceCloudModelState, VoiceCloudPlatform, VoiceEngineId } from '@/composables/chat/useVoiceEngine'
 import ChatComposerModelRouting from '@/components/chat/ChatComposerModelRouting.vue'
 import ChatComposerPlanMode from '@/components/chat/ChatComposerPlanMode.vue'
 import ChatComposerRunMode from '@/components/chat/ChatComposerRunMode.vue'
@@ -582,6 +791,25 @@ const props = withDefaults(defineProps<{
   voiceBusy: boolean
   voiceRecording: boolean
   voiceReady: boolean
+  /** Known capture devices for the microphone picker; empty while unprobed. */
+  voiceDevices?: { deviceId: string; label: string }[]
+  /** Selected capture device id; empty string follows the system default. */
+  voiceDeviceId?: string
+  /** Real name of the OS default capture device, resolved by the picker. */
+  voiceDefaultLabel?: string
+  /** Device id of the OS default; hidden from the explicit list (no dupes). */
+  voiceDefaultDeviceId?: string
+  /** Saved recognition engine id; '' until the config read resolves. */
+  voiceEngineId?: string
+  voiceEngineBusy?: boolean
+  /** Model each engine transcribes with (shown instead of endpoint paths). */
+  voiceEngineModels?: Record<string, string>
+  /** Which fixed engines are configured; unconfigured ones stay hidden. */
+  voiceEngineConfigured?: Record<string, boolean>
+  /** OpenAI-compatible platforms, merged by base URL. */
+  voiceCloudPlatforms?: VoiceCloudPlatform[]
+  /** Fetched model lists per platform key. */
+  voiceCloudModels?: Record<string, VoiceCloudModelState>
   projectWorkspace?: { id: string; name: string; path: string } | null
   /** Settled presentation; sendBlockedMessage independently gates operations. */
   projectWorkspaceStatus?: 'none' | 'resolving' | 'ready' | 'unavailable' | 'removed' | 'unknown' | 'error'
@@ -618,6 +846,16 @@ const props = withDefaults(defineProps<{
   skillPositions: () => ({}),
   draftKey: '',
   localPaths: () => [],
+  voiceDevices: () => [],
+  voiceDeviceId: '',
+  voiceDefaultLabel: '',
+  voiceDefaultDeviceId: '',
+  voiceEngineId: '',
+  voiceEngineBusy: false,
+  voiceEngineModels: () => ({}),
+  voiceEngineConfigured: () => ({}),
+  voiceCloudPlatforms: () => [],
+  voiceCloudModels: () => ({}),
 })
 
 const emit = defineEmits<{
@@ -649,6 +887,11 @@ const emit = defineEmits<{
   cancelReplan: []
   voiceInput: []
   voiceSetup: []
+  voiceDevicesRefresh: []
+  openVoiceSettings: []
+  selectVoiceEngine: [engineId: VoiceEngineId]
+  selectCloudModel: [payload: { platformKey: string; modelId: string }]
+  selectVoiceDevice: [deviceId: string]
   exportMarkdown: []
   stop: []
   chooseProject: []
@@ -740,6 +983,7 @@ async function onAttachFiles() {
 }
 
 const addMenuOpen = ref(false)
+const voiceMenuOpen = ref(false)
 const modelRoutingOpen = ref(false)
 const modelRoutingPanelRef = ref<{ element: () => HTMLElement | null } | null>(null)
 const modelRoutingVisible = computed(() => Boolean(props.sessionRoutingAvailable || props.modelSelectionAvailable || props.modelSelection))
@@ -815,9 +1059,13 @@ const runModeOpen = ref(false)
 const addMenuAnchorEl = ref<HTMLElement | null>(null)
 const modelRoutingAnchorEl = ref<HTMLElement | null>(null)
 const runModeAnchorEl = ref<HTMLElement | null>(null)
+const voiceMenuAnchorEl = ref<HTMLElement | null>(null)
+const voiceMenuEl = ref<HTMLElement | null>(null)
+const voiceMenuShift = ref(0)
 
 const anyPopoverOpen = computed(() =>
   addMenuOpen.value
+  || voiceMenuOpen.value
   || modelRoutingOpen.value
   || runModeOpen.value,
 )
@@ -839,6 +1087,9 @@ function closeOpenPopoversFromOutside(event: PointerEvent) {
   }
   if (runModeOpen.value && !eventInsideRoot(event, runModeAnchorEl.value)) {
     runModeOpen.value = false
+  }
+  if (voiceMenuOpen.value && !eventInsideRoot(event, voiceMenuAnchorEl.value)) {
+    voiceMenuOpen.value = false
   }
 }
 
@@ -933,9 +1184,129 @@ watch(() => props.runModeLocked, (locked) => {
 
 function closeAllPopovers() {
   addMenuOpen.value = false
+  voiceMenuOpen.value = false
   modelRoutingOpen.value = false
   runModeOpen.value = false
 }
+
+function toggleVoiceMenu() {
+  voiceMenuOpen.value = !voiceMenuOpen.value
+  if (voiceMenuOpen.value) {
+    voiceDrillPlatform.value = ''
+    emit('voiceDevicesRefresh')
+    addMenuOpen.value = false
+    modelRoutingOpen.value = false
+    runModeOpen.value = false
+  }
+}
+
+// Mirrors the model-routing panel's settings entry: close the menu, then let
+// the view route to the recognition capability card.
+function openVoiceSettings() {
+  voiceMenuOpen.value = false
+  emit('openVoiceSettings')
+}
+
+// Recognition engines offered by the gateway's [audio.stt] chain. Labels are
+// shared with the settings capabilities card so the two surfaces never drift.
+const voiceEngineOptions = computed(() => (
+  [
+    { value: 'sensevoice', label: t('setup.audio.sttSenseVoice'), local: true, model: props.voiceEngineModels.sensevoice || 'SenseVoiceSmall' },
+    { value: 'elevenlabs', label: t('setup.audio.sttElevenLabs'), local: false, model: props.voiceEngineModels.elevenlabs || 'scribe_v2' },
+  ] as Array<{ value: VoiceEngineId; label: string; local: boolean; model: string }>
+).filter(engine => props.voiceEngineConfigured[engine.value] === true))
+
+// Cloud platforms drill down into their fetched model list; the drill state
+// resets whenever the menu opens so it never strands on a stale platform.
+const voiceDrillPlatform = ref('')
+const voiceDrillTarget = computed(() => (
+  props.voiceCloudPlatforms.find(platform => platform.key === voiceDrillPlatform.value) || null
+))
+const voiceDrillModels = computed<VoiceCloudModelState | null>(() => (
+  voiceDrillPlatform.value ? props.voiceCloudModels[voiceDrillPlatform.value] || null : null
+))
+
+function voicePlatformActive(platform: VoiceCloudPlatform): boolean {
+  return platform.engines.some(engine => engine === props.voiceEngineId)
+}
+
+function voicePlatformModelActive(platform: VoiceCloudPlatform, modelId: string): boolean {
+  return voicePlatformActive(platform)
+    && (props.voiceEngineModels[props.voiceEngineId] || '') === modelId
+}
+
+// The subline pins the platform's configured model even when another engine
+// is active — the selection belongs to the platform, not to the moment. Only
+// when no model is configured does it fall back to the discovery state.
+function voicePlatformSubline(platform: VoiceCloudPlatform): string {
+  const activeModel = voicePlatformActive(platform)
+    ? (props.voiceEngineModels[props.voiceEngineId] || '')
+    : ''
+  const configuredModel = activeModel
+    || platform.engines.map(engine => props.voiceEngineModels[engine] || '').find(model => Boolean(model))
+    || ''
+  if (configuredModel) return configuredModel
+  const state = props.voiceCloudModels[platform.key]
+  if (!state || state.status === 'loading') return t('chat.voiceModelsLoading')
+  if (state.status === 'nokey') return t('chat.voiceModelsNoKey')
+  if (state.status === 'error') return t('chat.voiceModelsFailed')
+  return t('chat.voiceModelsCount', { count: state.models.length })
+}
+
+function voiceDrillStatusText(): string {
+  const state = voiceDrillModels.value
+  if (!state || state.status === 'loading') return t('chat.voiceModelsLoading')
+  if (state.status === 'nokey') return t('chat.voiceModelsNoKey')
+  if (state.status === 'error') return t('chat.voiceModelsFailed')
+  return t('chat.voiceModelsEmpty')
+}
+
+function openVoicePlatformDrill(platform: VoiceCloudPlatform) {
+  voiceDrillPlatform.value = platform.key
+}
+
+// The follow-default entry already represents the OS default microphone;
+// hide that device from the explicit list so it is never shown twice.
+const voiceMenuDevices = computed(() => (
+  props.voiceDefaultDeviceId
+    ? props.voiceDevices.filter(device => device.deviceId !== props.voiceDefaultDeviceId)
+    : props.voiceDevices
+))
+// A selection pinned to the current default device reads as the default
+// entry being checked — that device no longer has its own row.
+const voiceDefaultSelected = computed(() => (
+  !props.voiceDeviceId || props.voiceDeviceId === props.voiceDefaultDeviceId
+))
+
+// The menu opens right-aligned to its trigger, which sits inset from the
+// viewport edge; on narrow screens the fixed width can still push its left
+// edge off-screen. Measure once per open (and on resize) and shift it back
+// inside the same 12px viewport margin the model-routing placement uses.
+function clampVoiceMenuToViewport() {
+  const menu = voiceMenuEl.value
+  if (!menu) return
+  const rect = menu.getBoundingClientRect()
+  const applied = voiceMenuShift.value
+  const left = rect.left - applied
+  const right = rect.right - applied
+  const margin = 12
+  const overflowLeft = margin - left
+  const overflowRight = right - (window.innerWidth - margin)
+  voiceMenuShift.value = Math.round(
+    overflowLeft > 0 ? overflowLeft : overflowRight > 0 ? -overflowRight : 0,
+  )
+}
+
+watch(voiceMenuOpen, (open) => {
+  if (open) {
+    voiceMenuShift.value = 0
+    nextTick(clampVoiceMenuToViewport)
+    window.addEventListener('resize', clampVoiceMenuToViewport)
+  } else {
+    window.removeEventListener('resize', clampVoiceMenuToViewport)
+  }
+})
+onBeforeUnmount(() => window.removeEventListener('resize', clampVoiceMenuToViewport))
 
 // The retract animation collapses the footer with overflow clipping; any open
 // menu would be clipped/vanished mid-flight, so close menus the moment the
@@ -1709,7 +2080,7 @@ button.attachment-chip__primary:focus-visible {
 
 @media (pointer: coarse) {
   .chat-plus-btn, .chat-run-mode-btn, .chat-project-choose,
-  .attachment-action { min-width: 44px; min-height: 44px; }
+  .attachment-action, .chat-mic-btn { min-width: 44px; min-height: 44px; }
   .chat-textarea { font-size: 1rem; }
 }
 .chat-input-wrap {
@@ -1761,6 +2132,330 @@ button.attachment-chip__primary:focus-visible {
 
 .chat-plus-btn {
   color: var(--text-muted);
+}
+
+.chat-mic-btn {
+  color: var(--text-muted);
+}
+
+/* Voice is offered before setup: the button stays clickable (it points at
+   Settings) but reads as unavailable until an STT provider is configured. */
+.chat-mic-btn--needs-setup {
+  opacity: var(--state-disabled-opacity);
+}
+
+.chat-mic-btn--needs-setup:hover {
+  opacity: 1;
+}
+
+/* Recording is a live state, not a toggle: it must survive hover. While
+   recording the button swaps btn--ghost for btn--danger — the theme layers
+   force ghost hover fills with !important but deliberately exempt danger
+   actions — and these higher-specificity selectors keep the danger tint
+   (instead of the solid danger fill) in both rest and hover, with the shared
+   live-pulse cadence on the icon. */
+.chat-mic-btn.is-active,
+.chat-mic-btn.is-active:not(:disabled):hover {
+  background: color-mix(in srgb, var(--danger) 14%, var(--bg-surface));
+  color: var(--danger);
+}
+
+.chat-mic-btn.is-active .icon {
+  animation: live-pulse var(--dur-pulse) var(--ease-standard) infinite;
+}
+
+/* Capture-device picker beside the mic: opens the list of audioinput devices
+   so a virtual mic (Steam, VB-Cable) or a headset Hands-Free channel can be
+   chosen explicitly instead of silently following the system default. */
+.chat-voice-anchor {
+  display: inline-flex;
+  align-items: center;
+}
+
+.chat-voice-devices-btn {
+  margin-left: -4px;
+}
+
+/* Voice menu — shares the model-routing panel's visual language: heading
+   bar, section labels, accent-tinted selected rows, benefit badges, and a
+   settings footer. Anchored above the mic button, opening leftward so it
+   stays inside the viewport (the clamp in openVoiceMenu shifts it if the
+   trigger sits too close to the window edge). */
+.chat-voice-menu {
+  position: absolute;
+  right: 0;
+  bottom: calc(100% + 8px);
+  width: min(320px, calc(100vw - 48px));
+  border: 1px solid var(--border);
+  border-radius: var(--radius-panel);
+  background: var(--bg-surface);
+  box-shadow: var(--shadow-xl);
+  z-index: 30;
+  display: flex;
+  flex-direction: column;
+  max-height: min(440px, calc(100vh - 140px));
+  overflow: hidden;
+  color: var(--text);
+}
+
+.chat-voice-menu__heading {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-shrink: 0;
+  min-height: 38px;
+  padding: 7px 12px;
+  font-size: var(--fs-sm);
+}
+
+.chat-voice-menu__heading strong {
+  flex: 1;
+  font-weight: 650;
+}
+
+.chat-voice-menu__close {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  flex-shrink: 0;
+  width: 24px;
+  height: 24px;
+  border: 0;
+  border-radius: var(--radius-control);
+  background: transparent;
+  color: var(--text-muted);
+  cursor: pointer;
+}
+
+.chat-voice-menu__close:hover {
+  background: var(--bg-hover);
+  color: var(--text);
+}
+
+.chat-voice-menu__body {
+  flex: 1;
+  min-height: 0;
+  padding: 0 8px 8px;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+}
+
+.chat-voice-menu__section-label {
+  padding: 6px 10px 4px;
+  color: var(--text-dim);
+  font-size: var(--fs-xs);
+  font-weight: 600;
+}
+
+.chat-voice-menu__group {
+  display: flex;
+  flex-direction: column;
+}
+
+.chat-voice-menu__mode {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-shrink: 0;
+  width: 100%;
+  padding: 9px 10px;
+  margin-bottom: 2px;
+  border: 1px solid transparent;
+  border-radius: var(--radius-control);
+  background: transparent;
+  color: var(--text);
+  font-size: var(--fs-sm);
+  font-weight: 500;
+  text-align: left;
+  cursor: pointer;
+}
+
+.chat-voice-menu__mode:hover {
+  background: var(--bg-hover);
+}
+
+.chat-voice-menu__mode.is-selected {
+  background: color-mix(in srgb, var(--accent) 9%, var(--bg-surface));
+  border-color: color-mix(in srgb, var(--accent) 20%, var(--border));
+}
+
+.chat-voice-menu__mode[aria-disabled='true'] {
+  opacity: var(--state-disabled-opacity);
+  cursor: default;
+}
+
+.chat-voice-menu__mode-label {
+  flex: 1;
+  min-width: 0;
+  white-space: normal;
+  overflow-wrap: anywhere;
+  line-height: 1.35;
+}
+
+/* Engine rows carry a model subline, mirroring the model-routing panel's
+   mode + selected-model layout. */
+.chat-voice-menu__mode--engine {
+  flex-direction: column;
+  align-items: stretch;
+  gap: 0;
+}
+
+.chat-voice-menu__mode-top {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  width: 100%;
+}
+
+.chat-voice-menu__model {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  width: 100%;
+  margin-top: 3px;
+  color: var(--text-muted);
+  font-size: var(--fs-xs);
+  font-weight: 400;
+  line-height: 1.4;
+}
+
+.chat-voice-menu__model-dot {
+  flex: 0 0 4px;
+  width: 4px;
+  height: 4px;
+  border-radius: 50%;
+  background: var(--accent);
+}
+
+.chat-voice-menu__model-name {
+  min-width: 0;
+  white-space: normal;
+  overflow-wrap: anywhere;
+}
+
+.chat-voice-menu__mode .chat-voice-menu__chevron {
+  color: var(--text-muted);
+}
+
+.chat-voice-menu__drill-head {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 6px 10px 4px;
+}
+
+.chat-voice-menu__back {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  flex-shrink: 0;
+  width: 24px;
+  height: 24px;
+  border: 0;
+  border-radius: var(--radius-control);
+  background: transparent;
+  color: var(--text-muted);
+  cursor: pointer;
+}
+
+.chat-voice-menu__back:hover {
+  background: var(--bg-hover);
+  color: var(--text);
+}
+
+.chat-voice-menu__drill-title {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--text-dim);
+  font-size: var(--fs-xs);
+  font-weight: 600;
+}
+
+.chat-voice-menu__mode .icon {
+  flex-shrink: 0;
+  color: var(--accent);
+}
+
+.chat-voice-menu__badge {
+  flex: 0 0 auto;
+  padding: 1px 5px;
+  border: 1px solid color-mix(in srgb, var(--accent) 28%, var(--border));
+  border-radius: var(--radius-control);
+  background: color-mix(in srgb, var(--accent) 9%, var(--bg-surface));
+  color: color-mix(in srgb, var(--accent) 80%, var(--text));
+  font-size: 10px;
+  font-weight: 500;
+  line-height: 1.35;
+  white-space: nowrap;
+}
+
+.chat-voice-menu__badge--dim {
+  border-color: var(--border);
+  background: transparent;
+  color: var(--text-dim);
+}
+
+.chat-voice-menu__empty {
+  padding: 0.5rem 10px;
+  color: var(--text-muted);
+  font-size: var(--fs-xs);
+}
+
+.chat-voice-menu__item {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.5rem;
+  width: 100%;
+  flex-shrink: 0;
+  padding: 8px 12px;
+  border: 0;
+  background: transparent;
+  color: var(--text-muted);
+  font-size: var(--fs-xs);
+  text-align: left;
+  cursor: pointer;
+}
+
+.chat-voice-menu__item:hover {
+  background: var(--bg-hover);
+  color: var(--text);
+}
+
+.chat-voice-menu__item .icon {
+  flex-shrink: 0;
+}
+
+.chat-voice-menu__settings {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  width: 100%;
+  flex-shrink: 0;
+  padding: 10px 12px;
+  border: 0;
+  border-top: 1px solid var(--border);
+  background: transparent;
+  color: var(--text-muted);
+  font-size: var(--fs-xs);
+  text-align: left;
+  cursor: pointer;
+}
+
+.chat-voice-menu__settings > span:not(.icon) {
+  flex: 1;
+}
+
+.chat-voice-menu__settings .icon {
+  flex-shrink: 0;
+}
+
+.chat-voice-menu__settings:hover {
+  color: var(--text);
+  background: var(--bg-hover);
 }
 
 .btn--ghost.is-active {
@@ -2090,7 +2785,7 @@ button.attachment-chip__primary:focus-visible {
 }
 
 .chat-input-footer:is([data-composer-density='compact'], [data-composer-density='icons']) :is(
-  .chat-plus-btn, .chat-run-mode-btn, .chat-project-choose, .chat-send-btn
+  .chat-plus-btn, .chat-run-mode-btn, .chat-project-choose, .chat-send-btn, .chat-mic-btn
 ) {
   flex: 0 0 var(--composer-control-size);
   width: var(--composer-control-size);

@@ -1281,6 +1281,9 @@ def create_gateway_app(
     register_audio_transcription_routes(
         app, config=config, usage_event_sink=usage_event_sink, session_manager=session_manager,
     )
+    from opensquilla.gateway.audio_speech import register_audio_speech_routes  # noqa: PLC0415
+
+    register_audio_speech_routes(app, config=config)
     from opensquilla.gateway.bundle_routes import register_bundle_routes  # noqa: PLC0415
 
     register_bundle_routes(app, config=config)

@@ -6,6 +6,29 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ## [Unreleased]
 
+### Added
+
+- Multi-provider speech-to-text for `POST /api/audio/transcribe`: the ElevenLabs
+  Scribe path (unchanged default) is joined by OpenAI-compatible
+  `/audio/transcriptions` (Whisper, SiliconFlow, Groq, ...) and chat-completion
+  `input_audio` (MiMo-style) backends, selected through `[audio.stt]` with an
+  ordered `fallback` chain and per-origin credential-env scoping.
+- The Web UI microphone entry now reports readiness for any configured STT
+  provider, not only ElevenLabs. Readiness resolves the selected provider's
+  credential through the same per-origin rule the runtime provider uses, so a
+  missing or non-reusable key degrades the control panel instead of lighting
+  up a microphone that would fail at request time.
+- Voice input moves from the composer's Add menu to a persistent toolbar
+  button between model routing and send. It stays visible before setup and
+  points at Settings, so the feature is discoverable instead of buried.
+- Auto-grant microphone-only `getUserMedia` from the app's own loopback gateway
+  origin inside an embedded Workbench preview. A confirmation request aimed at
+  the application asking to use its own interface has no actionable answer, and
+  in preview hosts without a confirmation surface it expired into a silent
+  denial, leaving voice input impossible to start. Camera requests, audio+video
+  requests, and every non-loopback or uninterpretable request still take the
+  existing prompt path, which remains authoritative.
+
 ## [0.5.8] - 2026-11-05
 
 ### Added

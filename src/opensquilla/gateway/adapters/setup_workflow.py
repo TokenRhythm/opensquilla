@@ -35,6 +35,7 @@ def setup_status(config: Any, *, is_owner: bool) -> SetupStatus:
 
 
 def _setup_status(config: Any, *, is_owner: bool) -> SetupStatus:
+    from opensquilla.audio.voice_presets import list_presets
     from opensquilla.onboarding.legacy_data import legacy_data_payload
     from opensquilla.onboarding.mutations import capability_resettable
     from opensquilla.onboarding.next_steps import env_recovery_commands
@@ -125,6 +126,7 @@ def _setup_status(config: Any, *, is_owner: bool) -> SetupStatus:
             "audioSource": status.audio_source,
             "audioProvider": status.audio_provider,
             "audioEnvKey": status.audio_env_key,
+            "voicePresets": list_presets(config),
             "searchConfigured": status.search_configured,
             "searchProvider": status.search_provider,
             "searchSource": status.search_source,

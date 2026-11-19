@@ -190,6 +190,21 @@
         "to": "runtime/runtime-pack-catalog.json"
       }
     ],
+    "extraFiles": [
+      {
+        "from": "../pet",
+        "to": "desktop/pet",
+        "filter": [
+          "**/*",
+          "!dev/**",
+          "!*.log"
+        ]
+      },
+      {
+        "from": "../../assets/opensquilla-mark.png",
+        "to": "assets/opensquilla-mark.png"
+      }
+    ],
     "mac": {
       "category": "public.app-category.developer-tools",
       "icon": "assets/icon.icns",

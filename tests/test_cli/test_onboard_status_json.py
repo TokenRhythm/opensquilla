@@ -46,6 +46,9 @@ RPC_STATUS_KEYS = frozenset(
         "audioSource",
         "audioProvider",
         "audioEnvKey",
+        # Additive text-to-speech voice preset inventory (see the matching
+        # deliberate extension in tests/test_contracts/test_onboarding_status.py).
+        "voicePresets",
         "searchConfigured",
         "searchProvider",
         "searchSource",

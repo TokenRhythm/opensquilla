@@ -694,3 +694,29 @@ export function nativeWorkbenchDownloadAllowed(
   // Saving a preview download remains a user-initiated native dialog.
   return hasUserGesture === true
 }
+
+export type NativeWorkbenchMediaPermissionDecision = 'prompt' | 'grant-microphone'
+
+/**
+ * Decide whether a media permission request may skip the confirmation prompt.
+ *
+ * The Control UI is the desktop application's own interface, served by the
+ * gateway it embeds; asking the user to trust it with the microphone is a
+ * prompt nobody can interpret. An audio-only request from a loopback origin is
+ * therefore granted directly. Everything else - above all anything that could
+ * reach the camera, from any non-loopback origin, or in a shape this function
+ * cannot fully interpret - keeps returning 'prompt' so the existing native
+ * confirmation path stays authoritative.
+ */
+export function nativeWorkbenchMediaPermissionDecision(
+  permission: unknown,
+  mediaTypes: unknown,
+  requestingOriginIsLoopback: unknown,
+): NativeWorkbenchMediaPermissionDecision {
+  if (requestingOriginIsLoopback !== true) return 'prompt'
+  if (permission !== 'media') return 'prompt'
+  if (!Array.isArray(mediaTypes) || mediaTypes.length === 0) return 'prompt'
+  return mediaTypes.every(mediaType => mediaType === 'audio')
+    ? 'grant-microphone'
+    : 'prompt'
+}

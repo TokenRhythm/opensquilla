@@ -895,5 +895,32 @@ async def handle_standalone_slash_command(
         record_turn(state, prompt, result)
         return True
 
+    if _slash_parts(cmd, "/voice"):
+        from opensquilla.cli.tui.adapters.voice import capture_voice_text
+        from opensquilla.onboarding.config_store import default_config_path, load_config
+
+        try:
+            config = load_config(default_config_path())
+        except Exception as exc:  # noqa: BLE001 - surface config load failure
+            console.print(f"[red]Could not load configuration for /voice: {exc}[/red]")
+            return True
+        text = await capture_voice_text(
+            config, host_ui=output_supports_host_ui(context.tui_output)
+        )
+        if text:
+            console.print(f"[dim]语音输入：[/dim]{text}")
+            result = await stream(
+                context.turn_runner,
+                context.session_key,
+                context.tool_ctx,
+                text,
+                model=context.model,
+                services=context.runtime_services,
+                timeout=context.timeout,
+                tui_output=context.tui_output,
+            )
+            record_turn(state, text, result)
+        return True
+
     console.print("[red]Unknown command.[/red] [dim]Use /help.[/dim]")
     return True

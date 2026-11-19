@@ -3194,6 +3194,15 @@ async def voice_search(
             "type": "string",
             "description": ("ElevenLabs voice identifier. Uses audio.tts.voice when omitted."),
         },
+        "preset": {
+            "type": "string",
+            "description": (
+                "Named voice preset from [audio.presets] (or a built-in name). "
+                "Overrides voice/model/settings parameters it defines; omitted "
+                "parameters fall back to audio.tts. Unknown names fail loudly "
+                "and list the available presets."
+            ),
+        },
         "output_path": {
             "type": "string",
             "description": "Output file path. Auto-generated if omitted.",
@@ -3240,6 +3249,7 @@ async def voice_search(
 async def tts(
     text: str,
     voice: str = "",
+    preset: str = "",
     output_path: str | None = None,
     language_code: str = "",
     speed: float = 1.0,
@@ -3264,14 +3274,60 @@ async def tts(
             missing_capability="text_to_speech",
             note="ElevenLabs audio provider is disabled or not configured.",
         )
+    # A named preset (PRD F3.6) merges over [audio.tts]; an explicit call-site
+    # parameter still beats the preset so per-request overrides stay possible.
+    resolved_preset = None
+    if str(preset or "").strip():
+        from opensquilla.audio.voice_presets import VoicePresetError, resolve_voice
+
+        try:
+            resolved_preset = resolve_voice(config, str(preset).strip())
+        except VoicePresetError as exc:
+            raise ToolError(str(exc)) from exc
     tts_config = getattr(config, "tts", None)
     model_id = str(getattr(tts_config, "model", "") or "eleven_multilingual_v2")
+    if resolved_preset is not None:
+        model_id = resolved_preset.model_id
+    elif str(getattr(tts_config, "preset", "") or "").strip():
+        # [audio.tts].preset is the configured default voice (PRD F3.6). An
+        # explicit call-site voice parameter still overrides it.
+        from opensquilla.audio.voice_presets import VoicePresetError, resolve_voice
+
+        if tts_config is None:
+            raise ToolError("text-to-speech is not configured")
+        try:
+            resolved_preset = resolve_voice(config, str(tts_config.preset).strip())
+        except VoicePresetError as exc:
+            raise ToolError(str(exc)) from exc
+        model_id = resolved_preset.model_id
     resolved_voice = str(voice or getattr(tts_config, "voice", "") or "").strip()
+    # Preset merge: an explicit voice parameter always wins; otherwise a
+    # preset (call-site `preset`, else [audio.tts].preset) supplies the voice.
+    if resolved_preset is not None and not str(voice or "").strip():
+        resolved_voice = resolved_preset.voice_id
+    elif not resolved_voice and resolved_preset is not None:
+        resolved_voice = resolved_preset.voice_id
     if not resolved_voice:
         raise ToolError("Voice must not be empty")
     resolved_language_code = str(
         language_code or getattr(tts_config, "language_code", "") or ""
     ).strip()
+    if resolved_preset is not None and not str(language_code or "").strip():
+        resolved_language_code = resolved_preset.language_code
+    if resolved_preset is not None:
+        # Preset is the base; only call-site values that differ from the
+        # tool's neutral defaults override it.
+        speed = float(speed if speed != 1.0 else resolved_preset.speed)
+        stability = stability if stability is not None else resolved_preset.stability
+        similarity_boost = (
+            similarity_boost if similarity_boost is not None
+            else resolved_preset.similarity_boost
+        )
+        style = style if style is not None else resolved_preset.style
+        use_speaker_boost = (
+            use_speaker_boost if use_speaker_boost is not None
+            else resolved_preset.use_speaker_boost
+        )
     voice_settings = _tts_voice_settings(
         speed=speed,
         stability=stability,

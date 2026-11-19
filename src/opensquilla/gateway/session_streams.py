@@ -5,6 +5,7 @@ from __future__ import annotations
 import time
 import uuid
 from collections import deque
+from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any
 
@@ -112,6 +113,39 @@ class SessionStreamRegistry:
         self._replay_reset_boundary_by_session: dict[str, BufferedSessionEvent] = {}
         self._unpersisted_tasks: dict[str, set[str]] = {}
         self._persisted_task_by_session: dict[str, str] = {}
+        # In-process observers (e.g. the desktop-pet reminder service) receive
+        # every accepted live session event without a WebSocket connection.
+        # Callbacks must be cheap and non-blocking; failures are isolated.
+        self._local_observers: list[Callable[[str, str, dict[str, Any]], None]] = []
+
+    def add_local_observer(
+        self, callback: Callable[[str, str, dict[str, Any]], None]
+    ) -> Callable[[], None]:
+        """Register an in-process observer of accepted live session events.
+
+        The callback receives ``(session_key, event_name, payload)`` for each
+        accepted ``session.event.*`` frame. Returns an idempotent removal
+        handle. Observers never affect replay buffering or WS delivery.
+        """
+        self._local_observers.append(callback)
+
+        def _remove() -> None:
+            try:
+                self._local_observers.remove(callback)
+            except ValueError:
+                pass
+
+        return _remove
+
+    def _notify_local_observers(
+        self, session_key: str, event_name: str, payload: dict[str, Any]
+    ) -> None:
+        for observer in tuple(self._local_observers):
+            try:
+                observer(session_key, event_name, payload)
+            except Exception:
+                # An observer fault must never break event recording/delivery.
+                pass
 
     def mark_terminal_persisted(
         self,
@@ -592,6 +626,7 @@ class SessionStreamRegistry:
         if task_id and not manual and self._persisted_task_by_session.get(session_key) != task_id:
             self._unpersisted_tasks.setdefault(session_key, set()).add(task_id)
         self._refresh_replay_budget(session_key)
+        self._notify_local_observers(session_key, event_name, enriched)
         return enriched
 
     @staticmethod

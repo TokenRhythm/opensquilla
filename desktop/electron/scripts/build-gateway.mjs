@@ -37,6 +37,17 @@ const gatewayUvArgs = [
   '--extra', 'recommended', '--extra', 'mcp', '--extra', 'msg',
   '--extra', 'matrix', '--extra', 'document-extras',
 ]
+// uv prefers a project-root `.venv` over its own environments. When that venv
+// predates the lock (or carries ad-hoc `pip install`ed dev tools), the frozen
+// Gateway and the release dependency inventory see un-locked distributions and
+// the audit fails. Pin the build to a dedicated lock-materialized environment.
+const gatewayEnv = {
+  ...process.env,
+  UV_PROJECT_ENVIRONMENT: join(pyinstallerWorkDir, 'build-env'),
+  PYTHONUNBUFFERED: '1',
+  PYTHONUTF8: '1',
+  PYTHONIOENCODING: 'utf-8:replace',
+}
 // PTY backends are imported lazily by the managed execution path, so
 // PyInstaller cannot discover them from the Python source graph.  Collect only
 // the backend for the current build platform: ptyprocess is pure Python on
@@ -146,12 +157,7 @@ function pythonPackageFile(packageName, relativePath) {
     [...gatewayUvArgs, 'python', '-c', code],
     {
       cwd: repoRoot,
-      env: {
-        ...process.env,
-        PYTHONUNBUFFERED: '1',
-        PYTHONUTF8: '1',
-        PYTHONIOENCODING: 'utf-8:replace',
-      },
+      env: gatewayEnv,
       encoding: 'utf8',
       windowsHide: true,
     },
@@ -332,7 +338,7 @@ const migrationRegistry = join(pyinstallerWorkDir, 'migration-registry', 'regist
 const freezeRegistry = spawnSync('uv', [
   ...gatewayUvArgs, 'python', join(repoRoot, 'scripts', 'freeze_migration_registry.py'),
   '--migrations', join(repoRoot, 'migrations'), '--output', migrationRegistry,
-], { cwd: repoRoot, encoding: 'utf8', windowsHide: true })
+], { cwd: repoRoot, env: gatewayEnv, encoding: 'utf8', windowsHide: true })
 if (freezeRegistry.error) throw freezeRegistry.error
 if (freezeRegistry.status !== 0) {
   throw new Error(`Migration registry build failed: ${freezeRegistry.stderr || freezeRegistry.stdout}`)
@@ -354,7 +360,7 @@ const prepareTokenizer = spawnSync('uv', [
     '    target.write_bytes(data)',
     'print("Verified offline cl100k_base encoding asset.")',
   ].join('\n'), join(tokenizerCacheDir, tokenizerCacheKey), tokenizerUrl, tokenizerSha256,
-], { cwd: repoRoot, encoding: 'utf8', windowsHide: true, timeout: 120000 })
+], { cwd: repoRoot, env: gatewayEnv, encoding: 'utf8', windowsHide: true, timeout: 120000 })
 if (prepareTokenizer.error) throw prepareTokenizer.error
 if (prepareTokenizer.status !== 0) {
   throw new Error(`Tokenizer asset preparation failed: ${prepareTokenizer.stderr || prepareTokenizer.stdout}`)
@@ -480,12 +486,7 @@ recordStage('prepare', gatewayBuildStarted)
 const freezeStarted = performance.now()
 const result = spawnSync('uv', args, {
   cwd: repoRoot,
-  env: {
-    ...process.env,
-    PYTHONUNBUFFERED: '1',
-    PYTHONUTF8: '1',
-    PYTHONIOENCODING: 'utf-8:replace',
-  },
+  env: { ...gatewayEnv, PYTHONUNBUFFERED: '1', PYTHONUTF8: '1', PYTHONIOENCODING: 'utf-8:replace' },
   stdio: 'inherit',
 })
 
@@ -507,7 +508,7 @@ const dependencyInventory = spawnSync('uv', [
   '--repo', repoRoot, '--kind', 'pyinstaller',
   '--analysis', join(pyinstallerWorkDir, 'opensquilla-gateway', 'Analysis-00.toc'),
   '--output', join(runtimeGatewayDir, 'dependency-inventory.json'),
-], { cwd: repoRoot, stdio: 'inherit', windowsHide: true })
+], { cwd: repoRoot, stdio: 'inherit', windowsHide: true, env: gatewayEnv })
 if (dependencyInventory.error) throw dependencyInventory.error
 if (dependencyInventory.status !== 0) process.exit(dependencyInventory.status ?? 1)
 recordStage('dependency-inventory', inventoryStarted)

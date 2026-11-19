@@ -1987,6 +1987,55 @@ class AudioProvidersConfig(BaseModel):
     elevenlabs: AudioElevenLabsProviderConfig = Field(default_factory=AudioElevenLabsProviderConfig)
 
 
+class AudioSttOpenAIProviderConfig(BaseModel):
+    """One OpenAI-compatible STT endpoint (transcriptions or chat style)."""
+
+    base_url: str = "https://api.openai.com/v1"
+    api_key: str = ""
+    api_key_env: str = "OPENAI_API_KEY"
+    model: str = ""
+    timeout_seconds: float = 120.0
+
+
+class AudioSttSenseVoiceProviderConfig(BaseModel):
+    """Local SenseVoice backend through sherpa-onnx.
+
+    ``model_dir`` follows the AgentRMC layout: a directory holding
+    ``model.int8.onnx`` (or ``model.onnx``) plus ``tokens.txt``. The recognizer
+    loads lazily and never reaches the network, which makes it the cheap
+    default for microphone testing.
+
+    ``language`` is the model hint; an empty value falls back to the global
+    ``[audio.stt].language`` and then to ``"auto"``.
+    """
+
+    model_dir: str = ""
+    language: str = ""
+    use_itn: bool = True
+    num_threads: int = 4
+
+
+class AudioSttConfig(BaseModel):
+    """``[audio.stt]`` — provider selection for speech-to-text.
+
+    ``provider`` stays ``elevenlabs`` by default so the WebUI microphone
+    path is unchanged until an operator opts in to another backend.
+    """
+
+    provider: str = "elevenlabs"
+    language: str = ""
+    fallback: list[str] = Field(default_factory=list)
+    openai_transcriptions: AudioSttOpenAIProviderConfig = Field(
+        default_factory=AudioSttOpenAIProviderConfig
+    )
+    openai_chat: AudioSttOpenAIProviderConfig = Field(
+        default_factory=AudioSttOpenAIProviderConfig
+    )
+    sensevoice: AudioSttSenseVoiceProviderConfig = Field(
+        default_factory=AudioSttSenseVoiceProviderConfig
+    )
+
+
 class AudioTTSConfig(BaseModel):
     model: str = "eleven_multilingual_v2"
     voice: str = "21m00Tcm4TlvDq8ikWAM"
@@ -1998,6 +2047,51 @@ class AudioTTSConfig(BaseModel):
     style: float | None = None
     use_speaker_boost: bool | None = None
     speed: float = 1.0
+    # Name of a [audio.presets.<name>] voice pack; empty = raw fields above.
+    preset: str = ""
+
+
+class AudioVoicePresetConfig(BaseModel):
+    """``[audio.presets.<name>]`` — a named, reusable TTS parameter pack (PRD F3.6).
+
+    Presets own no credentials: playback resolves the key from
+    ``[audio.providers.<provider>]``. Every optional field overrides the
+    matching ``[audio.tts]`` fallback only when set; unset fields keep the raw
+    TTS config so adopting presets never changes existing behavior.
+    """
+
+    label: str = ""
+    provider: str = "elevenlabs"
+    voice_id: str = ""
+    model_id: str = ""
+    language_code: str = ""
+    stability: float | None = Field(default=None, ge=0.0, le=1.0)
+    similarity_boost: float | None = Field(default=None, ge=0.0, le=1.0)
+    style: float | None = Field(default=None, ge=0.0, le=1.0)
+    use_speaker_boost: bool | None = None
+    # Range mirrors the tts tool contract (0.25–4.0); the previous 0.5–2.0 cap
+    # silently rejected legitimate fast/slow presets the tool already accepted.
+    speed: float | None = Field(default=None, ge=0.25, le=4.0)
+    source: str = "user"  # builtin | user | imported
+
+    @field_validator("source")
+    @classmethod
+    def _known_source(cls, value: str) -> str:
+        allowed = {"builtin", "user", "imported"}
+        normalized = (value or "user").strip().lower()
+        if normalized not in allowed:
+            raise ValueError(f"preset source must be one of: {', '.join(sorted(allowed))}")
+        return normalized
+
+
+class AudioCaptureConfig(BaseModel):
+    """``[audio.capture]`` — terminal microphone capture for voice input (PR-4)."""
+
+    # Empty device auto-detects the default capture device (Windows dshow).
+    device: str = ""
+    max_seconds: int = Field(default=60, ge=1, le=600)
+    # Submit the transcribed text immediately instead of filling the input box.
+    auto_send: bool = False
 
 
 class AudioConfig(BaseSettings):
@@ -2009,6 +2103,9 @@ class AudioConfig(BaseSettings):
     enabled: bool = False
     tts: AudioTTSConfig = Field(default_factory=AudioTTSConfig)
     providers: AudioProvidersConfig = Field(default_factory=AudioProvidersConfig)
+    stt: AudioSttConfig = Field(default_factory=AudioSttConfig)
+    capture: AudioCaptureConfig = Field(default_factory=AudioCaptureConfig)
+    presets: dict[str, AudioVoicePresetConfig] = Field(default_factory=dict)
 
 
 # ---------------------------------------------------------------------------
@@ -2610,6 +2707,49 @@ class GoalConfig(BaseSettings):
 GatewayPort = Annotated[int, Field(ge=0, le=65535)]
 
 
+class PetConfig(BaseSettings):
+    """``[pet]`` — in-process desktop-pet reminder & dispatch service (PRD F2/F3).
+
+    Disabled by default: users without the AgentRMC pet get zero behavior and
+    zero port probes. Every key lives in this one section so the feature can
+    later move to a built-in plugin without scattering config (PRD §7.4).
+    """
+
+    model_config = SettingsConfigDict(
+        env_prefix="OPENSQUILLA_PET_",
+        env_nested_delimiter="__",
+    )
+
+    enabled: bool = False
+    bridge_url: str = "http://127.0.0.1:45915"
+    # Image name the native dispatch queue filters on (``?exe=...``).
+    exe: str = "OpenSquilla.exe"
+    # Window raised to the foreground on permission/question notifications;
+    # empty disables foreground raising.
+    raise_window: str = "OpenSquilla.exe"
+    title: str = "OpenSquilla"
+    # Notify for cron-origin sessions too (off by default, like the old bridge).
+    include_cron: bool = False
+    dispatch_enabled: bool = True
+    poll_interval_ms: int = Field(default=1500, ge=250, le=60_000)
+    state_poll_interval_ms: int = Field(default=5000, ge=1000, le=120_000)
+    dedupe_window_ms: int = Field(default=15_000, ge=0, le=120_000)
+    request_timeout_ms: int = Field(default=5000, ge=500, le=60_000)
+    send_timeout_ms: int = Field(default=30_000, ge=1000, le=120_000)
+    # Empty spool_dir resolves to the legacy bridge location so the native
+    # importSpool() replays it unchanged (PRD §8.1).
+    spool_dir: str = ""
+    spool_cap_bytes: int = Field(default=1_048_576, ge=4096)
+    # Empty pause_file resolves to %TEMP%/opensquilla-pet-bridge.pause; create
+    # the file to mute, delete it to resume.
+    pause_file: str = ""
+    msg_stop: str = "OpenSquilla：任务完成"
+    msg_permission: str = "OpenSquilla：有个操作在等你确认"
+    msg_plan: str = "OpenSquilla：有个方案等你选择"
+    msg_clarify: str = "OpenSquilla：有个问题等你回答"
+    msg_turn_start: str = "新一轮对话开始"
+
+
 class GatewayConfig(BaseSettings):
     model_config = SettingsConfigDict(
         env_prefix="OPENSQUILLA_GATEWAY_",
@@ -2676,6 +2816,7 @@ class GatewayConfig(BaseSettings):
     image_generation: ImageGenerationConfig = Field(default_factory=ImageGenerationConfig)
     video_generation: VideoGenerationConfig = Field(default_factory=VideoGenerationConfig)
     audio: AudioConfig = Field(default_factory=AudioConfig)
+    pet: PetConfig = Field(default_factory=PetConfig)
     sandbox: SandboxSettings = Field(default_factory=SandboxSettings)
     channels: ChannelsConfig = Field(default_factory=ChannelsConfig)
     agents: list[AgentEntryConfig] = Field(default_factory=list)

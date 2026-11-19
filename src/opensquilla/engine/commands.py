@@ -580,6 +580,16 @@ _COMMANDS: tuple[CommandDef, ...] = (
         order=140,
     ),
     CommandDef(
+        name="/voice",
+        usage="/voice",
+        description="Record microphone input, transcribe it, and send the text.",
+        execution={_T: _local("voice.capture"), _S: _local("voice.capture")},
+        category=CommandCategory.TURN,
+        busy_policy=CommandBusyPolicy.NEXT_TURN,
+        presentation=CommandPresentation.TURN,
+        order=145,
+    ),
+    CommandDef(
         name="/approvals",
         usage="/approvals [reset]",
         description="Show or reset approval state.",

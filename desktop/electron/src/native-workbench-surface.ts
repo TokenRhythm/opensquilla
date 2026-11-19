@@ -43,6 +43,7 @@ import {
   NATIVE_WORKBENCH_PROTOCOL_VERSION_V4,
   nativeWorkbenchArtifactRequestIsDocument,
   nativeWorkbenchArtifactUrl,
+  nativeWorkbenchMediaPermissionDecision,
   nativeWorkbenchCssRectToDip,
   nativeWorkbenchDownloadAllowed,
   nativeWorkbenchMissingResourceIsLocal,
@@ -4386,16 +4387,39 @@ export class NativeWorkbenchSurfaceManager {
         reason: 'unsupported-device-permission',
       })
     })
+    const microphoneAutoGrant = (
+      requestedPermission: string,
+      requestedMediaTypes: readonly string[] | undefined,
+      originValue: string,
+    ): boolean => nativeWorkbenchMediaPermissionDecision(
+      requestedPermission,
+      requestedMediaTypes,
+      this.isLoopbackRequestOrigin(originValue),
+    ) === 'grant-microphone'
     previewSession.setPermissionCheckHandler(
-      (webContents, permission, requestingOrigin, details) => permission === 'fullscreen'
-        ? Boolean(member(webContents?.id)?.kind === 'url-preview') : Boolean(
-        member(webContents?.id)?.permissionGrants.has(this.permissionGrantKey(
-          this.normalizedOrigin(requestingOrigin),
-          permission === 'media'
-            ? `media:${details.mediaType ?? 'unknown'}`
-            : permission,
+      (webContents, permission, requestingOrigin, details) => {
+        if (permission === 'fullscreen') {
+          return Boolean(member(webContents?.id)?.kind === 'url-preview')
+        }
+        // The app's own Control UI lives on loopback; prompting to let it use
+        // the microphone has no actionable answer, and in hosts without a
+        // prompt surface the request would simply expire into a silent denial.
+        if (microphoneAutoGrant(
+          permission,
+          details.mediaType ? [details.mediaType] : undefined,
+          requestingOrigin ?? '',
+        )) {
+          return true
+        }
+        return Boolean(member(webContents?.id)?.permissionGrants.has(
+          this.permissionGrantKey(
+            this.normalizedOrigin(requestingOrigin),
+            permission === 'media'
+              ? `media:${details.mediaType ?? 'unknown'}`
+              : permission,
+          ),
         ))
-      ),
+      },
     )
     previewSession.setPermissionRequestHandler(
       (webContents, permission, callback, details) => {
@@ -4427,6 +4451,13 @@ export class NativeWorkbenchSurfaceManager {
         const grantPermissions = permission === 'media' && mediaTypes
           ? mediaTypes.map(mediaType => `media:${mediaType}`)
           : [permission]
+        if (microphoneAutoGrant(permission, mediaTypes, origin)) {
+          for (const granted of grantPermissions) {
+            record.permissionGrants.add(this.permissionGrantKey(origin, granted))
+          }
+          callback(true)
+          return
+        }
         const permissionLabel = permission === 'media' && mediaTypes
           ? mediaTypes.includes('video') && mediaTypes.includes('audio')
             ? 'camera-and-microphone'
@@ -5562,6 +5593,16 @@ export class NativeWorkbenchSurfaceManager {
 
   private hasRecentTrustedGesture(record: NativeWorkbenchSurfaceRecord): boolean {
     return Date.now() - record.lastTrustedGestureAt <= NATIVE_WORKBENCH_USER_GESTURE_WINDOW_MS
+  }
+
+  private isLoopbackRequestOrigin(value: string): boolean {
+    try {
+      const parsed = new URL(value)
+      return (parsed.protocol === 'http:' || parsed.protocol === 'https:')
+        && isLoopbackUrlHostname(parsed.hostname)
+    } catch {
+      return false
+    }
   }
 
   private httpUrl(value: string): URL | null {

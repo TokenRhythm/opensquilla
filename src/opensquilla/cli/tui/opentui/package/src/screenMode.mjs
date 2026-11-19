@@ -18,6 +18,10 @@ export function rendererOptions() {
   return {
     screenMode: ALTERNATE_SCREEN,
     useMouse: true,
+    // Kitty progressive enhancement: report press/repeat/release so Alt+V
+    // push-to-talk can stop on key release (PR-4). Terminals without kitty
+    // support fall back to raw keypress; the voice handler then toggles.
+    useKittyKeyboard: { disambiguate: true, alternateKeys: true, events: true },
   };
 }
 

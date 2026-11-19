@@ -15,6 +15,7 @@ test("the host has one fixed alternate-screen renderer contract", () => {
   assert.deepEqual(rendererOptions(), {
     screenMode: ALTERNATE_SCREEN,
     useMouse: true,
+    useKittyKeyboard: { disambiguate: true, alternateKeys: true, events: true },
   });
   assertRendererScreenMode({ screenMode: ALTERNATE_SCREEN });
   assert.throws(

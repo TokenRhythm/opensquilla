@@ -178,6 +178,199 @@ describe('parseContextWindowInput', () => {
   })
 })
 
+// The STT engine switch persists through config.patch dot-paths. Its dirty
+// baseline must be reactive (a ref): an earlier plain-object baseline made
+// sttDirty keep a stale re-seed comparison, so a saved switch stayed marked
+// unsaved until a full reload.
+describe('useSettingsPromotedForm — STT engine switch', () => {
+  it('seeds from saved audio.stt config and stays pristine', () => {
+    const f = useSettingsPromotedForm()
+    f.initFromConfig({
+      audio: { enabled: true, stt: { provider: 'sensevoice', sensevoice: { model_dir: 'D:\\models\\sv' } } },
+    })
+    expect(f.sttProvider.value).toBe('sensevoice')
+    expect(f.sttModelDir.value).toBe('D:\\models\\sv')
+    expect(f.sttDirty.value).toBe(false)
+    expect(f.sttPatches()).toEqual({})
+  })
+
+  it('marks dirty and patches the provider (plus model dir for sensevoice)', () => {
+    const f = useSettingsPromotedForm()
+    f.initFromConfig({ audio: { enabled: true, providers: { elevenlabs: {} } } })
+    f.updateAudioField('sttProvider', 'sensevoice')
+    f.updateAudioField('sttModelDir', 'D:\\models\\sv')
+    expect(f.sttDirty.value).toBe(true)
+    expect(f.sttPatches()).toEqual({
+      'audio.stt.provider': 'sensevoice',
+      'audio.stt.sensevoice.model_dir': 'D:\\models\\sv',
+    })
+  })
+
+  it('cloud switches patch only the provider key', () => {
+    const f = useSettingsPromotedForm()
+    f.initFromConfig({
+      audio: { stt: { provider: 'sensevoice', sensevoice: { model_dir: 'D:\\models\\sv' } } },
+    })
+    f.updateAudioField('sttProvider', 'elevenlabs')
+    expect(f.sttPatches()).toEqual({ 'audio.stt.provider': 'elevenlabs' })
+  })
+
+  it('clearing the model dir writes the empty-string default (str field, not null)', () => {
+    const f = useSettingsPromotedForm()
+    f.initFromConfig({
+      audio: { stt: { provider: 'sensevoice', sensevoice: { model_dir: 'D:\\old' } } },
+    })
+    f.updateAudioField('sttModelDir', '   ')
+    expect(f.sttPatches()['audio.stt.sensevoice.model_dir']).toBe('')
+  })
+
+  it('selecting and clearing a preset patches audio.tts.preset', () => {
+    const f = useSettingsPromotedForm()
+    f.initFromConfig({ audio: { tts: { preset: '' } } })
+    f.updateAudioField('preset', 'pet-alert')
+    expect(f.sttDirty.value).toBe(true)
+    expect(f.sttPatches()).toEqual({ 'audio.tts.preset': 'pet-alert' })
+    f.acceptSavedPreset('pet-alert')
+    expect(f.sttDirty.value).toBe(false)
+    f.updateAudioField('preset', '')
+    expect(f.sttPatches()).toEqual({ 'audio.tts.preset': '' })
+  })
+
+  it('acceptSavedStt rebaselines so a saved switch is clean again', () => {
+    const f = useSettingsPromotedForm()
+    f.initFromConfig({ audio: { stt: { provider: 'elevenlabs' } } })
+    f.updateAudioField('sttProvider', 'sensevoice')
+    f.updateAudioField('sttModelDir', 'D:\\models\\sv')
+    expect(f.sttDirty.value).toBe(true)
+    f.acceptSavedStt('sensevoice', 'D:\\models\\sv')
+    expect(f.sttProvider.value).toBe('sensevoice')
+    expect(f.sttDirty.value).toBe(false)
+    expect(f.sttPatches()).toEqual({})
+  })
+
+  it('initAudioFromConfig also rebaselines after a config reload', () => {
+    const f = useSettingsPromotedForm()
+    f.initFromConfig({ audio: { stt: { provider: 'elevenlabs' } } })
+    f.updateAudioField('sttProvider', 'sensevoice')
+    expect(f.sttDirty.value).toBe(true)
+    f.initFromConfig({ audio: { stt: { provider: 'sensevoice' } } })
+    expect(f.sttDirty.value).toBe(false)
+  })
+
+  it('an engine switch never marks the key fields dirty', () => {
+    const f = useSettingsPromotedForm()
+    f.initFromConfig({ audio: { enabled: true, providers: { elevenlabs: {} } } })
+    f.updateAudioField('sttProvider', 'sensevoice')
+    expect(f.audioDirty.value).toBe(false)
+    expect(f.sttDirty.value).toBe(true)
+  })
+})
+
+// Cloud engines (openai_transcriptions / openai_chat) own their credentials
+// under [audio.stt.<engine>]; the capabilities card edits them through the
+// same draft/patch/rebase cycle as the engine switch itself.
+describe('useSettingsPromotedForm — cloud STT credentials', () => {
+  const savedCloudConfig = {
+    audio: {
+      enabled: true,
+      stt: {
+        provider: 'openai_transcriptions',
+        openai_transcriptions: {
+          base_url: 'https://api.siliconflow.cn/v1',
+          api_key: '[redacted]',
+          model: 'whisper-1',
+        },
+        openai_chat: { base_url: 'https://api.xiaomimimo.com/v1', model: 'mimo-v2.5-asr' },
+      },
+    },
+  }
+
+  it('hydrates the selected cloud section and stays pristine', () => {
+    const f = useSettingsPromotedForm()
+    f.initFromConfig(savedCloudConfig)
+    expect(f.sttCloudBaseUrl.value).toBe('https://api.siliconflow.cn/v1')
+    expect(f.sttCloudModel.value).toBe('whisper-1')
+    expect(f.sttCloudKeyConfigured.value).toBe(true)
+    expect(f.sttCloudApiKey.value).toBe('')
+    expect(f.sttDirty.value).toBe(false)
+    expect(f.sttPatches()).toEqual({})
+  })
+
+  it('pasting a key and editing url/model patches the selected engine section', () => {
+    const f = useSettingsPromotedForm()
+    f.initFromConfig(savedCloudConfig)
+    f.updateAudioField('sttCloudApiKey', 'sk-new')
+    f.updateAudioField('sttCloudBaseUrl', 'https://api.openai.com/v1')
+    f.updateAudioField('sttCloudModel', 'gpt-4o-mini-transcribe')
+    expect(f.sttDirty.value).toBe(true)
+    expect(f.sttPatches()).toEqual({
+      'audio.stt.provider': 'openai_transcriptions',
+      'audio.stt.openai_transcriptions.base_url': 'https://api.openai.com/v1',
+      'audio.stt.openai_transcriptions.model': 'gpt-4o-mini-transcribe',
+      'audio.stt.openai_transcriptions.api_key': 'sk-new',
+    })
+  })
+
+  it('a key-only edit leaves url and model untouched', () => {
+    const f = useSettingsPromotedForm()
+    f.initFromConfig(savedCloudConfig)
+    f.updateAudioField('sttCloudApiKey', 'sk-rotate')
+    expect(f.sttPatches()).toEqual({
+      'audio.stt.provider': 'openai_transcriptions',
+      'audio.stt.openai_transcriptions.api_key': 'sk-rotate',
+    })
+  })
+
+  it('switching cloud engines rehydrates that engine section and drops the paste', () => {
+    const f = useSettingsPromotedForm()
+    f.initFromConfig(savedCloudConfig)
+    f.updateAudioField('sttCloudApiKey', 'sk-unsaved')
+    f.updateAudioField('sttProvider', 'openai_chat')
+    expect(f.sttCloudApiKey.value).toBe('')
+    expect(f.sttCloudBaseUrl.value).toBe('https://api.xiaomimimo.com/v1')
+    expect(f.sttCloudModel.value).toBe('mimo-v2.5-asr')
+    expect(f.sttCloudKeyConfigured.value).toBe(false)
+    // The switch itself is the draft; the hydrated fields are not.
+    expect(f.sttPatches()).toEqual({
+      'audio.stt.provider': 'openai_chat',
+      'audio.stt.openai_chat.base_url': 'https://api.xiaomimimo.com/v1',
+      'audio.stt.openai_chat.model': 'mimo-v2.5-asr',
+    })
+  })
+
+  it('switching away from a cloud engine never leaks cloud patches', () => {
+    const f = useSettingsPromotedForm()
+    f.initFromConfig(savedCloudConfig)
+    f.updateAudioField('sttCloudApiKey', 'sk-unsaved')
+    f.updateAudioField('sttProvider', 'sensevoice')
+    // sensevoice always carries its model_dir default; no cloud keys leak.
+    expect(f.sttPatches()).toEqual({
+      'audio.stt.provider': 'sensevoice',
+      'audio.stt.sensevoice.model_dir': '',
+    })
+  })
+
+  it('acceptSavedStt rebaselines cloud fields and keeps the cache in sync', () => {
+    const f = useSettingsPromotedForm()
+    f.initFromConfig({ audio: { stt: { provider: 'elevenlabs' } } })
+    f.updateAudioField('sttProvider', 'openai_chat')
+    f.updateAudioField('sttCloudApiKey', 'sk-chat')
+    f.updateAudioField('sttCloudModel', 'mimo-v2.5-asr')
+    expect(f.sttDirty.value).toBe(true)
+    f.acceptSavedStt('openai_chat', '', {
+      baseUrl: '', model: 'mimo-v2.5-asr', keySaved: true,
+    })
+    expect(f.sttCloudApiKey.value).toBe('')
+    expect(f.sttCloudKeyConfigured.value).toBe(true)
+    expect(f.sttDirty.value).toBe(false)
+    // Toggling engines before the post-save reload still shows the saved state.
+    f.updateAudioField('sttProvider', 'openai_transcriptions')
+    f.updateAudioField('sttProvider', 'openai_chat')
+    expect(f.sttCloudKeyConfigured.value).toBe(true)
+    expect(f.sttCloudModel.value).toBe('mimo-v2.5-asr')
+  })
+})
+
 // The global thinking level persists through the provider-save dot-path
 // snapshot; clearing the select writes null so the llm.thinking key is
 // removed (same clear semantics as the context-window override).
