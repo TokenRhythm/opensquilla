@@ -301,6 +301,10 @@ class OpenAICompatPolicy:
     # endpoints may opt into accepting that exact inert frame.
     allow_post_terminal_empty_choices: bool = False
 
+    # SGLang cache metadata is inert only in an explicitly empty-choices
+    # epilogue. Non-official OpenAI-compatible deployments may opt in.
+    allow_sglang_metadata_epilogue: bool = False
+
     # Gateway proxies with their own routing (LiteLLM): pin the requested
     # model by disabling the gateway's cross-model fallbacks per request, so
     # SquillaRouter stays the single routing authority.

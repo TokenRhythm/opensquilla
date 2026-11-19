@@ -1885,3 +1885,160 @@ def test_openai_nonstream_duplicate_tool_ids_fail_before_first_end(
     )
 
     _assert_not_committed(events, "provider_protocol_error")
+
+
+@pytest.mark.parametrize("provider_id", ["openai", "custom"])
+def test_sglang_empty_metadata_epilogue_preserves_usage(
+    monkeypatch: pytest.MonkeyPatch,
+    provider_id: str,
+) -> None:
+    _patch_body(
+        monkeypatch,
+        _sse(
+            {"choices": [{"index": 0, "delta": {"content": "OK"}, "finish_reason": None}]},
+            {"choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}], "usage": None},
+            {
+                "choices": [],
+                "usage": None,
+                "sglext": {"cached_tokens_details": {"device": 64, "host": 0}},
+            },
+            {
+                "choices": [],
+                "usage": {"prompt_tokens": 323, "completion_tokens": 78, "total_tokens": 401},
+            },
+        ),
+    )
+    events = _collect(
+        OpenAIProvider(
+            api_key="test",
+            model="local-model",
+            base_url="http://127.0.0.1:30000/v1",
+            provider_kind="openai",
+            provider_id=provider_id,
+        )
+    )
+    assert not any(isinstance(event, ErrorEvent) for event in events)
+    done = [event for event in events if isinstance(event, DoneEvent)]
+    assert len(done) == 1
+    assert done[0].input_tokens == 323
+    assert done[0].output_tokens == 78
+
+
+@pytest.mark.parametrize(
+    "tail",
+    [
+        {"choices": [], "usage": "bad", "sglext": {}},
+        {"choices": [], "usage": None, "sglext": None},
+        {"choices": [], "usage": None, "sglext": {}, "delta": {"content": "late"}},
+        {
+            "choices": [{"index": 0, "delta": {"tool_calls": [{"id": "late"}]}}],
+            "usage": None,
+            "sglext": {},
+        },
+        {
+            "choices": [{"index": 0, "delta": {}, "finish_reason": "length"}],
+            "usage": None,
+            "sglext": {},
+        },
+        {"usage": None, "sglext": {}},
+    ],
+)
+def test_sglang_epilogue_rejects_state_changes_and_invalid_shapes(monkeypatch, tail):
+    _patch_body(
+        monkeypatch,
+        _sse(
+            {"choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]},
+            tail,
+        ),
+    )
+    events = _collect(
+        OpenAIProvider(
+            api_key="test",
+            model="local-model",
+            base_url="http://127.0.0.1:30000/v1",
+            provider_kind="openai",
+            provider_id="custom",
+        )
+    )
+    _assert_not_committed(events, "invalid_stream_order")
+
+
+@pytest.mark.parametrize(
+    "kind,url",
+    [
+        ("openai", "https://api.openai.com/v1"),
+        ("openai", "https://api.openai.com./v1"),
+        ("tokenrhythm", "https://tokenrhythm.studio/v1"),
+        ("openrouter", "https://openrouter.ai/api/v1"),
+    ],
+)
+def test_sglang_epilogue_does_not_relax_official_or_other_dialects(monkeypatch, kind, url):
+    _patch_body(
+        monkeypatch,
+        _sse(
+            {"choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]},
+            {"choices": [], "usage": None, "sglext": {}},
+        ),
+    )
+    events = _collect(
+        OpenAIProvider(api_key="test", model="test-model", base_url=url, provider_kind=kind)
+    )
+    _assert_not_committed(events, "invalid_stream_order")
+
+
+@pytest.mark.parametrize("metadata_usage", [None, {"prompt_tokens": 323, "completion_tokens": 78}])
+def test_sglang_reported_tail_shape_with_standard_metadata(monkeypatch, metadata_usage):
+    common = {
+        "id": "synthetic",
+        "created": 1,
+        "model": "local-model",
+        "object": "chat.completion.chunk",
+    }
+    _patch_body(
+        monkeypatch,
+        _sse(
+            {
+                **common,
+                "choices": [
+                    {
+                        "index": 0,
+                        "delta": {"role": None, "content": None},
+                        "finish_reason": "stop",
+                        "logprobs": None,
+                        "matched_stop": 248046,
+                    }
+                ],
+                "usage": None,
+            },
+            {
+                **common,
+                "choices": [],
+                "usage": metadata_usage,
+                "sglext": {"cached_tokens_details": {"device": 64, "host": 0}},
+            },
+            {
+                **common,
+                "choices": [],
+                "usage": {
+                    "prompt_tokens": 323,
+                    "completion_tokens": 78,
+                    "total_tokens": 401,
+                    "prompt_tokens_details": {"cached_tokens": 64},
+                    "reasoning_tokens": 53,
+                },
+            },
+        ),
+    )
+    events = _collect(
+        OpenAIProvider(
+            api_key="test",
+            model="local-model",
+            base_url="http://127.0.0.1:30000/v1",
+            provider_kind="openai",
+        )
+    )
+    assert not any(isinstance(event, ErrorEvent) for event in events)
+    done = [event for event in events if isinstance(event, DoneEvent)]
+    assert len(done) == 1
+    assert done[0].input_tokens == 323
+    assert done[0].output_tokens == 78
