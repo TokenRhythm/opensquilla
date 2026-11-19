@@ -171,8 +171,8 @@ _ONBOARD_AGENT_STEPS: list[WizardStep] = [
                 field_type="select",
                 required=True,
                 choices=[
-                    "anthropic/claude-3-5-sonnet",
-                    "anthropic/claude-3-5-haiku",
+                    "anthropic/claude-sonnet-4-6",
+                    "anthropic/claude-haiku-4-5-20251001",
                     "openai/gpt-4o",
                     "openai/gpt-4o-mini",
                 ],
