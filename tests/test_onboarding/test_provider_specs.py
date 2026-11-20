@@ -79,7 +79,7 @@ EXPECTED_EXPERIMENTAL = {
     "azure", "bailian_coding", "bailian_coding_cn", "kimi_coding_openai",
     "kimi_coding_anthropic", "minimax", "minimax_openai", "minimax_coding_openai",
     "minimax_coding_anthropic", "minimax_cn", "minimax_global", "mimo_openai",
-    "mimo_anthropic", "mistral", "groq", "aihubmix", "vllm", "custom",
+    "mimo_anthropic", "mistral", "groq", "ionet", "aihubmix", "vllm", "custom",
     "custom_anthropic",
     "lm_studio", "siliconflow", "ovms", "litellm_proxy", "openai_codex",
     "volcengine_coding_plan", "volcengine_coding_plan_anthropic",
