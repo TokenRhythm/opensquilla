@@ -84,6 +84,7 @@ import type { ChatRenderedMessage } from '@/types/chat'
 import type { ChatMessageListVirtualizer } from '@/types/chatVirtualizer'
 import { chatMessageKey } from '@/utils/chat/messageIdentity'
 import { readDistanceFromEnd } from '@/utils/virtualizerLayout'
+import { applyProgrammaticScroll } from '@/utils/chat/scrollMutation'
 
 const MIN_TURNS = 8
 const ENTER_SCROLL_RANGE_RATIO = 1.5
@@ -102,6 +103,10 @@ const ENTER_INLINE_SIZE = 1120
 const EXIT_INLINE_SIZE = 1104
 const ARRIVAL_HIGHLIGHT_MS = 650
 const ARRIVAL_TOLERANCE_PX = 4
+// Bounded post-scroll convergence: at most two corrective snaps, 120ms apart
+// (240ms of the ≤300ms re-measure budget requested for issue 1447).
+const NAVIGATION_CORRECTION_MAX = 2
+const NAVIGATION_CORRECTION_DELAY_MS = 120
 const MAX_PREVIEW_LENGTH = 220
 const LENS_SIGMA = 1.15
 const MIN_LINE_SCALE_X = 4 / 15
@@ -167,6 +172,9 @@ let navigationBehavior: 'auto' | 'smooth' = 'auto'
 let navigationArrivalFrame = 0
 let arrivalSamples = 0
 let navigationGeneration = 0
+let navigationCorrections = 0
+let navigationScrollEnded = false
+let navigationExpectedTop: number | null = null
 let arrivalElement: HTMLElement | null = null
 let arrivalTimer = 0
 
@@ -411,13 +419,15 @@ function attachContainer(next: HTMLElement | null, previous: HTMLElement | null)
 }
 
 function clearNavigationEnd() {
-  if (navigationContainer) navigationContainer.removeEventListener('scrollend', finishNavigation)
+  if (navigationContainer) navigationContainer.removeEventListener('scrollend', onScrollEnd)
   navigationContainer = null
   if (navigationEndTimer) window.clearTimeout(navigationEndTimer)
   navigationEndTimer = 0
   cancelFrame(navigationArrivalFrame)
   navigationArrivalFrame = 0
   arrivalSamples = 0
+  navigationScrollEnded = false
+  navigationExpectedTop = null
 }
 
 function clearArrivalHighlight() {
@@ -438,18 +448,28 @@ function navigationTurn() {
   return turns.value.find(turn => turn.key === navigationTargetKey)
 }
 
+function measuredAnchorTop(container: HTMLElement, anchor: HTMLElement): number | null {
+  const containerRect = container.getBoundingClientRect()
+  const top = anchor.getBoundingClientRect().top - containerRect.top + container.scrollTop
+  return Number.isFinite(top) ? top : null
+}
+
+function clampNavigationTarget(container: HTMLElement, anchorTop: number): number {
+  return Math.min(
+    Math.max(0, container.scrollHeight - container.clientHeight),
+    Math.max(0, anchorTop - 16),
+  )
+}
+
 function hasArrived(): boolean {
   const container = navigationContainer
   const turn = navigationTurn()
   const target = turn ? turnElement(turn.sourceIndex) : null
   if (!container || !target) return false
   navigationTarget = target
-  const targetTop = Math.min(
-    Math.max(0, container.scrollHeight - container.clientHeight),
-    Math.max(0, target.getBoundingClientRect().top - container.getBoundingClientRect().top
-      + container.scrollTop - 16),
-  )
-  return Math.abs(container.scrollTop - targetTop) <= ARRIVAL_TOLERANCE_PX
+  const anchorTop = measuredAnchorTop(container, target)
+  if (anchorTop === null) return false
+  return Math.abs(container.scrollTop - clampNavigationTarget(container, anchorTop)) <= ARRIVAL_TOLERANCE_PX
 }
 
 function settleNavigation(showArrival: boolean) {
@@ -468,15 +488,65 @@ function settleNavigation(showArrival: boolean) {
   emit('navigateEnd')
 }
 
+// Rows that re-measure while a smooth scroll runs leave the landing off by
+// their height delta, so the scrollend position can miss the requested prompt.
+// Re-measure against live layout and snap the residual within a short bounded
+// budget before navigateEnd, so the arrival highlight and the reconciled
+// active marker match the clicked marker (issue 1447).
+function correctNavigationResidual(): boolean {
+  const container = navigationContainer
+  const turn = navigationTurn()
+  if (!container || !turn) return false
+  if (!navigationScrollEnded) return false
+  if (navigationExpectedTop === null) return false
+  // A reader gesture that moved the thread away from the offset we asked for
+  // is not ours to correct; only snap a landing that started from our seek.
+  if (Math.abs(container.scrollTop - navigationExpectedTop) > ARRIVAL_TOLERANCE_PX * 2) return false
+  if (navigationCorrections >= NAVIGATION_CORRECTION_MAX) return false
+  const target = turnElement(turn.sourceIndex)
+  if (!target || !target.isConnected) return false
+  const anchorTop = measuredAnchorTop(container, target)
+  if (anchorTop === null) return false
+  const targetTop = clampNavigationTarget(container, anchorTop)
+  if (Math.abs(container.scrollTop - targetTop) <= ARRIVAL_TOLERANCE_PX) return false
+  navigationCorrections += 1
+  // The residual is ours to correct: mark the assignment as application-owned
+  // so the reader-intent classifier cannot mistake it for scrollbar input.
+  applyProgrammaticScroll(container, () => {
+    container.scrollTop = targetTop
+  })
+  return true
+}
+
+function onScrollEnd() {
+  navigationScrollEnded = true
+  finishNavigation()
+}
+
 function finishNavigation() {
   // Measurements can trigger intermediate scrollend events. Release the
   // target only after arrival stays correct through three layout frames.
   if (!navigationPending || navigationArrivalFrame) return
   navigationArrivalFrame = requestFrame(() => {
     navigationArrivalFrame = 0
-    arrivalSamples = hasArrived() ? arrivalSamples + 1 : 0
-    if (arrivalSamples >= 3) settleNavigation(true)
-    else finishNavigation()
+    if (!hasArrived()) {
+      arrivalSamples = 0
+      // A smooth scroll can finish at a stale offset after a row above the
+      // target re-measures taller. Snap the residual within a bounded budget
+      // instead of holding the wrong marker until the navigation timeout.
+      if (correctNavigationResidual()) {
+        navigationEndTimer = window.setTimeout(finishNavigation, NAVIGATION_CORRECTION_DELAY_MS)
+        return
+      }
+      finishNavigation()
+      return
+    }
+    arrivalSamples += 1
+    if (arrivalSamples >= 3) {
+      settleNavigation(true)
+      return
+    }
+    finishNavigation()
   })
 }
 
@@ -490,7 +560,10 @@ function cancelNavigation() {
 defineExpose({ cancelNavigation })
 
 function armNavigationEnd(container: HTMLElement) {
-  container.addEventListener('scrollend', finishNavigation)
+  navigationCorrections = 0
+  arrivalSamples = 0
+  navigationScrollEnded = false
+  container.addEventListener('scrollend', onScrollEnd)
   navigationEndTimer = window.setTimeout(cancelNavigation, 2000)
   finishNavigation()
 }
@@ -532,6 +605,11 @@ async function navigateTo(index: number, focusTarget = false) {
     && window.matchMedia?.('(prefers-reduced-motion: reduce)').matches
   navigationSeekIndex = currentTurn.sourceIndex
   navigationBehavior = reduceMotion ? 'auto' : 'smooth'
+  const anchor = navigationTarget ?? turnElement(currentTurn.sourceIndex)
+  const anchorTop = anchor ? measuredAnchorTop(container, anchor) : null
+  navigationExpectedTop = anchorTop === null
+    ? null
+    : clampNavigationTarget(container, anchorTop)
   armNavigationEnd(container)
   virtualizer.scrollToMessage(currentTurn.sourceIndex, {
     align: 'start',
