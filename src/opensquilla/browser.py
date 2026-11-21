@@ -7,6 +7,7 @@ import base64
 import binascii
 import json
 import os
+import re
 import threading
 from dataclasses import dataclass, field
 from typing import Any
@@ -26,19 +27,93 @@ _NATIVE_ERROR_CODES = {
         "ACTION_UNAVAILABLE", "ELEMENT_NOT_FOUND", "NAVIGATION_BLOCKED", "OPEN_FAILED",
         "PAGE_CHANGED", "PAGE_NOT_READY", "SCREENSHOT_UNAVAILABLE", "SNAPSHOT_FAILED",
         "STALE_ELEMENT", "TARGET_NOT_ACTIVE", "TARGET_NOT_FOUND",
+        "NAVIGATION_FAILED", "NAVIGATION_CANCELLED", "RESOURCE_LIMIT", "PAGE_UNRESPONSIVE",
+        "DIALOG_BLOCKED", "DIALOG_CONTROL_UNAVAILABLE", "FILE_CHOOSER_PENDING",
+        "STALE_OBSERVATION", "VISUAL_TARGET_HIDDEN", "TEXT_UNAVAILABLE", "REFRESH_DEFERRED",
     )
 } | {
     "INVALID_REQUEST": "BROWSER_REQUEST_INVALID",
     "BROWSER_UNAVAILABLE": "BROWSER_UNAVAILABLE",
 }
+_TARGET_REF = re.compile(r"page-[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}\Z", re.ASCII)
+_BEFORE_EXECUTION_CODES = frozenset({
+    "BROWSER_REQUEST_INVALID", "BROWSER_FORBIDDEN", "BROWSER_UNAUTHORIZED",
+    "BROWSER_NOT_FOUND", "BROWSER_NAVIGATION_BLOCKED", "BROWSER_RESOURCE_LIMIT",
+})
 
 
 class DesktopBrowserError(RuntimeError):
     """A bounded public error without connection credentials or raw transport data."""
 
-    def __init__(self, code: str, message: str) -> None:
+    def __init__(
+        self, code: str, message: str, *, target_ref: str | None = None,
+        outcome: str | None = None,
+    ) -> None:
         self.code = code
+        self.target_ref = target_ref
+        self.outcome = outcome
         super().__init__(message)
+
+    @property
+    def may_have_created_target(self) -> bool:
+        return self.target_ref is not None or (
+            self.outcome != "not_started" and self.code not in _BEFORE_EXECUTION_CODES
+        )
+
+
+def _browser_failure(
+    code: str, *, operation: str, requested_target: str | None,
+    details: dict[str, Any] | None = None,
+) -> DesktopBrowserError:
+    """Project only fixed recovery facts from the native error boundary."""
+    details = details or {}
+    native_target = details.get("targetRef")
+    target = requested_target or native_target
+    if not isinstance(target, str) or not _TARGET_REF.fullmatch(target):
+        target = None
+    if requested_target and native_target not in (None, requested_target):
+        # A mismatched receipt cannot establish which target an operation affected.
+        target = None
+    outcome = details.get("outcome")
+    if not isinstance(outcome, str) or outcome not in {"not_started", "unknown", "completed"}:
+        outcome = "not_started" if code in _BEFORE_EXECUTION_CODES else "unknown"
+    if code == "BROWSER_TARGET_NOT_FOUND":
+        target = None
+    message = {
+        "not_started": "The browser operation did not start.",
+        "unknown": "The browser operation's outcome is unknown.",
+        "completed": "The browser operation finished with a failure.",
+    }[outcome]
+    if target:
+        message += (
+            f" The tab is retained: targetRef={target}."
+            if native_target == target else f" Inspect targetRef={target}."
+        )
+    uncertain_open = operation == "open" and not requested_target and (
+        target is not None or outcome != "not_started"
+    )
+    if uncertain_open:
+        message += " A tab may already exist; do not repeat open without targetRef."
+    recovery = details.get("recovery")
+    if code == "BROWSER_NAVIGATION_BLOCKED":
+        message += " Use an allowed URL."
+    elif code == "BROWSER_REQUEST_INVALID":
+        message += " Check the browser arguments; pass a plain URL, not a Markdown link."
+    elif recovery == "stop":
+        message += " Stop this operation."
+    elif recovery in ("manual_dialog_response", "resolve_file_chooser"):
+        message += " Resolve the pending browser dialog or file chooser before continuing."
+    else:
+        message += (
+            " Run snapshot with this targetRef before further actions."
+            if target else " Run list, then snapshot the existing targetRef before further actions."
+        )
+        if (
+            recovery in ("change_url", "change_url_or_network")
+            or code == "BROWSER_NAVIGATION_FAILED"
+        ):
+            message += " Correct the URL or network problem, then navigate that same targetRef."
+    return DesktopBrowserError(code, message, target_ref=target, outcome=outcome)
 
 
 @dataclass(frozen=True)
@@ -93,28 +168,41 @@ class DesktopBrowserClient:
                     async for chunk in response.aiter_bytes():
                         raw.extend(chunk)
                         if len(raw) > _MAX_RESPONSE_BYTES:
-                            raise DesktopBrowserError(
-                                "BROWSER_RESPONSE_TOO_LARGE", "Browser response exceeded its limit."
+                            raise _browser_failure(
+                                "BROWSER_RESPONSE_TOO_LARGE", operation=operation,
+                                requested_target=target_ref,
                             )
                     status = response.status_code
             result = json.loads(raw)
         except asyncio.CancelledError:
             raise
         except httpx.TimeoutException:
-            raise DesktopBrowserError("BROWSER_TIMEOUT", "Browser operation timed out.") from None
+            raise _browser_failure(
+                "BROWSER_TIMEOUT", operation=operation, requested_target=target_ref,
+            ) from None
         except (httpx.HTTPError, ValueError):
-            raise DesktopBrowserError(
-                "BROWSER_UNAVAILABLE", "The desktop browser connection is unavailable."
+            raise _browser_failure(
+                "BROWSER_UNAVAILABLE", operation=operation, requested_target=target_ref,
             ) from None
         if not isinstance(result, dict):
-            raise DesktopBrowserError("BROWSER_RESPONSE_INVALID", "Invalid browser response.")
+            raise _browser_failure(
+                "BROWSER_RESPONSE_INVALID", operation=operation, requested_target=target_ref,
+            )
         if status != 200 or result.get("ok") is False:
             native_code = result.get("code")
             code = (
                 _NATIVE_ERROR_CODES.get(native_code, "BROWSER_OPERATION_FAILED")
                 if isinstance(native_code, str) else "BROWSER_OPERATION_FAILED"
             )
-            raise DesktopBrowserError(code, "The browser operation could not be completed.")
+            raise _browser_failure(
+                code, operation=operation, requested_target=target_ref, details=result,
+            )
+        if operation == "open" and not target_ref and (
+            not isinstance(result.get("targetRef"), str) or not result["targetRef"].strip()
+        ):
+            raise _browser_failure(
+                "BROWSER_RESPONSE_INVALID", operation=operation, requested_target=None,
+            )
         if target_ref and result.get("targetRef") != target_ref:
             raise DesktopBrowserError("BROWSER_TARGET_CHANGED", "The browser target changed.")
         if operation == "screenshot":

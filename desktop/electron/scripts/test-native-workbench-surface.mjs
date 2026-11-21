@@ -163,6 +163,11 @@ const executeBrowser = new Function(
   'DesktopBrowserError', 'randomUUID', 'parseNativeWorkbenchNavigationUrl', 'NATIVE_WORKBENCH_PROTOCOL_VERSION_V4', 'BROWSER_BLANK_URL',
   `return ({${nativeWorkbenchSurfaceRuntime.slice(browserExecutorStart, browserExecutorEnd)}}).executeBrowser`,
 )(DesktopBrowserError, randomUUID, parseNativeWorkbenchNavigationUrl, NATIVE_WORKBENCH_PROTOCOL_VERSION_V4, BROWSER_BLANK_URL)
+const openingReconcilerStart = nativeWorkbenchSurfaceRuntime.indexOf('    async reconcileBrowserOpening(')
+assert.ok(openingReconcilerStart >= 0 && openingReconcilerStart < browserExecutorStart)
+const reconcileBrowserOpening = new Function('DesktopBrowserError',
+  `return ({${nativeWorkbenchSurfaceRuntime.slice(openingReconcilerStart, browserExecutorStart)}}).reconcileBrowserOpening`,
+)(DesktopBrowserError)
 const viewportInitializerStart = nativeWorkbenchSurfaceRuntime.indexOf('    initializeHiddenBrowserViewport(')
 const viewportInitializerEnd = nativeWorkbenchSurfaceRuntime.indexOf('    cdpCommand(', viewportInitializerStart)
 assert.ok(viewportInitializerStart >= 0 && viewportInitializerEnd > viewportInitializerStart)
@@ -309,6 +314,108 @@ for (const failure of ['set', 'clear', 'both', 'cancel', 'replace', 'close', 'ow
 await assertBrowserOpenPreservesForeground('background-session', false, null, true)
 await assertBrowserOpenPreservesForeground('blank-session', false, null, false, BROWSER_BLANK_URL)
 await assertBrowserOpenPreservesForeground('blank-session', true, null, true, BROWSER_BLANK_URL)
+
+async function assertBrowserOpenRouteRecovery(scenario, expectedCode, expectedAttempts) {
+  const controller = new AbortController()
+  const events = []
+  const commands = []
+  const destroyed = []
+  let created = 0
+  let attempts = 0
+  const record = {
+    kind: 'url-preview', scopeId: 'route-session', targetRef: 'route-target',
+    annotationDocumentGeneration: 1, browserNavigationGeneration: 1,
+    requestedRect: null, url: 'https://example.test/login',
+    owner: { isDestroyed: () => false }, contents: { isDestroyed: () => false },
+    view: { getBounds: () => ({ x: 0, y: 0, width: 960, height: 720 }) },
+  }
+  const route = () => {
+    record.annotationDocumentGeneration += 1
+    record.url = `https://example.test/login#route-${record.annotationDocumentGeneration}`
+  }
+  const manager = {
+    surfaces: new Map(), initializeHiddenBrowserViewport, reconcileBrowserOpening,
+    isPrivilegedGatewayTarget: () => false, browserHostBlockers: () => [],
+    hasRecentTrustedGesture: () => false,
+    async createSurface(request) {
+      created += 1
+      record.id = request.surfaceId
+      this.surfaces.set(record.id, record)
+      if (scenario === 'late-competing-navigation' || scenario === 'invalid-opening-navigation') {
+        record.browserOpeningNavigation = { generation: 1, redirects: 0, url: record.url }
+        if (scenario === 'late-competing-navigation') record.browserNavigationGeneration += 1
+        else record.browserOpeningNavigation.invalid = true
+      }
+      return { ok: true }
+    },
+    async queueSurfaceOperation(_key, operation) { return await operation() },
+    async cdpCommand(_record, method, _params, beforeSend) {
+      beforeSend?.()
+      commands.push(method)
+      if (method !== 'Emulation.setDeviceMetricsOverride') return
+      attempts += 1
+      if (scenario === 'route-churn' || attempts <= (scenario === 'route-twice' ? 2 : 1)
+        && scenario !== 'pointer-route') route()
+      if (scenario === 'cross-document') record.browserNavigationGeneration += 1
+      if (attempts === 2 && scenario === 'cancel-after-route') controller.abort()
+      if (attempts === 2 && scenario === 'close-after-route') record.disposed = true
+      if (attempts === 2 && scenario === 'replace-after-route') this.surfaces.set(record.id, { ...record, targetRef: 'replacement' })
+    },
+    async touchBrowserPointer() { if (scenario === 'pointer-route' && attempts === 1) route() },
+    getBrowserTarget: () => ({ targetRef: record.targetRef, url: record.url }),
+    emit(_record, type, detail) { events.push({ type, detail }) },
+    noteBrowserNavigationFailure(_record, _url, code) { record.browserNavigationError = { code } },
+    browserNavigationFailure: () => new DesktopBrowserError('TIMEOUT', 'Cancelled', 409, { targetRef: record.targetRef }),
+    async destroyRecord(record) { destroyed.push(record); this.surfaces.delete(record.id) },
+  }
+  const opened = executeBrowser.call(manager,
+    { operation: 'open', sessionKey: record.scopeId, url: record.url }, controller.signal)
+  if (expectedCode) {
+    await assert.rejects(opened, error => {
+      assert.equal(error.code, expectedCode, scenario)
+      if (expectedCode === 'PAGE_CHANGED') {
+        assert.equal(error.details.targetRef, record.targetRef)
+        assert.equal(error.details.retryable, false)
+        assert.equal(error.details.recovery, 'inspect')
+      }
+      return true
+    })
+  } else {
+    const target = await opened
+    assert.equal(target.targetRef, record.targetRef)
+    assert.equal(target.url, record.url)
+  }
+  assert.equal(created, 1, 'route recovery must never create a duplicate tab')
+  assert.equal(attempts, expectedAttempts, scenario)
+  assert.equal(commands.filter(command => command === 'Emulation.clearDeviceMetricsOverride').length,
+    expectedCode === 'TARGET_NOT_FOUND' ? attempts - 1 : attempts,
+    'each surviving viewport attempt clears its emulation')
+  if (expectedCode === 'TARGET_NOT_FOUND') {
+    assert.deepEqual(events, [], 'a closed or replaced target must never be adopted')
+    if (scenario === 'replace-after-route') {
+      assert.deepEqual(destroyed, [])
+      assert.equal(manager.surfaces.get(record.id).targetRef, 'replacement')
+    }
+  } else {
+    assert.deepEqual(destroyed, [])
+    assert.equal(manager.surfaces.get(record.id), record)
+    assert.equal(events.length, 1, 'publish exactly one receipt for the retained tab')
+    assert.equal(events[0].type, 'browser-opened')
+    assert.equal(events[0].detail.targetRef, record.targetRef)
+  }
+}
+await assertBrowserOpenRouteRecovery('route-once', undefined, 2)
+await assertBrowserOpenRouteRecovery('route-twice', undefined, 3)
+await assertBrowserOpenRouteRecovery('pointer-route', undefined, 2)
+await assertBrowserOpenRouteRecovery('route-churn', 'PAGE_CHANGED', 3)
+await assertBrowserOpenRouteRecovery('cross-document', 'PAGE_CHANGED', 1)
+await assertBrowserOpenRouteRecovery('cancel-after-route', 'TIMEOUT', 2)
+await assertBrowserOpenRouteRecovery('close-after-route', 'TARGET_NOT_FOUND', 2)
+await assertBrowserOpenRouteRecovery('replace-after-route', 'TARGET_NOT_FOUND', 2)
+// The original load can settle before another navigation wins the creation
+// continuation. Its generation must still be fenced before tab adoption.
+await assertBrowserOpenRouteRecovery('late-competing-navigation', 'PAGE_CHANGED', 0)
+await assertBrowserOpenRouteRecovery('invalid-opening-navigation', 'PAGE_CHANGED', 0)
 
 const navigationPolicyStart = nativeWorkbenchSurfaceRuntime.indexOf('    v2TopLevelNavigationAllowed(')
 const navigationPolicyEnd = nativeWorkbenchSurfaceRuntime.indexOf('    isPrivilegedGatewayTarget(', navigationPolicyStart)
