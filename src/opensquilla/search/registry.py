@@ -34,6 +34,12 @@ _provider_specs: dict[str, SearchProviderSpec] = {
         env_key="TAVILY_API_KEY",
         capabilities=frozenset({"web", "freshness", "domain_filter"}),
     ),
+    "specstream": SearchProviderSpec(
+        provider_id="specstream",
+        requires_api_key=True,
+        env_key="SPECSTREAM_API_KEY",
+        capabilities=frozenset({"web", "freshness", "domain_filter", "content"}),
+    ),
     "exa": SearchProviderSpec(
         provider_id="exa",
         requires_api_key=True,
