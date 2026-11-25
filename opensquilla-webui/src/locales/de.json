@@ -3886,6 +3886,14 @@
         }
       }
     },
+    "mention": {
+      "groups": {
+        "workspace": "Arbeitsbereichsdateien",
+        "sessions": "Letzte Chats"
+      },
+      "unavailable": "Arbeitsbereichsdateien sind derzeit nicht verfügbar.",
+      "hint": "↑↓ zum Auswählen · Enter zum Einfügen · Esc zum Schließen"
+    },
     "sessionCreated": {
       "title": "Chat erstellt",
       "open": "Chat öffnen",

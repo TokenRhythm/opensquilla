@@ -5,6 +5,7 @@ import type {
   ChatPendingItem,
 } from '@/types/chat'
 import type { ChatSlashCommand } from '@/composables/chat/useChatSlashCommands'
+import type { MentionCandidate } from '@/composables/chat/useChatMentions'
 
 export interface UseChatComposerShortcutsOptions {
   inputText: Ref<string>
@@ -27,6 +28,13 @@ export interface UseChatComposerShortcutsOptions {
   closeSlashMenu: () => void
   completeSlashCmd: (cmd: ChatSlashCommand) => void
   activateSlashCmd: (cmd: ChatSlashCommand) => void
+  /** The `@` mention panel, when the composer exposes one. */
+  mentionOpen?: Ref<boolean>
+  mentionIdx?: Ref<number>
+  mentionItems?: Ref<MentionCandidate[]>
+  chooseMention?: (candidate: MentionCandidate) => void
+  closeMention?: () => void
+  handleMentionInput?: () => void
   popPendingTail: () => boolean
   enqueuePendingInput: (text: string) => boolean | Promise<boolean>
   sendCurrentInput: () => void
@@ -105,6 +113,7 @@ export function useChatComposerShortcuts(options: UseChatComposerShortcutsOption
     ) return
     if (options.composing.value || (event && 'isComposing' in event && event.isComposing)) return
     options.handleSlashInput()
+    options.handleMentionInput?.()
   }
 
   function onTextareaKeydown(e: KeyboardEvent) {
@@ -151,6 +160,34 @@ export function useChatComposerShortcuts(options: UseChatComposerShortcutsOption
       if (e.key === 'Escape') {
         e.preventDefault()
         options.closeSlashMenu()
+        return
+      }
+    }
+
+    if (options.mentionOpen?.value) {
+      const mentionIdx = options.mentionIdx
+      const mentionItems = options.mentionItems?.value ?? []
+      if (e.key === 'ArrowDown') {
+        e.preventDefault()
+        if (mentionIdx) mentionIdx.value = Math.max(0, Math.min(mentionIdx.value + 1, mentionItems.length - 1))
+        return
+      }
+      if (e.key === 'ArrowUp') {
+        e.preventDefault()
+        if (mentionIdx) mentionIdx.value = Math.max(mentionIdx.value - 1, 0)
+        return
+      }
+      if (e.key === 'Enter' || e.key === 'Tab') {
+        const candidate = mentionItems[mentionIdx?.value ?? 0]
+        e.preventDefault()
+        if (!candidate) return
+        clearTextareaUndoState()
+        options.chooseMention?.(candidate)
+        return
+      }
+      if (e.key === 'Escape') {
+        e.preventDefault()
+        options.closeMention?.()
         return
       }
     }
