@@ -1,3 +1,5 @@
+import os
+import stat
 import sys
 import tomllib
 from types import SimpleNamespace
@@ -69,3 +71,34 @@ def test_init_cancel_keeps_existing_config(tmp_path, monkeypatch) -> None:
     assert stopped.value.exit_code == 1
     assert config.read_text(encoding="utf-8") == 'existing = "unchanged"\n'
     assert not (home / ".env").exists()
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX file permissions")
+@pytest.mark.parametrize("existing", [False, True])
+def test_init_writes_private_files(tmp_path, monkeypatch, existing) -> None:
+    home = tmp_path / "profile"
+    if existing:
+        home.mkdir()
+        for name in (".env", "config.toml"):
+            path = home / name
+            path.write_text("", encoding="utf-8")
+            path.chmod(0o644)
+    monkeypatch.setitem(sys.modules, "questionary", SimpleNamespace(
+        select=lambda *a, **kw: SimpleNamespace(ask=lambda: "openai"),
+        password=lambda *a, **kw: SimpleNamespace(ask=lambda: "synthetic-test-key"),
+        text=lambda *a, **kw: SimpleNamespace(ask=lambda: "synthetic-model"),
+    ))
+    monkeypatch.setattr(init_cmd, "default_opensquilla_home", lambda: home)
+
+    previous_umask = os.umask(0o022)
+    try:
+        init_cmd.run_init()
+    finally:
+        os.umask(previous_umask)
+
+    for name in (".env", "config.toml"):
+        assert stat.S_IMODE((home / name).stat().st_mode) == 0o600
+    assert (home / ".env").read_text(encoding="utf-8") == (
+        "OPENAI_API_KEY=synthetic-test-key\n"
+    )
+    assert sorted(path.name for path in home.iterdir()) == [".env", "config.toml", "state"]
