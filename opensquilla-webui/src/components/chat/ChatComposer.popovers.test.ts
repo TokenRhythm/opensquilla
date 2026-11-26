@@ -71,10 +71,29 @@ describe('ChatComposer popovers', () => {
     })
 
     expect(el.querySelector('button[aria-label="More"]')).toBeNull()
+    // Voice lives on the toolbar (left of send, right of model routing),
+    // not inside the Add menu. The mic and its device-picker trigger sit in a
+    // shared anchor so the popover keeps them together.
+    const mic = el.querySelector<HTMLButtonElement>('.chat-input-actions--right .chat-voice-anchor .chat-mic-btn')
+    expect(mic).toBeTruthy()
+    expect(mic!.getAttribute('aria-label')).toBe('Record voice input')
+    expect(el.querySelector('.chat-input-actions--right .chat-voice-devices-btn')).toBeTruthy()
     await clickButton(el, 'Add')
-    expect(el.querySelector('.composer-add-menu [aria-label="Record voice input"]')).toBeTruthy()
+    expect(el.querySelector('.composer-add-menu [aria-label="Record voice input"]')).toBeNull()
     expect(el.querySelector('.composer-add-menu [aria-label="Export as Markdown"]')).toBeTruthy()
     expect(el.querySelector('.composer-add-menu [data-testid="chat-composer-action-keepalive"]')).toBeTruthy()
+
+    app.unmount()
+  })
+
+  it('keeps the mic button clickable for setup guidance when voice is not configured', async () => {
+    const { app, el } = await mountComposer({ voiceReady: false })
+
+    const mic = el.querySelector<HTMLButtonElement>('.chat-input-actions--right .chat-voice-anchor .chat-mic-btn')
+    expect(mic).toBeTruthy()
+    expect(mic!.disabled).toBe(false)
+    expect(mic!.classList.contains('chat-mic-btn--needs-setup')).toBe(true)
+    expect(mic!.getAttribute('aria-label')).toBe("Voice input isn't set up — enable it in Settings")
 
     app.unmount()
   })

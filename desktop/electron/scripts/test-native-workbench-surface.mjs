@@ -68,6 +68,7 @@ import {
   nativeWorkbenchArtifactUrl,
   nativeWorkbenchCssRectToDip,
   nativeWorkbenchDownloadAllowed,
+  nativeWorkbenchMediaPermissionDecision,
   nativeWorkbenchMissingResourceIsLocal,
   nativeWorkbenchNetworkUrlAllowed,
   nativeWorkbenchV2NetworkUrlAllowed,
@@ -925,6 +926,34 @@ for (const untrustedGesture of [false, undefined, null, 1, 'true']) {
     nativeWorkbenchDownloadAllowed(untrustedGesture),
     false,
     "only Electron's exact user-gesture signal may authorize a save dialog",
+  )
+}
+
+// Microphone auto-grant is scoped to the app's own loopback Control UI and to
+// audio alone: a camera-capable or non-loopback request must keep prompting.
+assert.equal(
+  nativeWorkbenchMediaPermissionDecision('media', ['audio'], true),
+  'grant-microphone',
+)
+for (const [permission, mediaTypes, loopback] of [
+  ['media', ['video'], true],
+  ['media', ['audio', 'video'], true],
+  ['media', [], true],
+  ['media', undefined, true],
+  ['media', 'audio', true],
+  ['media', ['audio'], false],
+  ['media', ['audio'], undefined],
+  ['media', ['audio'], 'true'],
+  ['microphone', ['audio'], true],
+  ['display-capture', ['audio'], true],
+  ['fullscreen', ['audio'], true],
+]) {
+  assert.equal(
+    nativeWorkbenchMediaPermissionDecision(permission, mediaTypes, loopback),
+    'prompt',
+    `only an audio-only loopback media request may skip the prompt (got ${JSON.stringify(
+      [permission, mediaTypes, loopback],
+    )})`,
   )
 }
 assert.equal(

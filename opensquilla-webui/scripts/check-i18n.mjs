@@ -21,6 +21,7 @@ const LEAKAGE_LOCALES = new Set(['zh-Hans'])
 const ZH_HANS_ENGLISH_TERMS = new Set([
   'chat.routerFx.ensembleTokens',
   'account.manualKey', // TokenRhythm · API Key is the product/credential label in both locales.
+  'setup.stt.cloudBaseUrlPlaceholder', // A URL placeholder is language-neutral by nature.
 ])
 
 function load(name) {

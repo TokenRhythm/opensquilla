@@ -329,6 +329,9 @@ function verifyMainProcess(source, label) {
     'isCurrentWindowAtDesktopRenderer',
     'desktopGatewayConnectionSnapshot',
     'readinessCheck',
+    // A packaged Electron binary ignores a directory argument, so the bundled
+    // pet is reached through this switch rather than through argv.
+    'OPENSQUILLA_PET_APP',
   ]) {
     if (!source.includes(expected)) fail(`${label} main process is missing ${expected}`)
   }
@@ -501,6 +504,33 @@ async function verifyInstallerDataPolicy() {
       fail(`electron-builder has an unexpected runtime resource mapping: ${from} -> ${to}`)
     }
   }
+
+  // The Eggy desktop pet is spawned from `<app root>/desktop/pet` and reads its
+  // logo from `<app root>/assets/opensquilla-mark.png`; both must be installed
+  // next to the executable rather than inside app.asar.
+  const extraFiles = packageJson.build?.extraFiles
+  if (!Array.isArray(extraFiles)) {
+    fail('electron-builder extraFiles must be an explicit allowlist')
+    return
+  }
+  const expectedExtraFiles = new Map([
+    ['../pet', 'desktop/pet'],
+    ['../../assets/opensquilla-mark.png', 'assets/opensquilla-mark.png'],
+  ])
+  for (const [from, to] of expectedExtraFiles) {
+    const entry = extraFiles.find((candidate) => candidate?.from === from && candidate?.to === to)
+    if (!entry) {
+      fail(`electron-builder extraFiles is missing ${from} -> ${to}`)
+      continue
+    }
+    if (from !== '../pet') continue
+    const filter = Array.isArray(entry.filter)
+      ? entry.filter.map((value) => String(value).replaceAll('\\', '/'))
+      : []
+    if (!filter.includes('!dev/**')) {
+      fail('electron-builder must not ship the desktop pet dev screenshots (desktop/pet/dev)')
+    }
+  }
 }
 
 async function verifyCompiledMain() {
@@ -594,6 +624,20 @@ async function verifyGeneratedBundle({ label, resourcesDir, platform }) {
   if (!existsSync(asarPath)) {
     fail(`${label} is missing app.asar`)
     return
+  }
+
+  // The pet is shipped outside the asar so `main.ts` can spawn it as a child
+  // Electron app; a bundle without it silently disables the tray toggle.
+  const appRoot = dirname(resourcesDir)
+  const petDir = join(appRoot, 'desktop', 'pet')
+  for (const relativePath of ['main.js', 'package.json', 'preload.js', 'renderer/index.html', 'lib/gateway.js', 'lib/tts.js']) {
+    if (!existsSync(join(petDir, ...relativePath.split('/')))) {
+      fail(`${label} is missing the bundled desktop pet file ${join(petDir, ...relativePath.split('/'))}`)
+    }
+  }
+  const petLogo = join(appRoot, 'assets', 'opensquilla-mark.png')
+  if (!existsSync(petLogo)) {
+    fail(`${label} is missing the bundled desktop pet logo at ${petLogo}`)
   }
 
   try {

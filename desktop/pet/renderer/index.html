@@ -1,0 +1,163 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta http-equiv="Content-Security-Policy" content="default-src 'self'; img-src 'self' data: file:; style-src 'self' 'unsafe-inline'; media-src 'self' data:; script-src 'self'" />
+  <title>蛋仔</title>
+  <link rel="stylesheet" href="pet.css" />
+</head>
+<body>
+  <div id="stage">
+    <!-- 气泡层 -->
+    <div id="bubble-layer" data-interactive></div>
+
+    <!-- 桌宠本体 -->
+    <div id="pet" class="mood-idle" data-interactive title="单击回复 · 拖动移动 · 右键菜单">
+      <div id="fx"></div>
+      <svg id="egg" viewBox="0 0 200 232" width="170" height="197" aria-label="蛋仔">
+        <defs>
+          <linearGradient id="bodyGrad" x1="0" y1="0" x2="0" y2="1">
+            <stop offset="0" stop-color="#FFFDF8" />
+            <stop offset="0.62" stop-color="#FFF4E6" />
+            <stop offset="1" stop-color="#FFE2C2" />
+          </linearGradient>
+          <radialGradient id="cheekGrad" cx="0.5" cy="0.5" r="0.5">
+            <stop offset="0" stop-color="#FFB199" stop-opacity="0.9" />
+            <stop offset="1" stop-color="#FFB199" stop-opacity="0" />
+          </radialGradient>
+        </defs>
+
+        <!-- 地面阴影 -->
+        <ellipse id="shadow" cx="100" cy="224" rx="52" ry="9" fill="#000" opacity="0.14" />
+
+        <g id="body-group">
+          <!-- 呆毛（闪电，呼应 logo 的 Z） -->
+          <path id="ahoge" d="M100 30 L92 12 L101 14 L96 2 L110 18 L101 16 L106 30 Z" fill="#F26A1B" />
+
+          <!-- 小翅膀 -->
+          <path id="arm-left" d="M38 132 C24 138 22 154 34 160 C40 150 42 140 44 134 Z" fill="#FFD9AE" />
+          <path id="arm-right" d="M162 132 C176 138 178 154 166 160 C160 150 158 140 156 134 Z" fill="#FFD9AE" />
+
+          <!-- 蛋身 -->
+          <path id="body" d="M100 30 C140 30 165 80 165 132 C165 182 135 214 100 214 C65 214 35 182 35 132 C35 80 60 30 100 30 Z"
+                fill="url(#bodyGrad)" stroke="#F0C9A0" stroke-width="2" />
+
+          <!-- 肚皮上的品牌印记（默认 logo） -->
+          <image id="belly-mark" href="../../../assets/opensquilla-mark.png" x="62" y="128" width="76" height="71" opacity="0.92" />
+
+          <!-- 腮红 -->
+          <circle cx="62" cy="118" r="13" fill="url(#cheekGrad)" />
+          <circle cx="138" cy="118" r="13" fill="url(#cheekGrad)" />
+
+          <!-- 眼睛（常态） -->
+          <g id="eyes-open">
+            <g class="eye">
+              <ellipse cx="76" cy="96" rx="11" ry="14" fill="#3A2A20" />
+              <circle cx="79" cy="90" r="4" fill="#fff" />
+              <circle cx="73" cy="99" r="2" fill="#fff" opacity="0.7" />
+            </g>
+            <g class="eye">
+              <ellipse cx="124" cy="96" rx="11" ry="14" fill="#3A2A20" />
+              <circle cx="127" cy="90" r="4" fill="#fff" />
+              <circle cx="121" cy="99" r="2" fill="#fff" opacity="0.7" />
+            </g>
+          </g>
+          <!-- 眼睛（开心 ^ ^） -->
+          <g id="eyes-happy" style="display:none">
+            <path d="M66 96 Q76 84 86 96" stroke="#3A2A20" stroke-width="5" fill="none" stroke-linecap="round" />
+            <path d="M114 96 Q124 84 134 96" stroke="#3A2A20" stroke-width="5" fill="none" stroke-linecap="round" />
+          </g>
+
+          <!-- 嘴巴 -->
+          <path id="mouth-smile" d="M92 116 Q100 124 108 116" stroke="#C9743A" stroke-width="4" fill="none" stroke-linecap="round" />
+          <ellipse id="mouth-talk" cx="100" cy="118" rx="8" ry="6" fill="#C9743A" style="display:none" />
+
+          <!-- 小脚 -->
+          <ellipse cx="82" cy="212" rx="13" ry="7" fill="#F26A1B" />
+          <ellipse cx="118" cy="212" rx="13" ry="7" fill="#F26A1B" />
+        </g>
+
+        <!-- 状态符号 -->
+        <g id="sig-alert" style="display:none">
+          <rect x="150" y="40" width="10" height="26" rx="5" fill="#F26A1B" />
+          <circle cx="155" cy="74" r="5" fill="#F26A1B" />
+        </g>
+        <g id="sig-think" style="display:none" fill="#F26A1B">
+          <circle class="dot d1" cx="150" cy="52" r="4" />
+          <circle class="dot d2" cx="162" cy="44" r="5" />
+          <circle class="dot d3" cx="176" cy="34" r="6" />
+        </g>
+      </svg>
+      <div id="conn-dot" role="status" tabindex="0"></div>
+    </div>
+
+    <!-- 设置弹层 -->
+    <div id="settings" class="hidden" data-interactive>
+      <div class="set-head">
+        <span>蛋仔设置</span>
+        <button id="set-close" class="icon-btn" title="关闭">×</button>
+      </div>
+      <div class="set-body">
+        <div class="set-sec">网关</div>
+        <label>WS 地址<input id="gw-url" type="text" placeholder="ws://127.0.0.1:18791/ws" /></label>
+        <label>Token（可选）<input id="gw-token" type="password" placeholder="auth=none 时留空" /></label>
+
+        <div class="set-sec">语音</div>
+        <label>引擎
+          <select id="tts-provider">
+            <option value="gateway">复用桌面语音配置（网关）</option>
+            <option value="windows">Windows 本地（免 KEY）</option>
+            <option value="openai">OpenAI 兼容云端</option>
+          </select>
+        </label>
+        <div id="tts-gateway" class="hint">复用桌面 app「语音」设置里的提供商 / URL / Key / 音色，无需重复填写；网关语音不可用时自动回退本地语音。</div>
+        <div id="tts-windows">
+          <label>音色
+            <span class="row">
+              <select id="win-voice"></select>
+              <button id="win-voice-fetch" class="mini" type="button">刷新</button>
+            </span>
+          </label>
+          <label>语速 <input id="tts-rate" type="range" min="0.5" max="2" step="0.1" /></label>
+        </div>
+        <div id="tts-openai" class="hidden">
+          <label>Base URL<input id="tts-base" type="text" placeholder="https://api.openai.com/v1" /></label>
+          <label>API Key<input id="tts-key" type="password" placeholder="sk-..." /></label>
+          <label>模型
+            <span class="row">
+              <input id="tts-model" type="text" list="model-list" placeholder="tts-1" />
+              <button id="model-fetch" class="mini" type="button">拉取</button>
+            </span>
+          </label>
+          <datalist id="model-list"></datalist>
+          <label>音色
+            <span class="row">
+              <input id="tts-voice" type="text" list="voice-list" placeholder="alloy" />
+              <button id="voice-fetch" class="mini" type="button">拉取</button>
+            </span>
+          </label>
+          <datalist id="voice-list"></datalist>
+          <label>音色端点（可选）<input id="tts-voices-url" type="text" placeholder="默认 /audio/voices" /></label>
+        </div>
+        <label>音量 <input id="tts-volume" type="range" min="0" max="1" step="0.05" /></label>
+        <label class="chk"><input id="tts-enabled" type="checkbox" /> 启用语音</label>
+        <button id="tts-test" class="btn" type="button">试听一句</button>
+        <div id="tts-msg" class="hint"></div>
+
+        <div class="set-sec">桌宠</div>
+        <label class="chk"><input id="pet-muted" type="checkbox" /> 静音</label>
+        <label class="chk"><input id="pet-autospeak" type="checkbox" /> 事件自动播报</label>
+        <label class="chk"><input id="pet-turnstart" type="checkbox" /> 显示新一轮开始</label>
+        <label>大小 <input id="pet-size" type="range" min="0.7" max="1.5" step="0.05" /></label>
+      </div>
+      <div class="set-foot">
+        <button id="set-save" class="btn primary" type="button">保存</button>
+      </div>
+    </div>
+
+    <div id="ctxmenu" class="hidden" data-interactive></div>
+    <div id="toast" class="hidden"></div>
+  </div>
+  <script src="pet.js"></script>
+</body>
+</html>

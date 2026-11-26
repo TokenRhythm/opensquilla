@@ -765,6 +765,26 @@ async def _dispatch_gateway_slash_command(
         console.print(render_help_table(Surface.CLI_GATEWAY))
         return True
 
+    if _slash_parts(cmd, "/voice"):
+        from opensquilla.cli.tui.adapters.voice import capture_voice_text
+        from opensquilla.onboarding.config_store import default_config_path, load_config
+
+        try:
+            config = load_config(default_config_path())
+        except Exception as exc:  # noqa: BLE001 - surface config load failure
+            console.print(f"[red]Could not load configuration for /voice: {exc}[/red]")
+            return True
+        text = await capture_voice_text(
+            config, host_ui=output_supports_host_ui(tui_output)
+        )
+        if text:
+            console.print(f"[dim]语音输入：[/dim]{text}")
+            result = await stream(
+                client, state.session_key, text, elevated_state, tui_output=tui_output
+            )
+            record_turn(state, text, result)
+        return True
+
     if cmd in {"/keys", "/shortcuts"}:
         console.print(render_keys_table(opentui=output_supports_host_ui(tui_output)))
         return True

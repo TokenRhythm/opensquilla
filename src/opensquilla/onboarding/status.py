@@ -45,6 +45,7 @@ from opensquilla.onboarding.section_status import (
     router_section_status,
     search_section_status,
     section_verifiers,
+    stt_provider_annotation,
 )
 from opensquilla.onboarding.section_status import (
     needs_onboarding as _needs_onboarding,
@@ -1164,6 +1165,10 @@ def _audio_annotations(
     audio_cfg = getattr(cfg, "audio", None)
     if audio_cfg is None or status is SectionStatus.OPTIONAL:
         return "none", "", ""
+    stt_source, stt_provider, stt_env = stt_provider_annotation(cfg)
+    if stt_provider and stt_provider != "elevenlabs":
+        # A dedicated [audio.stt] provider is the effective speech source.
+        return stt_source, stt_provider, stt_env
     provider_id = "elevenlabs"
     try:
         spec = get_audio_provider_setup_spec(provider_id)

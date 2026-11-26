@@ -52,6 +52,10 @@ STATUS_TOP_LEVEL_KEYS = frozenset(
         "audioSource",
         "audioProvider",
         "audioEnvKey",
+        # Additive text-to-speech voice preset inventory: the setup UI lists
+        # the voices this build offers, so the key rides the same frozen
+        # contract. Older gateways omit it and clients must tolerate that.
+        "voicePresets",
         "searchConfigured",
         "searchProvider",
         "searchSource",

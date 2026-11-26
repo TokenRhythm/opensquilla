@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import shutil
 import subprocess
 from pathlib import Path
@@ -8,6 +9,25 @@ from pathlib import Path
 import pytest
 
 from opensquilla.cli.tui.opentui.completion import fuzzy_filter, fuzzy_rank
+
+
+def _bun_executable() -> str | None:
+    """Resolve a bun binary subprocess can actually execute.
+
+    On Windows npm installs bun as a ``.ps1``/``.cmd`` shim that ``subprocess``
+    cannot launch directly; prefer the real ``bun.exe`` shipped beside the shim.
+    """
+    bun = shutil.which("bun")
+    if bun is None:
+        return None
+    if os.name == "nt":
+        candidate = Path(bun).parent / "node_modules" / "bun" / "bin" / "bun.exe"
+        if candidate.is_file():
+            return str(candidate)
+        exe = shutil.which("bun.exe")
+        if exe:
+            return exe
+    return bun
 
 _COMPOSER_MJS = (
     Path(__file__).resolve().parents[4]
@@ -86,7 +106,7 @@ def test_fuzzy_rank_returns_candidate_indexes_and_scores() -> None:
     assert ranked[0][1] >= ranked[1][1]
 
 
-@pytest.mark.skipif(shutil.which("bun") is None, reason="bun runtime is not on PATH")
+@pytest.mark.skipif(_bun_executable() is None, reason="bun runtime is not on PATH")
 def test_fuzzy_rank_order_matches_js_filter_catalog(tmp_path: Path) -> None:
     script = tmp_path / "parity.mjs"
     script.write_text(
@@ -100,7 +120,7 @@ def test_fuzzy_rank_order_matches_js_filter_catalog(tmp_path: Path) -> None:
     )
 
     result = subprocess.run(
-        ["bun", str(script), json.dumps(_PARITY_FIXTURES)],
+        [_bun_executable(), str(script), json.dumps(_PARITY_FIXTURES)],
         capture_output=True,
         text=True,
         check=False,

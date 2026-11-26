@@ -362,6 +362,7 @@ def test_host_to_python_registry_round_trips_canonical_frames() -> None:
         "input.submit": '{"type":"input.submit","text":"hi"}',
         "input.cancel": '{"type":"input.cancel"}',
         "input.eof": '{"type":"input.eof"}',
+        "input.voice": '{"type":"input.voice","action":"press"}',
         "resize": '{"type":"resize","width":80,"height":24}',
         "completion.request": (
             '{"type":"completion.request","kind":"file","query":"a","request_id":1}'

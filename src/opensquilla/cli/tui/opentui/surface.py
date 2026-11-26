@@ -10,7 +10,7 @@ from collections.abc import AsyncIterator, Callable
 from contextlib import AbstractAsyncContextManager, asynccontextmanager
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Protocol
+from typing import Any, Protocol
 
 import structlog
 
@@ -37,10 +37,12 @@ from opensquilla.cli.tui.opentui.messages import (
     HostInputCancel,
     HostInputEof,
     HostInputSubmit,
+    HostInputVoice,
     HostProtocolUnknown,
     HostReady,
     HostResize,
     HostThemeSelected,
+    NoticeWrite,
     RouterPluginState,
     ScrollbackWrite,
 )
@@ -469,6 +471,11 @@ class OpenTuiSurface:
         self._completion_task: asyncio.Task[None] | None = None
         self._persist_tasks: set[asyncio.Task[None]] = set()
         self._last_resize: tuple[int, int] | None = None
+        # Alt+V push-to-talk (PR-4): live recorder + in-flight transcribe task.
+        self._voice_recorder: Any = None
+        self._voice_task: asyncio.Task[None] | None = None
+        self._voice_config: Any = None
+        self._voice_busy = False
         self._output_handle = OpenTuiOutputHandle(
             bridge,
             approval_surface=approval_surface,
@@ -515,6 +522,9 @@ class OpenTuiSurface:
             if isinstance(message, HostInputCancel):
                 if self._cancel_callback is not None:
                     self._cancel_callback()
+                continue
+            if isinstance(message, HostInputVoice):
+                self._toggle_voice(message.action)
                 continue
             if isinstance(message, HostInputEof):
                 self._eof_emitted = True
@@ -570,6 +580,95 @@ class OpenTuiSurface:
 
     def set_shutdown_callback(self, cb: Callable[[], None] | None) -> None:
         self._shutdown_callback = cb
+
+    def _toggle_voice(self, action: str = "press") -> None:
+        # Alt+V push-to-talk (PR-4). Run off the input pump so microphone IO and
+        # transcription never block queued input/cancel/approval frames.
+        if self._voice_busy:
+            return
+        # A release with nothing recording is a no-op (e.g. a stray key-up).
+        if action == "release" and self._voice_recorder is None:
+            return
+        self._voice_busy = True
+        task = asyncio.get_running_loop().create_task(self._voice_toggle_async())
+        self._persist_tasks.add(task)
+        task.add_done_callback(self._persist_tasks.discard)
+
+    async def _voice_toggle_async(self) -> None:
+        from opensquilla.audio.stt_types import SttAudio
+        from opensquilla.audio.voice_capture import (
+            MicrophoneRecorder,
+            VoiceCaptureError,
+            resolve_device,
+            transcribe_audio,
+        )
+        from opensquilla.onboarding.config_store import default_config_path, load_config
+
+        # While recording, any voice signal stops capture (release on kitty
+        # terminals, or a second press as the raw-terminal toggle fallback).
+        # Otherwise a press starts capture; a stray release is filtered upstream.
+        try:
+            if self._voice_recorder is not None:
+                recorder = self._voice_recorder
+                self._voice_recorder = None
+                config = self._voice_config
+                await self._bridge.send("notice.write", NoticeWrite(text="转写中…"))
+                try:
+                    data = await recorder.stop()
+                except Exception:  # noqa: BLE001 - finalize is best-effort
+                    data = b""
+                if not data:
+                    await self._bridge.send("notice.write", NoticeWrite(text="未录到音频"))
+                    return
+                audio = SttAudio(data=data, filename="voice.wav", mime_type="audio/wav")
+                try:
+                    result = await transcribe_audio(config, audio)
+                except VoiceCaptureError as exc:
+                    await self._bridge.send(
+                        "notice.write", NoticeWrite(text=f"转写失败：{exc}")
+                    )
+                    return
+                if result is None or not (result.text or "").strip():
+                    await self._bridge.send(
+                        "notice.write", NoticeWrite(text="未识别到语音内容")
+                    )
+                    return
+                # Fill the composer so the user can review/edit before sending.
+                await self._bridge.send(
+                    "composer.set", ComposerState(text=result.text.strip())
+                )
+                await self._bridge.send("notice.write", NoticeWrite(text=""))
+                return
+
+            try:
+                config = load_config(default_config_path())
+            except Exception as exc:  # noqa: BLE001
+                await self._bridge.send(
+                    "notice.write", NoticeWrite(text=f"无法加载配置：{exc}")
+                )
+                return
+            if not getattr(config.audio, "enabled", False):
+                await self._bridge.send(
+                    "notice.write",
+                    NoticeWrite(text="语音输入未启用：设 [audio].enabled=true 并配置 [audio.stt]"),
+                )
+                return
+            device = resolve_device(config.audio.capture.device)
+            recorder = MicrophoneRecorder(max_seconds=config.audio.capture.max_seconds)
+            try:
+                await recorder.start(device)
+            except VoiceCaptureError as exc:
+                await self._bridge.send(
+                    "notice.write", NoticeWrite(text=f"录音启动失败：{exc}")
+                )
+                return
+            self._voice_recorder = recorder
+            self._voice_config = config
+            await self._bridge.send(
+                "notice.write", NoticeWrite(text="● 录音中… 再按 Alt+V 停止并转写")
+            )
+        finally:
+            self._voice_busy = False
 
     def emit_eof(self) -> None:
         self._eof_emitted = True
