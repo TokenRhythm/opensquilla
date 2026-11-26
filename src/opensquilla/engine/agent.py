@@ -17,6 +17,7 @@ import math
 import os
 import re
 import stat
+import threading
 import time
 import uuid
 from collections.abc import AsyncIterator, Callable, Iterator, Mapping, Sequence
@@ -979,12 +980,17 @@ _COMPACTED_TOOL_ARGUMENT_MARKERS = frozenset(
 )
 
 
-def _tool_result_search_hints(content: str) -> str:
+def _tool_result_search_hints(
+    content: str, *, checkpoint: Callable[[], None] | None = None,
+) -> str:
     lines: list[str] = []
     candidates: list[tuple[int, int, str]] = []
     used_chars = 0
     seen: set[str] = set()
     for line_number, line in enumerate(content.splitlines(), start=1):
+        # A single retained log may take longer to render than a snapshot batch.
+        if checkpoint is not None:
+            checkpoint()
         stripped = line.strip()
         if not stripped:
             continue
@@ -1003,6 +1009,8 @@ def _tool_result_search_hints(content: str) -> str:
             continue
         seen.add(normalized)
         candidates.append((-score, line_number, rendered))
+    if checkpoint is not None:
+        checkpoint()
     for _score, _line_number, rendered in sorted(candidates):
         if used_chars + len(rendered) > _TOOL_RESULT_HINT_MAX_CHARS:
             continue
@@ -2469,8 +2477,10 @@ class Agent:
         self._provider_tool_result_overrides: dict[str, ContentBlockToolResult] = {}
         self._provider_tool_result_frozen_overrides: dict[str, ContentBlockToolResult] = {}
         self._provider_tool_result_frozen_full_ids: set[str] = set()
+        self._snapshot_store: ToolResultStore | None = None
+        self._snapshot_store_lock = threading.Lock()
         self._tool_result_snapshot_cache: dict[
-            tuple[str, str, str, str, str, str], ToolResultRecord
+            tuple[Path, str, str, str, str, str, str], ToolResultRecord
         ] = {}
         self._runtime_git_state = GitRunState.OK
         self._runtime_git_skip_states_recorded: set[GitRunState] = set()
@@ -4484,6 +4494,8 @@ class Agent:
     def _compact_aggregate_tool_results_for_provider(
         self,
         messages: list[Message],
+        *,
+        store: ToolResultStore | None = None,
     ) -> list[Message]:
         """Compact old bulky tool results in the provider request view only.
 
@@ -4516,6 +4528,7 @@ class Agent:
             tool_result_refs,
             tool_name_by_use_id,
             tool_input_by_use_id,
+            store=store,
         )
         tool_result_refs = []
         for message_index, message in enumerate(messages):
@@ -4576,51 +4589,60 @@ class Agent:
         replacements: dict[tuple[int, int], ContentBlockToolResult] = {}
         stored_handles: list[str] = []
 
-        for message_index, block_index, block, content, original_tokens in eligible_refs:
-            if total_tool_result_tokens <= budget_tokens:
-                break
-            digest = hashlib.sha256(content.encode("utf-8")).hexdigest()
-            stored = self._store_tool_result_snapshot(
-                content,
-                tool_use_id=block.tool_use_id,
-                tool_name=tool_name_by_use_id.get(block.tool_use_id, "tool"),
-            )
-            if stored is None and self.config.tool_result_store_dir:
-                continue
-            if stored is not None:
-                stored_handles.append(stored.handle)
-            head = content[:240]
-            tail = content[-240:] if len(content) > 240 else ""
-            omitted = max(0, len(content) - len(head) - len(tail))
-            handle_line = f"tool_result_handle: {stored.handle}\n" if stored is not None else ""
-            retrieve_hint = _TOOL_RESULT_RETRIEVE_HINT if stored is not None else ""
-            search_hints = _tool_result_search_hints(content) if stored is not None else ""
-            compacted = (
-                "[aggregate_tool_result_compacted]\n"
-                f"tool_use_id: {block.tool_use_id}\n"
-                f"original_chars: {len(content)}\n"
-                f"original_tokens_estimate: {_tool_result_budget_tokens(content)}\n"
-                f"sha256: {digest}\n"
-                f"{handle_line}"
-                f"{retrieve_hint}"
-                f"{search_hints}"
-                f"omitted_chars: {omitted}\n"
-                f"preview_complete: {str(omitted == 0).lower()}\n"
-                "reason: older non-error tool result compacted for provider context budget.\n"
-                f"head:\n{head}"
-            )
-            if tail and tail != head:
-                compacted += f"\n...\ntail:\n{tail}"
-            replacement: ContentBlockToolResult | None
-            replacement = ContentBlockToolResult(
-                tool_use_id=block.tool_use_id,
-                content=compacted,
-                is_error=block.is_error,
-            )
-            replacements[(message_index, block_index)] = replacement
-            self._freeze_provider_tool_result_projection(replacement)
-            replacement_tokens = _tool_result_budget_tokens(compacted)
-            total_tool_result_tokens -= max(0, original_tokens - replacement_tokens)
+        hint_checkpoint = store.yield_projection_lock_if_due if store is not None else None
+        batch = (
+            store.projection_items(eligible_refs)
+            if store is not None else contextlib.nullcontext(iter(eligible_refs))
+        )
+        with batch as items:
+            for message_index, block_index, block, content, original_tokens in items:
+                if total_tool_result_tokens <= budget_tokens:
+                    break
+                digest = hashlib.sha256(content.encode("utf-8")).hexdigest()
+                stored = self._store_tool_result_snapshot(
+                    content,
+                    tool_use_id=block.tool_use_id,
+                    tool_name=tool_name_by_use_id.get(block.tool_use_id, "tool"),
+                )
+                if stored is None and self.config.tool_result_store_dir:
+                    continue
+                if stored is not None:
+                    stored_handles.append(stored.handle)
+                head = content[:240]
+                tail = content[-240:] if len(content) > 240 else ""
+                omitted = max(0, len(content) - len(head) - len(tail))
+                handle_line = f"tool_result_handle: {stored.handle}\n" if stored is not None else ""
+                retrieve_hint = _TOOL_RESULT_RETRIEVE_HINT if stored is not None else ""
+                search_hints = (
+                    _tool_result_search_hints(content, checkpoint=hint_checkpoint)
+                    if stored is not None else ""
+                )
+                compacted = (
+                    "[aggregate_tool_result_compacted]\n"
+                    f"tool_use_id: {block.tool_use_id}\n"
+                    f"original_chars: {len(content)}\n"
+                    f"original_tokens_estimate: {original_tokens}\n"
+                    f"sha256: {digest}\n"
+                    f"{handle_line}"
+                    f"{retrieve_hint}"
+                    f"{search_hints}"
+                    f"omitted_chars: {omitted}\n"
+                    f"preview_complete: {str(omitted == 0).lower()}\n"
+                    "reason: older non-error tool result compacted for provider context budget.\n"
+                    f"head:\n{head}"
+                )
+                if tail and tail != head:
+                    compacted += f"\n...\ntail:\n{tail}"
+                replacement: ContentBlockToolResult | None
+                replacement = ContentBlockToolResult(
+                    tool_use_id=block.tool_use_id,
+                    content=compacted,
+                    is_error=block.is_error,
+                )
+                replacements[(message_index, block_index)] = replacement
+                self._freeze_provider_tool_result_projection(replacement)
+                replacement_tokens = _tool_result_budget_tokens(compacted)
+                total_tool_result_tokens -= max(0, original_tokens - replacement_tokens)
 
         if not replacements:
             return messages
@@ -4702,6 +4724,8 @@ class Agent:
         tool_result_refs: list[tuple[int, int, ContentBlockToolResult]],
         tool_name_by_use_id: dict[str, str],
         tool_input_by_use_id: dict[str, dict[str, Any]],
+        *,
+        store: ToolResultStore | None = None,
     ) -> list[Message]:
         cap = self._tool_result_provider_request_max_chars(ToolResultBudgetClass.LOCAL)
         if cap <= 0 or not tool_result_refs:
@@ -4737,86 +4761,98 @@ class Agent:
         recent_external_ids = {id(block) for _m, _b, block in recent_external_refs}
         replacements: dict[tuple[int, int], ContentBlockToolResult] = {}
 
-        for message_index, block_index, block in tool_result_refs:
-            if not _over_budget():
-                break
-            content = _content(block)
-            tool_name = tool_name_by_use_id.get(block.tool_use_id, "")
-            budget_class = resolve_budget_class(tool_name)
-            if _tool_result_content_is_provider_projection(content):
-                continue
-            if block.tool_use_id in self._provider_tool_result_frozen_full_ids:
-                continue
-            semantic_skip_reason = self._semantic_provider_tool_result_projection_skip_reason(
-                tool_use_id=block.tool_use_id,
-                tool_name=tool_name or "tool",
-                content=content,
-                is_error=block.is_error,
-                arguments=tool_input_by_use_id.get(block.tool_use_id),
-            )
-            if semantic_skip_reason is not None:
-                self._record_provider_tool_result_semantic_preserve(
+        hint_checkpoint = store.yield_projection_lock_if_due if store is not None else None
+        batch = (
+            store.projection_items(tool_result_refs)
+            if store is not None else contextlib.nullcontext(iter(tool_result_refs))
+        )
+        with batch as items:
+            for message_index, block_index, block in items:
+                if not _over_budget():
+                    break
+                content = _content(block)
+                tool_name = tool_name_by_use_id.get(block.tool_use_id, "")
+                budget_class = resolve_budget_class(tool_name)
+                if _tool_result_content_is_provider_projection(content):
+                    continue
+                if block.tool_use_id in self._provider_tool_result_frozen_full_ids:
+                    continue
+                semantic_skip_reason = self._semantic_provider_tool_result_projection_skip_reason(
                     tool_use_id=block.tool_use_id,
                     tool_name=tool_name or "tool",
-                    original_chars=len(content),
-                    reason=semantic_skip_reason,
-                    mechanism="absolute",
-                )
-                continue
-            result_cap = self._tool_result_provider_request_max_chars(budget_class)
-            single_over_budget = result_cap > 0 and len(content) > result_cap
-            replacement_content: str | None = None
-            if budget_class is ToolResultBudgetClass.CONTROL:
-                replacement_content = self._tool_result_projection_for_provider(
-                    content,
-                    tool_use_id=block.tool_use_id,
-                    tool_name=tool_name or "tool",
-                    reason="control tool result compacted for provider request context",
-                    max_preview_chars=160,
-                )
-            elif (
-                budget_class is ToolResultBudgetClass.EXTERNAL
-                and not block.is_error
-                and not _tool_result_content_has_artifact(content)
-                and (single_over_budget or id(block) not in recent_external_ids)
-            ):
-                replacement_content = self._tool_result_projection_for_provider(
-                    content,
-                    tool_use_id=block.tool_use_id,
-                    tool_name=tool_name or "tool",
-                    reason="external tool result compacted for provider request context",
-                    max_preview_chars=min(result_cap, 4_000),
-                )
-            elif (
-                not block.is_error
-                and not _tool_result_content_has_artifact(content)
-                and (
-                    single_over_budget
-                    or (self.config.context_window_tokens >= 64_000 and id(block) not in recent_ids)
-                )
-            ):
-                replacement_content = self._tool_result_projection_for_provider(
                     content=content,
-                    tool_use_id=block.tool_use_id,
-                    tool_name=tool_name or "tool",
-                    reason="tool result compacted for provider request context",
-                    max_preview_chars=min(result_cap, 4_000),
+                    is_error=block.is_error,
+                    arguments=tool_input_by_use_id.get(block.tool_use_id),
                 )
+                if semantic_skip_reason is not None:
+                    self._record_provider_tool_result_semantic_preserve(
+                        tool_use_id=block.tool_use_id,
+                        tool_name=tool_name or "tool",
+                        original_chars=len(content),
+                        reason=semantic_skip_reason,
+                        mechanism="absolute",
+                    )
+                    continue
+                result_cap = self._tool_result_provider_request_max_chars(budget_class)
+                single_over_budget = result_cap > 0 and len(content) > result_cap
+                replacement_content: str | None = None
+                if budget_class is ToolResultBudgetClass.CONTROL:
+                    replacement_content = self._tool_result_projection_for_provider(
+                        content,
+                        tool_use_id=block.tool_use_id,
+                        tool_name=tool_name or "tool",
+                        reason="control tool result compacted for provider request context",
+                        max_preview_chars=160,
+                        hint_checkpoint=hint_checkpoint,
+                    )
+                elif (
+                    budget_class is ToolResultBudgetClass.EXTERNAL
+                    and not block.is_error
+                    and not _tool_result_content_has_artifact(content)
+                    and (single_over_budget or id(block) not in recent_external_ids)
+                ):
+                    replacement_content = self._tool_result_projection_for_provider(
+                        content,
+                        tool_use_id=block.tool_use_id,
+                        tool_name=tool_name or "tool",
+                        reason="external tool result compacted for provider request context",
+                        max_preview_chars=min(result_cap, 4_000),
+                        hint_checkpoint=hint_checkpoint,
+                    )
+                elif (
+                    not block.is_error
+                    and not _tool_result_content_has_artifact(content)
+                    and (
+                        single_over_budget
+                        or (
+                            self.config.context_window_tokens >= 64_000
+                            and id(block) not in recent_ids
+                        )
+                    )
+                ):
+                    replacement_content = self._tool_result_projection_for_provider(
+                        content=content,
+                        tool_use_id=block.tool_use_id,
+                        tool_name=tool_name or "tool",
+                        reason="tool result compacted for provider request context",
+                        max_preview_chars=min(result_cap, 4_000),
+                        hint_checkpoint=hint_checkpoint,
+                    )
 
-            if replacement_content is None or len(replacement_content) >= len(content):
-                continue
-            replacement: ContentBlockToolResult | None
-            replacement = ContentBlockToolResult(
-                tool_use_id=block.tool_use_id,
-                content=replacement_content,
-                is_error=block.is_error,
-            )
-            replacements[(message_index, block_index)] = replacement
-            self._freeze_provider_tool_result_projection(replacement)
-            saved_chars = len(content) - len(replacement_content)
-            total_chars -= saved_chars
-            if budget_class is ToolResultBudgetClass.EXTERNAL:
-                external_chars -= saved_chars
+                if replacement_content is None or len(replacement_content) >= len(content):
+                    continue
+                replacement: ContentBlockToolResult | None
+                replacement = ContentBlockToolResult(
+                    tool_use_id=block.tool_use_id,
+                    content=replacement_content,
+                    is_error=block.is_error,
+                )
+                replacements[(message_index, block_index)] = replacement
+                self._freeze_provider_tool_result_projection(replacement)
+                saved_chars = len(content) - len(replacement_content)
+                total_chars -= saved_chars
+                if budget_class is ToolResultBudgetClass.EXTERNAL:
+                    external_chars -= saved_chars
 
         if not replacements:
             return messages
@@ -4909,6 +4945,7 @@ class Agent:
         tool_name: str,
         reason: str,
         max_preview_chars: int,
+        hint_checkpoint: Callable[[], None] | None = None,
     ) -> str | None:
         if not self._tool_result_recovery_available():
             return None
@@ -4925,7 +4962,7 @@ class Agent:
             return None
         handle_line = f"tool_result_handle: {stored.handle}\n"
         retrieve_hint = _TOOL_RESULT_RETRIEVE_HINT
-        search_hints = _tool_result_search_hints(content)
+        search_hints = _tool_result_search_hints(content, checkpoint=hint_checkpoint)
         if max_preview_chars <= 0:
             head = ""
             tail = ""
@@ -5067,6 +5104,18 @@ class Agent:
             return None
         return {"handle": record.handle, "sha256": record.sha256}
 
+    def _snapshot_store_for_config(self) -> ToolResultStore | None:
+        store_dir = self.config.tool_result_store_dir
+        if not store_dir:
+            return None
+        root = Path(store_dir)
+        # All workers using this root share the store. Each worker's projection
+        # batch is thread-local, so other workers and the gateway stay independent.
+        with self._snapshot_store_lock:
+            if self._snapshot_store is None or self._snapshot_store.root != root:
+                self._snapshot_store = ToolResultStore(root)
+            return self._snapshot_store
+
     def _store_tool_result_snapshot(
         self,
         content: str,
@@ -5074,7 +5123,8 @@ class Agent:
         tool_use_id: str,
         tool_name: str,
     ) -> ToolResultRecord | None:
-        if not self.config.tool_result_store_dir:
+        store = self._snapshot_store_for_config()
+        if store is None:
             return None
         scope = self._tool_result_store_scope()
         if scope is None:
@@ -5084,8 +5134,7 @@ class Agent:
             return None
         session_id, session_key, agent_id = scope
         sha = hashlib.sha256(content.encode("utf-8")).hexdigest()
-        cache_key = (session_id, session_key, agent_id, tool_use_id, tool_name, sha)
-        store = ToolResultStore(self.config.tool_result_store_dir)
+        cache_key = (store.root, session_id, session_key, agent_id, tool_use_id, tool_name, sha)
         cached = self._tool_result_snapshot_cache.get(cache_key)
         if cached is not None:
             try:
@@ -14674,6 +14723,7 @@ class Agent:
         runtime_context_message: Message,
         runtime_context_insert_index: int,
         preview: bool = False,
+        batch_snapshots: bool = False,
     ) -> tuple[list[Message], SessionSanitizeResult]:
         source_messages = self._with_request_context_messages(
             messages,
@@ -14691,7 +14741,10 @@ class Agent:
         # not affect message cardinality.  Skip them during a count preview:
         # the normal paths update metadata, logs, and snapshot stores.
         if not preview:
-            source_messages = self._compact_aggregate_tool_results_for_provider(source_messages)
+            store = self._snapshot_store_for_config() if batch_snapshots else None
+            source_messages = self._compact_aggregate_tool_results_for_provider(
+                source_messages, store=store,
+            )
         source_messages = self._sanitize_projected_tool_use_arguments_for_provider(
             source_messages,
             record=not preview,
@@ -14711,26 +14764,17 @@ class Agent:
         runtime_context_message: Message,
         runtime_context_insert_index: int,
     ) -> tuple[list[Message], SessionSanitizeResult]:
-        """Off-loop wrapper for :meth:`_provider_request_messages_with_sanitize`.
+        """Assemble a request in a worker, sharing snapshot cleanup across its history."""
 
-        The synchronous assembly runs the tool-result compaction snapshot writes,
-        each of which does a store-wide ``rglob`` over the shared tool-result
-        store (issue #305). Running the whole assembly in a worker thread keeps
-        that O(store) filesystem scan off the gateway event loop so per-turn
-        latency does not grow with the number of stored results. The assembly
-        touches no asyncio primitives, so it is thread-safe to offload.
-        """
-
-        def _run() -> tuple[list[Message], SessionSanitizeResult]:
-            return self._provider_request_messages_with_sanitize(
-                messages,
-                request_context_message=request_context_message,
-                request_context_insert_index=request_context_insert_index,
-                runtime_context_message=runtime_context_message,
-                runtime_context_insert_index=runtime_context_insert_index,
-            )
-
-        return await asyncio.to_thread(_run)
+        return await asyncio.to_thread(
+            self._provider_request_messages_with_sanitize,
+            messages,
+            request_context_message=request_context_message,
+            request_context_insert_index=request_context_insert_index,
+            runtime_context_message=runtime_context_message,
+            runtime_context_insert_index=runtime_context_insert_index,
+            batch_snapshots=True,
+        )
 
     async def _provider_request_messages_async(
         self,
