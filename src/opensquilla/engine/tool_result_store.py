@@ -10,9 +10,11 @@ import os
 import re
 import secrets
 import struct
-from collections.abc import Iterator
-from contextlib import contextmanager, suppress
-from dataclasses import dataclass
+import threading
+import time
+from collections.abc import Iterable, Iterator
+from contextlib import ExitStack, contextmanager, suppress
+from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any, BinaryIO
@@ -41,6 +43,8 @@ _TOOL_OUTPUT_LEASE_NAME = "output.lease"
 # handle. 32 hex chars = 128 bits, which both satisfies the ``tr-<32 hex>`` handle
 # format and makes truncated-digest collisions between distinct payloads negligible.
 _CONTENT_HANDLE_HEX = 32
+_PROJECTION_BATCH_WRITES = 32
+_PROJECTION_BATCH_SECONDS = 0.25
 
 _SAFE_TOKEN_RE = re.compile(r"[^A-Za-z0-9._-]+")
 
@@ -78,11 +82,126 @@ class _StoredMeta:
     active: bool = False
 
 
+@dataclass
+class _RecordScan:
+    records: list[_StoredMeta] = field(default_factory=list)
+    complete: bool = True
+
+
+@dataclass
+class _ProjectionBatch:
+    """Conservative bounds valid only while this worker owns the budget lock."""
+
+    lock: ExitStack = field(default_factory=ExitStack)
+    writes: int = 0
+    release_at: float = 0.0
+    bytes_on_disk: int | None = None
+    oldest: datetime | None = None
+
+    def release(self) -> None:
+        self.bytes_on_disk = None
+        self.oldest = None
+        self.writes = 0
+        self.lock.close()
+
+    def release_if_due(self) -> None:
+        if self.writes and (
+            self.writes >= _PROJECTION_BATCH_WRITES or time.monotonic() >= self.release_at
+        ):
+            self.release()
+
+    def items[T](self, items: Iterable[T]) -> Iterator[T]:
+        for item in items:
+            # A cache hit or a skipped result never reaches the disk writer.
+            self.release_if_due()
+            yield item
+
+    def needs_cleanup(self, retention_seconds: int | None) -> bool:
+        if self.bytes_on_disk is None:
+            return True
+        if self.oldest is None or retention_seconds is None:
+            return False
+        return self.oldest < datetime.now(UTC) - timedelta(seconds=max(0, int(retention_seconds)))
+
+    def observe_scan(self, scan: _RecordScan) -> None:
+        # A legacy active output can grow without taking the snapshot budget lock.
+        if not scan.complete or any(record.active for record in scan.records):
+            self.bytes_on_disk = None
+            return
+        self.bytes_on_disk = sum(record.size_bytes for record in scan.records)
+        self.oldest = min((record.created_at for record in scan.records), default=None)
+
+    def observe_new_file(self, path: Path) -> None:
+        if self.bytes_on_disk is None:
+            return
+        try:
+            stat = path.stat()
+        except OSError:
+            self.bytes_on_disk = None
+            return
+        self.bytes_on_disk += stat.st_size
+        modified = datetime.fromtimestamp(stat.st_mtime, tz=UTC)
+        self.oldest = min(self.oldest, modified) if self.oldest else modified
+
+
+class _ProjectionWorker(threading.local):
+    batch: _ProjectionBatch | None = None
+
+
 class ToolResultStore:
     """Store full raw tool results omitted from provider context."""
 
     def __init__(self, root: str | Path) -> None:
         self.root = Path(root)
+        self._worker = _ProjectionWorker()
+
+    @contextmanager
+    def projection_batch(self) -> Iterator[_ProjectionBatch]:
+        """Amortize cleanup for a single synchronous history projection."""
+        if self._worker.batch is not None:
+            yield self._worker.batch
+            return
+        batch = self._worker.batch = _ProjectionBatch()
+        try:
+            yield batch
+        finally:
+            batch.release()
+            self._worker.batch = None
+
+    @contextmanager
+    def projection_items[T](self, items: Iterable[T]) -> Iterator[Iterator[T]]:
+        """Release the lock before other projection phases process the full history."""
+        with self.projection_batch() as batch:
+            yield batch.items(items)
+
+    def yield_projection_lock_if_due(self) -> None:
+        """Give other writers a turn during CPU work on a single large result."""
+        batch = self._worker.batch
+        if batch is not None:
+            batch.release_if_due()
+
+    @contextmanager
+    def _snapshot_write_lock(self, timeout: float) -> Iterator[_ProjectionBatch | None]:
+        batch = self._worker.batch
+        if batch is None:
+            with self._budget_lock(timeout=timeout):
+                yield None
+            return
+        if batch.writes == 0:
+            batch.lock.enter_context(self._budget_lock(timeout=timeout))
+        try:
+            yield batch
+        except BaseException:
+            # A prune or atomic publication may already have changed the directory.
+            batch.release()
+            raise
+        batch.writes += 1
+        if batch.writes == 1:
+            # The initial directory walk can already take seconds on a slow disk.
+            # Limit additional lock occupancy after that unavoidable first write.
+            batch.release_at = time.monotonic() + _PROJECTION_BATCH_SECONDS
+        else:
+            batch.release_if_due()
 
     def write(
         self,
@@ -98,12 +217,12 @@ class ToolResultStore:
         retention_seconds: int | None = DEFAULT_TOOL_RESULT_RETENTION_SECONDS,
         lock_timeout_seconds: float = 5.0,
     ) -> ToolResultRecord:
-        with self._budget_lock(timeout=lock_timeout_seconds):
+        with self._snapshot_write_lock(lock_timeout_seconds) as batch:
             return self._write(
                 content, tool_use_id=tool_use_id, tool_name=tool_name,
                 session_id=session_id, session_key=session_key, agent_id=agent_id,
                 max_bytes=max_bytes, disk_budget_bytes=disk_budget_bytes,
-                retention_seconds=retention_seconds,
+                retention_seconds=retention_seconds, batch=batch,
             )
 
     def _write(
@@ -118,6 +237,7 @@ class ToolResultStore:
         max_bytes: int | None = DEFAULT_TOOL_RESULT_MAX_BYTES,
         disk_budget_bytes: int | None = DEFAULT_TOOL_RESULT_DISK_BUDGET_BYTES,
         retention_seconds: int | None = DEFAULT_TOOL_RESULT_RETENTION_SECONDS,
+        batch: _ProjectionBatch | None = None,
     ) -> ToolResultRecord:
         session_id = _validate_non_empty("session_id", session_id)
         session_key = _validate_non_empty("session_key", session_key)
@@ -146,15 +266,13 @@ class ToolResultStore:
         sha = hashlib.sha256(payload).hexdigest()
         primary_handle = f"tr-{sha[:_CONTENT_HANDLE_HEX]}"
 
-        # One cleanup scan feeds both retention and the budget prune below, so a new
-        # write pays a single store walk instead of re-scanning the whole store once
-        # per cleanup pass (issue #305). Retention runs first — a deduped write must
-        # never bypass cleanup nor reuse a record retention is about to evict (a
-        # small/zero retention_seconds would otherwise hand back a handle to an
-        # immediately-reaped record) — and the surviving records prune to fit.
-        surviving_records = self._remove_expired(
-            self._iter_record_stats(), retention_seconds
-        )
+        # Check retention before reusing a handle. A projection can skip the walk
+        # while its locked scan proves even the oldest snapshot is recent enough.
+        scan = None
+        if batch is None or batch.needs_cleanup(retention_seconds):
+            scan = self._scan_unexpired(retention_seconds)
+            if batch is not None:
+                batch.observe_scan(scan)
 
         # Content-addressed snapshots: identical content that survived retention is
         # reused instead of rewritten — refreshing its access time so a frequently
@@ -175,8 +293,19 @@ class ToolResultStore:
             self._touch(primary_handle, session_id=session_id)
             return reused
 
-        if disk_budget_bytes is not None:
-            self._prune_to_fit(surviving_records, stored_size_bytes, disk_budget_bytes)
+        if disk_budget_bytes is not None and (
+            batch is None or batch.bytes_on_disk is None
+            or batch.bytes_on_disk + stored_size_bytes > disk_budget_bytes
+        ):
+            # Only filesystem mtimes give the correct eviction order after a hit.
+            # Touches leave the cached oldest bound conservatively early.
+            if scan is None:
+                scan = self._scan_unexpired(retention_seconds)
+            if not scan.complete:
+                raise ToolResultStoreBudgetError("could not verify tool result disk budget")
+            self._prune_to_fit(scan.records, stored_size_bytes, disk_budget_bytes)
+            if batch is not None:
+                batch.bytes_on_disk = None
 
         created_at = datetime.now(UTC).isoformat().replace("+00:00", "Z")
         # The deterministic handle is tried first; a random handle is only needed for
@@ -255,6 +384,8 @@ class ToolResultStore:
             except BaseException:
                 _remove_record_dir(record_dir)
                 raise
+            if batch is not None:
+                batch.observe_new_file(record_dir / content_name)
             return record
         raise FileExistsError("could not allocate unique tool result handle")
 
@@ -312,7 +443,7 @@ class ToolResultStore:
         return self.root / _TOOL_OUTPUT_BUCKET / relative
 
     def _iter_output_stats(self) -> list[_StoredMeta]:
-        return ToolResultStore(self.root / _TOOL_OUTPUT_BUCKET)._iter_record_stats()
+        return ToolResultStore(self.root / _TOOL_OUTPUT_BUCKET)._iter_record_stats().records
 
     def read_output_metadata(self, handle: str, *, session_id: str) -> dict[str, Any] | None:
         """Return a completed execution-log header without reading its payload.
@@ -352,8 +483,8 @@ class ToolResultStore:
                 codecs.getincrementaldecoder(name)
             except LookupError as exc:
                 raise ValueError("invalid tool output encoding") from exc
-        for field in ("chars", "line_count", "size_bytes", "stored_size_bytes"):
-            if type(meta.get(field)) is not int or meta[field] < 0:
+        for name in ("chars", "line_count", "size_bytes", "stored_size_bytes"):
+            if type(meta.get(name)) is not int or meta[name] < 0:
                 raise ValueError("invalid tool output size metadata")
         content_path = record_dir / _TOOL_OUTPUT_CONTENT_NAME
         if content_path.stat().st_size != meta["stored_size_bytes"]:
@@ -579,31 +710,44 @@ class ToolResultStore:
             / normalized
         )
 
-    def _iter_record_stats(self) -> list[_StoredMeta]:
-        """Enumerate stored records for cleanup using only filesystem stat — size from
-        the content file and age from its mtime — instead of parsing every meta.json.
-        Cleanup runs only when genuinely new content is stored, and even then this keeps
-        the scan to cheap stat calls rather than O(records) JSON reads."""
+    def _scan_unexpired(self, retention_seconds: int | None) -> _RecordScan:
+        scan = self._iter_record_stats()
+        scan.records = self._remove_expired(scan.records, retention_seconds)
+        return scan
+
+    def _iter_record_stats(self) -> _RecordScan:
+        """Track incomplete walks so their byte totals cannot authorize another allocation."""
         root = self.root / TOOL_RESULT_STORE_SESSION_BUCKET
-        if not root.exists():
-            return []
-        records: list[_StoredMeta] = []
-        for pattern in (
+        scan = _RecordScan()
+
+        def on_error(error: OSError) -> None:
+            # The first snapshot creates this bucket. An inaccessible bucket is different.
+            if isinstance(error, FileNotFoundError) and error.filename == os.fspath(root):
+                return
+            scan.complete = False
+
+        payload_names = {
             TOOL_RESULT_CONTENT_NAME, TOOL_RESULT_COMPRESSED_CONTENT_NAME,
             _TOOL_OUTPUT_SPOOL_NAME, _TOOL_OUTPUT_CONTENT_NAME,
-        ):
-            for content_path in root.rglob(pattern):
-                record_dir = content_path.parent
+        }
+        for directory, subdirs, files in os.walk(root, onerror=on_error, followlinks=False):
+            record_dir = Path(directory)
+            if os.name == "nt":
+                subdirs[:] = [name for name in subdirs if not (record_dir / name).is_junction()]
+            try:
+                _validate_handle(record_dir.name)
+            except ValueError:
+                continue
+            for name in files:
+                if os.path.normcase(name) not in payload_names:
+                    continue
                 try:
-                    # Only ever consider (and later delete) well-formed tr-<32hex> record
-                    # dirs, so cleanup can never touch a stray or foreign file that happens
-                    # to live under the shared media root.
-                    _validate_handle(record_dir.name)
-                    stat = content_path.stat()
-                except (OSError, ValueError):
+                    stat = (record_dir / name).stat()
+                except OSError:
+                    scan.complete = False
                     continue
                 active = _output_spool_active(record_dir)
-                records.append(
+                scan.records.append(
                     _StoredMeta(
                         created_at=datetime.fromtimestamp(stat.st_mtime, tz=UTC),
                         size_bytes=max(0, stat.st_size),
@@ -611,7 +755,7 @@ class ToolResultStore:
                         active=active,
                     )
                 )
-        return records
+        return scan
 
     def _remove_expired(
         self, records: list[_StoredMeta], retention_seconds: int | None
@@ -847,8 +991,11 @@ def _output_spool_active(record_dir: Path) -> bool:
                 _release_file_lock(lease)
                 return False
             return True
-    except OSError:
+    except FileNotFoundError:
         return False
+    except OSError:
+        # An unreadable lease may still protect a growing execution log.
+        return True
 
 
 def _record_payload_exists(record_dir: Path) -> bool:
