@@ -80,6 +80,7 @@ EXPECTED_EXPERIMENTAL = {
     "kimi_coding_anthropic", "minimax", "minimax_openai", "minimax_coding_openai",
     "minimax_coding_anthropic", "minimax_cn", "minimax_global", "mimo_openai",
     "mimo_anthropic", "mistral", "groq", "aihubmix", "vllm", "custom",
+    "tsubasa",
     "custom_anthropic",
     "lm_studio", "siliconflow", "ovms", "litellm_proxy", "openai_codex",
     "volcengine_coding_plan", "volcengine_coding_plan_anthropic",
