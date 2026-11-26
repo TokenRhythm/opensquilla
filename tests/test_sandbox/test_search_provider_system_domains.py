@@ -23,6 +23,7 @@ _PROVIDER_API_URL_ATTRS = {
     "duckduckgo": ("opensquilla.search.providers.duckduckgo", "_DDHTML_URL"),
     "exa": ("opensquilla.search.providers.exa", "_API_URL"),
     "iqs": ("opensquilla.search.providers.iqs", "_API_URL"),
+    "specstream": ("opensquilla.search.providers.specstream", "_API_URL"),
     "tavily": ("opensquilla.search.providers.tavily", "_API_URL"),
 }
 
@@ -72,6 +73,7 @@ def test_search_provider_system_domains_match_provider_api_hosts(
     [
         ("bocha", "off", ("api.bochaai.com",)),
         ("exa", "off", ("api.exa.ai",)),
+        ("specstream", "off", ("api.specstream.ai",)),
         ("tavily", "network", ("api.tavily.com", "html.duckduckgo.com")),
         ("duckduckgo", "network", ("html.duckduckgo.com",)),
     ],
