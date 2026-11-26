@@ -853,8 +853,9 @@ _CATALOG_COMMANDS = {
         "opensquilla onboard configure image --image-provider <provider> "
         "--primary <model> --api-key-env <ENV_NAME>"
     ),
-    # Voice audio has no headless configure recipe yet; the Web UI setup page
-    # is the supported configuration surface.
+    # Voice audio and video generation have no headless configure recipe yet;
+    # the Web UI setup page is the supported configuration surface.
+    "videoGenerationProviders": "opensquilla gateway run",
     "audioProviders": "opensquilla gateway run",
     "memoryEmbeddingProviders": (
         "opensquilla onboard configure memory --memory-provider <provider> "
@@ -868,6 +869,7 @@ _CATALOG_SECTION_COMMANDS = {
     "searchProviders": "opensquilla onboard catalog search",
     "channels": "opensquilla onboard catalog channels",
     "imageGenerationProviders": "opensquilla onboard catalog image",
+    "videoGenerationProviders": "opensquilla onboard catalog video",
     "audioProviders": "opensquilla onboard catalog audio",
     "memoryEmbeddingProviders": "opensquilla onboard catalog memory",
 }
@@ -878,6 +880,7 @@ _CATALOG_TITLES = {
     "searchProviders": "Web search providers",
     "channels": "Channel types",
     "imageGenerationProviders": "Image generation providers",
+    "videoGenerationProviders": "Video generation providers",
     "audioProviders": "Voice audio providers",
     "memoryEmbeddingProviders": "Memory embedding providers",
 }
@@ -990,6 +993,11 @@ def _catalog_try_command(
             command += f" --base-url {_catalog_value(row, 'defaultBaseUrl', '<base-url>')}"
         return f"{command}{config_arg}"
 
+    if name == "videoGenerationProviders":
+        # No headless configure recipe exists for video generation yet; point
+        # at the gateway so the Web UI setup page can finish the job.
+        return f"opensquilla gateway run{config_arg}"
+
     if name == "audioProviders":
         # No headless configure recipe exists for voice audio yet; point at
         # the gateway so the Web UI setup page can finish the job.
@@ -1080,6 +1088,21 @@ def _print_list_catalog(
     if name == "imageGenerationProviders":
         console.print("[bold]OpenSquilla image generation provider options[/bold]")
         _print_catalog_recipe_hint()
+        for row in rows:
+            _print_catalog_line(
+                f"- {_catalog_value(row, 'providerId')}: {_catalog_value(row, 'label')}"
+                f" | key {_catalog_key_requirement(row)}"
+                f" | default {_catalog_value(row, 'defaultModel', 'custom')}"
+            )
+            _print_catalog_try_command(name, row, config_arg)
+        return
+
+    if name == "videoGenerationProviders":
+        console.print("[bold]OpenSquilla video generation provider options[/bold]")
+        console.print(
+            "Configure video generation from the Web UI setup page after "
+            "starting the gateway with the Try command."
+        )
         for row in rows:
             _print_catalog_line(
                 f"- {_catalog_value(row, 'providerId')}: {_catalog_value(row, 'label')}"
