@@ -955,3 +955,15 @@ def test_router_catalog_tracks_router_tier_helpers(tmp_path, monkeypatch):
     assert result.exit_code == 0, result.stdout
     for tier in TEXT_TIERS:
         assert f"{tier}:" in result.stdout
+
+
+def test_configure_router_prints_router_mutation_warnings(tmp_path, monkeypatch):
+    # `upsert_router` computes warnings (e.g. the legacy image_model notice) on
+    # every save; the headless router path used to drop them silently.
+    target = tmp_path / "c.toml"
+    monkeypatch.setenv("OPENSQUILLA_GATEWAY_CONFIG_PATH", str(target))
+
+    result = runner.invoke(app, ["onboard", "configure", "router", "--router", "recommended"])
+
+    assert result.exit_code == 0, result.output
+    assert "legacy image_model" in _plain(result.output)
