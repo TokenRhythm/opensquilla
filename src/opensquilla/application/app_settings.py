@@ -93,8 +93,10 @@ _VIDEO_KEY_BINDING_PATHS = frozenset(
     f"video_generation.providers.{provider}.api_key_base_url"
     for provider in VIDEO_GENERATION_OFFICIAL_BASE_URLS
 )
+# Preserve the retired JEV switch from legacy local configs without exposing
+# it as an operator setting or allowing an RPC write to toggle it.
 _READONLY_PATHS = (
-    frozenset({"auth.token", "auth.password", "config_version"})
+    frozenset({"auth.token", "auth.password", "config_version", "jev_router.enabled"})
     | _SCOPED_TELEMETRY_CONSENT_PATHS
     | _VIDEO_KEY_BINDING_PATHS
 )
