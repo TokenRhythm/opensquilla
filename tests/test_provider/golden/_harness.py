@@ -88,6 +88,8 @@ COMPAT_THINKING_MODELS: dict[str, tuple[str, str]] = {
     "moonshot": ("kimi-k2.7-code", "moonshot"),
     "minimax": (_NEUTRAL_MODEL, "none"),
     "mimo": (_NEUTRAL_MODEL, "none"),
+    # An OpenAI-compatible gateway with no reasoning dialect of its own.
+    "opper": (_NEUTRAL_MODEL, "none"),
     "mistral": (_NEUTRAL_MODEL, "none"),
     "groq": (_NEUTRAL_MODEL, "none"),
     # glm-5 prefix in the zai ladder (model_catalog) -> "zai".
