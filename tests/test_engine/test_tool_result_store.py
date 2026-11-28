@@ -13,6 +13,7 @@ import pytest
 
 import opensquilla.engine.agent as agent_mod
 from opensquilla.engine import Agent, AgentConfig, ToolResult
+from opensquilla.engine import tool_result_store as store_mod
 from opensquilla.engine.tool_result_store import (
     ToolResultStore,
     ToolResultStoreBudgetError,
@@ -201,6 +202,242 @@ def test_prunes_oldest_for_disk_budget(tmp_path: Path) -> None:
         store.read(first.handle, session_id=_SESSION_ID)
     assert store.read(second.handle, session_id=_SESSION_ID).content == "b" * 40
     assert store.read(third.handle, session_id=_SESSION_ID).content == "c" * 40
+
+
+def test_projection_batch_applies_current_retention_before_dedup(tmp_path: Path) -> None:
+    store = ToolResultStore(tmp_path)
+    stale = _write(store, "stale")
+    stale_path = store._record_dir(stale.handle, session_id=_SESSION_ID) / "content.txt"
+    os.utime(stale_path, (1_000.0, 1_000.0))
+
+    with store.projection_batch():
+        hot = _write(store, "hot", retention_seconds=None)
+        assert stale_path.exists()
+        hit = _write(store, "hot", tool_use_id="second-call", retention_seconds=60)
+        assert hit.handle == hot.handle
+        assert hit.tool_use_id == "second-call"
+        assert not stale_path.exists()
+
+    assert store.read(hit.handle, session_id=_SESSION_ID).content == "hot"
+
+
+def test_projection_batch_prunes_using_touched_age_and_stored_bytes(tmp_path: Path) -> None:
+    store = ToolResultStore(tmp_path)
+    compressed_body = "a" * 4_000
+    hot = _write(store, compressed_body, max_bytes=128)
+    cold = _write(store, "cold" * 10)
+    hot_path = store._record_dir(hot.handle, session_id=_SESSION_ID) / "content.txt.gz"
+    cold_path = store._record_dir(cold.handle, session_id=_SESSION_ID) / "content.txt"
+    now = time.time()
+    os.utime(hot_path, (now - 120, now - 120))
+    os.utime(cold_path, (now - 60, now - 60))
+    budget = hot_path.stat().st_size + len("fresh") + len("last")
+
+    with store.projection_batch():
+        fresh = _write(store, "fresh")
+        assert _write(store, "fresh").handle == fresh.handle
+        assert _write(store, compressed_body, max_bytes=128).handle == hot.handle
+        last = _write(store, "last", disk_budget_bytes=budget)
+
+    assert not cold_path.exists()
+    for record in (hot, fresh, last):
+        assert store.read(record.handle, session_id=_SESSION_ID).content == record.content
+
+
+def test_projection_batch_counts_undeleted_payload_after_failed_prune(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = ToolResultStore(tmp_path)
+    original_unlink = Path.unlink
+    with store.projection_batch():
+        locked = _write(store, "a" * 20)
+        content = store._record_dir(locked.handle, session_id=_SESSION_ID) / "content.txt"
+
+        def unlink_except_locked_payload(path, *args, **kwargs):
+            if path == content:
+                raise PermissionError("file is open")
+            return original_unlink(path, *args, **kwargs)
+
+        with monkeypatch.context() as patch:
+            patch.setattr(Path, "unlink", unlink_except_locked_payload)
+            with pytest.raises(ToolResultStoreBudgetError, match="disk budget"):
+                _write(store, "b" * 30, disk_budget_bytes=30)
+            assert content.exists()
+        last = _write(store, "c" * 30, disk_budget_bytes=30)
+
+    assert not content.exists()
+    assert store.read(last.handle, session_id=_SESSION_ID).content == "c" * 30
+
+
+@pytest.mark.parametrize("unreadable", ["payload", "directory"])
+def test_projection_batch_rechecks_budget_after_incomplete_scan(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, unreadable: str,
+) -> None:
+    store = ToolResultStore(tmp_path)
+    budget = {"disk_budget_bytes": 80, "retention_seconds": None}
+    old = _write(store, "x" * 60, **budget)
+    hot = _write(store, "a" * 5, **budget)
+    old_path = store._record_dir(old.handle, session_id=_SESSION_ID) / "content.txt"
+    os.utime(old_path, (1_000.0, 1_000.0))
+    real_stat = Path.stat
+    real_scandir = os.scandir
+    faults = 0
+
+    def fail_stat_once(path, *args, **kwargs):
+        nonlocal faults
+        if path == old_path and faults == 0:
+            faults += 1
+            raise PermissionError("temporarily unreadable payload")
+        return real_stat(path, *args, **kwargs)
+
+    def fail_scandir(path):
+        nonlocal faults
+        if Path(path) == old_path.parent:
+            faults += 1
+            raise PermissionError("temporarily unreadable directory")
+        return real_scandir(path)
+
+    with store.projection_batch():
+        with monkeypatch.context() as patch:
+            if unreadable == "payload":
+                patch.setattr(Path, "stat", fail_stat_once)
+            else:
+                patch.setattr(os, "scandir", fail_scandir)
+            assert _write(store, "a" * 5, **budget).handle == hot.handle
+        assert faults > 0
+        new = _write(store, "y" * 30, **budget)
+
+    assert sum(path.stat().st_size for path in tmp_path.rglob("content.txt")) == 35
+    assert not old_path.exists()
+    assert store.read(new.handle, session_id=_SESSION_ID).content == "y" * 30
+
+
+def test_new_snapshot_preserves_store_when_budget_scan_is_incomplete(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = ToolResultStore(tmp_path)
+    budget = {"disk_budget_bytes": 80, "retention_seconds": None}
+    hidden = _write(store, "x" * 60, **budget)
+    visible = _write(store, "a" * 15, **budget)
+    hidden_path = store._record_dir(hidden.handle, session_id=_SESSION_ID) / "content.txt"
+    real_stat = Path.stat
+
+    def fail_stat(path, *args, **kwargs):
+        if path == hidden_path:
+            raise PermissionError("temporarily unreadable payload")
+        return real_stat(path, *args, **kwargs)
+
+    with store.projection_batch():
+        with monkeypatch.context() as patch:
+            patch.setattr(Path, "stat", fail_stat)
+            with pytest.raises(ToolResultStoreBudgetError):
+                _write(store, "y" * 70, **budget)
+        assert sum(path.stat().st_size for path in tmp_path.rglob("content.txt")) == 75
+        assert store.read(hidden.handle, session_id=_SESSION_ID).content == "x" * 60
+        assert store.read(visible.handle, session_id=_SESSION_ID).content == "a" * 15
+        new = _write(store, "y" * 70, **budget)
+
+    assert sum(path.stat().st_size for path in tmp_path.rglob("content.txt")) <= 80
+    assert store.read(new.handle, session_id=_SESSION_ID).content == "y" * 70
+
+
+@pytest.mark.parametrize(
+    ("initial_writes", "seconds_per_write"), [(32, 0.0), (2, 1.0)], ids=["count", "time"],
+)
+def test_projection_batch_rescans_after_another_writer_acquires_the_lock(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, initial_writes: int, seconds_per_write: float,
+) -> None:
+    from contextlib import contextmanager
+
+    store = ToolResultStore(tmp_path)
+    other = ToolResultStore(tmp_path)
+    original_lock = store._budget_lock
+    other_payload = None
+    clock = 0.0
+    monkeypatch.setattr(store_mod, "time", SimpleNamespace(monotonic=lambda: clock))
+
+    @contextmanager
+    def write_between_batches(*, timeout=5.0):
+        nonlocal other_payload
+        with original_lock(timeout=timeout):
+            yield
+        if other_payload is None:
+            record = _write(other, "external" * 8, lock_timeout_seconds=0)
+            other_payload = other._record_dir(record.handle, session_id=_SESSION_ID) / "content.txt"
+            os.utime(other_payload, (1_000.0, 1_000.0))
+
+    monkeypatch.setattr(store, "_budget_lock", write_between_batches)
+    with store.projection_batch():
+        for _ in range(initial_writes):
+            _write(store, "one", retention_seconds=None)
+            clock += seconds_per_write
+        last = _write(store, "two", disk_budget_bytes=6, retention_seconds=None)
+
+    assert other_payload is not None
+    assert not other_payload.exists()
+    assert store.read(last.handle, session_id=_SESSION_ID).content == "two"
+
+
+def test_projection_items_releases_lock_on_skipped_items_and_loop_exit(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from opensquilla.managed_artifacts import ManagedArtifactError
+
+    store, other = ToolResultStore(tmp_path), ToolResultStore(tmp_path)
+    clock = 0.0
+    monkeypatch.setattr(store_mod, "time", SimpleNamespace(monotonic=lambda: clock))
+    with store.projection_items(["write", "cache hit", "skip", "write again"]) as items:
+        assert next(items) == "write"
+        _write(store, "first")
+        assert next(items) == "cache hit"
+        with pytest.raises(ManagedArtifactError):
+            _write(other, "contender", lock_timeout_seconds=0)
+        clock += 1.0
+        assert next(items) == "skip"
+        _write(other, "contender", lock_timeout_seconds=0)
+        assert next(items) == "write again"
+        _write(store, "last")
+    _write(other, "after projection", lock_timeout_seconds=0)
+
+
+@pytest.mark.parametrize("unreadable_lease", [False, True], ids=["held-lease", "unreadable-lease"])
+def test_projection_batch_accounts_for_growing_legacy_output(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, unreadable_lease: bool,
+) -> None:
+    store = ToolResultStore(tmp_path)
+    monkeypatch.setattr(store_mod, "time", SimpleNamespace(monotonic=lambda: 0.0))
+    # Older stores put live output in the same bucket as ordinary snapshots.
+    record_dir = store._record_dir("tr-" + "ab" * 16, session_id=_SESSION_ID)
+    record_dir.mkdir(parents=True)
+    lease_path = record_dir / "output.lease"
+    lease_path.write_bytes(b"0")
+    spool_path = record_dir / "output.spool"
+    with lease_path.open("r+b") as lease, spool_path.open("wb", buffering=0) as out:
+        assert store_mod._try_file_lock(lease)
+        try:
+            out.write(b"a")
+            with store.projection_batch():
+                real_open = Path.open
+                faults = 0
+
+                def fail_lease_once(path, *args, **kwargs):
+                    nonlocal faults
+                    if path == lease_path and faults == 0:
+                        faults += 1
+                        raise PermissionError("temporarily unreadable lease")
+                    return real_open(path, *args, **kwargs)
+
+                with monkeypatch.context() as patch:
+                    if unreadable_lease:
+                        patch.setattr(Path, "open", fail_lease_once)
+                    _write(store, "one", disk_budget_bytes=16)
+                assert faults == int(unreadable_lease)
+                out.write(b"b" * 20)
+                with pytest.raises(ToolResultStoreBudgetError, match="disk budget"):
+                    _write(store, "two", disk_budget_bytes=16)
+        finally:
+            store_mod._release_file_lock(lease)
+    assert spool_path.stat().st_size == 21
 
 
 def test_expired_records_removed_before_write(tmp_path: Path) -> None:

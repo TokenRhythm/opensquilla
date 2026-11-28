@@ -2140,6 +2140,20 @@ def _inspect_profile(
             allowed_actions=transaction_actions,
         )
 
+    if not config.exists:
+        from opensquilla.recovery.config_recovery import has_interrupted_config_recovery
+
+        if has_interrupted_config_recovery(home_path):
+            return _report(
+                home=home_path,
+                config=config,
+                candidates=candidates,
+                outcome="attention",
+                stable_code="config_recovery_interrupted",
+                effective_workspace=None,
+                allowed_actions=("recover-config", *_RECOVERY_ACTIONS),
+            )
+
     # Only an empty home that still resolves both implicit canonical roots is
     # safe to initialize. Ambient/explicit missing external paths are never
     # mistaken for a fresh profile.

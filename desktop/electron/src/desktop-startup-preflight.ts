@@ -145,6 +145,22 @@ function completedConsolidationBackups(userData: string, home: string, snapshots
   } finally { directory.closeSync() }
 }
 
+function consolidationInventoryUnchanged(userData: string, snapshots: MetadataSnapshots): boolean {
+  const root = join(userData, 'backups', 'profile-consolidation')
+  if (!snapshots.get(root)) return optionalStat(root) === null
+  const expected = new Set([...snapshots]
+    .filter(([path, info]) => dirname(path) === root && info?.isDirectory())
+    .map(([path]) => basename(path)))
+  const directory = opendirSync(root)
+  let count = 0
+  try {
+    for (let entry = directory.readSync(); entry; entry = directory.readSync()) {
+      if (++count > MAX_CONSOLIDATION_RECEIPTS || !expected.delete(entry.name)) return false
+    }
+    return expected.size === 0
+  } finally { directory.closeSync() }
+}
+
 /** Resolve TOML data roots using the profile home, including the current-user ~. */
 export function configuredDesktopDataDirectory(home: string, value: unknown, fallback: string): string | null {
   // Python str.strip and JavaScript trim disagree on these characters. Defer
@@ -267,7 +283,12 @@ export function inspectDesktopStartupMetadata(
       || [...snapshots].some(([path, before]) => {
         const after = optionalStat(path)
         return before ? !after || !sameFile(before, after) : after !== null
-      })) {
+      })
+      // Windows can expose equal directory timestamps for concurrent changes.
+      // Recheck the bounded recovery inventory, not just its stat metadata,
+      // before granting the healthy-profile shortcut.
+      || !emptyOrMissingDirectory(join(userData, 'recovery-profiles'))
+      || !consolidationInventoryUnchanged(userData, snapshots)) {
       return fallback('metadata_changed')
     }
     return { canSkipMaintenance: true, stateDirectory, workspaceDirectory }

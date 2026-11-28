@@ -22,10 +22,14 @@ from opensquilla.provider.types import (
 )
 
 
-def _tokenrhythm_limit_body(*, maximum: int = 100, inclusive: bool = True) -> dict[str, Any]:
+def _tokenrhythm_limit_body(
+    *, maximum: int = 100, inclusive: bool = True, nested: bool = False
+) -> dict[str, Any]:
+    fields: dict[str, Any] = {"code": "BAD_REQUEST", "message": "请求参数错误"}
+    if nested:
+        fields = {"error": {**fields, "type": "invalid_request_error", "param": None}}
     return {
-        "code": "BAD_REQUEST",
-        "message": "请求参数错误",
+        **fields,
         "data": [
             {
                 "origin": "array",
@@ -176,12 +180,16 @@ def test_openai_projection_uses_same_prompt_schema_fallback_as_send(
     assert captured["payload"]["messages"][0]["role"] == "system"
 
 
-def test_tokenrhythm_original_583_envelope_yields_typed_limit_proof(
+@pytest.mark.parametrize("envelope", ["platform", "openai", "mixed"])
+def test_tokenrhythm_message_limit_envelopes_yield_typed_limit_proof(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Any,
+    envelope: str,
 ) -> None:
     captured: dict[str, Any] = {}
-    body = _tokenrhythm_limit_body()
+    body = _tokenrhythm_limit_body(nested=envelope == "openai")
+    if envelope == "mixed":
+        body["error"] = {"code": "OTHER", "message": "ignored nested message"}
     body["data"][0]["value"] = ["DO_NOT_RECORD_RESPONSE_VALUE"]
     _patch_chat_response(
         monkeypatch,
@@ -337,6 +345,29 @@ def test_message_limit_detection_rejects_inexact_evidence(
         )
         is None
     )
+
+
+@pytest.mark.parametrize("nested", [False, True], ids=["platform", "openai"])
+@pytest.mark.parametrize("details", ["missing", "wrong_path"])
+def test_tokenrhythm_unproven_message_limit_stays_generic(
+    monkeypatch: pytest.MonkeyPatch,
+    nested: bool,
+    details: str,
+) -> None:
+    body = _tokenrhythm_limit_body(maximum=1, nested=nested)
+    if details == "missing":
+        del body["data"]
+    else:
+        body["data"][0]["path"] = ["tools"]
+    _patch_chat_response(monkeypatch, status_code=400, response_json=body, captured={})
+    provider = OpenAIProvider(
+        api_key="test",
+        base_url="https://tokenrhythm.studio/v1",
+        provider_kind="tokenrhythm",
+    )
+    (error,) = _collect_errors(provider, [Message(role="user", content="sample")] * 2)
+    assert error.code == "400"
+    assert error.message_limit_proof is None
 
 
 def test_message_limit_detection_requires_local_count_above_observed_limit() -> None:

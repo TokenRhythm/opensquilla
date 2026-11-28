@@ -29,15 +29,30 @@ test('macOS startup disables Chromium Keychain access before ready for all defau
 
 test('an old OS-encrypted manual credential cannot block startup or trigger a system prompt', async () => {
   const existing = { encryption: 'safeStorage', encryptedApiKey: 'legacy-secret' }
-  const result = await bind('prepareDesktopStartupConnection', {
+  let osStorageReads = 0
+  const env = {
+    desktopStartupConnectionPromise: null, secretStorageBackendCache: null,
     loadPendingMigrationProviderSetup: async () => null,
     loadDesktopCredential: async () => existing,
     desktopSecretStoragePolicyBackend: () => secretStorageBackendForPolicy({ platform: 'darwin', appPackaged: true }),
     isConnectionReady: () => assert.fail('legacy keys must not be decrypted'),
     pathExists: async () => true, desktopConfigPath: () => '/synthetic/config.toml',
-    forceOnboardingOnNextStartup: false, safeStorage: noOSStorage,
-  })()
-  assert.equal(result, null)
+    forceOnboardingOnNextStartup: false,
+    safeStorage: new Proxy({}, { get() { osStorageReads++; throw Error('OS storage forbidden') } }),
+    activeDesktopProfile: () => ({ home: '/synthetic' }),
+    unreadableDesktopCredentials: new Map(), desktopLog() {},
+  }
+  for (const name of ['prepareDesktopStartupConnectionOnce', 'desktopSecretStorageBackend',
+    'decryptSecret', 'decryptApiKey', 'decryptSearchApiKey', 'readDesktopStartupSecret']) {
+    env[name] = bind(name, env)
+  }
+  const result = await bind('prepareDesktopStartupConnection', env)()
+  // Keep the record for an actionable recovery notice; omit only the unreadable
+  // process-local injection, without touching macOS Keychain or saved bytes.
+  assert.equal(result, existing)
+  assert.equal(env.readDesktopStartupSecret(result, 'encryptedApiKey'), '')
+  assert.equal(osStorageReads, 0)
+  assert.equal(env.unreadableDesktopCredentials.get('/synthetic').encryptedApiKey, 'legacy-secret')
   assert.deepEqual(existing, { encryption: 'safeStorage', encryptedApiKey: 'legacy-secret' })
 })
 

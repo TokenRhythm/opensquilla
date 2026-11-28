@@ -331,6 +331,15 @@ try {
     const receipt = change === 'new-backups' ? null : archivedReceipt(item, 'complete')
     fs.mkdirSync(join(item.userData, 'recovery-profiles'))
     const originalOpen = fs.openSync
+    const originalStat = fs.lstatSync
+    const inventory = change === 'new-recovery'
+      ? join(item.userData, 'recovery-profiles')
+      : join(item.userData, 'backups', 'profile-consolidation')
+    const inventoryBefore = change === 'new-backups' ? null : originalStat(inventory)
+    // Make the Windows timestamp-coalescing race deterministic. The guard
+    // must observe the actual new source/transaction even if stat is equal.
+    fs.lstatSync = (path, ...args) => inventoryBefore && path === inventory
+      ? inventoryBefore : originalStat(path, ...args)
     let changed = false
     fs.openSync = (path, ...args) => {
       if (!changed && path === join(item.home, 'config.toml')) {
@@ -344,6 +353,7 @@ try {
     syncBuiltinESMExports()
     try { assert.equal(check(item, false).reason, 'metadata_changed') } finally {
       fs.openSync = originalOpen
+      fs.lstatSync = originalStat
       syncBuiltinESMExports()
     }
     assert.equal(changed, true)

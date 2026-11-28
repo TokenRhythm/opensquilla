@@ -13,11 +13,14 @@ import threading
 import time
 from contextlib import asynccontextmanager, contextmanager
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
 from opensquilla.engine import Agent, AgentConfig
+from opensquilla.engine import agent as agent_module
 from opensquilla.engine import tool_result_store as trs_module
+from opensquilla.engine.session_sanitize import recoverable_tool_result_reference
 from opensquilla.managed_artifacts import ManagedArtifactError
 from opensquilla.provider import ContentBlockToolResult, ContentBlockToolUse, Message
 from opensquilla.tools import ToolRegistry, tool
@@ -129,16 +132,16 @@ async def test_body_writer_refuses_missing_scope_or_retrieval(tmp_path):
         current_tool_context.reset(token)
 
 
-def _bulky_messages() -> list[Message]:
-    raw = "compaction bulky output\n" + ("x" * 8000)
+def _bulky_messages(tool_id: str = "tool-1", size: int = 8000) -> list[Message]:
+    raw = f"{tool_id} output\n" + ("x" * size)
     return [
         Message(
             role="assistant",
-            content=[ContentBlockToolUse(id="tool-1", name="execute_code", input={})],
+            content=[ContentBlockToolUse(id=tool_id, name="execute_code", input={})],
         ),
         Message(
             role="user",
-            content=[ContentBlockToolResult(tool_use_id="tool-1", content=raw)],
+            content=[ContentBlockToolResult(tool_use_id=tool_id, content=raw)],
         ),
     ]
 
@@ -180,6 +183,139 @@ async def test_store_scan_runs_off_event_loop_thread(tmp_path: Path, monkeypatch
         if isinstance(block, ContentBlockToolResult) and block.tool_use_id == "tool-1"
     )
     assert len(projected.content) < 8000
+
+
+async def test_history_snapshots_share_one_scan_per_projection_pass(tmp_path, monkeypatch):
+    # Exercise the unexpired batch even when CI filesystem latency is high.
+    monkeypatch.setattr(trs_module, "time", SimpleNamespace(monotonic=lambda: 1.0))
+    # Old under-cap results trigger aggregate compaction; oversized results
+    # use the absolute cap. The two most recent under-cap results stay inline.
+    messages = []
+    original_content = {}
+    for index, size in enumerate([1600, 1600, 8000, 8000, 1600, 1600]):
+        tool_id = f"call-{index}"
+        pair = _bulky_messages(tool_id, size)
+        messages.extend(pair)
+        original_content[tool_id] = _tool_content(pair, tool_id)
+
+    scans = 0
+    original_scan = trs_module.ToolResultStore._iter_record_stats
+
+    def count_scan(store):
+        nonlocal scans
+        scans += 1
+        return original_scan(store)
+
+    monkeypatch.setattr(trs_module.ToolResultStore, "_iter_record_stats", count_scan)
+    store = trs_module.ToolResultStore(tmp_path / "store")
+    rebuilt = set()
+    original_copy = Message.model_copy
+
+    def copy_after_release(message, *, update=None, **kwargs):
+        blocks = (update or {}).get("content")
+        if isinstance(blocks, list) and blocks and isinstance(blocks[0], ContentBlockToolResult):
+            block = blocks[0]
+            if recoverable_tool_result_reference(block.content) is not None:
+                # Rebuilding messages after either write loop must allow an
+                # independent budget-lock owner to enter immediately.
+                with store._budget_lock(timeout=0):
+                    rebuilt.add(block.tool_use_id)
+        return original_copy(message, update=update, **kwargs)
+
+    monkeypatch.setattr(Message, "model_copy", copy_after_release)
+    stored_by_turn = []
+    for turn in range(2):
+        rebuilt.clear()
+        agent = _agent_with_store(tmp_path)
+        projected = await agent._provider_request_messages_async(
+            messages,
+            request_context_message=None,
+            request_context_insert_index=0,
+            runtime_context_message=Message(role="user", content="[Runtime context]"),
+            runtime_context_insert_index=len(messages),
+        )
+        assert scans == 2 * (turn + 1)
+        records = {}
+        for index, (tool_id, raw) in enumerate(original_content.items()):
+            content = _tool_content(projected, tool_id)
+            if index >= 4:
+                assert content == raw
+                continue
+            expected = (
+                "[aggregate_tool_result_compacted]" if index < 2 else "[tool_result_projection]"
+            )
+            assert content.splitlines()[0] == expected
+            reference = recoverable_tool_result_reference(content)
+            assert reference is not None
+            handle, sha = reference
+            record = store.read(handle, session_id="sid-a")
+            assert (record.sha256, record.content) == (sha, raw)
+            records[tool_id] = (handle, record.created_at)
+        assert rebuilt == set(records)
+        stored_by_turn.append(records)
+    assert stored_by_turn[1] == stored_by_turn[0]
+
+
+@pytest.mark.parametrize("aggregate", [False, True], ids=["single-large-result", "aggregate"])
+async def test_hint_rendering_yields_snapshot_lock_inside_one_result(
+    tmp_path: Path, monkeypatch, aggregate: bool,
+) -> None:
+    clock = 0.0
+    monkeypatch.setattr(trs_module, "time", SimpleNamespace(monotonic=lambda: clock))
+    other_writer = trs_module.ToolResultStore(tmp_path / "store")
+    observations = []
+    pattern = agent_module._TOOL_RESULT_HINT_PATTERN
+
+    def search(line):
+        nonlocal clock
+        if line == "start build log":
+            with pytest.raises(ManagedArtifactError):
+                with other_writer._budget_lock(timeout=0):
+                    pass
+            clock += 1.0
+            observations.append("started")
+        elif line == "error in build/objects":
+            with other_writer._budget_lock(timeout=0):
+                observations.append("writer entered")
+        return pattern.search(line)
+
+    monkeypatch.setattr(agent_module, "_TOOL_RESULT_HINT_PATTERN", SimpleNamespace(search=search))
+    messages = []
+    sizes = [1600, 1600, 8000, 8000, 1600, 1600] if aggregate else [8000]
+    for index, size in enumerate(sizes):
+        pair = _bulky_messages(f"call-{index}", size)
+        if index == 0:
+            raw = "start build log\nerror in build/objects\n" + ("build progress\n" * (size // 15))
+            pair[1] = Message(
+                role="user", content=[ContentBlockToolResult(tool_use_id="call-0", content=raw)],
+            )
+        messages.extend(pair)
+    projected = await _agent_with_store(tmp_path)._provider_request_messages_async(
+        messages, request_context_message=None, request_context_insert_index=0,
+        runtime_context_message=Message(role="user", content="[Runtime context]"),
+        runtime_context_insert_index=len(messages),
+    )
+    content = _tool_content(projected, "call-0")
+    expected = "[aggregate_tool_result_compacted]" if aggregate else "[tool_result_projection]"
+    assert content.splitlines()[0] == expected
+    assert "search_hints:\n- L2: error in build/objects\n" in content
+    assert observations == ["started", "writer entered"]
+
+
+def test_agent_snapshot_cache_follows_configured_store(tmp_path: Path) -> None:
+    agent = _agent_with_store(tmp_path)
+    first = agent._store_tool_result_snapshot("shared body", tool_use_id="t1", tool_name="fixture")
+    assert first is not None
+    second_root = tmp_path / "other"
+    store = trs_module.ToolResultStore(second_root)
+    existing = store.write(
+        "shared body", tool_use_id="t1", tool_name="fixture", session_id="sid-a",
+        session_key="agent:main:webchat:a", agent_id="main",
+    )
+    agent.config.tool_result_store_dir = str(second_root)
+    reused = agent._store_tool_result_snapshot("shared body", tool_use_id="t1", tool_name="fixture")
+    assert reused is not None and reused is not first
+    assert (reused.handle, reused.created_at) == (existing.handle, existing.created_at)
 
 
 @pytest.mark.asyncio
@@ -269,13 +405,13 @@ async def _hold_store_budget(store: trs_module.ToolResultStore):
         await holder
 
 
-def _tool_content(messages: list[Message]) -> str:
+def _tool_content(messages: list[Message], tool_id: str = "tool-1") -> str:
     return next(
         block.content
         for message in messages
         if isinstance(message.content, list)
         for block in message.content
-        if isinstance(block, ContentBlockToolResult) and block.tool_use_id == "tool-1"
+        if isinstance(block, ContentBlockToolResult) and block.tool_use_id == tool_id
     )
 
 

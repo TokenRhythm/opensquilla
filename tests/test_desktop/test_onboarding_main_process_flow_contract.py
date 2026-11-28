@@ -62,8 +62,9 @@ def test_onboarding_save_preserves_recovery_and_writer_ordering() -> None:
     marker = save.index("() => readPendingMigrationProviderSetup()")
     settings_stage = save.index("telemetry.stage('settings_persist'")
     imported = save.index("await saveImportedDesktopCredential(")
-    ordinary = save.index("await saveDesktopCredential(payload, true, true)")
+    ordinary = save.index("await saveDesktopCredential(payload, true, true, accountPrimary)")
     refresh_keychain = save.index("invalidateSecretStorageBackendCache()")
+    account_verification = save.index("await desktopAccount().account.selectSource('account')")
     settings_persisted = save.index("telemetry.markSettingsPersistedConfirmed()")
     finalize_stage = save.index("telemetry.stage('local_finalize'")
     locale = save.index("applyDesktopLocaleChoice(payload.locale)")
@@ -81,6 +82,8 @@ def test_onboarding_save_preserves_recovery_and_writer_ordering() -> None:
     assert writer_admitted < marker_stage < marker < settings_stage
     assert settings_stage < refresh_keychain < imported < settings_persisted
     assert refresh_keychain < ordinary < settings_persisted
+    assert refresh_keychain < account_verification < ordinary
+    assert "accountPrimary = false" in save
     assert settings_persisted < finalize_stage < locale < clear_marker < finish
     assert finish < handoff_stage < lifecycle_guard < complete < telemetry_finish
     assert "app.isPackaged" in save
@@ -88,6 +91,22 @@ def test_onboarding_save_preserves_recovery_and_writer_ordering() -> None:
     assert "return telemetry.recordReturned(" in save
     assert "if (flow.state === 'saving') flow.state = 'editing'" in save
     assert "throw error" in save
+
+
+def test_account_onboarding_uses_trusted_coordinated_save_before_success() -> None:
+    source = _main_source()
+    handler = _section(
+        source, "ipcMain.handle('desktop:onboarding:account'",
+        "ipcMain.handle('desktop:onboarding:skip'",
+    )
+    trust = handler.index("if (!flow || !trustedOnboardingIpc(event, flow))")
+    request = handler.index("onboardingFlows.requestSave(")
+    assert trust < request < handler.index("return await request.promise")
+    assert "performOnboardingSave(flow, payload, true)" in handler
+    assert "provider: 'tokenrhythm', credentialSource: 'account'" in handler
+    assert "request.kind === 'conflict'" in handler
+    assert "request.kind === 'inactive'" in handler
+    assert "dismissOnboardingFlow" not in handler
 
 
 def test_fresh_onboarding_runs_before_gateway_without_changing_existing_prompt_path() -> None:

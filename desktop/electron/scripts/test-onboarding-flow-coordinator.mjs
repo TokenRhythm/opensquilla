@@ -107,7 +107,7 @@ async function verifyAbandonedFlowCannotCompleteOrReplaceCurrentFlow() {
   assert.equal(coordinator.active, null)
 }
 
-function compiledSaveHarness(coordinator, stopGateway) {
+function compiledSaveHarness(coordinator, stopGateway, restartGateway = async () => {}) {
   const main = readFileSync(new URL('../dist/main.js', import.meta.url), 'utf8')
   const start = main.indexOf('async function performOnboardingSave(')
   const end = main.indexOf('async function withRecoveryOperation', start)
@@ -131,8 +131,32 @@ function compiledSaveHarness(coordinator, stopGateway) {
     appExitPhase: 'running',
     clearReusableGatewayState: () => {},
     bootError: null,
-    openOrResumeDesktopApp: async () => {},
+    openOrResumeDesktopApp: restartGateway,
   })
+}
+
+async function verifyFailedSaveWaitsForRuntimeRestoration() {
+  const coordinator = new OnboardingFlowCoordinator()
+  const current = flow()
+  coordinator.activate(current)
+  const restoring = deferred()
+  const entered = deferred()
+  const perform = compiledSaveHarness(coordinator, async () => {}, async () => {
+    entered.resolve()
+    await restoring.promise
+  })
+  const first = coordinator.requestSave(current, {}, () => perform(current, {}))
+  let settled = false
+  void first.promise.then(() => { settled = true })
+  await entered.promise
+  assert.equal(settled, false, 'do not release a failed save while its runtime is still starting')
+  const correction = coordinator.requestSave(current, { apiKey: 'synthetic-correction' }, () => {
+    assert.fail('the correction must not stop the restoring runtime')
+  })
+  assert.equal(correction.kind, 'conflict')
+  restoring.resolve()
+  assert.equal((await first.promise).code, 'recovery_required')
+  assert.equal(current.savePromise, null)
 }
 
 async function verifyGatewayStopFailureCanBeRetried() {
@@ -235,6 +259,7 @@ async function verifyImportDoesNotReuseThePreviousProviderDraft() {
 await verifyExactPayloadSingleFlight()
 await verifyAbandonedFlowCannotCompleteOrReplaceCurrentFlow()
 await verifyGatewayStopFailureCanBeRetried()
+await verifyFailedSaveWaitsForRuntimeRestoration()
 await verifyGatewayStopFailureDoesNotReviveDismissedFlow()
 await verifyImportDoesNotReuseThePreviousProviderDraft()
 console.log('onboarding flow coordinator tests passed')

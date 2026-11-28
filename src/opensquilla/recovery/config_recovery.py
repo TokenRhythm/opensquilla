@@ -1,19 +1,21 @@
 """Offline recovery of a corrupt profile ``config.toml``.
 
 The repair is deliberately conservative: the corrupt file is preserved by an
-atomic no-replace rename to ``config.toml.corrupt.<stamp>`` before any byte is
-written, and the replacement comes from the newest sibling backup whose bytes
+atomic no-replace rename to ``config.toml.corrupt.<stamp>`` before publication,
+and the replacement comes from the newest sibling backup whose bytes
 still validate. Without a usable backup a minimal default config is written so
 startup can proceed. A crash between the rename and the write leaves no config
-at all, which the inspector already treats as a fresh profile with defaults —
-never a replaced or half-written file.
+at all. The inspector recognizes that preserved evidence and offers this same
+repair again; a nonempty profile is never passed off as a fresh installation.
 """
 
 from __future__ import annotations
 
 import datetime
 import os
+import re
 import tomllib
+import uuid
 from pathlib import Path
 
 from opensquilla.config_version import LATEST_CONFIG_VERSION
@@ -31,9 +33,33 @@ from opensquilla.recovery.locking import (
 )
 from opensquilla.recovery.models import RecoveryReport
 
-_RECOVERABLE_CONFIG_CODES = frozenset({"config_invalid", "config_unreadable"})
+_RECOVERABLE_CONFIG_CODES = frozenset({
+    "config_invalid", "config_unreadable", "config_recovery_interrupted",
+})
 _DEFAULT_CONFIG = f"config_version = {LATEST_CONFIG_VERSION}\n".encode()
 _BACKUP_PREFIX = "config.toml.backup."
+
+
+def has_interrupted_config_recovery(home: Path) -> bool:
+    """A parked original is evidence of the old rename/write interruption.
+
+    Merely having a nonempty home is not permission to create a default config.
+    ConfigSnapshot rejects directories, links, reparse points and hardlinks.
+    """
+    try:
+        names = [entry.name for entry in os.scandir(_native_io_path(home))]
+    except OSError:
+        return False
+    for name in names:
+        if not re.fullmatch(r"config\.toml\.corrupt\.[0-9]{20}(?:\.[0-9]+)?", name):
+            continue
+        try:
+            snapshot = ConfigSnapshot.capture(home / name)
+        except RecoveryError:
+            continue
+        if snapshot.identity is not None:
+            return True
+    return False
 
 
 def _fsync_directory(path: Path) -> None:
@@ -154,7 +180,7 @@ def recover_config(home: str | Path, *, lock_timeout: float = 0.0) -> RecoveryRe
 
     Inspection runs inside the profile locks and gates the repair, so pending
     crash-recovery journals keep their priority and only
-    ``config_invalid``/``config_unreadable`` may proceed.
+    corrupt, unreadable, or evidenced interrupted config recovery may proceed.
     ``config_schema_too_new`` is a downgrade scenario, not corruption, and is
     never rewritten.
     """
@@ -174,9 +200,22 @@ def recover_config(home: str | Path, *, lock_timeout: float = 0.0) -> RecoveryRe
                     )
                 return report
             restored = _newest_valid_backup_bytes(home_path)
-            _park_corrupt_config(config_path)
+            # Prepare and flush the replacement before parking the original.
+            # A write failure therefore leaves config.toml in place; publication
+            # is a no-replace atomic rename, never a visible partial config.
+            temporary = home_path / f".config.toml.recovery-{uuid.uuid4()}.tmp"
             _write_config_no_replace(
-                config_path,
+                temporary,
                 restored if restored is not None else _DEFAULT_CONFIG,
             )
+            prepared = ConfigSnapshot.capture(temporary)
+            try:
+                if report.stable_code != "config_recovery_interrupted":
+                    _park_corrupt_config(config_path)
+                native_move_no_replace(temporary, config_path)
+                _fsync_directory(home_path)
+            finally:
+                remaining = ConfigSnapshot.capture(temporary)
+                if remaining.identity is not None and remaining.identity == prepared.identity:
+                    os.unlink(_native_io_path(temporary))
     return inspect_profile(home_path)
